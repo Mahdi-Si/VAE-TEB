@@ -291,7 +291,7 @@ def test_the_profile_figure_draws_every_head_and_shades_a_truncated_region() -> 
         shaded = [
             label
             for label in figure.axes[0].get_legend_handles_labels()[1]
-            if label.startswith("lags truncated at")
+            if label.startswith("lags truncated")
         ]
         label = figure.axes[0].get_xlabel()
     finally:
@@ -324,7 +324,7 @@ def test_an_untruncated_geometry_shades_nothing() -> None:
         shaded = [
             label
             for label in figure.axes[0].get_legend_handles_labels()[1]
-            if label.startswith("lags truncated at")
+            if label.startswith("lags truncated")
         ]
     finally:
         plt.close(figure)
@@ -333,9 +333,10 @@ def test_an_untruncated_geometry_shades_nothing() -> None:
     assert shaded == []
 
 
-def test_both_figures_carry_the_group_delay_caveat() -> None:
+def test_both_figures_carry_the_group_delay_note() -> None:
     """A figure is the artifact most likely to be lifted out of a run directory and shown alone,
-    and an attention peak read off one without this beside it is read as a physiological delay."""
+    and an attention peak read off one without this beside it is read as a physiological delay.
+    The figure carries the one-line note; the long caveat is in the record."""
     import matplotlib.pyplot as plt
 
     lag = _lag_block()
@@ -358,8 +359,8 @@ def test_both_figures_carry_the_group_delay_caveat() -> None:
         plt.close(profile_figure)
         plt.close(heatmap_figure)
 
-    assert lag_axis.GROUP_DELAY_CAVEAT in profile_texts
-    assert lag_axis.GROUP_DELAY_CAVEAT in heatmap_texts
+    assert lag_axis.GROUP_DELAY_NOTE in profile_texts
+    assert lag_axis.GROUP_DELAY_NOTE in heatmap_texts
 
 
 def test_the_heatmap_uses_no_interpolation_and_the_coefficient_time_axis() -> None:

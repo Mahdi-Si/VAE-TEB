@@ -213,7 +213,8 @@ def test_the_distribution_figure_marks_zero_and_the_interval_on_the_mean() -> No
 
 
 def test_the_agreement_panel_counts_sign_agreement_over_recordings() -> None:
-    """Two estimators that disagree in sign on half the recordings say so in the title."""
+    """Two estimators that disagree in sign on half the recordings say so in the record, and the
+    panel names its pair by the rank correlation in the title."""
     from teb_vae.lag_attn.eval import figures as shared_figures
 
     per_guid = _per_guid(
@@ -230,7 +231,9 @@ def test_the_agreement_panel_counts_sign_agreement_over_recordings() -> None:
         shared_figures.plt.close(figure)
 
     assert drawn == 4
-    assert "same sign on 50% of 4 recordings" in title
+    assert "$\\rho$" in title
+    agreement = coupling_analysis.pair_agreement(per_guid, "pred_gap_mc_nats", "pred_gap_mean_nats")
+    assert agreement["same_sign_share"] == 0.5 and agreement["n_recordings"] == 4
 
 
 # =============================================================================

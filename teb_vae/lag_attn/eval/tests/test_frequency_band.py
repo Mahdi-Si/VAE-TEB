@@ -317,7 +317,7 @@ def test_the_frequency_scatter_drops_channels_with_no_centre_frequency_and_says_
         assert handle.get_offsets().shape[0] == 2
         assert axes[0, 0].get_xscale() == "log"
         legend = axes[0, 0].get_legend()
-        assert legend is not None and "2 channel(s)" in legend.get_texts()[0].get_text()
+        assert legend is not None and "2 without frequency" in legend.get_texts()[0].get_text()
     finally:
         figures.plt.close(figure)
 

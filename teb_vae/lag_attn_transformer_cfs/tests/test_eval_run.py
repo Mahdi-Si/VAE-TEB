@@ -108,10 +108,10 @@ def _write_arm(root: Path, name: str, *, model_class: str, anchor_stride: int = 
 
 
 def test_the_tables_carry_this_cells_one_axis_and_the_cross_cell_comparison(tmp_path) -> None:
-    """One sweep section rather than the cfs cell's four: this package ships one ``sweep_*.yaml``
-    arm, and a section whose every row read ``(absent)`` would print a sweep nobody ran as though
-    somebody had. The cross-cell table is the shared one, so the two cells' rows are assembled the
-    same way."""
+    """The tiling table, the arm leaves table and the shared cross-cell table. The tiling table is
+    the cfs cell's own; every other shipped arm is identified in the leaves table by the leaf it
+    moved; the cross-cell table is the shared one, so the two cells' rows are assembled the same
+    way."""
     _write_arm(tmp_path, "trf_dense", model_class="SeqVaeLagAttnTrfCfs", anchor_stride=1)
     _write_arm(tmp_path, "trf_tiled", model_class="SeqVaeLagAttnTrfCfs", anchor_stride=15)
     _write_arm(tmp_path, "cfs_tiled", model_class="SeqVaeLagAttnCfs", anchor_stride=15)
@@ -124,6 +124,7 @@ def test_the_tables_carry_this_cells_one_axis_and_the_cross_cell_comparison(tmp_
     assert headings == [
         "## Arm inventory",
         "## Anchor tiling sweep (`anchor_stride`)",
+        "## Arm leaves",
         "## Cross-cell comparison",
     ], headings
     # Both cells' rows in the cross-cell table, keyed on the class each run recorded.
@@ -131,6 +132,23 @@ def test_the_tables_carry_this_cells_one_axis_and_the_cross_cell_comparison(tmp_
     assert "SeqVaeLagAttnCfs" in document
     assert shared_verify.SELECTION_RULE in document
 
+
+
+def test_every_shipped_sweep_arm_is_identified_by_a_leaf_the_tables_print() -> None:
+    """A shipped arm whose moved leaf no table prints is a row a reader can tell apart only by its
+    directory name. ``anchor_stride`` has its own table; every other arm must move at least one leaf
+    of :data:`SWEPT_ARM_LEAVES`."""
+    import yaml
+
+    tabulated = {path[-1] for _, path in verify_module.SWEPT_ARM_LEAVES}
+    tabulated.add(verify_module.SWEPT_ANCHOR_STRIDE[-1])
+    configs = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_transformer_cfs" / "configs"
+    arms = sorted(configs.glob("sweep_*.yaml"))
+    assert arms
+    for arm in arms:
+        leaves = set((yaml.safe_load(arm.read_text(encoding="utf-8")).get("model_config") or {})
+                     .get("VAE_model") or {})
+        assert leaves & tabulated, f"{arm.name} moves {sorted(leaves)}, none of which a table prints"
 
 def test_the_gate_and_the_tables_dispatch_from_one_command_line(tmp_path) -> None:
     import json

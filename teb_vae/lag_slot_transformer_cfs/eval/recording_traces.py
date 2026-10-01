@@ -68,7 +68,9 @@ STATUS_SKIPPED = "SKIPPED"
 STATUS_EMPTY = "EMPTY"
 STATUS_TRACED = "TRACED"
 
-#: The qualification every artifact of this stage carries about its lag family.
+#: The qualification every record of this stage carries about its lag family, and the dashboard
+#: its caption. A figure prints :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`
+#: instead, one line, and this sentence stays in the records and the figure guide.
 PROPOSAL_QUALIFICATION = (
     "The lag map on these traces is the proposal norm ||r_{t,l}||_2 at every anchor and lag: an "
     "update magnitude before the sum and the limiter, not a distribution over lags and not an "
@@ -80,23 +82,21 @@ PROPOSAL_QUALIFICATION = (
 PANELS: Tuple[Any, ...] = (
     traces.LinePanel(("kld_per_t",), "Divergence $K_t$ per anchor", "nats", labels=("$K_t$",),
                      segment_mean=True),
-    traces.LinePanel(("pred_gap",), "Forecast gap per anchor, single draw", "nats",
+    traces.LinePanel(("pred_gap",), "Forecast gap per anchor", "nats",
                      labels=("base $-$ full",), segment_mean=True),
-    traces.HeatmapPanel("mu_post", "Full-branch mean $\\mu^q$ over the latent coordinates", "coordinate",
-                        symmetric=True),
-    traces.HeatmapPanel("update_mean", "Bounded mean update $a_t$ (signed log colour scale)", "coordinate",
-                        symmetric=True, log=True),
-    traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate, $K_{t,d}$", "coordinate"),
-    traces.HeatmapPanel("proposal_lag_map", "Proposal norm $\\| r_{t,\\ell}\\|_2$ over lags (log colour scale)", "",
+    traces.HeatmapPanel("mu_post", "Full-branch mean $\\mu^q$", "coordinate", symmetric=True),
+    traces.HeatmapPanel("update_mean", "Mean update $a_t$", "coordinate", symmetric=True, log=True),
+    traces.HeatmapPanel("kld_per_dim", "Divergence per coordinate", "coordinate"),
+    traces.HeatmapPanel("proposal_lag_map", "Proposal norm $\\| r_{t,\\ell}\\|_2$", "",
                         log=True, lag_axis=True, argmax_column="proposal_argmax_lag"),
     traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units",
                      labels=("$\\|\\mu^p\\|_2$", "$\\|\\mu^q - \\mu^p\\|_2$")),
-    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance over coordinates", "",
+    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance", "",
                      labels=("prior", "posterior")),
     traces.LinePanel(("proposal_lag_centroid_s", "proposal_lag_median_s"),
-                     "Lag centre of the proposal norm", "s (stored-coefficient time)",
+                     "Proposal lag centre", "s (stored-coefficient time)",
                      labels=("centroid", "median")),
-    traces.LinePanel(("cancellation_ratio_mean",), "Cancellation ratio of the mean update", "",
+    traces.LinePanel(("cancellation_ratio_mean",), "Cancellation ratio", "",
                      labels=("cancellation ratio",)),
 )
 
@@ -104,12 +104,11 @@ PANELS: Tuple[Any, ...] = (
 SUMMARY_METRICS: Tuple[traces.SummaryMetric, ...] = (
     traces.SummaryMetric("kld_per_t", "nats per anchor", "Divergence $K_t$"),
     traces.SummaryMetric("pred_gap", "nats per anchor", "Single-draw forecast gap"),
-    traces.SummaryMetric("delta_mu_norm", "latent units",
-                         "Source shift of the latent mean, $\\|\\mu^q - \\mu^p\\|_2$"),
+    traces.SummaryMetric("delta_mu_norm", "latent units", "Source shift $\\|\\mu^q - \\mu^p\\|_2$"),
     traces.SummaryMetric("n_active_dims", "coordinates", "Active latent coordinates"),
     traces.SummaryMetric("proposal_lag_centroid_s", "s (stored-coefficient time)",
-                         "Lag centroid of the proposal norm"),
-    traces.SummaryMetric("cancellation_ratio_mean", "ratio", "Cancellation ratio of the mean update"),
+                         "Proposal lag centroid"),
+    traces.SummaryMetric("cancellation_ratio_mean", "ratio", "Cancellation ratio"),
 )
 
 
@@ -441,7 +440,7 @@ def run_recording_traces(
             figure = figures.render_figure(
                 traces.build_recording_figure(
                     recording, panels=PANELS, lag_seconds=lag_seconds,
-                    caveat=f"{PROPOSAL_QUALIFICATION} {lag_axis.GROUP_DELAY_CAVEAT}",
+                    caveat=lag_axis.GROUP_DELAY_NOTE,
                 ),
                 class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
             )

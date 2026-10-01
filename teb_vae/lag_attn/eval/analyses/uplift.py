@@ -109,11 +109,11 @@ def run_uplift_analysis(
     figure, axes = figures.new_figure(2)
     try:
         figures.histogram_panel(
-            axes[0, 0], absolute, title="Absolute uplift $L_{base} - L_{full}$",
-            xlabel="uplift_abs", reference=0.0, reference_label="no uplift",
+            axes[0, 0], absolute, title="Absolute uplift",
+            xlabel="$L_{base} - L_{full}$", reference=0.0, reference_label="no uplift",
         )
         figures.histogram_panel(
-            axes[1, 0], relative, title="Relative uplift", xlabel="uplift_rel",
+            axes[1, 0], relative, title="Relative uplift", xlabel="Uplift / $|L_{base}|$",
             reference=0.0, reference_label="no uplift",
         )
         figure_path = str(figures.render_figure(figure, directory / "uplift"))

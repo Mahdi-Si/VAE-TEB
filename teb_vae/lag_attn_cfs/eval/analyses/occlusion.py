@@ -720,30 +720,27 @@ def build_horizon_figure(per_horizon: pd.DataFrame, bands: Dict[str, Tuple[int, 
     if per_horizon.empty:
         figures.multi_line_panel(
             axis, np.asarray([]), np.asarray([]), [],
-            title="source occlusion: no band scored",
-            xlabel="horizon step", ylabel=NATS_PER_ANCHOR_STEP,
+            title="Forecast cost of band removal",
+            xlabel="horizon step", ylabel="nats per anchor per step",
         )
         return figure
 
     steps = np.sort(per_horizon["horizon_step"].unique())
     curves, names = [], []
-    for name, band in bands.items():
+    for name in bands:
         subset = per_horizon[per_horizon["band"] == name].sort_values("horizon_step")
         if subset.empty:
             continue
         curves.append(np.asarray(subset["delta_nats"], dtype=np.float64))
-        names.append(
-            f"{name} [{int(band[0])}, {int(band[1])}] "
-            f"(live {float(subset['live_fraction'].iloc[0]):.2f})"
-        )
+        names.append(f"{name} (live {float(subset['live_fraction'].iloc[0]):.2f})")
     figures.multi_line_panel(
         axis,
         steps,
         np.asarray(curves, dtype=np.float64) if curves else np.asarray([]),
         names,
-        title="forecast cost of removing a band of source, by horizon step",
+        title="Forecast cost of band removal",
         xlabel="horizon step",
-        ylabel=NATS_PER_ANCHOR_STEP,
+        ylabel="nats per anchor per step",
     )
     axis.axhline(0.0, linestyle="--", linewidth=figures.LINE_THIN, color="0.4")
     return figure
@@ -1027,9 +1024,9 @@ def build_clock_figure(
             )
         span = bands[name]
         panel.set_title(
-            f"{name}: lags {span[0]}-{span[1]} steps "
-            f"({float(lag_compensated_seconds(span[0], delay_steps=delay_steps)):g}-"
-            f"{float(lag_compensated_seconds(span[1], delay_steps=delay_steps)):g} s)",
+            f"{name.capitalize()}, "
+            f"{float(lag_compensated_seconds(span[0], delay_steps=delay_steps)):g}-"
+            f"{float(lag_compensated_seconds(span[1], delay_steps=delay_steps)):g} s",
             fontsize=figures.FONT_SMALL,
         )
         panel.set_ylabel("nats per anchor")

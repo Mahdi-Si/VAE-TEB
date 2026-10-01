@@ -1288,7 +1288,9 @@ def _draw_lines(
             continue
         colour = LINE_COLOURS[index % len(LINE_COLOURS)]
         label = panel.labels[index] if index < len(panel.labels) else column
-        first = True
+        # A panel's one series is named by its title, so it gets no key of its own: only several
+        # series, and the segment mean drawn over one, need a legend.
+        first = len(panel.columns) > 1
         for cell in _segment_slices(frame):
             hours = np.asarray(cell[cohort.HOURS_COLUMN], dtype=np.float64)
             values = np.asarray(cell[column], dtype=np.float64)
@@ -1302,13 +1304,14 @@ def _draw_lines(
                 )
                 first = False
                 drawn += 1
-    entries = sum(1 for column in panel.columns if column in frame.columns)
     if drawn and panel.segment_mean and panel.columns:
-        entries += int(_draw_segment_means(ax, recording, panel.columns[0]))
+        _draw_segment_means(ax, recording, panel.columns[0])
     if drawn == 0:
         _note_empty(ax)
     else:
-        _title_legend(ax, entries)
+        keyed = len(ax.get_legend_handles_labels()[0])
+        if keyed:
+            _title_legend(ax, keyed)
         if y_range is not None:
             ax.set_ylim(*y_range)
     figures.style_axes(ax)
@@ -1335,12 +1338,17 @@ def build_recording_figure(
     fixed :data:`RAW_SIGNAL_LIMITS` scale, so every model row is read against the physiology it
     came from and two recordings' pages share one grid.
 
+    The page is titled by the recording alone, ``guid G, subgroup S, class C``; how many segments
+    and breaks it holds is in the manifest. A raw row is titled by the signal and carries its
+    unit on the y axis.
+
     Args:
         recording: The assembled recording.
         panels: :class:`HeatmapPanel` and :class:`LinePanel` entries, top to bottom.
         lag_seconds: The compensated lag axis, for the lag-resolved heatmaps.
-        caveat: A sentence printed under the figure, or ``None``. A figure carrying a lag axis
-            carries the group-delay caveat.
+        caveat: A one-line note printed under the figure, or ``None``; a figure carrying a lag
+            axis passes :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`, never the
+            long caveat the records hold.
         scales: From :func:`shared_panel_scales`, so every traced recording draws each panel on
             one scale; ``None`` scales each panel to this recording alone.
 
@@ -1380,7 +1388,7 @@ def build_recording_figure(
             cax.set_axis_off()
             t_abs, values, unit = painted_raw(recording, panel)
             draw_raw_signal(ax, -t_abs / cohort.SECONDS_PER_HOUR, values, panel, unit)
-            ax.set_title(f"{RAW_SIGNAL_TITLES[panel]} ({unit})")
+            ax.set_title(RAW_SIGNAL_TITLES[panel])
             figures.style_axes(ax)
         if row < len(panels) - 1:
             ax.tick_params(labelbottom=False)
@@ -1405,15 +1413,8 @@ def build_recording_figure(
         axes[0].set_xlim(*x_range)
         _shade_rows(axes, recording, alternate=[not isinstance(panel, HeatmapPanel) for panel in panels])
         _draw_clocks(axes, recording, x_range)
-    n_segments = len(recording.segments)
-    n_breaks = int(recording.summary["is_break"].sum()) if "is_break" in recording.summary.columns else 0
-    span = (
-        float(recording.summary[cohort.HOURS_COLUMN].max() - recording.summary[cohort.HOURS_COLUMN].min())
-        if len(recording.summary) else float("nan")
-    )
     figure.suptitle(
-        f"guid {recording.guid} — subgroup {recording.subgroup} — class {recording.clinical_class} "
-        f"— {n_segments} segment(s) over {span:.1f} h, {n_breaks} break(s)",
+        f"guid {recording.guid}, subgroup {recording.subgroup}, class {recording.clinical_class}",
         y=1.0 - 0.22 * _TITLE_ROOM_IN / height_in, fontsize=figures.FONT_NOTE,
     )
     figures.mark_laid_out(figure)
@@ -1498,8 +1499,8 @@ def build_summary_figure(
     Args:
         summary: The stacked segment summaries of every traced recording.
         metrics: The columns to draw, one panel each.
-        window_hours: When given, the axis is bounded to this many hours before delivery and the
-            number of segments left outside is stated under the figure.
+        window_hours: When given, the axis is bounded to this many hours before delivery; the
+            segments beyond it stay in ``segment_summary.csv``.
 
     Returns:
         The figure, already laid out; the caller renders and closes it.
@@ -1512,22 +1513,8 @@ def build_summary_figure(
         if len(summary) and labels.CLASS_COLUMN in summary.columns else []
     )
     colours = figures.group_colors(classes)
-    counts = {
-        name: int(summary[summary[labels.CLASS_COLUMN].astype(object) == name]["guid"].nunique())
-        for name in classes
-    }
-    outside = 0
-    if window_hours is not None and len(summary) and cohort.HOURS_COLUMN in summary.columns:
-        outside = int((np.asarray(summary[cohort.HOURS_COLUMN], dtype=np.float64) > float(window_hours)).sum())
-    note = (
-        f"Thin lines: one recording each, its per-segment means over scored anchors, lifted at a break. "
-        f"Bold: the class median over recordings per {SUMMARY_BIN_HOURS:g} h window, with the "
-        f"inter-quartile band where at least {MIN_RECORDINGS_PER_BAND} recordings contribute; the top "
-        f"row counts them. Class order and colour follow severity; a difference between classes here "
-        f"is a hypothesis for the population analyses, not a result."
-        + (f" The axis is bounded to {float(window_hours):g} h before delivery; {outside} segment(s) "
-           f"lie beyond it." if window_hours is not None else "")
-    )
+    # The window width, the band's minimum count and the reading rule are in the guide.
+    note = "Thin lines: recordings. Bold: class median with inter-quartile band."
     bottom = _XLABEL_ROOM_IN / height_in + figures.caveat_note(figure, note)
     grid = figure.add_gridspec(
         n_rows, 1, height_ratios=[0.55, *([1.0] * len(metrics))],
@@ -1539,7 +1526,7 @@ def build_summary_figure(
 
     # The coverage row.
     ax = axes[0]
-    ax.set_title(f"Recordings contributing per {SUMMARY_BIN_HOURS:g} h window")
+    ax.set_title("Coverage")
     ax.set_ylabel("recordings")
     covered = 0
     for name in classes:
@@ -1551,7 +1538,7 @@ def build_summary_figure(
         _note_empty(ax)
     if classes:
         handles = [
-            Line2D([0], [0], color=colours[name], linewidth=figures.LINE_EMPHASIS, label=f"{name} (n={counts[name]})")
+            Line2D([0], [0], color=colours[name], linewidth=figures.LINE_EMPHASIS, label=str(name))
             for name in classes
         ]
         ax.legend(
@@ -1611,10 +1598,6 @@ def build_summary_figure(
         if window_hours is not None:
             high = min(high, float(window_hours))
         axes[0].set_xlim(high * 1.02, 0.0 - 0.02 * high)
-    figure.suptitle(
-        "Per-segment summaries of every traced recording, one line per recording, with the class median",
-        y=1.0 - 0.22 * _TITLE_ROOM_IN / height_in, fontsize=figures.FONT_NOTE,
-    )
     figures.mark_laid_out(figure)
     return figure
 

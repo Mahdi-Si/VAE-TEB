@@ -3696,7 +3696,7 @@ ATTRIBUTION_TABLE = ["model_id", "seed", "fold", "split", "channel_group", "clin
 
 def run_E6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """E6 -> ``attribution.parquet`` (:data:`ATTRIBUTION_TABLE`): the primary model's test IG attributions (§11.12;
-    ``run.neural_attribution``) per channel group and class, per fold and pooled (shared test GUIDs as
+    ``run.attribution_fold``) per channel group and class, per fold and pooled (shared test GUIDs as
     ``data.shared_test_policy``). A seed ensemble's are its members' means per GUID (IG is linear in the score and
     ``ens`` averages the raw member scores). The IG completeness error (|Σ IG - (f(x) - f(0))| over |f(x) - f(0)|) is
     reported, not gated. Off (nothing written) unless ``eval.attribution.enabled``."""

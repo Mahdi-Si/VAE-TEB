@@ -193,10 +193,10 @@ def _draw_context_row(rows: ForecastRowInputs) -> None:
     # grid -- so the row is annotated rather than raised over. It keeps its title, its axis and its
     # place in the layout, so the rows below stay column-aligned and the gap is visible.
     ax, cax = rows.row_axes(RAW_ROW)
-    ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
+    ax.set_title("Raw target FHR and source UP", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.text(
-        0.5, 0.5, "raw traces unavailable in this batch",
+        0.5, 0.5, "raw traces unavailable",
         transform=ax.transAxes, ha="center", va="center", fontsize=8, color=COLOR_GRAY,
     )
     style_axes(ax, grid="both")
@@ -279,6 +279,11 @@ def feature_forecast_rows(
 ) -> None:
     r"""Draw the feature-domain page's first two rows.
 
+    The forecast row's title is the bare quantity, so the rest of the reading is stated here. The
+    three lanes are the worst, middle and best channels by $2\sigma$ calibration, named by declared
+    channel and coverage on the y ticks and offset by a stride taken from the widest lane; the
+    shaded window is the anchor the error map draws.
+
     Bound to a model's channel facts by the task and handed to
     :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` as its ``forecast_rows``
     seam. Those facts are the two things the page cannot recover from the arrays it is given:
@@ -357,9 +362,8 @@ def feature_forecast_rows(
             label="true $Y^{+}$" if lane == 0 else None,
         )
         for mean_all, sigma_all, colour, alpha, style, label in (
-            (base_mean, base_sigma, COLOR_GRAY, 0.22, "--", "base ($z^p$, target-only)"),
-            (full_mean, full_sigma, COLOR_VERMILLION, 0.18, "-",
-             "full ($z^q$, source-conditioned)"),
+            (base_mean, base_sigma, COLOR_GRAY, 0.22, "--", "base ($z^p$)"),
+            (full_mean, full_sigma, COLOR_VERMILLION, 0.18, "-", "full ($z^q$)"),
         ):
             mean = mean_all[:, channel] + offset
             half = BAND_SIGMAS * sigma_all[:, channel]
@@ -390,15 +394,9 @@ def feature_forecast_rows(
         color=COLOR_ORANGE, alpha=0.14, zorder=0,
     )
 
-    ax.set_title(
-        f"Forecast — {len(lanes)} of {len(keep)} target channels by "
-        f"{BAND_SIGMAS:.0f}$\\sigma$ calibration (worst, middle, best), lanes offset by "
-        f"{stride:.3g}, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$; shaded: the anchor the error map "
-        f"draws",
-        fontsize=9, pad=6,
-    )
+    ax.set_title(f"Forecast, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("target coefficient (normalised)", fontsize=8)
+    ax.set_ylabel("Coefficient (normalised)", fontsize=8)
     ax.legend(loc="upper left", fontsize=7, framealpha=0.95)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)

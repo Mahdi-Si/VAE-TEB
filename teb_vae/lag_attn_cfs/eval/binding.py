@@ -287,10 +287,10 @@ EXTRA_ANALYSES: Dict[str, Any] = {
 #: resolve on a run of every model that uses this pipeline.
 #:
 #: ``coupling_minus_clock_nats`` is the load-bearing entry and it is registered unconditionally.
-#: The verdict it belongs to ships with **no threshold**, so on the first production runs it is
-#: INCONCLUSIVE -- and the whole point of shipping it that way is that the *measurement* still
-#: reaches every arm table, so the threshold can eventually be set from the observed spread rather
-#: than guessed. A number that stays out of the headline stays out of every arm table too.
+#: The verdict it belongs to has **no threshold** by schema default, which makes it INCONCLUSIVE;
+#: the committed override delta sets one from the observed spread. Either way the *measurement*
+#: reaches every arm table, which is what let the threshold be set from data rather than
+#: guessed. A number that stays out of the headline stays out of every arm table too.
 #:
 #: The two geometry guards are here for the mirror-image reason: they are exact structural numbers
 #: rather than statistics, and an arm table whose rows disagree about the anchor count is an arm

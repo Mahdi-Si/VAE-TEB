@@ -231,11 +231,10 @@ def _write_te_figure(frame: pd.DataFrame, lag_columns: list, directory: Path) ->
     try:
         figures.ribbon_plot(
             axes[0, 0], lags, profile,
-            title="Lag-resolved transfer-entropy surrogate "
-                  "$\\widetilde{TE}_{t,\\ell}$, averaged over the valid support",
+            title="Lag-resolved TE surrogate",
             xlabel="Model lag $\\ell$",
             ylabel="$\\widetilde{TE}_\\ell$ (nats)",
-            label="median over samples",
+            label="median",
         )
         seconds = axes[0, 0].secondary_xaxis(
             "top",
@@ -244,7 +243,7 @@ def _write_te_figure(frame: pd.DataFrame, lag_columns: list, directory: Path) ->
                 lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
-        seconds.set_xlabel("Physical delay (s)", fontsize=8)
+        seconds.set_xlabel("Lag (s)", fontsize=8)
 
         # $-1$ is the "no supported anchor" sentinel written by ``_per_batch_te_lag``, not a lag.
         # ``run_te_lag_analysis`` strips it before ``median_argmax_lag``; stripping it here too is
@@ -252,22 +251,15 @@ def _write_te_figure(frame: pd.DataFrame, lag_columns: list, directory: Path) ->
         argmax_lag = frame["argmax_lag"] if "argmax_lag" in frame else pd.Series(dtype=float)
         figures.histogram_panel(
             axes[1, 0], argmax_lag[argmax_lag >= 0],
-            title="Per-sample argmax of the lag attribution",
+            title="Argmax lag",
             xlabel="Model lag $\\ell$", bins=max(len(lag_columns), 1),
             color=figures.COLOR_PURPLE,
         )
         figures.histogram_panel(
             axes[2, 0], frame.get("identity_rel_deviation", pd.Series(dtype=float)),
-            title="Identity residual $|\\sum_\\ell \\widetilde{TE}_\\ell - K| / |K|$ "
-                  "after eval's averaging",
-            xlabel="relative deviation", color=figures.COLOR_GRAY,
+            title="Identity residual",
+            xlabel="Relative deviation", color=figures.COLOR_GRAY,
             reference=IDENTITY_TOLERANCE, reference_label="tolerance",
-        )
-        figure.suptitle(
-            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline. "
-            f"Dead anchors are excluded: their attention rows are zeroed, not renormalised, so "
-            f"averaging them in would subtract mass from the profile.",
-            fontsize=7, y=0.999,
         )
         return str(figures.render_figure(figure, directory / "te_lag"))
     finally:
@@ -292,8 +284,7 @@ def _write_per_head_figure(profile: np.ndarray, frame: pd.DataFrame, directory: 
     try:
         figures.heatmap_with_colorbar(
             figure, axes[0, 0], profile,
-            title="Head-resolved lag profile "
-                  "$K^{(m)}_t\\,\\alpha^{(m)}_{t,\\ell}$ (support mean)",
+            title="Head-resolved lag profile",
             xlabel="Model lag $\\ell$", ylabel="Head $m$",
             cmap="viridis", symmetric=False, colorbar_label="nats",
         )
@@ -304,7 +295,7 @@ def _write_per_head_figure(profile: np.ndarray, frame: pd.DataFrame, directory: 
                 lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
-        top.set_xlabel("Physical delay (s)", fontsize=8)
+        top.set_xlabel("Lag (s)", fontsize=8)
 
         ax = axes[1, 0]
         means = [float(frame[name].mean()) for name in share_columns]
@@ -314,14 +305,9 @@ def _write_per_head_figure(profile: np.ndarray, frame: pd.DataFrame, directory: 
         )
         ax.set_title("Mean per-head share of $K_t$")
         ax.set_xlabel("Head $m$")
-        ax.set_ylabel("share")
+        ax.set_ylabel("Share")
         ax.set_xticks(range(len(share_columns)))
         figures.style_axes(ax)
-        figure.suptitle(
-            "Rows sum to the lag attribution; shares sum to 1. Both are decompositions only "
-            "because head_structured_latent is on -- under a flat latent this panel is refused.",
-            fontsize=7, y=0.999,
-        )
         return str(figures.render_figure(figure, directory / "per_head_lag_profile"))
     finally:
         figures.plt.close(figure)

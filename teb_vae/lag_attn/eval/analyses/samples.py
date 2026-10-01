@@ -30,7 +30,7 @@ import pandas as pd
 import torch
 from loguru import logger
 
-from teb_vae.lag_attn.eval import figures, masks, metrics, preflight, sample_figure
+from teb_vae.lag_attn.eval import figures, labels, masks, metrics, preflight, sample_figure
 from teb_vae.lag_attn.eval.collectors import CollectionPlan
 from teb_vae.lag_attn.eval.runner import (
     EvalRunner,
@@ -196,6 +196,7 @@ def _render_one(
             warmup=int(runner.model._warmup_steps(seq_len)),
             horizon=int(runner.model.horizon),
             guid=guid,
+            subgroup=labels.subgroup_of(_source_of(batch, offset)),
             epoch=epoch,
             step_seconds=metrics.STEP_SECONDS,
             te_lag_label=te_lag_label,

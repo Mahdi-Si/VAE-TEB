@@ -152,6 +152,13 @@ def _stream_channels(stream: StreamWarmup) -> Any:
 def build_warmup_budget_figure(budget: WarmupBudget, *, horizon: int) -> Any:
     r"""Draw the run-level figure: every input channel's warm-up against the forecast window.
 
+    The figure carries stream names and axis labels only, so this paragraph is its caption. Each
+    kept bar spans $[-\Delta W'_c, 0]$, the channel's warm-up $W'_c$ drawn backwards from the
+    anchor's causal endpoint; the shaded span is the forecast window of $H$ steps; the dashed line
+    is the budget $-\Delta B$. A dropped channel is drawn at $\delta_c = 0$, so its bar runs
+    forward through the window it was still warming up for. Bars that run past the right edge are
+    clipped at the frame, and the count is what :func:`_budget_panel` returns.
+
     Args:
         budget: The resolved warm-up budget. The **declared**-width vectors are what makes this
             figure worth drawing: it exists to show the channels the budget dropped beside the ones
@@ -182,9 +189,8 @@ def build_warmup_budget_figure(budget: WarmupBudget, *, horizon: int) -> Any:
         gridspec_kw={"height_ratios": heights, "hspace": 0.28},
         squeeze=False,
     )
-    clipped = 0
-    for ax, stream, resolved in zip(axes[:, 0], described, streams):
-        clipped += _budget_panel(ax, stream, horizon_s=horizon_s, x_limits=x_limits)
+    for ax, stream in zip(axes[:, 0], described):
+        _budget_panel(ax, stream, horizon_s=horizon_s, x_limits=x_limits)
         # The budget itself, on the axis the bars are drawn against: no kept target bar may start
         # left of it, which is the whole content of the guard and is otherwise something a reader
         # has to measure off the figure. Drawn on the source panel too, where it is *not* the
@@ -193,34 +199,14 @@ def build_warmup_budget_figure(budget: WarmupBudget, *, horizon: int) -> Any:
         # design records.
         ax.axvline(
             budget_s, color=COLOR_BLUE, linewidth=1.0, linestyle="--",
-            label=f"budget $-\\Delta B$ = {budget_s:g} s",
+            label=f"budget {budget_s:g} s",
         )
-        # The shared panel titles this a *delay*, which is what it is on the two-sided figure and
-        # is not what these bars measure: they are a settling length, and the region behind the
-        # boundary holds real values on no defined scale rather than a zero fill. The alignment
-        # does introduce a genuine per-channel delay, and this figure deliberately does not draw
-        # it -- a bar that silently became W' + d would make the two figures of this family measure
-        # different quantities under one caption.
-        blocks = ", ".join(
-            f"{name} {kept}/{declared}" for name, kept, declared in resolved.block_counts()
-        )
-        ax.set_title(
-            f"{resolved.name} stream — {blocks}; {resolved.kept_width}/"
-            f"{resolved.declared_width} channels kept; warm-up 0-{resolved.max_warmup} steps "
-            f"(0-{resolved.max_warmup * SECONDS_PER_STEP:g} s)",
-            fontsize=9, pad=6,
-        )
+        # Not the shared panel's *delay* reading: these bars are a settling length, and the region
+        # behind the boundary holds real values on no defined scale rather than a zero fill. The
+        # alignment does introduce a genuine per-channel delay, and this figure deliberately does
+        # not draw it -- a bar that silently became W' + d would make the two figures of this
+        # family measure different quantities under one caption.
         ax.legend(loc="lower right", fontsize=7, framealpha=0.95)
-
-    figure.suptitle(
-        f"Causal warm-up budget — each channel's warm-up $W'_c$ drawn backwards from the anchor's\n"
-        f"causal endpoint, against the {horizon_s:.0f} s forecast window (shaded). A kept bar "
-        f"spans $[-\\Delta W'_c, 0]$; a dropped channel is drawn at $\\delta_c = 0$, so its bar "
-        f"runs forward\nthrough the window it was still warming up for. {clipped} bar(s) run past "
-        f"the right edge and are clipped.",
-        fontsize=10, y=0.995, va="top",
-    )
-    figure.subplots_adjust(top=1.0 - 1.0 / figure.get_figheight())
     return figure
 
 
@@ -346,6 +332,10 @@ def build_tradeoff_figure(
 ) -> Any:
     r"""Draw the curve that justifies a budget: channels, anchors and tiles against $B$.
 
+    Channels kept against the supervision bought, with the tiles counted at phase $\varphi = 0$;
+    the grey span is the budgets whose floor leaves no tile. The figure has no title, so this is
+    its caption.
+
     Args:
         points: The tradeoff, from :func:`budget_tradeoff`.
         shipped_budget: The threshold to mark, or ``None`` to mark none.
@@ -368,7 +358,7 @@ def build_tradeoff_figure(
     for values, colour, label in (
         ([point.kept for point in points], COLOR_ORANGE, "target channels kept"),
         ([point.anchors for point in points], COLOR_VERMILLION, "anchors admitted"),
-        ([point.tiles for point in points], COLOR_BLUE, "tiles per sample at $\\varphi=0$"),
+        ([point.tiles for point in points], COLOR_BLUE, "tiles per sample"),
     ):
         ax.step(thresholds, values, where="post", color=colour, linewidth=1.2, label=label)
 
@@ -384,11 +374,8 @@ def build_tradeoff_figure(
                 xytext=(6, 8), textcoords="offset points", fontsize=8, color=COLOR_BLACK,
             )
 
-    ax.set_xlabel("Warm-up budget $B$ (decimated steps)", fontsize=9)
-    ax.set_ylabel("count", fontsize=9)
-    ax.set_title(
-        "Warm-up budget tradeoff — channels kept against supervision bought", fontsize=10, pad=8
-    )
+    ax.set_xlabel("Warm-up budget $B$ (steps)", fontsize=9)
+    ax.set_ylabel("Count", fontsize=9)
     ax.legend(loc="upper right", fontsize=8, framealpha=0.95)
     style_axes(ax, grid="both")
     # Seconds beside steps, because the budget is argued about in minutes of recording and read off
@@ -493,9 +480,8 @@ def readable_window_seconds(
     operator see *which* delays a censored candidate still covers rather than only that the named
     band is not among them.
 
-    Stated on the canonical stored timeline: there is no dataset-shift term. The window is an
-    approximate coefficient-content lead (the offset carries the $\kappa$ convention), not an
-    exact physiological delay.
+    The window is an approximate coefficient-content lead (the offset carries the $\kappa$
+    convention), not an exact physiological delay.
 
     Args:
         offset_s: $\kappa\,(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$ in seconds -- the
@@ -549,8 +535,8 @@ def content_lag_seconds(
 
     with $s_c$ the scored target channel's forecast shift (zero under the stored clock), $d^u_j$
     the source channel's input shift (zero unaligned), and $\delta$ the explicitly approximate
-    content-delay summary of each channel's composed group delay. Stated on the canonical stored
-    timeline: no dataset-shift term. It is the general identity the reference-based
+    content-delay summary of each channel's composed group delay. It is the general identity the
+    reference-based
     :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` reduces to on an aligned run,
     computed here from the gathers themselves rather than from the two references, so the target
     side is automatically the SCORED clock -- $	au_{\min}$ under ``'physical'``, each channel's
@@ -696,7 +682,7 @@ def _lag_for_physical_delay(
     r"""Which lag index reports a physiological delay of ``delay_s`` at horizon step $h$.
 
     The inverse of :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds`, solved for
-    $\ell$ on the canonical stored timeline:
+    $\ell$:
 
     $$\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \kappa\bigl(\tau^u_{\mathrm{ref}}
       - \tau^y_{\mathrm{ref}}\bigr)
@@ -704,8 +690,7 @@ def _lag_for_physical_delay(
     \ell = \frac{\tau^{\mathrm{phys}} - \mathrm{offset}}{\Delta} - 1 - h ,$$
 
     with $\mathrm{offset} = \kappa(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$ the realised
-    bias the caller has already scaled. There is no dataset-shift term: the builder's UP shift is
-    part of the stored signal.
+    bias the caller has already scaled.
 
     Returned as a **float** rather than rounded to a bin: what this answers is whether the band
     clears the window's two censoring edges, and rounding first would turn a delay sitting $0.4$

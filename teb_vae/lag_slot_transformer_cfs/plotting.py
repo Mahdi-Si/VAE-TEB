@@ -20,8 +20,9 @@ cannot serve:
   ``all_reduce`` over its packed denominators, and this callback runs on rank zero alone. Rank zero
   would block there for six peers that are already running the next epoch; they would block at
   their own next collective; and the run would stop with nothing written and nothing raised. The
-  title's numbers come from what the epoch already logged instead -- see :func:`_epoch_readouts`,
-  which explains why that is the better source and not merely the safe one.
+  epoch's numbers come from what the epoch already logged instead -- see :func:`_epoch_readouts`,
+  which explains why that is the better source and not merely the safe one. The page takes them
+  but does not print them: its title names the epoch, the recording and its subgroup only.
 * The page's four lag rows are computed from the **per-lag proposals**, which a forward returns
   only when asked. The shared callback never asks, because on every other model in the family
   there is nothing to ask for.
@@ -54,6 +55,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from teb_vae.lag_attn_rws.plotting import (  # noqa: E402
     LagAttnRwsPlotCallback,
+    _cohort_of,
     _guid_of,
     _source_delay_steps,
     input_stream_panels,
@@ -83,8 +85,8 @@ __all__ = ["LagResidualTrfCfsPlotCallback", "PAGE_DPI"]
 #: collective until it finishes.
 PAGE_DPI = 200
 
-#: Stage prefix the framework gives a validation metric on its way out. The page's title names its
-#: readouts without one, as the objective produces them.
+#: Stage prefix the framework gives a validation metric on its way out. The readouts are named
+#: without one, as the objective produces them.
 _VALIDATION_PREFIX = "val/"
 
 #: Batch fields a sliced micro-batch carries. Written out rather than discovered, because the two
@@ -107,7 +109,7 @@ _SLICED_FIELDS: Tuple[str, ...] = (
 
 
 def _epoch_readouts(trainer: Any) -> Dict[str, float]:
-    r"""The validation readouts this epoch already logged, for the page's title.
+    r"""The validation readouts this epoch already logged, handed to the page.
 
     **This is deliberately not a fresh call to the objective, and that is the whole point.**
 
@@ -130,8 +132,7 @@ def _epoch_readouts(trainer: Any) -> Dict[str, float]:
 
     Returns:
         The validation metrics with their stage prefix removed, as floats. Empty when the trainer
-        carries none, which is what a hand-built one gives and which the title renders by simply
-        omitting the line.
+        carries none, which is what a hand-built one gives.
     """
     metrics = getattr(trainer, "callback_metrics", None) or {}
     readouts: Dict[str, float] = {}
@@ -142,7 +143,7 @@ def _epoch_readouts(trainer: Any) -> Dict[str, float]:
         try:
             readouts[name[len(_VALIDATION_PREFIX) :]] = float(value)
         except (TypeError, ValueError):
-            # A non-scalar entry is some other callback's, and the title wants numbers.
+            # A non-scalar entry is some other callback's, and a readout is a number.
             continue
     return readouts
 
@@ -201,8 +202,8 @@ class LagResidualTrfCfsPlotCallback(LagAttnRwsPlotCallback):
         samples only, because the per-lag proposals it must retain are the largest tensor this
         architecture holds.
 
-        The title's numbers are the epoch's, taken from what the run already logged. The rows
-        below are one recording's, and the page says which is which.
+        The epoch's numbers are taken from what the run already logged and handed to the page,
+        which does not print them; the rows are one recording's.
 
         Args:
             trainer: The Lightning trainer.
@@ -266,6 +267,9 @@ class LagResidualTrfCfsPlotCallback(LagAttnRwsPlotCallback):
                 sample_index=index,
                 epoch=epoch,
                 guid=guid,
+                # The subgroup beside the GUID, when the batch carries a shard stem to read it
+                # from: a page lifted out of its directory still says which cohort it came from.
+                cohort=_cohort_of(drawn, index),
                 beta=beta,
                 scalars={name: float(value) for name, value in scalars.items()},
                 # The raw source, taken from the batch rather than from the forward inputs: this

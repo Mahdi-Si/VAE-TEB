@@ -19,10 +19,11 @@ suppression qualification names -- $r_\ell \mapsto r_\ell + k_\ell(h_t)$ with
 $\sum_\ell k_\ell \equiv 0$ -- leaves the update, the divergence and every prediction unchanged
 while changing both profiles at every lag. So a centroid here says where the fitted head's
 proposals sit, and a band mass says how much of them sit in a band; neither says the source at
-that lag was necessary. The qualification travels on every table and figure built from this
-module, and the shape statistics are the family's own
-(:mod:`teb_vae.lag_attn_cfs.eval.lag_shape`) so a centroid means the same thing on both cells --
-computed of a different profile, under a different reading.
+that lag was necessary. The qualification travels on every record built from this module, and the
+figures carry only the one-line
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`. The shape statistics are the
+family's own (:mod:`teb_vae.lag_attn_cfs.eval.lag_shape`) so a centroid means the same thing on
+both cells -- computed of a different profile, under a different reading.
 
 **The signed profile is rectified before it is shaped.** The shape statistics are functions of
 $p_\ell = w_\ell / \sum_k w_k$ and refuse a negative bin; the divergence drop can be negative at a
@@ -62,10 +63,12 @@ class ProfileSource:
         key: The suffix every statistic of this profile carries in a table column.
         vector: The per-sample vector in ``per_sample_vectors.npz``.
         anchor_map: The per-anchor map in ``per_anchor_vectors.npz``.
-        label: What the readout is, for a panel title.
+        label: What the readout is, as the records name it.
         unit: The unit of one bin.
         signed: Whether a bin may be negative, in which case the shape is taken of the rectified
             profile and the discarded negative mass is reported beside it.
+        title: The short noun phrase a figure panel is titled with. The records keep the longer
+            ``label``.
     """
 
     key: str
@@ -74,6 +77,7 @@ class ProfileSource:
     label: str
     unit: str
     signed: bool
+    title: str = ""
 
 
 #: The two readouts, in the order every table carries them. The proposal norm is what the head
@@ -87,6 +91,7 @@ PROFILE_SOURCES: Tuple[ProfileSource, ...] = (
         label="proposal norm",
         unit="latent units",
         signed=False,
+        title="Proposal norm",
     ),
     ProfileSource(
         key="drop",
@@ -95,6 +100,7 @@ PROFILE_SOURCES: Tuple[ProfileSource, ...] = (
         label="divergence drop, lag removed alone",
         unit="nats per anchor",
         signed=True,
+        title="Divergence drop",
     ),
 )
 
@@ -499,7 +505,7 @@ CLOCKS: Tuple[Clock, ...] = (
         bin=cohort.add_second_stage_bins,
         bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
         center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
-        axis_label="Time from second-stage onset (hours; negative before onset)",
+        axis_label="Time from second-stage onset (hours)",
         inverted=False,
         eligible_only=True,
     ),
@@ -829,8 +835,13 @@ def draw_trajectory_panel(
     title: str,
     ylabel: str,
     zero: bool = False,
+    legend: bool = True,
 ) -> int:
     """Draw one metric's per-cohort trajectory: median with inter-quartile ribbon, counts on it.
+
+    The number over each point is the count of recordings the window holds for that cohort. The
+    legend names the cohorts only; a figure whose panels share the cohorts asks for it on its first
+    panel alone.
 
     Args:
         ax: Target axes.
@@ -840,6 +851,7 @@ def draw_trajectory_panel(
         title: Panel title.
         ylabel: Y label.
         zero: Whether to draw a reference line at zero.
+        legend: Whether to draw the cohort legend on this panel.
 
     Returns:
         The number of cohorts drawn; zero draws the empty note.
@@ -867,7 +879,7 @@ def draw_trajectory_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell]), marker="o",
             markersize=figures.MARKER_SMALL, color=colour, linewidth=figures.LINE_REGULAR,
-            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))})",
+            label=str(group),
         )
         for row in cell:
             ax.annotate(
@@ -883,7 +895,8 @@ def draw_trajectory_panel(
         ax.axvline(0.0, color=figures.COLOR_LIGHT_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
     ax.set_xlabel(clock.axis_label)
     ax.set_ylabel(ylabel)
-    ax.legend(fontsize=figures.FONT_SMALL, loc="best")
+    if legend:
+        ax.legend(fontsize=figures.FONT_SMALL, loc="best")
     figures.style_axes(ax)
     return len(groups)
 

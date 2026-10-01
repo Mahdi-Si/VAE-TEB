@@ -42,8 +42,8 @@ them. Unaligned, that bias is indexed by a channel *pair* and no single number l
 the source channels shifted onto one reference $\tau^u_{\mathrm{ref}}$ it collapses to a constant,
 and because $\tau^y \equiv 0$ here the lead time
 $\Delta(\ell + 1 + h) + \kappa\tau^u_{\mathrm{ref}}$ s is a delay between *signals* rather than
-between two filters' reports of them, stated on the canonical stored timeline with no dataset-shift
-term. That is what the footnote states, and the arithmetic behind it is
+between two filters' reports of them. The footnote carries the one-line form of that statement,
+and the arithmetic behind it is
 :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` rather than a second copy here.
 
 The footnote is where it is said because the two lag panels belong to the shared builder, and the
@@ -74,8 +74,6 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_VERMILLION,
     to_numpy,
 )
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
-from teb_vae.lag_attn_cfs.causal_warmup import ALIGNMENT_DELAY_FACTOR  # noqa: E402
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     _draw_anchor_overlay,
     _tiling_anchors,
@@ -91,40 +89,20 @@ from utils.style import style_axes  # noqa: E402
 
 __all__ = ["LAG_TIME_CAVEAT", "causal_raw_forecast_rows"]
 
-#: The caveat every lag-resolved panel on this page is read under. Stated once, as a page footnote,
-#: because the two lag panels are the shared builder's and the six shipped models must not gain a
-#: caption about a transform they do not use. Asserted as a string by the suite, so it cannot be
-#: dropped by an edit that keeps the figure rendering.
+#: The one line every lag-resolved panel on this page is read under. Stated once, as a page
+#: footnote, because the two lag panels are the shared builder's and the six shipped models must
+#: not gain a caption about a transform they do not use. Asserted as a string by the suite, so it
+#: cannot be dropped by an edit that keeps the figure rendering.
 #:
-#: It is deliberately **one-sided** where the causal-feature page's is two-sided: the correction to a
-#: physical delay has a term for each side of the attention, and this cell's target side contributes
-#: none -- a raw sample is at the instant it is at. What is left is the source channel's own
-#: composed group delay. There is no dataset-shift term: the stored UP/FHR timeline is canonical,
-#: and the builder's UP shift is part of the signal rather than something a caption undoes.
-#:
-#: It states the **identity** and not a number, because $\tau^u_{\mathrm{ref}}$ is a decision of the
-#: run rather than a property of this module and nothing the page is handed carries it: the rows are
-#: given arrays, a geometry and the loader's statistics, and the model's own ``source_delay_steps``
-#: is the largest *stored-step* shift -- attained by the channel furthest from the reference -- and
-#: is emphatically not it. The resolved value travels in the run's own record instead, which the
-#: sentence names so a reader of a page can find the constant that completes it.
-#:
-#: $\Delta$ and $\kappa$ are interpolated from :mod:`~teb_vae.lag_attn.nets.lag_report` and
-#: :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` rather than typed, so the
-#: caption and the function a consumer would evaluate it with cannot state two different constants.
-LAG_TIME_CAVEAT = (
-    f"Lag axes are stored-coefficient time on the input side, not physical delay: the raw target "
-    f"carries no group delay, so $\\tau^y \\equiv 0$ and the anchor is exact, while a causal input "
-    f"coefficient lags by its own composed group delay (13-791 s as declared). Aligned onto one "
-    f"source reference $\\tau^u_{{\\mathrm{{ref}}}}$ -- the run's own, logged as "
-    f"source_reference_delay_s -- that bias is a single constant, and a peak at lag $\\ell$, "
-    f"horizon element $h$, is an approximate content lead time of "
-    f"${SECONDS_PER_STEP:.0f}(\\ell + 1 + h) + \\kappa\\tau^u_{{\\mathrm{{ref}}}}$ s with "
-    f"$\\kappa={ALIGNMENT_DELAY_FACTOR:g}$, on the stored timeline as recorded. The correction is "
-    f"one-sided here: there is no target-side $\\tau^y$ term to subtract. Unaligned, "
-    f"$\\tau^u_{{\\mathrm{{ref}}}}$ is replaced by each channel's own $\\tau^u_c$ and no single "
-    f"number labels the axis."
-)
+#: It is the short form of a one-sided statement. The raw target carries no group delay, so
+#: $\tau^y \equiv 0$ and the anchor is exact, and what is left is the source channel's own composed
+#: group delay: aligned onto one reference $\tau^u_{\mathrm{ref}}$, a peak at lag $\ell$, horizon
+#: element $h$, is an approximate content lead time of $\Delta(\ell + 1 + h) + \kappa\tau^u_{\mathrm{ref}}$
+#: seconds, with $\tau^u_{\mathrm{ref}}$ the run's own ``source_reference_delay_s`` record; unaligned it is
+#: each channel's own $\tau^u_c$ and no single number labels the axis. The figure states none of
+#: that, because $\tau^u_{\mathrm{ref}}$ is a decision of the run and nothing the page is handed
+#: carries it; the arithmetic is :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds`.
+LAG_TIME_CAVEAT = "Lag is stored-coefficient time, not a physiological latency."
 
 
 def _tiled_branch(
@@ -189,6 +167,10 @@ def causal_raw_forecast_rows(rows: ForecastRowInputs, *, training_stride: int = 
     overlap $(H-1)/H$ and plotted at that stride the row would show each instant $H$ times over, from
     $H$ different latents.
 
+    The title is the bare quantity, so the rest of the reading is stated here: the dashed verticals
+    are the window edges, the ticks are the anchors this page decoded, and the dotted grid is the
+    sparser set a training step tiles.
+
     Args:
         rows: The row inputs and the layout hooks. ``rows.outs`` must carry ``anchor_index`` and
             ``anchor_valid``: the forecast tensors are indexed by *position in the decoded set*, not
@@ -232,11 +214,8 @@ def causal_raw_forecast_rows(rows: ForecastRowInputs, *, training_stride: int = 
         rows.time_raw, truth_tiled, color=COLOR_BLACK, linewidth=0.7, label="true $Y^{+}$"
     )
     for mean, low, high, colour, alpha, style, label in (
-        (base_mean, base_lo, base_hi, COLOR_GRAY, 0.22, "--", "base ($z^p$, target-only)"),
-        (
-            full_mean, full_lo, full_hi, COLOR_VERMILLION, 0.18, "-",
-            "full ($z^q$, source-conditioned)",
-        ),
+        (base_mean, base_lo, base_hi, COLOR_GRAY, 0.22, "--", "base ($z^p$)"),
+        (full_mean, full_lo, full_hi, COLOR_VERMILLION, 0.18, "-", "full ($z^q$)"),
     ):
         ax.fill_between(rows.time_raw, low, high, color=colour, alpha=alpha, linewidth=0)
         ax.plot(
@@ -264,20 +243,16 @@ def causal_raw_forecast_rows(rows: ForecastRowInputs, *, training_stride: int = 
             alpha=0.7, zorder=1,
         )
 
-    window_seconds = block * seconds_per_sample
-    ax.set_title(
-        f"Forecast — {len(positions)} of {int(valid.sum())} decoded anchors drawn, as consecutive "
-        f"non-overlapping {window_seconds:.0f} s windows, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$ "
-        f"({horizon}$\\times${raw_per_step} = {block} raw samples each; dashed: window edges).\n"
-        f"Drawn at the evaluation resolution — every valid anchor — so the ticks are what this page "
-        f"decoded; the dotted grid is the sparser set a training step tiles.",
-        fontsize=9, pad=6,
-    )
+    ax.set_title(f"Forecast, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
-    _draw_anchor_overlay(ax, rows, anchors, valid, seconds_per_step, int(training_stride))
+    # The raw target has no forecast clock, so the last anchor that exists is the geometry's own
+    # and the training-tile grid runs to it; the overlay draws no ceiling mark in that case.
+    _draw_anchor_overlay(
+        ax, rows, anchors, valid, seconds_per_step, int(training_stride), int(geometry.t_valid)
+    )
     ax.legend(loc="upper right", fontsize=6, framealpha=0.95, ncol=2)
     cax.set_visible(False)
 

@@ -165,7 +165,8 @@ def build_profile_figure(
 
     Each panel draws the median over recordings with its inter-quartile ribbon, shades the
     declared bands, and marks the guarded peak -- or says the profile is degenerate, so a peak
-    position is not read off a flat line.
+    position is not read off a flat line. The legend, which every panel shares, sits on the first
+    panel alone; a later panel adds an entry only for a degenerate peak.
 
     Args:
         stratified: The stratified rows, of which the ``all`` cut is drawn.
@@ -187,7 +188,7 @@ def build_profile_figure(
             if not frame.empty else frame
         )
         if cell.empty or not np.isfinite(cell["median"].to_numpy(dtype=np.float64)).any():
-            ax.set_title(f"{source.label}, pooled over recordings")
+            ax.set_title(source.title)
             ax.text(
                 0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
                 fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
@@ -197,15 +198,15 @@ def build_profile_figure(
         colour = figures.COLOR_BLUE if not source.signed else figures.COLOR_VERMILLION
         ax.fill_between(
             axis.seconds, cell["q25"].to_numpy(), cell["q75"].to_numpy(),
-            color=colour, alpha=0.18, linewidth=0, label="inter-quartile range over recordings",
+            color=colour, alpha=0.18, linewidth=0, label="IQR" if row == 0 else None,
         )
         ax.plot(
             axis.seconds, cell["median"].to_numpy(), color=colour,
-            linewidth=figures.LINE_REGULAR, label="median over recordings",
+            linewidth=figures.LINE_REGULAR, label="median" if row == 0 else None,
         )
         ax.plot(
             axis.seconds, cell["mean"].to_numpy(), color=figures.COLOR_BLACK,
-            linewidth=figures.LINE_THIN, linestyle="--", label="mean over recordings",
+            linewidth=figures.LINE_THIN, linestyle="--", label="mean" if row == 0 else None,
         )
         if source.signed:
             ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
@@ -220,26 +221,20 @@ def build_profile_figure(
             if peak.get("degenerate"):
                 # As a legend entry rather than free text, so it sits with the other reading
                 # aids instead of on top of the band names or the legend itself.
-                ax.plot(
-                    [], [], linestyle="none",
-                    label="peak degenerate: no position read",
-                )
+                ax.plot([], [], linestyle="none", label="peak degenerate")
             else:
                 ax.axvline(
                     float(peak["argmax_seconds"]), color=figures.COLOR_GRAY, linestyle="--",
-                    linewidth=figures.LINE_THIN,
-                    label=f"peak at {float(peak['argmax_seconds']):g} s "
-                          f"(share {float(peak['peak_share']):.2f})",
+                    linewidth=figures.LINE_THIN, label="peak" if row == 0 else None,
                 )
         lag_structure.shade_bands(ax, bands, axis.seconds)
-        ax.set_title(
-            f"{source.label}, pooled over {int(cell['n_recordings'].iloc[0])} recordings"
-        )
+        ax.set_title(f"{source.title} (n={int(cell['n_recordings'].iloc[0])})")
         ax.set_ylabel(source.unit)
-        figures.legend_with_headroom(ax, ncol=2)
+        if ax.get_legend_handles_labels()[0]:
+            figures.legend_with_headroom(ax, ncol=2)
         figures.style_axes(ax)
     axes[-1, 0].set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 
@@ -253,7 +248,8 @@ def build_stratified_figure(
 
     Shares rather than magnitudes, so a cohort with a larger source pathway does not sit above
     the others for that reason alone; the magnitude is on the per-recording table and its
-    grouped pages.
+    grouped pages. A cohort axis names its cohorts in a legend on the first row alone, and the
+    recording count of each is on the stratified table.
 
     Args:
         stratified: The stratified rows.
@@ -280,7 +276,7 @@ def build_stratified_figure(
                 cohort.ordered_groups(sorted(set(cell["group"].astype(str))), group_column)
                 if not cell.empty else []
             )
-            ax.set_title(f"{source.label}: share by lag, by {group_column}")
+            ax.set_title(f"{source.title} by {group_column.replace('_', ' ')}")
             if not groups:
                 ax.text(
                     0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center",
@@ -294,16 +290,16 @@ def build_stratified_figure(
                 part = cell[cell["group"].astype(str) == group].sort_values("lag_step")
                 ax.plot(
                     axis.seconds, part["share"].to_numpy(), color=colours.get(group),
-                    linewidth=figures.LINE_REGULAR,
-                    label=f"{group} (n={int(part['n_recordings'].iloc[0])})",
+                    linewidth=figures.LINE_REGULAR, label=str(group),
                 )
             lag_structure.shade_bands(ax, bands, axis.seconds)
-            ax.set_ylabel("share of the rectified profile")
+            ax.set_ylabel("share of profile")
             if row == len(sources) - 1:
                 ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-            figures.legend_with_headroom(ax, ncol=min(len(groups), 4))
+            if row == 0:
+                figures.legend_with_headroom(ax, ncol=min(len(groups), 4))
             figures.style_axes(ax)
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 

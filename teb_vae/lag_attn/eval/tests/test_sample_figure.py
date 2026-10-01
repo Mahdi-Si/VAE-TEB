@@ -91,6 +91,7 @@ def _build(**overrides: Any):
         "warmup": WARMUP,
         "horizon": H_D,
         "guid": "abc123",
+        "subgroup": "sub_a",
         "epoch": 7,
     }
     kwargs.update(overrides)
@@ -292,10 +293,10 @@ def test_the_lag_seconds_axis_agrees_with_the_pipelines_own_conversion():
             )
 
 
-def test_the_page_title_carries_the_guid_and_the_epoch():
+def test_the_page_title_carries_the_guid_its_subgroup_and_the_epoch():
     figure = _build()
     try:
-        assert "abc123" in figure._suptitle.get_text()
-        assert "epoch 7" in figure._suptitle.get_text()
+        # A GUID is always followed by its subgroup, and the title carries nothing else.
+        assert figure._suptitle.get_text() == "guid abc123, subgroup sub_a, epoch 7"
     finally:
         plt.close(figure)

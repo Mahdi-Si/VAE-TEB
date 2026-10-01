@@ -494,7 +494,7 @@ def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
         return
     axis.axvspan(
         float(low), float(high), color=figures.COLOR_ORANGE, alpha=0.25, zorder=0,
-        label=f"95% CI of the mean [{float(low):.4g}, {float(high):.4g}]",
+        label="95% CI of mean",
     )
     axis.legend(fontsize=figures.FONT_LABEL, loc="best")
 
@@ -523,10 +523,7 @@ def build_distribution_figure(
     figures.histogram_panel(
         axis,
         finite_column(per_guid, PRED_GAP_COLUMNS[0][1]),
-        title=(
-            f"pred_gap per recording, n = {int(headline.get('n_recordings_scored') or 0)} "
-            f"(Monte Carlo marginalised)"
-        ),
+        title="pred_gap per recording",
         xlabel="nats per anchor",
         reference=0.0,
         reference_label="no improvement",
@@ -536,11 +533,12 @@ def build_distribution_figure(
     figures.violin_panel(
         axes[1, 0],
         {name: finite_column(per_guid, column) for name, column, _ in PRED_GAP_COLUMNS},
-        title="pred_gap per recording, by estimator",
+        title="By estimator",
         ylabel="nats per anchor",
         reference=0.0,
         reference_label="no improvement",
     )
+    figures.drop_legend(axes[1, 0])
     return figure
 
 
@@ -571,11 +569,8 @@ def build_percent_figure(
     figures.histogram_panel(
         axis,
         finite_column(per_guid, HEADLINE_PERCENT),
-        title=(
-            f"{HEADLINE_PERCENT} per recording, "
-            f"n = {int(headline.get('n_recordings_scored') or 0)}"
-        ),
-        xlabel="percent of the target-only forecast error removed",
+        title=f"{HEADLINE_PERCENT} per recording",
+        xlabel="error removed (%)",
         reference=0.0,
         reference_label="no improvement",
     )
@@ -584,22 +579,24 @@ def build_percent_figure(
     figures.violin_panel(
         axes[1, 0],
         {name: finite_column(per_guid, name) for name in ERROR_SPACE_PERCENTS},
-        title="error space: percent of the forecast error the source removed",
-        ylabel="percent",
+        title="Error space",
+        ylabel="error removed (%)",
         reference=0.0,
         reference_label="no improvement",
     )
+    figures.drop_legend(axes[1, 0])
     # A column the run did not produce reads back as all-NaN, which the panel draws as its empty
     # note -- so a run scored under 'mse', or one whose geometry was unavailable, says "not
     # measured" on the page rather than dropping a panel and changing the figure's shape.
     figures.violin_panel(
         axes[2, 0],
         {LIKELIHOOD_SPACE_PERCENT: finite_column(per_guid, LIKELIHOOD_SPACE_PERCENT)},
-        title="likelihood space: extra density on each observed raw sample",
-        ylabel="percent",
+        title="Likelihood space",
+        ylabel="extra density (%)",
         reference=0.0,
         reference_label="no improvement",
     )
+    figures.drop_legend(axes[2, 0])
     return figure
 
 

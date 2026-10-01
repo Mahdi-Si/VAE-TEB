@@ -19,6 +19,10 @@
       "attribution_time_profile.pdf",
       "attribution_time_to_delivery.pdf"
     ],
+    "calibration": [
+      "logvar_distribution.pdf",
+      "pit_reliability.pdf"
+    ],
     "coupling": [
       "pred_gap_distribution.pdf",
       "pred_gap_percent.pdf"
@@ -31,7 +35,8 @@
       "subgroup_histograms.pdf"
     ],
     "events": [
-      "conditioned_coupling.pdf"
+      "conditioned_coupling.pdf",
+      "contraction_detection.pdf"
     ],
     "forecast": [
       "anchor_profile.pdf",
@@ -95,6 +100,9 @@
     "sufficiency": [
       "sufficiency.pdf"
     ],
+    "time_shift": [
+      "time_shift_control.pdf"
+    ],
     "time_to_delivery": [
       "time_to_delivery_trajectory_kl.pdf",
       "time_to_delivery_trajectory_pred_gap.pdf",
@@ -118,16 +126,20 @@
       "guide_marker": "_by_clinical_class.pdf"
     },
     "sample_pages": {
-      "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf",
+      "pattern": "samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>.pdf",
       "guide_marker": "The per-recording pages"
     },
     "sample_pages_compact": {
-      "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>_compact.pdf",
+      "pattern": "samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>_compact.pdf",
       "guide_marker": "The reduced per-recording pages"
     },
     "recording_traces": {
       "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.pdf",
       "guide_marker": "The per-recording traces"
+    },
+    "recording_trace_dashboards": {
+      "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.html, the interactive twin of each trace page",
+      "guide_marker": "The interactive page"
     },
     "attribution_traces": {
       "pattern": "attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf",

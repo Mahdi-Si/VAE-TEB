@@ -46,8 +46,9 @@ the coefficients come from a strictly one-sided bank whose composed per-channel 
 the same order as the lag search itself, so a peak's position here is not a physiological latency
 and is not a transfer entropy.
 :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` therefore travels on the artifacts
-that state a lag *position* -- the two peak tables, the figure and the summary block -- rather than
-in a document beside them. It is deliberately **not** repeated down the two per-lag profile tables:
+that state a lag *position* -- the two peak tables and the summary block, and on the figure as the
+one-line :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE` -- rather than in a document
+beside them. It is deliberately **not** repeated down the two per-lag profile tables:
 those are the input to a positional reading rather than a reading, they run to thousands of rows on
 the stratified axis, and a four-hundred-character sentence per row would be tens of megabytes of
 one sentence.
@@ -694,9 +695,10 @@ def build_profile_figure(
     contributing-anchor count that separates the first two -- drawn rather than described, since a
     reader looking at a corrected profile is entitled to see the denominator that produced it.
 
-    The group-delay caveat is printed under the figure. A figure is the artifact most likely to be
-    lifted out of a run directory and shown alone, and a peak read off one without it beside it is
-    read as a physiological latency -- which is the one claim this axis cannot support.
+    The one-line :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE` is printed under the
+    figure. A figure is the artifact most likely to be lifted out of a run directory and shown
+    alone, and a peak read off one without it beside it is read as a physiological latency -- which
+    is the one claim this axis cannot support. The full caveat is in the records.
 
     Args:
         profile: The per-lag table.
@@ -714,9 +716,9 @@ def build_profile_figure(
         axis, seconds,
         np.vstack([profile_column(profile, column, n_lags) for _, _, column, _ in PROFILES]),
         [
-            "raw attribution (sums to the KL)",
-            "support-corrected (per contributing anchor)",
-            "untruncated (anchors where every lag exists)",
+            "raw",
+            "support-corrected",
+            "untruncated",
         ],
         title="Per-lag KL attribution",
         xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
@@ -739,7 +741,7 @@ def build_profile_figure(
     figures.multi_line_panel(
         axes[1, 0], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],
         ["contributing anchors"],
-        title="Anchors contributing to each lag -- the correction's denominator",
+        title="Contributing anchors",
         xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         ylabel="anchors per segment",
     )

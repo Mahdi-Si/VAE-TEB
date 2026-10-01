@@ -123,8 +123,9 @@ Two partition subdirectories, `clinical/` and `by_kind/`, each carrying the same
 a `per_channel/` directory. **Rows and ticks run high frequency to low** on every panel here, so
 the top of a figure is always the fastest structure.
 
-Every label carries its frequency range explicitly — `deceleration (0.008-0.04 Hz, 22 ch)` — so no
-panel requires looking a band name up. A clinical band shows its *defining* range; a harmonic kind,
+Every tick and row label carries its frequency range explicitly — `deceleration (0.008-0.04 Hz, 22 ch)` — so no
+panel requires looking a band name up; the line panel's legend carries the bare band names, in the
+row order of the heatmaps below it. A clinical band shows its *defining* range; a harmonic kind,
 which is not a frequency range, shows the range its channels actually occupy. A label whose
 channels carry no centre frequency at all says `no centre frequency` rather than being drawn at
 $0$ Hz, which would assert a frequency the provenance does not determine.
@@ -223,7 +224,8 @@ is noise wearing a hat. `summary.json`'s `sanity.argmax_lag` checks both, dividi
 ceiling — against $\log L$ its uniformity branch could never fire at production geometry.
 
 ### `attention_heatmaps.pdf`
-Per-sample $\alpha$ over $(t, \ell)$ for a capped stratified draw. Rows sum to $1$ — from an
+Per-sample head-averaged $\alpha$ over $(t, \ell)$ for a capped stratified draw, one row per
+recording titled with its GUID and subgroup; the grey band is the warm-up. Rows sum to $1$ — from an
 `eval()`-mode pass. **Under `train()` dropout is live inside the attention, the rows do not sum to
 1, and the `te_lag_map` identity silently stops holding.** Emitted only when samples were retained.
 
@@ -241,12 +243,19 @@ across a recording, so a raw map is dominated by a few bright columns and the la
 invisible everywhere else. Columns whose KL is effectively zero are left blank rather than
 amplified into a confident-looking pattern.
 
+**Dead anchors are excluded from the profile:** their attention rows are zeroed, not
+renormalised, so averaging them in would subtract mass. The identity panel is
+$|\sum_\ell \widetilde{TE}_\ell - K| / |K|$ after eval's averaging, against its tolerance.
+
 See traps 1.2, 1.3 and 1.4 before reading a lag off this.
 
 ### `per_head_lag_profile.pdf`
 The per-head decomposition $K_t = \sum_m K_t^{(m)}$ — the readout only this model supports.
 **Emitted only when `head_structured_latent` is true.** Absent otherwise, with the reason in
 `summary.json` under `te_lag.per_head.reason`.
+
+The heatmap is $K^{(m)}_t\,\alpha^{(m)}_{t,\ell}$ averaged over the support; its sum over heads is the
+lag attribution, and the per-head shares sum to $1$.
 
 **Read:** whether the heads specialise by lag or all look alike. All-alike is not a bug, but it
 means the head structure is buying nothing.
@@ -286,9 +295,9 @@ All three are emitted only when the checkpoint was trained with `likelihood='gau
 calibrate and the analysis records a clean skip.
 
 ### `reliability.pdf`
-The PIT diagram. Under a perfectly calibrated predictive Gaussian the PIT values are uniform, so
-the curve is the diagonal. A sagging curve means over-confidence (intervals too narrow); a bulging
-one means under-confidence.
+The PIT histogram, drawn as a density. Under a perfectly calibrated predictive Gaussian the PIT
+values are uniform, so the curve is flat at $1$. A $\cup$ shape means over-confidence (intervals too
+narrow); a $\cap$ shape means over-dispersion (too wide).
 
 ### `coverage.pdf`
 Observed central-interval coverage at $1/2/3\sigma$ against nominal. Note the $2\sigma$ nominal is
@@ -299,7 +308,8 @@ as a real miscalibration if you compare against the wrong one.
 The predictive $\sigma$ distribution against the homoscedastic reference. **Read together with
 `reliability.pdf`:** calibration alone is trivially achievable by predicting a huge constant
 variance. The learned variance is worth having only if it is *both* calibrated and sharper than the
-constant, which is what `mean_nll_gain` and `learned_variance_beats_homoscedastic` report.
+constant, which is what `mean_nll_gain` and `learned_variance_beats_homoscedastic` report. The NLL
+gain is over the homoscedastic reference, and positive is better.
 
 ---
 
@@ -315,11 +325,14 @@ $L_{\mathrm{feat}}$, $L_{\mathrm{base}}$, $L_{\mathrm{feat,\ shuffled}}$.
   smoother would be unharmed by shuffling.
 
 Both together give `source_specific`. Only the first gives `influential_not_specific`. Neither
-gives `no_uplift`, and too few samples to derange gives `undetermined`.
+gives `no_uplift`, and too few samples to derange gives `undetermined`. The panel title carries the
+verdict; the criterion and both margins are in `summary.json`. The lower panel is the per-sample
+shuffle penalty $L_{\mathrm{feat,\ shuffled}} - L_{\mathrm{base}}$, where positive supports specificity.
 
 ### `kl_overlay.pdf`
 $K_{\mathrm{true}}$ against $K_{\mathrm{shuffled}}$ per step. **See trap 1.1** — this panel cannot
-prove or disprove specificity, and the direction most readers expect is the wrong one.
+prove or disprove specificity, and the direction most readers expect is the wrong one; the figure's
+one footnote says so.
 
 **Cross-referencing the CSV: mind the normalisation.** These are the $d_z$-summed per-step KL, and
 `per_sample.csv` names them `kld_true_per_t` / `kld_shuffled_per_t` for that reason. They are
@@ -346,7 +359,7 @@ band running alone. A **small** $\Delta$ means the band alone nearly reproduced 
 and is therefore **sufficient**; a **large** one means it was not enough, which says the rest of the
 window carried what it lacks — *not* that the band mattered more. Read as a removal ablation the
 ranking inverts exactly, which on a model whose UP influence lives at short lags would publish the
-longest lags as the important ones. The title says "with ONLY this lag band kept" for that reason,
+longest lags as the important ones. The title says "band kept alone" for that reason,
 and `summary.json` names both ends, `most_sufficient_band` ($\min$) and `least_sufficient_band`
 ($\max$), plus a `semantics` string that travels with the numbers. There is no "most damaging band":
 the phrase has no correct reading under a keep-mask.
@@ -373,7 +386,8 @@ the common support depends on the widest band configured.
 
 ## 11. Per-sample pages — `samples/sample<index>_<guid>_epoch<epoch>.pdf`
 
-One page per selected recording. Every row shares one physical-time axis in seconds, so a vertical
+One page per selected recording, titled `guid <id>, subgroup <name>, epoch <n>`; each row is titled by
+its quantity alone, and the table below holds what the titles leave out. Every row shares one physical-time axis in seconds, so a vertical
 line cuts every panel at the same instant and a feature seen in the attention can be traced
 straight down into the forecast. That alignment is the entire point of the page.
 
@@ -382,14 +396,14 @@ Rows, in order:
 | Row | Shows | Read for |
 | --- | --- | --- |
 | Raw FHR / UP | The loaded traces, twin-axis | Context: is this a recording with real contractions? **Omitted entirely when `fhr`/`up` are not in `load_fields`** — the page is one row shorter, not one row blank. |
-| Forecast | Overlap-averaged $\mu_{\mathrm{full}}$, all $c_y$ channels | Structure. Flat bands are channels the model gave up on. |
+| Forecast | Overlap-averaged $\mu_{\mathrm{full}}$, all $c_y$ channels; the dashed line is the scattering / phase-harmonic boundary | Structure. Flat bands are channels the model gave up on. |
 | Target | $Y$, same colour range | Direct comparison — **the shared range is deliberate**; scaling the two independently makes a badly-scaled forecast look well-scaled. |
 | Forecast residual | $\mu_{\mathrm{full}} - Y$, own range | Which channels and which times carry the error. |
 | Latent $z$ | One seeded draw | Whether the latent varies at all. |
 | Per-dimension KL | $(d_z, T)$ | Which dimensions carry information, and when. |
 | $K_t$ | Per-step KL, with attention entropy on the twin axis | Coupling over time. **See trap 1.5** about the right edge. |
 | Lag attention | Mean $\alpha$ over heads, with the argmax overlaid | Where the model looks. **See trap 1.2** about the seconds axis. |
-| TE lag attribution | Column-normalised `te_lag_map` | Which lag carries the coupling. Title states `attribution` or `diagnostic` — **see trap 1.3**. |
+| TE lag attribution | Column-normalised `te_lag_map` | Which lag carries the coupling. The title adds `diagnostic` when the map is not a rigorous attribution — **see trap 1.3**. |
 
 The heatmaps draw with `interpolation='none'`, so one data cell is one cell. `'nearest'` would
 resample at 600 dpi and can merge adjacent channels — on a per-channel diagnostic that is the one
@@ -403,6 +417,7 @@ every sample whose render failed and why.
 ## 11b. By-class and by-subgroup variants — `<analysis>/<stem>_by_class.pdf`, `<analysis>/<stem>_by_subgroup.pdf`
 
 One violin panel per headline metric, split across cohorts, beside every analysis's pooled output.
+Each panel is titled by its metric; the grouping axis is the file name's `_by_<axis>` suffix.
 Class colours come from the repository's shared table, so an eval figure and a training figure of
 the same cohort are the same colour.
 
@@ -458,7 +473,9 @@ Holm-adjusted $p$ from the per-window Kruskal-Wallis across classes, against the
 the same inverted time axis — bars above the line are the windows in which the classes' $\overline{K}$
 separates after correction across every window. Lower: Cliff's delta for each surviving class pair
 in those windows; positive means the *left* class of the pair runs higher, the scale symmetric about
-zero.
+zero. A panel that reads `not tested` has its reason in the record's `significance.reason`, and the
+per-group segment counts of the trajectories are in `trajectory_by_class.csv` and
+`trajectory_by_subgroup.csv`.
 
 **Three traps.** The **pooled** class test in `kld_time_to_delivery.json` is *not* the trajectory
 answer — it ignores time and is flagged `confounded_by_time`, because the classes do not cover the

@@ -41,7 +41,7 @@ from loguru import logger
 from torch.utils.data import DataLoader, Subset
 
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
-from teb_vae.lag_attn_rws.eval._reuse import subsample_indices
+from teb_vae.lag_attn_rws.eval._reuse import labels, subsample_indices
 from teb_vae.lag_attn_rws.eval.metrics import batch_field, model_inputs
 from teb_vae.lag_attn_rws.sample_page import build_diagnostic_figure
 
@@ -312,6 +312,7 @@ def render_pages(
                 guid=str(row["guid"]),
                 beta=float(task.hparams.get("kld_beta", 1.0)),
                 scalars=_page_scalars(row),
+                page_title=_page_title(row),
                 # Read off the batch rather than from `model_inputs`, which returns only what the
                 # net is fed: the raw source trace is never one of the model's inputs. `None` for
                 # a batch that does not carry it, which the page renders as an FHR-only first row.
@@ -329,8 +330,27 @@ def render_pages(
     return written, failures
 
 
+def _page_title(row: Any) -> str:
+    """Return the first line of a page's title: the recording and the subgroup it belongs to.
+
+    Args:
+        row: The resolved row the page is drawn from.
+
+    Returns:
+        ``guid <guid>, subgroup <subgroup>``; the GUID alone for a row that carries no subgroup.
+        The segment's place before delivery is in the file name, not repeated here.
+    """
+    subgroup = row.get(labels.SUBGROUP_COLUMN) if hasattr(row, "get") else None
+    if subgroup is None or pd.isna(subgroup):
+        return f"guid {row['guid']}"
+    return f"guid {row['guid']}, subgroup {subgroup}"
+
+
 def _page_scalars(row: Any) -> Dict[str, float]:
-    """Return the readouts the page's title carries, from the row rather than from a re-scoring."""
+    """Return the readouts the page builder is handed, from the row rather than from a re-scoring.
+
+    The page no longer prints them; they stay in ``per_sample.csv``.
+    """
     names = ("nll_base_block", "nll_full_block", "pred_gap", "source_conditioned_kl_raw")
     return {
         name: float(row[name])

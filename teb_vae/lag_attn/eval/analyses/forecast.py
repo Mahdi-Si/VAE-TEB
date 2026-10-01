@@ -215,7 +215,7 @@ def _write_figures(
         figures.ribbon_plot(
             axes[0, 0], figures.sequence_axis(horizon.shape[1] if horizon.size else 0), horizon,
             title="Forecast error by horizon step",
-            xlabel="Horizon step $h$", ylabel="Masked MSE", label="median over samples",
+            xlabel="Horizon step $h$", ylabel="Masked MSE", label="median",
         )
         written["horizon_error"] = str(
             figures.render_figure(figure, directory / "horizon_error")
@@ -230,7 +230,7 @@ def _write_figures(
             axes[0, 0], figures.sequence_axis(anchor.shape[1] if anchor.size else 0), anchor,
             title="Forecast error by anchor position",
             xlabel="Anchor $t$ (decimated steps)", ylabel="Masked MSE",
-            label="median over samples",
+            label="median",
         )
         written["anchor_error"] = str(
             figures.render_figure(figure, directory / "anchor_error")
@@ -242,12 +242,12 @@ def _write_figures(
     try:
         figures.histogram_panel(
             axes[0, 0], frame.get("feat_mse_total", []), title="Per-sample masked MSE",
-            xlabel="feat_mse_total",
+            xlabel="Masked MSE",
         )
         figures.histogram_panel(
             axes[1, 0], frame.get("feat_r2_total", []), title="Per-sample $R^2$",
-            xlabel="feat_r2_total", reference=0.0,
-            reference_label="$R^2 = 0$ (predicting the channel mean)",
+            xlabel="$R^2$", reference=0.0,
+            reference_label="$R^2 = 0$",
         )
         written["distributions"] = str(
             figures.render_figure(figure, directory / "distributions")
@@ -262,7 +262,7 @@ def _write_figures(
             (
                 ("forecast", "Mean forecast $\\mu_{\\mathrm{full}}$", True),
                 ("target", "Mean target $Y$", True),
-                ("residual_rms", "RMS residual (per channel, per step)", False),
+                ("residual_rms", "RMS residual", False),
             )
         ):
             figures.heatmap_with_colorbar(

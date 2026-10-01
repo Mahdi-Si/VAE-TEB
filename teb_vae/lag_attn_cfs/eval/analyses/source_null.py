@@ -287,21 +287,18 @@ def build_difference_figure(
     figures.histogram_panel(
         axes[0, 0],
         finite_column(per_guid, DIFFERENCE_COLUMN),
-        title=(
-            f"coupling minus availability clock per recording, "
-            f"n = {int(difference.get('n_recordings_scored') or 0)}"
-        ),
+        title=f"Coupling minus clock, n = {int(difference.get('n_recordings_scored') or 0)}",
         xlabel="nats per anchor",
         reference=0.0,
-        reference_label="the clock accounts for all of it",
+        reference_label="no excess",
     )
     figures.violin_panel(
         axes[1, 0],
         {
-            COUPLING_COLUMN: finite_column(per_guid, COUPLING_COLUMN),
-            NULL_COLUMN: finite_column(per_guid, NULL_COLUMN),
+            "matched": finite_column(per_guid, COUPLING_COLUMN),
+            "source-null": finite_column(per_guid, NULL_COLUMN),
         },
-        title="the matched coupling readout and the source-null arm, on one support",
+        title="Matched and source-null arms",
         ylabel="nats per anchor",
     )
     return figure
@@ -542,21 +539,21 @@ def build_lag_figure(
     top.plot(
         axis, frame["kl_nats"], color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS,
         marker="o", markersize=figures.MARKER_SMALL,
-        label="matched: KL(q(z|Y,U) || p(z|Y))",
+        label="matched",
     )
     top.plot(
         axis, frame["kl_null_nats"], color=figures.COLOR_ORANGE, linewidth=figures.LINE_EMPHASIS,
         marker="o", markersize=figures.MARKER_SMALL,
-        label="source-null: the availability clock",
+        label="source-null",
     )
     top.set_ylabel("nats per anchor")
-    top.set_title("Where the coupling exceeded the availability clock")
+    top.set_title("Lag profile")
 
     bottom.axhline(0.0, linewidth=figures.LINE_THIN, color=figures.COLOR_GRAY)
     bottom.plot(
         axis, frame["clock_excess_nats"], color=figures.COLOR_VERMILLION,
         linewidth=figures.LINE_EMPHASIS, marker="o", markersize=figures.MARKER_SMALL,
-        label="clock-excess (signed)",
+        label="clock excess",
     )
     bottom.set_ylabel("nats per anchor")
     bottom.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
@@ -592,12 +589,9 @@ def build_lag_figure(
     figures.legend_with_headroom(bottom, ncol=2, headroom=0.35, fontsize=figures.FONT_SMALL)
     notes = []
     if record.get("clock_excess_degenerate"):
-        notes.append("clock-excess profile is degenerate: no mask emitted")
+        notes.append("degenerate, no mask")
     if record.get("clock_excess_at_window_edge"):
-        notes.append(
-            "clock-excess peak is on the longest searched lag: censored by the window, "
-            "the true peak may lie beyond it"
-        )
+        notes.append("edge-censored peak")
     if notes:
         bottom.annotate(
             "; ".join(notes), xy=(0.01, 0.04), xycoords="axes fraction",

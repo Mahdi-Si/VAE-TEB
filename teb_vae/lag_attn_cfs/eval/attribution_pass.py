@@ -16,12 +16,13 @@ eligibility floor of one segment rather than two, and the segment is the recordi
 by ``epoch``. The cap is on segments, so the per-class draw is the cap divided by the number of
 classes the split carries, rounded up, and the last class drawn stops at the cap.
 
-**What is attributed per anchor.** The divergence and the mean-decoded forecast gap under both
-baselines; the model's own lag readout on every configured lag band under the source-null
+**What is attributed per anchor.** The main readouts (:data:`~.attributions.MAIN_READOUTS`: the
+divergence, the mean-decoded forecast gap, the full block score and the full block error) under
+both baselines; the model's own lag readout on every configured lag band under the source-null
 baseline alone (the target streams are held there, so the question is what source content makes
 the model read that band); the anchor's largest per-coordinate divergence under the source-null
-baseline; the layer split of the divergence and the gap; and the source zeroed band by band, as
-feature ablation, on the divergence and the gap. The structural checks are measured on every row
+baseline; the layer split of every main readout; and the source zeroed band by band, as feature
+ablation, on every main readout. The structural checks are measured on every row
 of a real run and land in the block beside the fixture-proved ones.
 
 **One example anchor per class keeps its full maps**, for the example pages and the overview,
@@ -45,7 +46,7 @@ import torch
 from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval import attributions as core
-from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces
+from teb_vae.lag_attn_cfs.eval import cohort, frames, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
@@ -1390,7 +1391,7 @@ def write_example_pages(
         directory: The analysis directory.
         lag_seconds: The compensated lag axis.
         cell: The cell binding.
-        caveat: The sentence printed under every page.
+        caveat: The one-line note printed under every page (:data:`~attributions.ATTRIBUTION_NOTE`).
         lag_bands: The configured lag bands, in the order their rows are drawn.
         horizons: The named horizon steps, in the order their rows are drawn, or ``None``.
 
@@ -1499,7 +1500,7 @@ def run_traces(
             figure = figures.render_figure(
                 traces.build_recording_figure(
                     recording, panels=core.TRACE_PANELS, lag_seconds=lag_seconds,
-                    caveat=f"{cell.lag_qualification}. {caveat}. {lag_axis.GROUP_DELAY_CAVEAT}",
+                    caveat=caveat,
                     scales=scales,
                 ),
                 destination,
@@ -1663,7 +1664,9 @@ def run_pass(
     blocks = blocks_frame(rows)
     blocks.to_csv(directory / core.BLOCKS_FILENAME, index=False)
 
+    # The long sentence travels in the record; the figures print its one-line form.
     caveat = core.ATTRIBUTION_CAVEAT
+    note = core.ATTRIBUTION_NOTE
     files: List[str] = [
         core.ROWS_FILENAME, core.VECTORS_FILENAME, core.RECORDINGS_FILENAME, core.SUMMARY_FILENAME,
         core.BANDS_FILENAME, core.LAG_BANDS_FILENAME, core.LAYER_FILENAME, core.NULL_FILENAME,
@@ -1674,55 +1677,55 @@ def run_pass(
     if lag_channel:
         files.append(core.LAG_CHANNEL_FILENAME)
     figure_paths = [
-        figures.render_figure(core.build_map_figure(examples, lag_seconds=lag_seconds, cell=cell, caveat=caveat), directory / core.MAP_FIGURE),
+        figures.render_figure(core.build_map_figure(examples, lag_seconds=lag_seconds, cell=cell, caveat=note), directory / core.MAP_FIGURE),
         figures.render_figure(
             core.build_lag_profile_figure(
-                rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, cell=cell, caveat=caveat,
+                rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, cell=cell, caveat=note,
                 lag_bands=lag_bands,
             ),
             directory / core.LAG_PROFILE_FIGURE,
         ),
-        figures.render_figure(core.build_band_figure(bands, lag_band_table, readouts=core.MAIN_READOUTS, caveat=caveat), directory / core.BAND_FIGURE),
+        figures.render_figure(core.build_band_figure(bands, lag_band_table, readouts=core.MAIN_READOUTS, caveat=note), directory / core.BAND_FIGURE),
         figures.render_figure(
-            core.build_layer_figure(layer, _top_coordinate_rows(rows, vectors), cell=cell, lag_seconds=lag_seconds, caveat=caveat),
+            core.build_layer_figure(layer, _top_coordinate_rows(rows, vectors), cell=cell, lag_seconds=lag_seconds, caveat=note),
             directory / core.LAYER_FIGURE,
         ),
-        figures.render_figure(core.build_null_figure(null, caveat=caveat), directory / core.NULL_FIGURE),
+        figures.render_figure(core.build_null_figure(null, caveat=note), directory / core.NULL_FIGURE),
         figures.render_figure(
             core.build_channel_figure(
                 rows, vectors, readouts=core.MAIN_READOUTS, channel_groups=channel_groups,
-                n_scattering=work.n_scattering, caveat=caveat,
+                n_scattering=work.n_scattering, caveat=note,
             ),
             directory / core.CHANNEL_FIGURE,
         ),
         figures.render_figure(
             core.build_lag_channel_figure(
                 lag_channel, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS,
-                n_scattering=work.n_scattering, caveat=caveat,
+                n_scattering=work.n_scattering, caveat=note,
             ),
             directory / core.LAG_CHANNEL_FIGURE,
         ),
         figures.render_figure(
-            core.build_time_profile_figure(rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, caveat=caveat),
+            core.build_time_profile_figure(rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, caveat=note),
             directory / core.TIME_PROFILE_FIGURE,
         ),
         figures.render_figure(
-            core.build_checks_figure(rows, tolerance=COMPLETENESS_TOLERANCE, caveat=caveat),
+            core.build_checks_figure(rows, tolerance=COMPLETENESS_TOLERANCE, caveat=note),
             directory / core.CHECKS_FIGURE,
         ),
         figures.render_figure(
-            core.build_delivery_figure(rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, caveat=caveat),
+            core.build_delivery_figure(rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, caveat=note),
             directory / core.DELIVERY_FIGURE,
         ),
-        figures.render_figure(core.build_block_figure(blocks, caveat=caveat), directory / core.BLOCK_FIGURE),
+        figures.render_figure(core.build_block_figure(blocks, caveat=note), directory / core.BLOCK_FIGURE),
         figures.render_figure(
-            core.build_horizon_figure(rows, vectors, lag_seconds=lag_seconds, horizons=horizons, caveat=caveat),
+            core.build_horizon_figure(rows, vectors, lag_seconds=lag_seconds, horizons=horizons, caveat=note),
             directory / core.HORIZON_FIGURE,
         ),
     ]
     files.extend(Path(path).name for path in figure_paths)
     example_manifest = write_example_pages(
-        examples, directory=directory, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands,
+        examples, directory=directory, lag_seconds=lag_seconds, cell=cell, caveat=note, lag_bands=lag_bands,
         horizons=horizons,
     )
     pd.DataFrame(example_manifest, columns=list(EXAMPLE_MANIFEST_COLUMNS)).to_csv(
@@ -1739,7 +1742,7 @@ def run_pass(
     manifest, failures, trace_anchors = run_traces(
         task, loader, chosen, cohort.within_horizon_index(index_map, window_hours), cell,
         directory=directory, lag_seconds=lag_seconds,
-        break_after_s=break_after_s, n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, caveat=caveat,
+        break_after_s=break_after_s, n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, caveat=note,
         raw_scales=raw_scales,
     )
     trace_elapsed = time.perf_counter() - trace_started

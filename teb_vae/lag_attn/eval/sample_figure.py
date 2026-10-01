@@ -86,7 +86,7 @@ ROW_SPECS: Tuple[Tuple[str, str, float], ...] = (
     ("residual", "Forecast residual", 1.4),
     ("latent", "Latent z", 1.0),
     ("kld_dims", "Per-dimension KL", 1.15),
-    ("kld_total", "K_t", 0.9),
+    ("kld_total", "$K_t$", 0.9),
     ("attention", "Lag attention", 1.15),
     ("te_lag", "TE lag attribution", 1.15),
 )
@@ -221,12 +221,13 @@ class RowGrid:
         Args:
             ax: The row's main axes.
             name: Row name, supplying the title prefix.
-            detail: Appended to the title prefix after an em dash.
+            detail: Appended to the title prefix after a colon; empty for a row whose prefix
+                already names what is drawn.
             warmup: Warm-up length in decimated steps, shaded when positive.
             T: Total decimated steps, for the step-to-seconds conversion.
         """
         title = self.titles.get(name, name)
-        ax.set_title(f"{title} — {detail}" if detail else title, fontsize=9, pad=6)
+        ax.set_title(f"{title}: {detail}" if detail else title, fontsize=9, pad=6)
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_xlim(0.0, self.t_max)
         if warmup and T:
@@ -247,9 +248,9 @@ def _channel_heatmap(
     name: str,
     field: np.ndarray,
     *,
-    detail: str,
     colorbar_label: str,
     warmup: int,
+    detail: str = "",
     limit: Optional[float] = None,
     separator: Optional[int] = None,
     cmap: str = "bwr",
@@ -260,7 +261,7 @@ def _channel_heatmap(
         grid: The row grid.
         name: Row name.
         field: The field, $(\mathrm{rows}, T)$.
-        detail: Title detail after the prefix.
+        detail: Title detail after the prefix; empty by default.
         colorbar_label: Colorbar label.
         warmup: Warm-up length in decimated steps.
         limit: Symmetric colour limit. ``None`` derives one from the field, which is right for
@@ -296,6 +297,7 @@ def build_sample_figure(
     warmup: int,
     horizon: int,
     guid: str = "unknown",
+    subgroup: Optional[str] = None,
     epoch: Optional[int] = None,
     step_seconds: float = 4.0,
     te_lag_label: str = "attribution",
@@ -316,11 +318,13 @@ def build_sample_figure(
         warmup: Warm-up length $T_w$ in decimated steps.
         horizon: Forecast horizon $H_d$ in decimated steps.
         guid: Record identifier, for the page title.
+        subgroup: The recording's canonical subgroup, which the page title always names beside
+            the GUID; ``None`` is written as ``unknown``.
         epoch: The recording's epoch, for the page title.
         step_seconds: Decimated step duration, for the lag second-axis.
         te_lag_label: ``'attribution'`` when ``head_structured_latent`` makes the TE lag map a
-            rigorous attribution, ``'diagnostic'`` otherwise. Stated in the row title because a
-            reader cannot tell the two apart from the picture.
+            rigorous attribution, ``'diagnostic'`` otherwise. A diagnostic is stated in the row
+            title because a reader cannot tell the two apart from the picture.
 
     Returns:
         The figure. The caller saves and closes it.
@@ -361,12 +365,9 @@ def build_sample_figure(
             ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
             twin.set_ylabel("UP (normalised)", fontsize=8, color=COLOR_GREEN)
             twin.tick_params(axis="y", labelcolor=COLOR_GREEN)
-            handles = ax.get_legend_handles_labels()
-            twin_handles = twin.get_legend_handles_labels()
-            ax.legend(handles[0] + twin_handles[0], handles[1] + twin_handles[1],
-                      loc="upper right", fontsize=7, framealpha=0.95)
+            # No legend: each twin axis carries its series' colour on its label and ticks.
             style_axes(ax, grid="both")
-            grid.finalise(ax, "raw", "signals as loaded", warmup=warmup, T=T)
+            grid.finalise(ax, "raw", warmup=warmup, T=T)
             twin.set_xlim(0.0, t_max)
             grid.hide_colorbar(cax)
 
@@ -387,17 +388,14 @@ def build_sample_figure(
         separator = n_scattering - 1 if 0 < n_scattering < n_channels else None
         _channel_heatmap(
             grid, "forecast", forecast.T, warmup=warmup, limit=shared_limit, separator=separator,
-            detail=f"overlap-averaged $\\mu_{{\\mathrm{{full}}}}$, {n_channels} channels, $H_d$={horizon}",
             colorbar_label="value",
         )
         _channel_heatmap(
             grid, "truth", truth.T, warmup=warmup, limit=shared_limit, separator=separator,
-            detail=f"$Y$, {n_channels} channels (scattering above row {n_scattering}, phase below)",
             colorbar_label="value",
         )
         _channel_heatmap(
             grid, "residual", residual.T, warmup=warmup, separator=separator,
-            detail="$\\mu_{\\mathrm{full}} - Y$, own colour range",
             colorbar_label="residual",
         )
 
@@ -413,7 +411,7 @@ def build_sample_figure(
         ax.set_ylabel("Latent dim", fontsize=8)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "z")
-        grid.finalise(ax, "latent", f"$d_z$={d_z}, one seeded draw", warmup=warmup, T=T)
+        grid.finalise(ax, "latent", warmup=warmup, T=T)
 
         # ---- Per-dimension KL ----------------------------------------------------
         kld_per_dim = kld_per_dim_np(
@@ -433,7 +431,7 @@ def build_sample_figure(
         ax.set_ylabel("Latent dim", fontsize=8)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "KL (nats)")
-        grid.finalise(ax, "kld_dims", f"max {kld_max:.3g} nats", warmup=warmup, T=T)
+        grid.finalise(ax, "kld_dims", warmup=warmup, T=T)
 
         # ---- Total K_t, with the attention entropy alongside ---------------------
         kld_per_t = np.asarray(to_numpy(outputs["kld_per_t"]), dtype=np.float64).ravel()
@@ -449,14 +447,11 @@ def build_sample_figure(
         twin = ax.twinx()
         twin.plot(time_dec, entropy, color=COLOR_ORANGE, linewidth=0.9, alpha=0.85,
                   label="attention entropy")
-        twin.set_ylabel("Entropy (nats)", fontsize=8, color=COLOR_ORANGE)
+        twin.set_ylabel("Attention entropy (nats)", fontsize=8, color=COLOR_ORANGE)
         twin.tick_params(axis="y", labelcolor=COLOR_ORANGE)
-        handles = ax.get_legend_handles_labels()
-        twin_handles = twin.get_legend_handles_labels()
-        ax.legend(handles[0] + twin_handles[0], handles[1] + twin_handles[1],
-                  loc="upper right", fontsize=7, framealpha=0.95)
+        # No legend: each twin axis carries its series' colour on its label and ticks.
         style_axes(ax, grid="both")
-        grid.finalise(ax, "kld_total", "per-step KL against attention sharpness", warmup=warmup, T=T)
+        grid.finalise(ax, "kld_total", warmup=warmup, T=T)
         twin.set_xlim(0.0, t_max)
         grid.hide_colorbar(cax)
 
@@ -468,17 +463,12 @@ def build_sample_figure(
         )
         ax.plot(time_dec, mean_alpha.argmax(axis=-1), color=COLOR_VERMILLION, linewidth=0.9,
                 alpha=0.9, label="argmax lag")
-        ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Zero offset: the stored timeline is canonical and no dataset-shift term is ever applied
-        # to a lag axis. This page reads no input-delay guard, so the offset is exactly 0.
+        ax.set_ylabel(r"Lag $\ell$", fontsize=8)
         attach_lag_seconds_axis(ax, step_seconds, 0.0)
         ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "attn prob")
-        grid.finalise(
-            ax, "attention", f"mean over {int(alpha.shape[1])} heads, $L$={n_lags}",
-            warmup=warmup, T=T,
-        )
+        grid.finalise(ax, "attention", warmup=warmup, T=T)
 
         # ---- TE lag attribution --------------------------------------------------
         # Column-normalised: the per-step KL varies over orders of magnitude across a recording, so
@@ -498,22 +488,21 @@ def build_sample_figure(
             te_norm, aspect="auto", cmap="viridis", origin="lower", vmin=0.0, vmax=1.0,
             extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
         )
-        ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Zero offset: the stored timeline is canonical and no dataset-shift term is ever applied
-        # to a lag axis. This page reads no input-delay guard, so the offset is exactly 0.
+        ax.set_ylabel(r"Lag $\ell$", fontsize=8)
         attach_lag_seconds_axis(ax, step_seconds, 0.0)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "column-norm")
+        # The row title already says "attribution"; only the weaker reading needs stating.
         grid.finalise(
-            ax, "te_lag",
-            f"{te_lag_label}, column-normalised (max {te_max:.3g} nats)",
+            ax, "te_lag", "" if te_lag_label == "attribution" else te_lag_label,
             warmup=warmup, T=T,
         )
 
-        heading = f"guid {guid}" if epoch is None else f"guid {guid}, epoch {epoch}"
-        grid.figure.suptitle(
-            f"Sample diagnostics — {heading}", fontsize=11, color=COLOR_GRAY, y=0.995
-        )
+        # The identity of the recording and nothing else; a GUID is always followed by its subgroup.
+        heading = f"guid {guid}, subgroup {subgroup or 'unknown'}"
+        if epoch is not None:
+            heading += f", epoch {epoch}"
+        grid.figure.suptitle(heading, fontsize=11, color=COLOR_GRAY, y=0.995)
         return grid.figure
     except BaseException:
         plt.close(grid.figure)

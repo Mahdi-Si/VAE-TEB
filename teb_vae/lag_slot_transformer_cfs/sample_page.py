@@ -33,10 +33,15 @@ x label. Nothing is shifted to compensate for a group delay: the stored timeline
 per-lag split of the divergence for a summed update, because the cross terms can reinforce or
 cancel. What is drawn instead is what removing a lag does to the fitted computation, which is a
 different and answerable question --
-:data:`~teb_vae.lag_slot_transformer_cfs.nets.controls.SUPPRESSION_QUALIFICATION` states its limit
-and is written into the figure rather than only into this docstring. The rows exist only where the
-lags are summed; under the comparator's normalised aggregation there is no per-lag term to remove
-and they are omitted rather than faked.
+:data:`~teb_vae.lag_slot_transformer_cfs.nets.controls.SUPPRESSION_QUALIFICATION` states its limit.
+The page itself carries the one-line
+:data:`~teb_vae.lag_attn_cfs.sample_page.LAG_TIME_CAVEAT` under the lag rows, and the figure
+guide carries the rest. The rows exist only where the lags are summed; under the comparator's
+normalised aggregation there is no per-lag term to remove and they are omitted rather than faked.
+
+**Text is kept to what a panel needs.** A row title is a short noun phrase, a legend entry a word
+or two, and the page carries one note line; the clauses that explained each row live in the figure
+guide. The suptitle names the epoch, the recording and its subgroup, and nothing else.
 
 This module is matplotlib-only: no Lightning, no MLflow, no config, no loader. It does not call
 :func:`~utils.style.apply_publication_style`, which mutates global ``rcParams`` and is called once
@@ -44,7 +49,6 @@ by whoever owns the process.
 """
 from __future__ import annotations
 
-import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -111,10 +115,7 @@ from teb_vae.lag_attn_rws.sample_page import (  # noqa: E402
     _raw_overlay,
     top_down_extent,
 )
-from teb_vae.lag_slot_transformer_cfs.nets.controls import (  # noqa: E402
-    SUPPRESSION_QUALIFICATION,
-    suppressed_parameters,
-)
+from teb_vae.lag_slot_transformer_cfs.nets.controls import suppressed_parameters  # noqa: E402
 from utils.style import style_axes  # noqa: E402
 
 __all__ = [
@@ -125,7 +126,6 @@ __all__ = [
     "causal_stream_panels",
     "residual_forecast_rows",
     "residual_lag_panels",
-    "wrapped_caption",
 ]
 
 #: Raw sampling rate of the stored record, in Hz. The page's own $\Delta$ is re-derived from it and
@@ -133,36 +133,18 @@ __all__ = [
 #: decimation draws the axis it actually has.
 _FS_RAW = 4.0
 
-#: Fixed physical strip for the two-line suptitle. A fraction would shrink with every row added and
+#: Fixed physical strip for the one-line suptitle. A fraction would shrink with every row added and
 #: put the title on top of the first panel's own.
-_HEADER_INCHES = 0.75
+_HEADER_INCHES = 0.5
 
-#: Fixed physical strip for the two footnotes, which is wider than the sibling's because this page
-#: carries two: the family's lag-time caveat and this architecture's suppression qualification. A
-#: floor rather than a replacement; see :func:`build_residual_page`.
-_FOOTER_INCHES = 1.7
+#: Fixed physical strip under the last row: its x label, and the one note line below that. In
+#: inches for the reason the header strip is.
+_FOOTER_INCHES = 0.7
 
-#: Where each footnote's baseline sits, in inches from the figure's bottom edge. In inches and not
-#: in figure fractions for the reason the header strip is: a fraction moves with the row count, and
+#: Where the note's baseline sits, in inches from the figure's bottom edge. In inches and not in
+#: figure fractions for the reason the header strip is: a fraction moves with the row count, and
 #: this page's row count depends on the arm.
-_CAVEAT_INCHES = 0.65
-_QUALIFICATION_INCHES = 0.12
-
-#: Characters per line of a footnote, and the reason this page wraps its own captions rather than
-#: asking matplotlib to.
-#:
-#: ``Text(wrap=True)`` finds its break points by **measuring**: it re-measures the line so far once
-#: per word, and every one of those measurements re-parses whatever mathtext the line contains, so
-#: the cost grows with the square of the caption's length. MEASURED at the production geometry:
-#: the two captions below cost $7.9$ s of a $20.7$ s page, for two blocks of prose. Wrapped here
-#: they cost nothing measurable.
-#:
-#: Whitespace is a safe break point for these two strings and stays safe: no ``$...$`` span in
-#: either contains a space, so a break can never land inside one, and
-#: :func:`_test_captions_break_only_between_math_spans` in the package's page tests holds that.
-#: The count suits $7$ pt over this page's $14$ inch width with a margin for the mathtext, which
-#: sets wider than the prose around it.
-_CAPTION_CHARS = 235
+_NOTE_INCHES = 0.1
 
 #: Never interpolate a heatmap on this page: a cell is one anchor by one channel or one lag, and a
 #: smoothed edge invents a value between two the model produced.
@@ -183,21 +165,6 @@ PROPOSAL_ROWS: Tuple[Tuple[str, float], ...] = (
     ("kld_dims", 1.1),
     ("kld_total", 0.85),
 )
-
-
-def wrapped_caption(text: str) -> str:
-    """Break one caption into lines here, rather than leaving it to the renderer.
-
-    See :data:`_CAPTION_CHARS` for why. Breaking on whitespace cannot split a ``$...$`` span in
-    either caption this page draws, because neither contains one with a space in it.
-
-    Args:
-        text: The caption, as one paragraph.
-
-    Returns:
-        The same text with newlines at the break points.
-    """
-    return "\n".join(textwrap.wrap(text, width=_CAPTION_CHARS))
 
 
 @dataclass(frozen=True)
@@ -375,7 +342,6 @@ def _draw_weighted_gap_row(
     *,
     scores: Optional[Dict[str, np.ndarray]],
     likelihood: str,
-    coverage_floor: float,
     seconds_per_step: float,
     weighted: bool,
 ) -> None:
@@ -389,8 +355,7 @@ def _draw_weighted_gap_row(
         rows: The row inputs and the layout hooks.
         stitched: The drawn tiling.
         scores: ``{'base', 'full'}`` over the drawn windows, or ``None``.
-        likelihood: The objective's own likelihood, for the axis label and the title.
-        coverage_floor: The model's own anchor coverage floor, for the title.
+        likelihood: The objective's own likelihood, for the axis label.
         seconds_per_step: $\Delta$ in seconds, for placing a window in physical time.
         weighted: Whether a channel or horizon weighting is in force, which decides whether the
             row may call its unit nats at all.
@@ -409,9 +374,9 @@ def _draw_weighted_gap_row(
     if scores is None:
         # The row keeps its title, its axis and its place, so the rows below stay column-aligned
         # and the gap is visible.
-        ax.set_title("Per-window forecast score", fontsize=9, pad=6)
+        ax.set_title("Forecast score per window", fontsize=9, pad=6)
         ax.text(
-            0.5, 0.5, "no validity signal in this batch, so the objective's mask cannot be built",
+            0.5, 0.5, "no validity signal",
             transform=ax.transAxes, ha="center", va="center", fontsize=8, color=COLOR_GRAY,
         )
         rows.finalise_time_axis(ax)
@@ -430,7 +395,7 @@ def _draw_weighted_gap_row(
     base, full = scores["base"], scores["full"]
 
     for condition, colour, label in (
-        (base >= full, COLOR_GREEN, "source helps ($D_0 > D_1$)"),
+        (base >= full, COLOR_GREEN, "source helps"),
         (base < full, COLOR_VERMILLION, "source hurts"),
     ):
         ax.fill_between(
@@ -439,23 +404,14 @@ def _draw_weighted_gap_row(
         )
     ax.plot(
         centres, base, color=COLOR_GRAY, linewidth=0.9, linestyle="--", marker="o", markersize=2.5,
-        label="$D_0$ base ($z^p$, target-only)",
+        label="base",
     )
     ax.plot(
         centres, full, color=COLOR_VERMILLION, linewidth=0.9, marker="o", markersize=2.5,
-        label="$D_1$ full ($z^q$, source-conditioned)",
+        label="full",
     )
 
-    gap = float(np.mean(base - full)) if base.size else float("nan")
-    ax.set_title(
-        f"Per-window forecast score, reduced as the objective reduces it "
-        f"('{likelihood}', {'channel- and horizon-weighted' if weighted else 'unweighted'}, "
-        f"masked at the model's coverage floor {coverage_floor:g}) — "
-        f"{base.size} windows, mean gap $D_0-D_1$ = {gap:.4g} over the drawn set.\n"
-        f"Insets: per-channel error and $\\pm${BAND_SIGMAS:.0f}$\\sigma$ coverage over the same "
-        f"windows, on the channel axis of the rows above.",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Forecast score per window", fontsize=9, pad=6)
     ax.legend(loc="upper right", fontsize=6, framealpha=0.95, ncol=2)
     rows.finalise_time_axis(ax)
 
@@ -533,17 +489,6 @@ def residual_forecast_rows(
     """
     index, geometry = rows.sample_index, rows.geometry
     _draw_context_row(rows)
-
-    # The footnote the lag rows are read under, in the GridSpec's bottom margin so it costs no
-    # row, and written before the early return: a page that keeps the lag rows and drops the
-    # forecast rows is exactly the page that leads with a lag axis. Positioned from the figure's
-    # own height rather than at a fixed fraction, because this page's row count depends on the arm
-    # and a fraction that clears the last row on one lands inside it on another.
-    rows.figure.text(
-        0.5, _CAVEAT_INCHES / float(rows.figure.get_figheight()),
-        wrapped_caption(LAG_TIME_CAVEAT),
-        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY,
-    )
 
     if not rows.wants(FORECAST_ROW):
         return
@@ -624,9 +569,8 @@ def residual_forecast_rows(
             label="true $Y^{+}$" if lane == 0 else None,
         )
         for mean_all, sigma_all, colour, alpha, style, label in (
-            (base_mean, base_sigma, COLOR_GRAY, 0.22, "--", "base ($z^p$, target-only)"),
-            (full_mean, full_sigma, COLOR_VERMILLION, 0.18, "-",
-             "full ($z^q$, source-conditioned)"),
+            (base_mean, base_sigma, COLOR_GRAY, 0.22, "--", "base"),
+            (full_mean, full_sigma, COLOR_VERMILLION, 0.18, "-", "full"),
         ):
             mean = mean_all[:, channel] + offset
             half = BAND_SIGMAS * sigma_all[:, channel]
@@ -655,12 +599,7 @@ def residual_forecast_rows(
             ax.plot(
                 time_dec[start:stop], fan_mean[position, : stop - start, channel] + offset,
                 color=COLOR_VERMILLION, linewidth=0.5, alpha=0.45, zorder=1.5,
-                label=(
-                    f"training-tile forecasts ($\\mu^q$, $S$={int(training_stride)}, "
-                    f"$\\varphi$=0)"
-                    if lane == 0 and count == 0
-                    else None
-                ),
+                label="tile forecasts" if lane == 0 and count == 0 else None,
             )
 
     # Each lane named by its **declared** channel, so the number on the axis survives a change of
@@ -681,16 +620,7 @@ def residual_forecast_rows(
         color=COLOR_ORANGE, alpha=0.14, zorder=0,
     )
 
-    ax.set_title(
-        f"Forecast — {len(lanes)} of {len(keep)} target channels by "
-        f"{BAND_SIGMAS:.0f}$\\sigma$ calibration (worst, middle, best), lanes offset by "
-        f"{stride:.3g}, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$; {len(positions)} of "
-        f"{int(valid.sum())} decoded anchors stitched, first anchor wins; shaded: the anchor the "
-        f"error map draws.\nDrawn at the evaluation resolution — every valid anchor — so the "
-        f"ticks are what this page decoded; the dotted grid is the sparser set a training step "
-        f"tiles.",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Forecast, selected channels", fontsize=9, pad=6)
     ax.set_xlabel(stitched.time_label, fontsize=8)
     ax.set_ylabel("target coefficient (normalised)", fontsize=8)
     style_axes(ax, grid="both")
@@ -737,7 +667,6 @@ def residual_forecast_rows(
         stitched,
         scores=scores,
         likelihood=likelihood,
-        coverage_floor=coverage_floor,
         seconds_per_step=seconds_per_step,
         weighted=channel_weight is not None or horizon_weight is not None,
     )
@@ -779,12 +708,11 @@ def build_residual_page(
         sample_index: Which sample of the batch to draw.
         epoch: For the title.
         guid: For the title.
-        beta: The divergence weight **resolved for this epoch**, not the raw hyperparameter.
-        scalars: The **epoch's** own loss readouts for the title, keyed as the objective names
-            them, and not this sample's: the caller takes them from what the run already logged
-            rather than recomputing them, because this architecture's objective ends in a
-            collective and the page is drawn on one rank. Missing keys are skipped, and an empty
-            mapping leaves the title's second line off entirely.
+        beta: The divergence weight resolved for this epoch. Not drawn: the title names the epoch
+            and the recording and nothing else, and the run's log carries the weight.
+        scalars: The epoch's own loss readouts, taken by the caller from what the run already
+            logged. Not drawn, for the reason ``beta`` is not; kept so a caller's signature does
+            not change.
         up_raw: The raw source in loader units, or ``None``.
         normalization_stats: The loader's statistics, so the raw row renders in physical units.
         delay_steps: The causal input delay $\delta$, for the lag rows' compensated axis.
@@ -800,7 +728,7 @@ def build_residual_page(
             unrecognised name raises rather than being ignored: a page quietly missing the panel
             it was rendered for is invisible in the output.
         cohort: The recording's cohort -- its subgroup, which names the class -- written into
-            the title beside the GUID, so a page lifted out of its directory still says which
+            the title after the GUID, so a page lifted out of its directory still says which
             cohort it came from. ``None`` omits it.
 
     Returns:
@@ -859,9 +787,7 @@ def build_residual_page(
     fig = plt.figure(figsize=(14, figure_height))
     try:
         header_frac = _HEADER_INCHES / figure_height
-        # A floor, not a replacement: a page long enough for the fraction to be the wider margin
-        # keeps the fraction.
-        bottom_frac = max(0.03, _FOOTER_INCHES / figure_height)
+        bottom_frac = _FOOTER_INCHES / figure_height
         grid = GridSpec(
             len(row_specs), 2, figure=fig,
             height_ratios=height_ratios, width_ratios=[1.0, 0.022],
@@ -1038,12 +964,7 @@ def build_residual_page(
             ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
             ax.set_yticks([d_z // 2, d_z + d_z // 2])
             ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
-            ax.set_title(
-                "Target-only latent state and the source-derived shift, at the decoded anchors "
-                "(shared colour scale). The design's claim is that the second is small beside "
-                "the first.",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("Latent prior and source shift", fontsize=9, pad=6)
             ax.set_xlabel("Anchor step (s)", fontsize=8)
             heatmap_spines(ax)
             attach_cbar(cax, image, "value")
@@ -1061,11 +982,7 @@ def build_residual_page(
                 extent=top_down_extent(left, right, d_z),
                 interpolation=_IMSHOW_INTERPOLATION,
             )
-            ax.set_title(
-                "Per-coordinate source-conditioned divergence (nats), at the decoded anchors — "
-                "where a collapse into one or two coordinates shows up",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("Divergence per latent dimension", fontsize=9, pad=6)
             ax.set_xlabel("Anchor step (s)", fontsize=8)
             ax.set_ylabel("Latent dim", fontsize=8)
             heatmap_spines(ax)
@@ -1079,10 +996,7 @@ def build_residual_page(
                 anchor_steps * seconds_per_step, kld_total_np,
                 color=COLOR_VERMILLION, linewidth=0.9,
             )
-            ax.set_title(
-                "$K_t$ — total source-conditioned divergence per decoded anchor",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("Total divergence $K_t$", fontsize=9, pad=6)
             ax.set_xlabel("Anchor step (s)", fontsize=8)
             ax.set_ylabel("nats", fontsize=8)
             style_axes(ax, grid="both")
@@ -1099,8 +1013,7 @@ def build_residual_page(
                 ax, cax = row_axes("lag_proposal")
                 image = lag_row(
                     ax, lag_panels.proposal_norm[kept],
-                    "$\\| r^{\\mu}_{t,\\ell} \\|_2$ — per-lag proposal magnitude, "
-                    "before the sum, the scaling and the limiter",
+                    "Proposal norm $\\| r^{\\mu}_{t,\\ell} \\|_2$",
                     "viridis",
                 )
                 attach_cbar(cax, image, "magnitude")
@@ -1110,8 +1023,7 @@ def build_residual_page(
                 ax, cax = row_axes("lag_exposure")
                 image = lag_row(
                     ax, lag_panels.exposure[kept],
-                    "Available source channels per anchor-lag pair — the denominator the two "
-                    "rows around this one are read against",
+                    "Source channels available",
                     "cividis",
                 )
                 attach_cbar(cax, image, "channels")
@@ -1121,9 +1033,7 @@ def build_residual_page(
                 ax, cax = row_axes("lag_suppression")
                 image = lag_row(
                     ax, lag_panels.suppression[kept],
-                    "$K_t - K_t^{\\setminus \\ell}$ — fall in the divergence when that lag's "
-                    "proposals alone are removed. A reliance reading, not an attribution; "
-                    "grey carried no source at all.",
+                    "Divergence drop (grey: no source)",
                     "magma", available=drawn_valid,
                 )
                 attach_cbar(cax, image, "nats")
@@ -1134,14 +1044,14 @@ def build_residual_page(
                 seconds = anchor_steps * seconds_per_step
                 ax.plot(
                     seconds, lag_panels.cancellation_ratio[kept],
-                    color=COLOR_VERMILLION, linewidth=0.9, label="$\\kappa_t$ (ratio)",
+                    color=COLOR_VERMILLION, linewidth=0.9, label="$\\kappa_t$",
                 )
                 twin = ax.twinx()
                 for values, colour, style, label in (
                     (lag_panels.cancellation_numerator, COLOR_BLACK, "-",
-                     "$\\| \\sum_\\ell r_{t,\\ell} \\|_2$"),
+                     "$\\| \\sum_\\ell r_\\ell \\|_2$"),
                     (lag_panels.cancellation_denominator, COLOR_GRAY, "--",
-                     "$\\sum_\\ell \\| r_{t,\\ell} \\|_2$"),
+                     "$\\sum_\\ell \\| r_\\ell \\|_2$"),
                 ):
                     twin.plot(
                         seconds, values[kept], color=colour, linewidth=0.7, linestyle=style,
@@ -1150,12 +1060,7 @@ def build_residual_page(
                 twin.set_ylabel("magnitude", fontsize=8)
                 twin.tick_params(labelsize=7)
                 twin.grid(False)
-                ax.set_title(
-                    "$\\kappa_t$ — how much per-lag proposal mass survives the sum, with both "
-                    "of its parts. The ratio alone cannot separate proposals that cancel from "
-                    "proposals that are all near zero; the denominator can.",
-                    fontsize=9, pad=6,
-                )
+                ax.set_title("Cancellation ratio $\\kappa_t$", fontsize=9, pad=6)
                 ax.set_xlabel("Anchor step (s)", fontsize=8)
                 ax.set_ylabel("$\\kappa_t$", fontsize=8)
                 ax.set_ylim(0.0, 1.05)
@@ -1169,31 +1074,18 @@ def build_residual_page(
                 finalise_time_axis(ax, tail=True)
                 cax.set_visible(False)
 
-            # The qualification travels with the figure rather than only with the design note: a
-            # caveat that lives in a planning document is one edit away from being dropped from
-            # the thing a reader actually opens.
+            # One line, under the lag rows and in the GridSpec's bottom margin so it costs no row:
+            # a lag axis is stored-coefficient time, and the full qualification of the suppression
+            # rows is in the figure guide. Positioned from the figure's own height rather than at
+            # a fixed fraction, because a fraction that clears the last row on one arm lands inside
+            # it on another.
             fig.text(
-                0.5, _QUALIFICATION_INCHES / figure_height,
-                wrapped_caption(SUPPRESSION_QUALIFICATION),
+                0.5, _NOTE_INCHES / figure_height, LAG_TIME_CAVEAT,
                 ha="center", va="bottom", fontsize=7, color=COLOR_GRAY,
             )
 
-        readouts = "  ".join(
-            f"{name}={float(scalars[name]):.4g}"
-            for name in (
-                "nll_base_block", "nll_full_block", "pred_gap",
-                "source_conditioned_kl_raw", "prior_rate",
-            )
-            if name in scalars
-        )
-        # Labelled, because these are the epoch's own readouts over the whole validation set and
-        # the rows below are one recording's. Unlabelled, a reader would take them for this
-        # sample's and find that the gap row does not average to the gap printed above it.
         fig.suptitle(
-            f"epoch {epoch} — sample {index} — guid {guid}"
-            + (f" — {cohort}" if cohort else "")
-            + f" — beta={beta:.4g}"
-            + (f"\nvalidation epoch: {readouts}" if readouts else ""),
+            f"epoch {epoch}, guid {guid}" + (f", subgroup {cohort}" if cohort else ""),
             fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
         )
         return fig

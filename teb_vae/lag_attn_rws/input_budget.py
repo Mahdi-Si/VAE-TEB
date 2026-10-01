@@ -23,6 +23,11 @@ dropped channel's bar, drawn where it would sit if it were read at the anchor, c
 runs into the forecast window -- for the slowest scattering channels by several times the window's
 own width. That crossing *is* the reason it was dropped, stated in the same units as the forecast.
 
+The figures carry only a title naming the stream and axis labels with units. What they used to
+print around them lives in the records: the per-stream counts, centre-frequency span and delay
+range are :meth:`StreamChannels.summary`, and the number of bars that run past the right edge
+(clipped at the frame) is the return value of :func:`_budget_panel`.
+
 **The arithmetic is imported, not restated.** :mod:`teb_vae.lag_attn.channel_reach` owns the
 filter bank, the reaches and the budget resolution, and :mod:`teb_vae.lag_attn.eval.band_partition`
 owns the clinical band edges. This module reads the guard off the model's own gates rather than
@@ -54,7 +59,6 @@ from teb_vae.lag_attn.channel_reach import (  # noqa: E402
     block_center_hz,
     block_reach_seconds,
 )
-from teb_vae.lag_attn.eval.band_partition import CLINICAL_BANDS  # noqa: E402
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
     COLOR_GRAY,
@@ -301,12 +305,6 @@ def stream_panels(
         gate = _gate_of(model, described.name)
         with torch.no_grad():
             gated = values if gate is None else gate(values)
-        guard = (
-            f"unguarded (every channel, no delay)"
-            if gate is None
-            else f"guarded, max delay {described.max_delay} steps "
-            f"({described.max_delay * SECONDS_PER_STEP:g} s)"
-        )
         panels.append(
             InputStreamPanel(
                 name=described.name,
@@ -315,8 +313,8 @@ def stream_panels(
                 center_hz=described.center_hz[described.keep_index],
                 blocks=described.kept_block_spans(),
                 title=(
-                    f"Model input — {described.name} stream as the encoder receives it: "
-                    f"{described.summary()}; {guard}"
+                    f"{described.name.capitalize()} input, "
+                    f"{described.kept_width}/{described.declared_width} channels"
                 ),
             )
         )
@@ -382,8 +380,8 @@ def _budget_panel(
 
     ax.set_xlim(*x_limits)
     ax.set_ylim(-0.5, described.declared_width - 0.5)
-    ax.set_title(f"{described.name} stream — {described.summary()}", fontsize=9, pad=6)
-    ax.set_xlabel("Seconds relative to the anchor's causal endpoint", fontsize=8)
+    ax.set_title(f"{described.name.capitalize()} stream", fontsize=9, pad=6)
+    ax.set_xlabel("Time from anchor (s)", fontsize=8)
     ax.set_ylabel("Declared channel", fontsize=8)
     ax.legend(loc="lower right", fontsize=7, framealpha=0.95)
     style_axes(ax, grid="major")
@@ -395,6 +393,10 @@ def _budget_panel(
 
 def build_input_budget_figure(model: Any, *, geometry: Any = None) -> Any:
     r"""Draw the run-level figure: every input channel's reach against the forecast window.
+
+    Each bar is a channel's forward reach $L_{95}$ and the shaded span is the forecast window; a
+    bar ending at or before $0$ cannot see past the anchor. The figure carries no title beyond the
+    stream names, so this paragraph is its caption.
 
     Args:
         model: The net, for its gates, its stream widths and (by default) its geometry.
@@ -420,23 +422,8 @@ def build_input_budget_figure(model: Any, *, geometry: Any = None) -> Any:
         gridspec_kw={"height_ratios": heights, "hspace": 0.28},
         squeeze=False,
     )
-    clipped = sum(
+    for ax, stream in zip(axes[:, 0], described):
         _budget_panel(ax, stream, horizon_s=horizon_s, x_limits=x_limits)
-        for ax, stream in zip(axes[:, 0], described)
-    )
-
-    bands = ", ".join(
-        f"{name} {low:g}–{high:g} Hz" if np.isfinite(high) else f"{name} $\\geq${low:g} Hz"
-        for name, (low, high) in CLINICAL_BANDS.items()
-    )
-    figure.suptitle(
-        f"Causal input budget — each channel's forward reach $L_{{95}}$ against the "
-        f"{horizon_s:.0f} s forecast window (shaded)\n"
-        f"a bar ending at or before 0 cannot see past the anchor; {clipped} bar(s) run past the "
-        f"right edge and are clipped.  Clinical bands: {bands}",
-        fontsize=10, y=0.995, va="top",
-    )
-    figure.subplots_adjust(top=1.0 - 1.0 / figure.get_figheight())
     return figure
 
 

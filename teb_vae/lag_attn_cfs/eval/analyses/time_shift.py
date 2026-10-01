@@ -274,19 +274,20 @@ def build_figure(per_recording: pd.DataFrame, summary: pd.DataFrame) -> Any:
     """
     figure, axes = figures.new_figure(1, 3, height_per_row=2.8)
     left, middle, right = axes[0, 0], axes[0, 1], axes[0, 2]
-    arms = [(NULL_COLUMN, "source null\n(clock only)"), ("kld_shifted", "own source,\ntime-shifted"),
-            ("kld_aligned", "own source,\naligned")]
+    arms = [(NULL_COLUMN, "source null"), ("kld_shifted", "shifted"), ("kld_aligned", "aligned")]
     present = [(column, label) for column, label in arms if column in per_recording.columns]
     classes = per_recording.get(labels.CLASS_COLUMN, pd.Series(index=per_recording.index, dtype=object))
-    colours = figures.group_colors(sorted({str(value) for value in classes.dropna()}))
+    colours = figures.group_colors(
+        cohort.ordered_groups(sorted({str(value) for value in classes.dropna()}), labels.CLASS_COLUMN)
+    )
     for guid, row in per_recording.iterrows():
         values = [float(row[column]) for column, _ in present]
         colour = colours.get(str(classes.get(guid)), figures.COLOR_GRAY)
         left.plot(range(len(present)), values, color=colour, linewidth=figures.LINE_THIN,
                   marker="o", markersize=figures.MARKER_SMALL, alpha=0.8)
     left.set_xticks(range(len(present)), [label for _, label in present])
-    left.set_ylabel("source-conditioned KL (nats per step)")
-    left.set_title(f"KL per recording under three sources (n = {len(per_recording)})")
+    left.set_ylabel("KL (nats per step)")
+    left.set_title("KL by source")
     for name, colour in colours.items():
         left.plot([], [], color=colour, label=name)
     if colours:
@@ -297,7 +298,7 @@ def build_figure(per_recording: pd.DataFrame, summary: pd.DataFrame) -> Any:
     # One panel per difference: the two are in different units and three orders apart.
     for ax, (name, _left, _right, unit) in zip((middle, right), DIFFERENCES):
         symbol = r"$\Delta K$" if name == "delta_kld" else r"$\Delta g$"
-        ax.set_title(f"{symbol}: aligned minus time-shifted")
+        ax.set_title(f"{symbol}: aligned minus shifted")
         ax.set_ylabel(unit)
         ax.axhline(0.0, color=figures.COLOR_BLACK, linewidth=figures.LINE_HAIRLINE)
         if name in per_recording.columns:
@@ -311,18 +312,14 @@ def build_figure(per_recording: pd.DataFrame, summary: pd.DataFrame) -> Any:
                 [0.0], [record["value"]],
                 yerr=[[record["value"] - record["ci_lo"]], [record["ci_hi"] - record["value"]]],
                 fmt="o", color=figures.COLOR_BLUE, capsize=3, linewidth=figures.LINE_REGULAR,
-                label="mean, 95% bootstrap CI",
+                label="mean, 95% CI",
             )
         ax.set_xticks([])
         ax.set_xlim(-0.5, 0.6)
-        figures.legend_with_headroom(ax, ncol=2)
+        # The two panels share their keys, so the legend is drawn once, in the first.
+        if ax is middle:
+            figures.legend_with_headroom(ax, ncol=2)
         figures.style_axes(ax)
-    figures.caveat_note(
-        figure,
-        "Each segment is paired with the nearest segment of the same recording that shares no stored "
-        "sample; the posterior is posed on the partner's source with everything target-side unchanged. "
-        "Both arms mean-decoded. Grey points: recordings.",
-    )
     return figure
 
 

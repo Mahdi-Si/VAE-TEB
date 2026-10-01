@@ -51,17 +51,24 @@ $\alpha = 10^{-6}$ along the straight path and the directional derivative at $\a
 order $10^{14}$ to $10^{22}$, so integrated gradients from the exact zero do not converge at any
 step count. The path therefore starts at $x_0 = b + \alpha_0 (x - b)$ with
 $\alpha_0 =$ :data:`BASELINE_ENTRY_FRACTION`, where the integral converges to a relative error
-below $10^{-3}$ at :data:`IG_STEPS` steps on every fixture; the readout at the exact baseline, at
+of order $10^{-3}$ at :data:`IG_STEPS` steps on the fixtures -- below it on most, but the
+transformer ``entmax15`` fixture measured $1.3\times10^{-3}$, so the residual is reported per row
+rather than assumed; the readout at the exact baseline, at
 the entry point and at the input all travel on every row, so the **entry jump**
 $f(x_0) - f(b)$ is a reported scalar rather than a hidden one. It belongs to no input step: it is
-the normalisation snapping out of its degenerate state.
+the normalisation snapping out of its degenerate state. The one measured exception is the
+lag-residual model's source-null path under its default ``pointwise`` source stem, which carries no
+temporal normalisation and was smooth at zero; its all-zero path still passes through the target
+encoder's norm and is degenerate like every other. The entry point is applied to every path
+regardless.
 
 **Structural properties every attribution here is checked against**, and that the tests assert on
 the tiny models: attribution to any stored step later than the anchor is exactly zero; attribution
 to a source step a channel has not warmed up at is exactly zero; the source attribution of a
 target-only readout ($\mu^p$, the base block score) is exactly zero; and the integrated-gradient
 sum reproduces $f(x) - f(x_0)$ within tolerance. The lag axis of every profile here is
-**stored-coefficient time**, and every lag-resolved figure prints the caveat.
+**stored-coefficient time**, and every figure prints :data:`ATTRIBUTION_NOTE`, the one-line form of
+the caveat; the full sentences stay in the records and the guide.
 """
 from __future__ import annotations
 
@@ -85,7 +92,7 @@ from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import cohort, events, lag_hist, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
-from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL, GROUP_DELAY_CAVEAT
+from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL
 from teb_vae.lag_attn_cfs.eval.metrics import DENSE_ANCHOR_GEOMETRY, forecast_likelihood_terms
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor, raw_sample_score
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
@@ -160,10 +167,11 @@ EXAMPLE_DIRNAME = "maps"
 EXAMPLE_SUFFIX = "_attribution_maps"
 
 #: Integrated-gradient steps and Captum's internal batch of interpolated inputs, in rows times
-#: steps per forward. The step count is the one at which the completeness residual fell below
-#: $10^{-3}$ of the readout on every fixture with the entry fraction below (the conv-LSTM cell's
+#: steps per forward. The step count is the one at which the completeness residual fell to order
+#: $10^{-3}$ of the readout on the fixtures with the entry fraction below -- not below it on every
+#: one: the transformer ``entmax15`` fixture measured $1.3\times10^{-3}$ (the conv-LSTM cell's
 #: per-step group norm makes its path the roughest of the three); the residual is recorded per row
-#: so a production run can say whether it held there too.
+#: so a production run can say what it reached there.
 IG_STEPS = 64
 IG_INTERNAL_BATCH_SIZE = 64
 
@@ -246,6 +254,12 @@ ATTRIBUTION_CAVEAT = (
     "availability clock, which is a constant of the step index and cannot be attributed to any "
     "input. Every lag axis is stored-coefficient time. Every summary is over recordings"
 )
+
+#: The one line an attribution **figure** carries in place of :data:`ATTRIBUTION_CAVEAT`: the two
+#: claims a reader must not make from a map or a lag profile. The argument for each stays in
+#: :data:`ATTRIBUTION_CAVEAT` (``summary.json``, ``ATTRIBUTION.md``) and in
+#: :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT`.
+ATTRIBUTION_NOTE = "Model sensitivity, not a causal effect or a physiological latency."
 
 #: What was tried on the tiny fixtures and what came of it, recorded in every block so a reader
 #: of a summary knows which methods were rejected and why rather than only which were kept.
@@ -924,10 +938,17 @@ def symlog_axis(ax: Any, *values: Any, axis: str = "y", headroom: float = 0.0) -
         (ax.set_ylim if axis == "y" else ax.set_xlim)(low, high)
 
 
-def symlog_legend(ax: Any, *values: Any, ncol: int = 2, axis: str = "y", **kwargs: Any) -> None:
-    """A symmetric-log axis with a decade of headroom and the legend placed in it."""
+def symlog_legend(
+    ax: Any, *values: Any, ncol: int = 2, axis: str = "y", legend: bool = True, **kwargs: Any
+) -> None:
+    """A symmetric-log axis with a decade of headroom and the legend placed in it.
+
+    ``legend=False`` keeps the axis and its headroom and draws no legend, for a panel whose keys
+    a neighbouring panel of the same figure already carries.
+    """
     symlog_axis(ax, *values, axis=axis, headroom=1.0)
-    ax.legend(loc="upper left", ncol=int(ncol), fontsize=figures.FONT_TINY, **kwargs)
+    if legend:
+        ax.legend(loc="upper left", ncol=int(ncol), fontsize=figures.FONT_TINY, **kwargs)
 
 
 def _attach_colorbar(figure: Any, image: Any, *, ax: Any, cax: Any, label: str, norm: Any) -> Any:
@@ -1432,7 +1453,7 @@ def channel_groups_from_map(channel_map: Optional[pd.DataFrame]) -> Dict[str, Di
 # =============================================================================
 # The figures
 # =============================================================================
-#: What each readout is called on a figure.
+#: The descriptive name of each readout, as the records carry it; a figure uses :data:`READOUT_SHORT`.
 READOUT_TITLES: Mapping[str, str] = {
     READOUT_KLD: "divergence $K_t$",
     READOUT_PRED_GAP: "forecast gap (base $-$ full)",
@@ -1506,6 +1527,32 @@ def variant_label(readout: str, tag: str = "") -> str:
     return READOUT_TITLES.get(readout, readout)
 
 
+#: What each readout is called on a **figure**: a short noun phrase for a panel title, a legend
+#: entry or a tick label. :data:`READOUT_TITLES` keeps the descriptive names the records carry
+#: (for example the ``label`` column of the block table); the sign convention of the gaps, base
+#: minus full, is in the guide.
+READOUT_SHORT: Mapping[str, str] = {
+    READOUT_KLD: "Divergence $K_t$",
+    READOUT_PRED_GAP: "Forecast gap",
+    READOUT_NLL_FULL: "Full-branch score",
+    READOUT_NLL_BASE: "Base-branch score",
+    READOUT_MSE_FULL: "Full squared error",
+    READOUT_MSE_GAP: "Squared-error gap",
+    READOUT_NLL_HORIZON: "Score at one step",
+    READOUT_KLD_DIM: "Top $K_{t,d}$",
+    READOUT_LAG_BAND: "Lag band",
+}
+
+
+def variant_short(readout: str, tag: str = "") -> str:
+    """What a readout variant is called on a figure: :data:`READOUT_SHORT`, qualified by its tag."""
+    if readout == READOUT_LAG_BAND:
+        return f"Lag band {tag}"
+    if readout == READOUT_NLL_HORIZON:
+        return f"Score, step {tag[1:] if tag.startswith('h') else tag}"
+    return READOUT_SHORT.get(readout, readout)
+
+
 def variant_colour(readout: str, tag: str, lag_bands: Sequence[str]) -> str:
     """The overlay colour of a readout variant: the readout's own, or its band's."""
     if readout == READOUT_LAG_BAND and tag in lag_bands:
@@ -1533,7 +1580,8 @@ def input_norm(values: np.ndarray) -> Optional[Any]:
     return mcolors.Normalize(vmin=low, vmax=high if high > low else low + 1.0)
 
 
-#: How the example maps' colour scales are shared, printed under every figure that draws them.
+#: How the example maps' colour scales are shared. Stated in ``ATTRIBUTION.md`` and the figure
+#: guide; the figures that draw them no longer print it.
 SHARED_SCALE_NOTE = (
     "colour scales are shared by every class example: the input coefficients one linear scale per "
     "stream (1st to 99th percentile of the read cells of all examples), each attribution map one "
@@ -1593,7 +1641,7 @@ def _mark_anchor(ax: Any, anchor: int, horizon: int) -> None:
     ax.axvline(float(anchor) * SECONDS_PER_STEP, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, zorder=3)
 
 
-def _raw_row(ax: Any, item: Mapping[str, Any], name: str, *, steps: int) -> None:
+def _raw_row(ax: Any, item: Mapping[str, Any], name: str, *, steps: int, titled: bool = True) -> None:
     r"""One raw signal of an example's segment, on the stored-time axis every map row uses.
 
     Raw sample $i$ sits at $i / f_s$ seconds and stored step $t$ at $t\,\Delta$, as on the samples
@@ -1606,11 +1654,12 @@ def _raw_row(ax: Any, item: Mapping[str, Any], name: str, *, steps: int) -> None
         item: The example record, read for ``raw``, ``raw_units``, ``anchor`` and ``horizon``.
         name: ``'fhr'`` or ``'up'``.
         steps: $T$, which fixes the axis to the whole segment.
+        titled: Whether to title the panel; an overview titles its first column only.
     """
-    title = traces.RAW_SIGNAL_TITLES[name]
+    title = traces.RAW_SIGNAL_TITLES[name] if titled else ""
     values = (item.get("raw") or {}).get(name)
     if values is None:
-        _empty(ax, f"{title}: not loaded for this run")
+        _empty(ax, title)
     else:
         values = np.asarray(values, dtype=np.float64)
         traces.draw_raw_signal(
@@ -1695,13 +1744,15 @@ def _stream_map(
 
 def _lag_view(
     ax: Any, profile: np.ndarray, model_profile: np.ndarray, *, lag_seconds: np.ndarray,
-    cell: CellBinding, title: str,
+    cell: CellBinding, title: str, legend: bool = True,
 ) -> None:
     """Normalised $|q_\\ell|$ beside the normalised model lag readout, on one share axis.
 
     One axis rather than a twin: both are shares per lag once normalised, and two scales on one
     panel is the one layout a reader cannot check by eye. Symmetric-log, because one lag's share
-    is often a hundred times another's and a linear axis shows only the one.
+    is often a hundred times another's and a linear axis shows only the one. The agreement of the
+    two curves (``lag_corr``, ``lag_js``) is in the per-row table, not in the title. ``legend=False``
+    leaves the keys to the panel of the figure that carries them.
     """
     profile = np.asarray(profile, dtype=np.float64)
     if not np.isfinite(profile).any():
@@ -1713,21 +1764,21 @@ def _lag_view(
     if np.isfinite(model_share).any():
         ax.plot(lag_seconds, model_share, color=figures.COLOR_ORANGE, linewidth=figures.LINE_THIN,
                 label="model lag readout")
-    fit = agreement(profile[None, :], np.asarray(model_profile, dtype=np.float64)[None, :])
-    ax.set_title(f"{title}; corr {fit['lag_corr'][0]:.2f}, JS {fit['lag_js'][0]:.2f}")
+    ax.set_title(title)
     ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
     ax.set_ylabel("share per lag")
-    symlog_legend(ax, share, model_share, ncol=2)
+    symlog_legend(ax, share, model_share, ncol=2, legend=legend)
     figures.style_axes(ax)
 
 
-def _example_title(item: Mapping[str, Any], separator: str = "; ") -> str:
-    """The identity line of one example anchor: who, where in the cohort, and when."""
-    hours = -float(traces.absolute_seconds(item["epoch"], item["anchor"])) / cohort.SECONDS_PER_HOUR
+def _example_title(item: Mapping[str, Any], separator: str = ", ") -> str:
+    """The identity of one example anchor: the recording with its subgroup, then its class.
+
+    The anchor and its epoch are in the examples manifest, not on the figure.
+    """
     return separator.join((
-        f"class {item[labels.CLASS_COLUMN]}",
         f"guid {item['guid']}, subgroup {item[labels.SUBGROUP_COLUMN]}",
-        f"anchor step {int(item['anchor'])}, {hours:.2f} h before delivery",
+        f"class {item[labels.CLASS_COLUMN]}",
     ))
 
 
@@ -1757,13 +1808,15 @@ def build_map_figure(
     baseline under which the target moves, and to the source under the **source-null** baseline,
     the primary comparison; and, off the time axis, the lag-aligned source attribution against the
     model's own lag readout at that anchor. Each map row is drawn on one colour scale shared by
-    every column (:func:`example_norms`), so a colour means the same value for every class.
+    every column (:func:`example_norms`), so a colour means the same value for every class; the
+    scale is stated in the guide, not under the figure. Panels are titled in the first column
+    only and the legend is kept in the first lag panel; a column is named by its header.
 
     Args:
         examples: One per class, as :func:`attribution_pass.attribute_example` builds them.
         lag_seconds: The compensated lag axis.
-        cell: The cell binding, for the legend.
-        caveat: The sentence printed under the figure.
+        cell: The cell binding.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
         norms: The shared colour scales, or ``None`` to derive them from ``examples``.
 
     Returns:
@@ -1774,15 +1827,14 @@ def build_map_figure(
     heights = [height for _name, height in OVERVIEW_ROWS]
     figure_height = sum(heights) * EXAMPLE_ROW_INCHES + EXAMPLE_HEADER_INCHES
     figure = plt.figure(figsize=(OVERVIEW_COLUMN_WIDTH * n_cols + 1.2, figure_height))
-    bottom = max(0.02, 0.35 / figure_height) + figures.caveat_note(
-        figure, f"{cell.lag_qualification}. {SHARED_SCALE_NOTE}. {caveat}. {GROUP_DELAY_CAVEAT}"
-    )
+    bottom = max(0.02, 0.35 / figure_height) + figures.caveat_note(figure, caveat)
     grid = GridSpec(
         len(OVERVIEW_ROWS), n_cols + 1, figure=figure, height_ratios=heights,
         width_ratios=[1.0] * n_cols + [0.035], left=0.07, right=0.94,
         top=1.0 - EXAMPLE_HEADER_INCHES / figure_height, bottom=bottom, hspace=0.75, wspace=0.3,
     )
     shared: Optional[Any] = None
+    last_time_row = max(row for row, (name, _height) in enumerate(OVERVIEW_ROWS) if name != "lags")
     for col in range(n_cols):
         item = examples[col] if col < len(examples) else None
         for row, (name, _height) in enumerate(OVERVIEW_ROWS):
@@ -1801,15 +1853,16 @@ def build_map_figure(
                 continue
             anchor, horizon = int(item["anchor"]), int(item.get("horizon", 0) or 0)
             steps = int(np.asarray(item["inputs"][STREAM_TARGET]).shape[0])
+            first = col == 0
             if name.startswith("raw_"):
-                _raw_row(ax, item, name[len("raw_"):], steps=steps)
+                _raw_row(ax, item, name[len("raw_"):], steps=steps, titled=first)
                 if cax is not None:
                     cax.set_axis_off()
             elif name.startswith("input_"):
                 stream = name[len("input_"):]
                 _stream_map(
                     figure, ax, (item.get("inputs") or {}).get(stream),
-                    title=f"{stream} input coefficients (standardised)", anchor=anchor,
+                    title=f"{stream.capitalize()} input" if first else "", anchor=anchor,
                     live=item.get(f"live_{stream}"),
                     n_scattering=item.get("n_scattering") if stream == STREAM_TARGET else None,
                     kind="input", cax=cax, horizon=horizon, norm=norms.get(("input", stream)),
@@ -1821,7 +1874,7 @@ def build_map_figure(
                 entry = (item.get("maps") or {}).get((READOUT_KLD, baseline, ""))
                 _stream_map(
                     figure, ax, None if entry is None else entry[stream],
-                    title=f"$K_t$ attributed to the {stream} ({baseline} baseline)", anchor=anchor,
+                    title=f"$K_t$ to {stream}" if first else "", anchor=anchor,
                     live=item.get(f"live_{stream}"),
                     n_scattering=item.get("n_scattering") if stream == STREAM_TARGET else None,
                     colorbar_label=READOUT_UNITS[READOUT_KLD], cax=cax, horizon=horizon,
@@ -1830,12 +1883,16 @@ def build_map_figure(
             else:
                 null = (item.get("maps") or {}).get((READOUT_KLD, BASELINE_SOURCE_NULL, ""))
                 if null is None:
-                    _empty(ax, "lag-aligned source attribution of $K_t$")
+                    _empty(ax, "$K_t$ by lag" if first else "")
                 else:
                     _lag_view(ax, null["lag_profile"], item["model_profile"], lag_seconds=lag_seconds,
-                              cell=cell, title="$K_t$ by lag")
+                              cell=cell, title="$K_t$ by lag" if first else "", legend=first)
                 if cax is not None:
                     cax.set_axis_off()
+            if not first:
+                ax.set_ylabel("")
+            if time_row and row < last_time_row:
+                ax.set_xlabel("")
             if row == 0:
                 ax.annotate(
                     _example_title(item, separator="\n"), xy=(0.5, 1.0), xycoords="axes fraction",
@@ -1865,8 +1922,8 @@ def build_example_figure(
     of the segment on the fixed CTG scales, the physiology every map below is read against; the
     two input streams the encoders read (cold cells blanked); then, per readout variant, its target
     attribution under the all-zero baseline and its source attribution under the source-null
-    baseline, each on a symmetric-log scale with the value at the input and at the exact null in
-    the title; then three rows off the time axis -- the latent at the anchor (prior mean, source
+    baseline, each on a symmetric-log scale, titled with the readout and the stream (the values at
+    the input and at the exact null are in the per-row table); then three rows off the time axis -- the latent at the anchor (prior mean, source
     shift, per-coordinate divergence), the layer split per readout on the cell's own axis (head or
     lag), and every readout's lag-aligned source attribution overlaid on one lag axis against the
     model's lag readout. Every time row rules the anchor and shades its forecast block.
@@ -1875,11 +1932,11 @@ def build_example_figure(
         item: The example, as :func:`attribution_pass.attribute_example` builds it.
         lag_seconds: The compensated lag axis.
         cell: The cell binding.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
         lag_bands: The configured lag bands, in the order their rows are drawn.
         horizons: The named horizon steps, in the order their rows are drawn, or ``None``.
         norms: The colour scales shared by every example page (:func:`example_norms`), or
-            ``None`` for scales of this page's own, which the footnote then says.
+            ``None`` for scales of this page's own.
 
     Returns:
         The figure, laid out; the caller renders and closes it.
@@ -1891,7 +1948,6 @@ def build_example_figure(
     variants = example_variants(lag_bands, horizons)
     latent = item.get("latent") or {}
     layer = item.get("layer") or {}
-    scale_note = SHARED_SCALE_NOTE if norms is not None else "every colour scale is this page's own"
     norms = example_norms([item]) if norms is None else norms
     steps = int(np.asarray(inputs[STREAM_TARGET]).shape[0])
 
@@ -1911,9 +1967,7 @@ def build_example_figure(
     heights = [height for _, height in rows]
     figure_height = sum(heights) * EXAMPLE_ROW_INCHES
     figure = plt.figure(figsize=(EXAMPLE_PAGE_WIDTH, figure_height))
-    bottom = max(0.02, 0.35 / figure_height) + figures.caveat_note(
-        figure, f"{cell.lag_qualification}. {scale_note}. {caveat}. {GROUP_DELAY_CAVEAT}"
-    )
+    bottom = max(0.02, 0.35 / figure_height) + figures.caveat_note(figure, caveat)
     grid = GridSpec(
         len(rows), 2, figure=figure, height_ratios=heights, width_ratios=[1.0, 0.022],
         left=0.065, right=0.93, top=1.0 - EXAMPLE_HEADER_INCHES / figure_height, bottom=bottom,
@@ -1936,7 +1990,7 @@ def build_example_figure(
             cax.set_axis_off()
         elif name.startswith("input_"):
             stream = name[len("input_"):]
-            _stream_map(figure, ax, inputs.get(stream), title=f"{stream} input coefficients (standardised; cold cells blanked)",
+            _stream_map(figure, ax, inputs.get(stream), title=f"{stream.capitalize()} input",
                         anchor=anchor, live=item.get(f"live_{stream}"),
                         n_scattering=item.get("n_scattering") if stream == STREAM_TARGET else None,
                         kind="input", cax=cax, horizon=horizon, norm=norms.get(("input", stream)),
@@ -1945,11 +1999,9 @@ def build_example_figure(
             stream, readout, tag = name.split(":", 2)
             baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
             entry = maps.get((readout, baseline, tag))
-            label = variant_label(readout, tag)
-            values = "" if entry is None else f"; {entry['value_input']:.3g} at the input, {entry['value_baseline']:.3g} at the null"
             _stream_map(
                 figure, ax, None if entry is None else entry[stream],
-                title=f"{stream} attribution of the {label} ({baseline} baseline){values}", anchor=anchor,
+                title=f"{variant_short(readout, tag)}: {stream}", anchor=anchor,
                 live=item.get(f"live_{stream}"), n_scattering=item.get("n_scattering") if stream == STREAM_TARGET else None,
                 colorbar_label=readout_unit(readout, cell), kind="signed", cax=cax, horizon=horizon,
                 norm=norms.get((readout, baseline, tag, stream)),
@@ -1970,8 +2022,7 @@ def build_example_figure(
         ax.set_yticklabels(["$\\mu^p$", "$\\mu^q - \\mu^p$", "$K_{t,d}$"])
         top = int(np.argmax(np.asarray(latent["kld_dim"], dtype=np.float64)))
         ax.plot([top], [2], marker="v", color=figures.COLOR_BLACK, markersize=4, linestyle="none")
-        ax.set_title(f"the latent at the anchor: prior mean, source shift and per-coordinate divergence "
-                     f"(top coordinate {top}, $K_t$ = {float(np.sum(latent['kld_dim'])):.3g} nats)")
+        ax.set_title("Latent at the anchor")
         ax.set_xlabel("latent coordinate")
         _attach_colorbar(figure, image, ax=ax, cax=cax, label="latent units / nats", norm=norm)
         figures.style_axes(ax, grid="none")
@@ -1994,8 +2045,8 @@ def build_example_figure(
         image = ax.imshow(field, aspect="auto", origin="upper", cmap=plt.get_cmap("RdBu_r").with_extremes(bad=UNREAD_COLOUR),
                           norm=norm, interpolation="none", extent=extent)
         ax.set_yticks(np.arange(len(keys)))
-        ax.set_yticklabels([variant_label(*key) for key in keys], fontsize=figures.FONT_TINY)
-        ax.set_title(f"activations: attribution on {cell.layer_label}, per {cell.layer_axis}, of every readout (source-null baseline)")
+        ax.set_yticklabels([variant_short(*key) for key in keys], fontsize=figures.FONT_TINY)
+        ax.set_title(f"Attribution per {cell.layer_axis}")
         ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
         if cell.layer_axis == "head":
             ax.set_xticks(np.arange(width))
@@ -2014,20 +2065,20 @@ def build_example_figure(
         series.append(share)
         ax.plot(lag_seconds, share, color=variant_colour(readout, tag, list(lag_bands)),
                 linewidth=figures.LINE_REGULAR, linestyle="--" if readout == READOUT_LAG_BAND else "-",
-                label=variant_label(readout, tag))
+                label=variant_short(readout, tag))
     if np.isfinite(model_profile).any():
         model_share = lag_hist.normalise(model_profile)[0]
         series.append(model_share)
         ax.plot(lag_seconds, model_share, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle=":",
-                label=f"model lag readout ({cell.lag_readout})")
+                label="model lag readout")
     if series:
-        ax.set_title("every readout on one lag axis: normalised |source attribution| by offset from the anchor (source-null baseline)")
+        ax.set_title("Lag profile")
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share per lag")
         symlog_legend(ax, *series, ncol=3)
         figures.style_axes(ax)
     else:
-        _empty(ax, "every readout on one lag axis")
+        _empty(ax, "Lag profile")
 
     figure.suptitle(_example_title(item), fontsize=figures.FONT_NOTE, y=1.0 - 0.3 * EXAMPLE_HEADER_INCHES / figure_height)
     figures.mark_laid_out(figure)
@@ -2047,7 +2098,7 @@ def build_block_figure(blocks: pd.DataFrame, *, caveat: str) -> Any:
 
     Args:
         blocks: The block table, one row per (readout, band, baseline, block).
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
         The figure.
@@ -2055,10 +2106,16 @@ def build_block_figure(blocks: pd.DataFrame, *, caveat: str) -> Any:
     figure, axes = figures.new_figure(1, 2, height_per_row=3.4, width=13.0)
     subset = blocks[blocks["baseline"].astype(str) == BASELINE_ALL_ZERO] if len(blocks) else blocks
     if subset.empty:
-        _empty(axes[0, 0], "unsigned attribution share by input block")
-        _empty(axes[0, 1], "signed attribution by input block")
+        _empty(axes[0, 0], "Share by input block")
+        _empty(axes[0, 1], "Signed block sums")
         figures.caveat_note(figure, caveat)
         return figure
+    if {"readout", "band"} <= set(subset.columns):
+        # The figure's own short names; the table's ``label`` column keeps the descriptive ones.
+        subset = subset.assign(label=[
+            variant_short(str(readout), "" if pd.isna(band) else str(band))
+            for readout, band in zip(subset["readout"], subset["band"])
+        ])
     labels_in_order = list(dict.fromkeys(subset["label"].astype(str)))
     y = np.arange(len(labels_in_order))
     colours = dict(zip(BLOCKS, (figures.COLOR_BLUE, "#56B4E9", figures.COLOR_ORANGE, figures.COLOR_VERMILLION)))
@@ -2074,8 +2131,8 @@ def build_block_figure(blocks: pd.DataFrame, *, caveat: str) -> Any:
     ax.set_yticklabels(labels_in_order, fontsize=figures.FONT_TINY)
     ax.invert_yaxis()
     ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("share of the unsigned attribution")
-    ax.set_title("unsigned share by input block (all-zero baseline)", fontsize=figures.FONT_SMALL)
+    ax.set_xlabel("Share of |attribution|")
+    ax.set_title("Share by input block", fontsize=figures.FONT_SMALL)
     ax.legend(fontsize=figures.FONT_TINY, loc="lower right", ncol=2)
     figures.style_axes(ax)
     ax = axes[0, 1]
@@ -2092,8 +2149,7 @@ def build_block_figure(blocks: pd.DataFrame, *, caveat: str) -> Any:
     ax.axvline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
     symlog_axis(ax, *drawn, axis="x")
     ax.set_xlabel("signed attribution (symlog)")
-    ax.set_title("signed block sums (positive raised the readout)", fontsize=figures.FONT_SMALL)
-    ax.legend(fontsize=figures.FONT_TINY, loc="lower right", ncol=2)
+    ax.set_title("Signed block sums", fontsize=figures.FONT_SMALL)
     figures.style_axes(ax)
     figures.caveat_note(figure, caveat)
     return figure
@@ -2122,17 +2178,16 @@ def build_horizon_figure(
         vectors: The row-aligned arrays.
         lag_seconds: The compensated lag axis.
         horizons: ``{name: step}`` from :func:`horizon_steps`.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
         The figure.
     """
     figure, axes = figures.new_figure(1, 3, height_per_row=3.0, width=15.0)
     if not len(rows) or not horizons:
-        for col, title in enumerate(("stream totals per horizon step", "source attribution by lag per horizon step",
-                                     "target attribution by offset per horizon step")):
+        for col, title in enumerate(("Stream totals", "Source by lag", "Target by lag")):
             _empty(axes[0, col], title)
-        figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+        figures.caveat_note(figure, caveat)
         return figure
     readout = rows["readout"].astype(str).to_numpy()
     baseline = rows["baseline"].astype(str).to_numpy()
@@ -2151,20 +2206,21 @@ def build_horizon_figure(
             column = rows[f"{stream}_abs_total"].to_numpy(dtype=np.float64)
             heights.append(float(_per_recording_mean(column[:, None], guids, keep)[0]) if keep.any() else np.nan)
         bars.append(np.asarray(heights))
-        ax.bar(x + (offset - 0.5) * 0.38, heights, width=0.38, color=colour, label=f"{stream} |attribution| total ({base})")
+        ax.bar(x + (offset - 0.5) * 0.38, heights, width=0.38, color=colour, label=stream.capitalize())
     scores = []
     for name in names:
         keep = (readout == READOUT_NLL_HORIZON) & (baseline == BASELINE_SOURCE_NULL) & (tag == f"h{int(horizons[name])}")
         column = rows["value_input"].to_numpy(dtype=np.float64)
         scores.append(float(_per_recording_mean(column[:, None], guids, keep)[0]) if keep.any() else np.nan)
     ax.plot(x, scores, color=figures.COLOR_BLACK, marker="o", markersize=figures.MARKER_SMALL, linewidth=figures.LINE_THIN,
-            label="score at the input (nats)")
+            label="Score at input")
     ax.set_xticks(x)
     ax.set_xticklabels([f"{name} (step {int(horizons[name])})" for name in names])
-    ax.set_title("per-step score: stream totals", fontsize=figures.FONT_SMALL)
+    ax.set_title("Stream totals", fontsize=figures.FONT_SMALL)
     ax.set_ylabel("nats per anchor (symlog)")
     symlog_legend(ax, *bars, np.asarray(scores), ncol=1)
     figures.style_axes(ax)
+    keyed = False
     for col, (stream, base, vector, xlabel) in enumerate((
         (STREAM_SOURCE, BASELINE_SOURCE_NULL, "lag_profile", COEFFICIENT_LAG_AXIS_LABEL),
         (STREAM_TARGET, BASELINE_ALL_ZERO, "target_lag_profile", COEFFICIENT_LAG_AXIS_LABEL),
@@ -2178,16 +2234,18 @@ def build_horizon_figure(
             profile = _per_recording_mean(np.abs(vectors[vector].astype(np.float64)), guids, keep)
             drawn.append(profile)
             ax.plot(lag_seconds, profile, color=(figures.COLOR_BLUE, figures.COLOR_VERMILLION, figures.COLOR_GREEN)[index % 3],
-                    linewidth=figures.LINE_REGULAR, label=f"{name} (step {int(horizons[name])}), {base} baseline")
+                    linewidth=figures.LINE_REGULAR, label=f"{name} (step {int(horizons[name])})")
         if not drawn:
-            _empty(ax, f"{stream} |attribution| by offset per horizon step")
+            _empty(ax, f"{stream.capitalize()} by lag")
             continue
-        ax.set_title(f"per-step score: {stream} |attribution| by offset", fontsize=figures.FONT_SMALL)
+        ax.set_title(f"{stream.capitalize()} by lag", fontsize=figures.FONT_SMALL)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("|attribution| (nats, symlog)")
-        symlog_legend(ax, *drawn, ncol=2)
+        # Both panels key the same horizon steps to the same colours: one legend, in the first.
+        symlog_legend(ax, *drawn, ncol=2, legend=not keyed)
+        keyed = True
         figures.style_axes(ax)
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2218,8 +2276,9 @@ def build_lag_profile_figure(
 
     One row per readout under the source-null baseline: the mean over recordings of the
     normalised $|q_\ell|$ beside the mean normalised model profile, pooled (left) and per class
-    (right), with the recording-mean agreement statistics in the titles. Normalised per row so a
-    recording with a large readout does not decide the shape for every other. A last row puts
+    (right); the recording-mean agreement statistics (``lag_corr``, ``lag_js``) are in the
+    per-row table. Normalised per row so a recording with a large readout does not decide the
+    shape for every other. The legend is kept in the first populated row. A last row puts
     every readout on one axis: the divergence, the forecast gap and the lag readout on each band,
     so where the model is sensitive for its latent change, for its forecast and for each band's
     own lag readout can be read against each other and against the model's lag profile.
@@ -2230,7 +2289,7 @@ def build_lag_profile_figure(
         lag_seconds: The compensated lag axis.
         readouts: The readouts to draw, one row each.
         cell: The cell binding.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
         lag_bands: The configured lag bands, for the comparison row; ``None`` draws the main
             readouts alone there.
 
@@ -2252,27 +2311,23 @@ def build_lag_profile_figure(
         readout_column = band_column = guids = classes = np.zeros(0, dtype=object)
         attribution = model_profile = np.zeros((0, len(lag_seconds)))
 
+    keyed = False
     for index, readout in enumerate(readouts):
         keep = null & (readout_column == readout) if null.size else null
         if not keep.any():
-            _empty(axes[index, 0], f"{READOUT_TITLES.get(readout, readout)}: lag-aligned attribution")
-            _empty(axes[index, 1], f"{READOUT_TITLES.get(readout, readout)}: by class")
+            _empty(axes[index, 0], READOUT_SHORT.get(readout, readout))
+            _empty(axes[index, 1], f"{READOUT_SHORT.get(readout, readout)}, by class")
             continue
-        subset = rows[keep]
         ax = axes[index, 0]
         ax.plot(lag_seconds, _per_recording_mean(attribution, guids, keep), color=figures.COLOR_BLUE,
-                linewidth=figures.LINE_REGULAR, label="|attribution|, normalised")
+                linewidth=figures.LINE_REGULAR, label="|attribution|")
         ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, keep), color=figures.COLOR_ORANGE,
-                linewidth=figures.LINE_THIN, label="model lag readout, normalised")
-        corr = float(np.nanmean(subset["lag_corr"])) if "lag_corr" in subset else float("nan")
-        js = float(np.nanmean(subset["lag_js"])) if "lag_js" in subset else float("nan")
-        ax.set_title(
-            f"{READOUT_TITLES.get(readout, readout)}: pooled ({len(np.unique(guids[keep]))} rec.), "
-            f"corr {corr:.2f}, JS {js:.2f}",
-        )
+                linewidth=figures.LINE_THIN, label="model lag readout")
+        ax.set_title(READOUT_SHORT.get(readout, readout))
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share per lag")
-        symlog_legend(ax, _per_recording_mean(attribution, guids, keep), _per_recording_mean(model_profile, guids, keep), ncol=2)
+        symlog_legend(ax, _per_recording_mean(attribution, guids, keep), _per_recording_mean(model_profile, guids, keep),
+                      ncol=2, legend=not keyed)
         figures.style_axes(ax)
 
         ax = axes[index, 1]
@@ -2287,20 +2342,22 @@ def build_lag_profile_figure(
                 continue
             colour = colours.get(name, figures.COLOR_GRAY)
             ax.plot(lag_seconds, _per_recording_mean(attribution, guids, of_class), color=colour,
-                    linewidth=figures.LINE_REGULAR, label=f"{name} (n={len(np.unique(guids[of_class]))})")
+                    linewidth=figures.LINE_REGULAR, label=str(name))
             ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, of_class), color=colour,
                     linewidth=figures.LINE_THIN, linestyle="--")
             drawn += 1
         if drawn == 0:
-            _empty(ax, f"{READOUT_TITLES.get(readout, readout)}: by class")
+            _empty(ax, f"{READOUT_SHORT.get(readout, readout)}, by class")
         else:
-            ax.set_title(f"{READOUT_TITLES.get(readout, readout)}: by class")
+            ax.set_title(f"{READOUT_SHORT.get(readout, readout)}, by class")
             ax.plot([], [], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="|attribution|")
             ax.plot([], [], color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--", label="model lag readout")
             ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
             ax.set_ylabel("share per lag")
-            symlog_legend(ax, _per_recording_mean(attribution, guids, keep), ncol=min(max(drawn, 1), 3))
+            symlog_legend(ax, _per_recording_mean(attribution, guids, keep), ncol=min(max(drawn, 1), 3),
+                          legend=not keyed)
             figures.style_axes(ax)
+        keyed = True
 
     # The comparison row: every readout on one axis, then the band readouts against their bands.
     ax, ax_bands = axes[len(readouts), 0], axes[len(readouts), 1]
@@ -2309,7 +2366,7 @@ def build_lag_profile_figure(
     for readout in readouts:
         keep = null & (readout_column == readout) if null.size else null
         if keep.any():
-            series.append((READOUT_TITLES.get(readout, readout), _per_recording_mean(attribution, guids, keep),
+            series.append((READOUT_SHORT.get(readout, readout), _per_recording_mean(attribution, guids, keep),
                            READOUT_COLOURS.get(readout, figures.COLOR_GRAY)))
     band_series: List[Tuple[str, np.ndarray, str, Tuple[int, int]]] = []
     for position, (name, span) in enumerate(bands.items()):
@@ -2317,7 +2374,7 @@ def build_lag_profile_figure(
         if keep.any():
             colour = BAND_COLOURS[position % len(BAND_COLOURS)]
             profile = _per_recording_mean(attribution, guids, keep)
-            series.append((f"lag readout on {name!r}", profile, colour))
+            series.append((variant_short(READOUT_LAG_BAND, str(name)), profile, colour))
             band_series.append((str(name), profile, colour, (int(span[0]), int(span[1]))))
     for label, profile, colour in series:
         ax.plot(lag_seconds, profile, color=colour, linewidth=figures.LINE_REGULAR, label=label)
@@ -2326,15 +2383,15 @@ def build_lag_profile_figure(
         ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, null), color=figures.COLOR_BLACK,
                 linewidth=figures.LINE_THIN, linestyle="--", label="model lag readout")
     if drawn == 0:
-        _empty(ax, "every readout on one lag axis")
+        _empty(ax, "All readouts")
     else:
-        ax.set_title("every readout: normalised |source attribution|, pooled")
+        ax.set_title("All readouts")
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share per lag")
         symlog_legend(ax, *[profile for _label, profile, _colour in series], ncol=2)
         figures.style_axes(ax)
     if not band_series:
-        _empty(ax_bands, "the lag-band readouts against their own bands")
+        _empty(ax_bands, "Lag bands")
     else:
         for name, profile, colour, (low, high) in band_series:
             low, high = max(0, low), min(len(lag_seconds) - 1, high)
@@ -2344,12 +2401,12 @@ def build_lag_profile_figure(
                     color=colour, alpha=0.12, linewidth=0,
                 )
             ax_bands.plot(lag_seconds, profile, color=colour, linewidth=figures.LINE_REGULAR, label=name)
-        ax_bands.set_title("lag-band readouts against their bands (shaded)")
+        ax_bands.set_title("Lag bands")
         ax_bands.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax_bands.set_ylabel("share per lag")
         symlog_legend(ax_bands, *[profile for _name, profile, _colour, _span in band_series], ncol=min(len(band_series), 4))
         figures.style_axes(ax_bands)
-    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2431,17 +2488,19 @@ def build_channel_figure(
         readouts: The readouts, one row each.
         channel_groups: ``{stream: {band: positions}}`` from the channel map, possibly empty.
         n_scattering: Width of the target scattering block, or ``None``.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
-        The figure.
+        The figure. The legend and the block label are kept in the first populated row of each
+        stream's column.
     """
     figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
     guids = rows["guid"].astype(str).to_numpy() if len(rows) else np.zeros(0, dtype=object)
+    keyed = {stream: False for stream in STREAMS}
     for index, readout in enumerate(readouts):
         for col, stream in enumerate(STREAMS):
             ax = axes[index, col]
-            title = f"{READOUT_TITLES.get(readout, readout)}: {stream} by channel"
+            title = f"{READOUT_SHORT.get(readout, readout)}: {stream}"
             keep = _stream_selection(rows, readout, stream)
             signed_name, unsigned_name = f"channel_profile_{stream}", f"channel_abs_profile_{stream}"
             if not keep.any() or signed_name not in vectors:
@@ -2451,24 +2510,27 @@ def build_channel_figure(
             width = int(signed.size)
             colours, legend = _band_colour_of_channels(width, channel_groups.get(stream, {}))
             x = np.arange(width)
-            ax.bar(x, signed, width=0.85, color=colours, linewidth=0, label="signed, mean over recordings")
+            ax.bar(x, signed, width=0.85, color=colours, linewidth=0, label="Signed")
             if unsigned_name in vectors:
                 unsigned = _per_recording_mean(vectors[unsigned_name].astype(np.float64), guids, keep)
-                ax.plot(x, unsigned, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN,
-                        label="unsigned, mean over recordings")
+                ax.plot(x, unsigned, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, label="Unsigned")
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
             if stream == STREAM_TARGET and n_scattering and 0 < int(n_scattering) < width:
                 ax.axvline(float(n_scattering) - 0.5, color=figures.COLOR_BLACK, linewidth=figures.LINE_HAIRLINE,
                            linestyle="--")
-                ax.text(float(n_scattering) - 0.5, 0.98, " phase-harmonic block", transform=ax.get_xaxis_transform(),
-                        ha="left", va="top", fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY)
-            for label, colour in legend:
-                ax.plot([], [], marker="s", linestyle="none", color=colour, label=label)
-            ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
+                if not keyed[stream]:
+                    ax.text(float(n_scattering) - 0.5, 0.98, " phase-harmonic block", transform=ax.get_xaxis_transform(),
+                            ha="left", va="top", fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY)
+            if not keyed[stream]:
+                for label, colour in legend:
+                    ax.plot([], [], marker="s", linestyle="none", color=colour, label=label)
+            ax.set_title(title)
             ax.set_xlabel("declared channel")
             ax.set_ylabel("attribution (symlog)")
             ax.set_xlim(-0.5, width - 0.5)
-            symlog_legend(ax, signed, unsigned if unsigned_name in vectors else signed, ncol=3)
+            symlog_legend(ax, signed, unsigned if unsigned_name in vectors else signed, ncol=3,
+                          legend=not keyed[stream])
+            keyed[stream] = True
             figures.style_axes(ax)
     figures.caveat_note(figure, caveat)
     return figure
@@ -2496,7 +2558,7 @@ def build_lag_channel_figure(
         lag_seconds: The compensated lag axis.
         readouts: The readouts, one row each.
         n_scattering: Width of the target scattering block, or ``None``.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
         The figure.
@@ -2507,7 +2569,7 @@ def build_lag_channel_figure(
         for col, stream in enumerate(STREAMS):
             ax = axes[index, col]
             baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
-            title = f"{READOUT_TITLES.get(readout, readout)}: {stream} ({baseline})"
+            title = f"{READOUT_SHORT.get(readout, readout)}: {stream}"
             entry = lag_channel.get((readout, baseline, stream))
             if entry is None or not np.isfinite(np.asarray(entry["mean_abs"])).any():
                 _empty(ax, title)
@@ -2516,11 +2578,11 @@ def build_lag_channel_figure(
             figures.heatmap_with_colorbar(
                 figure, ax, field, symmetric=False, interpolation="none", norm=unsigned_log_norm(field),
                 title=title, xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="declared channel",
-                colorbar_label=f"mean |attribution| over {int(entry['n_rows'])} anchors (log)",
+                colorbar_label="mean |attribution| (log)",
                 extent=(float(lag_seconds[0]) - half, float(lag_seconds[-1]) + half, field.shape[0] - 0.5, -0.5),
                 separator_row=(int(n_scattering) - 1) if (stream == STREAM_TARGET and n_scattering) else None,
             )
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2546,17 +2608,19 @@ def build_time_profile_figure(
         vectors: The row-aligned arrays, read for ``lag_profile`` and ``target_lag_profile``.
         lag_seconds: The compensated lag axis.
         readouts: The readouts, one row each.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
-        The figure.
+        The figure. Every panel keys the same four curves, so the legend is kept in the first
+        populated panel.
     """
     figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
     guids = rows["guid"].astype(str).to_numpy() if len(rows) else np.zeros(0, dtype=object)
+    keyed = False
     for index, readout in enumerate(readouts):
         for col, (stream, name) in enumerate(((STREAM_SOURCE, "lag_profile"), (STREAM_TARGET, "target_lag_profile"))):
             ax = axes[index, col]
-            title = f"{READOUT_TITLES.get(readout, readout)}: signed {stream}, by offset"
+            title = f"{READOUT_SHORT.get(readout, readout)}: {stream}"
             keep = _stream_selection(rows, readout, stream)
             if not keep.any() or name not in vectors:
                 _empty(ax, title)
@@ -2567,19 +2631,20 @@ def build_time_profile_figure(
             net = _per_recording_mean(profile, guids, keep)
             unsigned = _per_recording_mean(np.abs(profile), guids, keep)
             ax.fill_between(lag_seconds, 0.0, positive, color=figures.COLOR_VERMILLION, alpha=0.35, linewidth=0,
-                            label="positive part (raises the readout)")
+                            label="Raises readout")
             ax.fill_between(lag_seconds, negative, 0.0, color=figures.COLOR_BLUE, alpha=0.35, linewidth=0,
-                            label="negative part (lowers the readout)")
-            ax.plot(lag_seconds, net, color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="net mean")
+                            label="Lowers readout")
+            ax.plot(lag_seconds, net, color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="Net")
             ax.plot(lag_seconds, unsigned, color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN, linestyle="--",
-                    label="unsigned mean")
+                    label="Unsigned")
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
-            ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
+            ax.set_title(title)
             ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
             ax.set_ylabel("attribution (symlog)")
-            symlog_legend(ax, positive, negative, unsigned, ncol=2)
+            symlog_legend(ax, positive, negative, unsigned, ncol=2, legend=not keyed)
+            keyed = True
             figures.style_axes(ax)
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2593,12 +2658,14 @@ def build_checks_figure(rows: pd.DataFrame, *, tolerance: float, caveat: str) ->
     part of the move the excluded start of the path accounts for, unitless so every readout sits
     on one axis. Right: the two structural checks per readout, the largest attribution to a step
     after the anchor and to a gated-off source step, exactly zero on a causal model and printed
-    beside their bars so a zero reads as a zero.
+    beside their bars so a zero reads as a zero. The baseline of every strip is named on its tick
+    label, so the points carry one colour per baseline and no key. A numerical check makes no
+    claim about the physiology and carries no note under it.
 
     Args:
         rows: The per-row table.
         tolerance: The completeness tolerance the pass counts rows against.
-        caveat: The sentence printed under the figure.
+        caveat: Kept for the signature shared by the builders; this figure prints no note.
 
     Returns:
         The figure.
@@ -2606,24 +2673,22 @@ def build_checks_figure(rows: pd.DataFrame, *, tolerance: float, caveat: str) ->
     needed = {"readout", "baseline", "completeness_rel", "entry_jump", "value_input", "value_baseline"}
     if not len(rows) or not needed <= set(rows.columns):
         figure, axes = figures.new_figure(1, 3, height_per_row=3.0, width=15.0)
-        for col, title in enumerate(("completeness residual", "entry jump share", "structural checks")):
+        for col, title in enumerate(("Completeness residual", "Entry jump share", "Structural checks")):
             _empty(axes[0, col], title)
-        figures.caveat_note(figure, caveat)
         return figure
     band = rows["band"].fillna("").astype(str).to_numpy() if "band" in rows.columns else np.full(len(rows), "")
     keys = list(zip(rows["readout"].astype(str), band, rows["baseline"].astype(str)))
     groups = list(dict.fromkeys(keys))
     group_of = np.asarray([groups.index(key) for key in keys])
-    labels_of = [f"{variant_label(readout, tag)}, {baseline}" for readout, tag, baseline in groups]
+    labels_of = [f"{variant_short(readout, tag)}, {baseline}" for readout, tag, baseline in groups]
     figure, axes = figures.new_figure(1, 3, height_per_row=max(3.0, 0.24 * len(groups) + 1.2), width=15.0)
     residual = np.asarray(rows["completeness_rel"], dtype=np.float64)
     move = np.abs(np.asarray(rows["value_input"], dtype=np.float64) - np.asarray(rows["value_baseline"], dtype=np.float64))
     share = np.divide(np.abs(np.asarray(rows["entry_jump"], dtype=np.float64)), move,
                       out=np.full(move.shape, np.nan), where=move > 0.0)
     for ax, values, title, xlabel in (
-        (axes[0, 0], residual, f"completeness residual ({int((residual > tolerance).sum())} of {residual.size} rows over {tolerance:g})",
-         "|IG sum - (f(x) - f(x0))|, relative"),
-        (axes[0, 1], share, "entry jump as a share of the path's move", "|f(x0) - f(b)| / |f(x) - f(b)|"),
+        (axes[0, 0], residual, "Completeness residual", "Relative residual"),
+        (axes[0, 1], share, "Entry jump share", "Entry jump / path move"),
     ):
         finite = np.isfinite(values) & (values > 0.0)
         floor = float(values[finite].min()) if finite.any() else 1e-12
@@ -2643,11 +2708,14 @@ def build_checks_figure(rows: pd.DataFrame, *, tolerance: float, caveat: str) ->
         ax.set_title(title, fontsize=figures.FONT_SMALL)
         ax.set_xlabel(xlabel)
         figures.style_axes(ax)
-    axes[0, 0].axvline(float(tolerance), color=figures.COLOR_BLACK, linestyle=":", linewidth=figures.LINE_REGULAR)
+    axes[0, 0].axvline(float(tolerance), color=figures.COLOR_BLACK, linestyle=":", linewidth=figures.LINE_REGULAR,
+                       label="Tolerance")
+    axes[0, 0].plot([], [], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="Median")
+    axes[0, 0].legend(fontsize=figures.FONT_TINY)
 
     ax = axes[0, 2]
-    checks = [("after_anchor_max_abs", "after the anchor", figures.COLOR_BLUE),
-              ("gated_off_max_abs", "gated-off source step", figures.COLOR_ORANGE)]
+    checks = [("after_anchor_max_abs", "After the anchor", figures.COLOR_BLUE),
+              ("gated_off_max_abs", "Gated-off source", figures.COLOR_ORANGE)]
     if all(name in rows.columns for name, _label, _colour in checks):
         readouts = list(dict.fromkeys(rows["readout"].astype(str)))
         y = np.arange(len(readouts))
@@ -2656,25 +2724,21 @@ def build_checks_figure(rows: pd.DataFrame, *, tolerance: float, caveat: str) ->
             values = [float(np.nanmax(rows.loc[rows["readout"].astype(str) == readout, name])) for readout in readouts]
             largest = max([largest, *values])
             positions = y + (offset - 0.5) * 0.38
-            ax.barh(positions, values, height=0.38, color=colour, label=f"largest |attribution| {label}")
+            ax.barh(positions, values, height=0.38, color=colour, label=label)
             for position, value in zip(positions, values):
                 ax.annotate(f"{value:.2g}", (value, position), textcoords="offset points", xytext=(3, 0),
                             va="center", fontsize=figures.FONT_TINY)
         # Linear from zero: the expected value is exactly zero, printed beside every bar.
         ax.set_xlim(0.0, 1.3 * largest if largest > 0.0 else 1.0)
         ax.set_yticks(y)
-        ax.set_yticklabels([READOUT_TITLES.get(readout, readout) for readout in readouts], fontsize=figures.FONT_TINY)
+        ax.set_yticklabels([READOUT_SHORT.get(readout, readout) for readout in readouts], fontsize=figures.FONT_TINY)
         ax.set_ylim(len(readouts) - 0.5, -0.5)
-        ax.set_title("structural checks (zero on a causal model)", fontsize=figures.FONT_SMALL)
+        ax.set_title("Structural checks", fontsize=figures.FONT_SMALL)
         ax.set_xlabel("|attribution|, readout units")
         ax.legend(fontsize=figures.FONT_TINY, loc="lower right")
         figures.style_axes(ax)
     else:
-        _empty(ax, "structural checks per readout")
-    figures.caveat_note(
-        figure,
-        f"points: one per row, blue on the source-null path, vermilion on the all-zero one; bars: the median. {caveat}",
-    )
+        _empty(ax, "Structural checks")
     return figure
 
 
@@ -2708,13 +2772,15 @@ def build_delivery_figure(
         vectors: The row-aligned arrays, read for ``lag_profile``.
         lag_seconds: The compensated lag axis.
         readouts: The readouts, one row each.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
-        The figure.
+        The figure. Every panel keys the same classes, so the legend is kept in the first
+        populated panel.
     """
     figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
     window = 1.0
+    keyed = False
     if len(rows) and "lag_profile" in vectors:
         hours = -traces.absolute_seconds(rows["epoch"], rows["anchor"]) / cohort.SECONDS_PER_HOUR
         centroid = _lag_centroid(vectors["lag_profile"], lag_seconds)
@@ -2727,11 +2793,11 @@ def build_delivery_figure(
         keep = _stream_selection(rows, readout, STREAM_SOURCE)
         for col, (values, ylabel, what) in enumerate((
             (np.asarray(rows["source_total"], dtype=np.float64) if len(rows) else np.zeros(0),
-             READOUT_UNITS.get(readout, "readout units"), "source attribution total"),
-            (centroid, "s (stored-coefficient time)", "lag centroid of |source attribution|"),
+             READOUT_UNITS.get(readout, "readout units"), "source total"),
+            (centroid, "s (stored-coefficient time)", "lag centroid"),
         )):
             ax = axes[index, col]
-            title = f"{READOUT_TITLES.get(readout, readout)}: {what}"
+            title = f"{READOUT_SHORT.get(readout, readout)}: {what}"
             usable = keep & np.isfinite(values) & np.isfinite(hours) if keep.size else keep
             if not usable.any():
                 _empty(ax, title)
@@ -2742,7 +2808,7 @@ def build_delivery_figure(
                 of_class = usable & np.asarray([c == name for c in classes], dtype=bool)
                 colour = colours.get(name, figures.COLOR_GRAY)
                 ax.scatter(hours[of_class], values[of_class], s=8, color=colour, alpha=0.6, linewidths=0,
-                           label=f"{name} (n={len(np.unique(guids[of_class]))})")
+                           label=str(name))
                 bins = np.floor(hours[of_class] / window).astype(np.int64)
                 table = pd.DataFrame({"bin": bins, "guid": guids[of_class], "value": values[of_class]})
                 per_recording = table.groupby(["bin", "guid"])["value"].mean().reset_index()
@@ -2756,9 +2822,11 @@ def build_delivery_figure(
             ax.set_xlabel("hours before delivery")
             ax.set_ylabel(ylabel)
             ax.invert_xaxis()
-            figures.legend_with_headroom(ax, ncol=3, headroom=0.35)
+            if not keyed:
+                figures.legend_with_headroom(ax, ncol=3, headroom=0.35)
+                keyed = True
             figures.style_axes(ax)
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2784,18 +2852,19 @@ def build_band_figure(
         bands: The frequency-band table.
         lag_bands: The lag-band table.
         readouts: The readouts, one column each.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
-        The figure.
+        The figure. The legend of each row is kept in its first populated panel.
     """
     n_cols = max(len(readouts), 1)
+    keyed = [False, False]
     figure, axes = figures.new_figure(2, n_cols, height_per_row=3.0, width=5.0 * n_cols)
     for col, readout in enumerate(readouts):
         ax = axes[0, col]
         subset = bands[bands["readout"].astype(str) == readout] if len(bands) else bands
         if subset.empty:
-            _empty(ax, f"{READOUT_TITLES.get(readout, readout)}: by frequency band")
+            _empty(ax, f"{READOUT_SHORT.get(readout, readout)}: frequency band")
         else:
             names = list(dict.fromkeys(subset["band"].astype(str)))
             x = np.arange(len(names))
@@ -2803,17 +2872,17 @@ def build_band_figure(
             for offset, (stream, colour) in enumerate(((STREAM_TARGET, figures.COLOR_BLUE), (STREAM_SOURCE, figures.COLOR_ORANGE))):
                 part = subset[subset["stream"].astype(str) == stream].set_index("band")
                 heights = [float(part["attribution_mean"].get(name, np.nan)) for name in names]
-                baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
-                ax.bar(x + (offset - 0.5) * width, heights, width=width, color=colour, label=f"{stream} ({baseline})")
+                ax.bar(x + (offset - 0.5) * width, heights, width=width, color=colour, label=stream.capitalize())
             if "spectral_skill_pred_gap_nats" in subset.columns and subset["spectral_skill_pred_gap_nats"].notna().any():
                 twin = ax.twinx()
                 part = subset[subset["stream"].astype(str) == STREAM_TARGET].set_index("band")
                 twin.plot(x, [float(part["spectral_skill_pred_gap_nats"].get(name, np.nan)) for name in names],
                           color=figures.COLOR_GREEN, marker="o", markersize=2.5, linewidth=figures.LINE_THIN,
-                          label="spectral_skill pred_gap (target band)")
+                          label="Spectral skill")
                 twin.set_ylabel("nats per anchor", fontsize=figures.FONT_LABEL)
                 twin.tick_params(labelsize=figures.FONT_TINY)
-                twin.legend(fontsize=figures.FONT_TINY, loc="lower right")
+                if not keyed[0]:
+                    twin.legend(fontsize=figures.FONT_TINY, loc="lower right")
             ax.set_xticks(x)
             # Ticks name the frequency range (period in parentheses), not the clinical band key
             # the table is keyed by.
@@ -2822,25 +2891,27 @@ def build_band_figure(
                 rotation=30, ha="right", fontsize=figures.FONT_TINY,
             )
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
-            ax.set_title(f"{READOUT_TITLES.get(readout, readout)}: by frequency band", fontsize=figures.FONT_SMALL)
+            ax.set_title(f"{READOUT_SHORT.get(readout, readout)}: frequency band", fontsize=figures.FONT_SMALL)
             ax.set_ylabel(f"{READOUT_UNITS.get(readout, 'readout units')} (symlog)")
             symlog_axis(ax, subset["attribution_mean"].to_numpy(dtype=np.float64), headroom=1.0)
-            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            if not keyed[0]:
+                ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+                keyed[0] = True
             figures.style_axes(ax)
 
         ax = axes[1, col]
         subset = lag_bands[lag_bands["readout"].astype(str) == readout] if len(lag_bands) else lag_bands
         if subset.empty:
-            _empty(ax, f"{READOUT_TITLES.get(readout, readout)}: by lag band")
+            _empty(ax, f"{READOUT_SHORT.get(readout, readout)}: lag band")
         else:
             names = list(dict.fromkeys(subset["band"].astype(str)))
             x = np.arange(len(names))
             # ``(column, sign, label, colour)``: the two removal deltas are negated onto the
             # integrated gradient's convention, so three readings that agree point the same way.
             series = [
-                ("ig_attribution_mean", 1.0, "integrated gradients, sum over the band", figures.COLOR_BLUE),
-                ("ablation_delta_mean", -1.0, "minus the ablation delta (this analysis)", figures.COLOR_PURPLE),
-                ("occlusion_delta_total_nats", -1.0, "minus the occlusion delta (its own pass)", figures.COLOR_GREEN),
+                ("ig_attribution_mean", 1.0, "IG sum", figures.COLOR_BLUE),
+                ("ablation_delta_mean", -1.0, "$-$ ablation", figures.COLOR_PURPLE),
+                ("occlusion_delta_total_nats", -1.0, "$-$ occlusion", figures.COLOR_GREEN),
             ]
             present = [entry for entry in series if entry[0] in subset.columns and subset[entry[0]].notna().any()]
             width = 0.8 / max(len(present), 1)
@@ -2853,12 +2924,14 @@ def build_band_figure(
             ax.set_xticks(x)
             ax.set_xticklabels(names, fontsize=figures.FONT_TINY)
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
-            ax.set_title(f"{READOUT_TITLES.get(readout, readout)}: by lag band", fontsize=figures.FONT_SMALL)
+            ax.set_title(f"{READOUT_SHORT.get(readout, readout)}: lag band", fontsize=figures.FONT_SMALL)
             ax.set_ylabel(f"{READOUT_UNITS.get(readout, 'readout units')} (symlog)")
             symlog_axis(ax, *drawn, headroom=1.0)
-            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            if not keyed[1]:
+                ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+                keyed[1] = True
             figures.style_axes(ax)
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2884,7 +2957,7 @@ def build_layer_figure(
             lag-aligned source profiles attached as the column ``lag_profile`` (arrays).
         cell: The cell binding.
         lag_seconds: The compensated lag axis.
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
         The figure.
@@ -2892,7 +2965,7 @@ def build_layer_figure(
     figure, axes = figures.new_figure(1, 2, height_per_row=3.2, width=12.0)
     ax = axes[0, 0]
     if layer.empty:
-        _empty(ax, f"layer attribution per {cell.layer_axis}")
+        _empty(ax, f"Layer split per {cell.layer_axis}")
     else:
         readouts = list(dict.fromkeys(layer["readout"].astype(str)))
         pooled = layer[layer[labels.CLASS_COLUMN].astype(str) == "pooled"]
@@ -2903,17 +2976,17 @@ def build_layer_figure(
             values = [float(part["mean"].get(unit, np.nan)) for unit in units]
             if cell.layer_axis == "head":
                 ax.bar(x + (index - (len(readouts) - 1) / 2) * 0.8 / len(readouts), values,
-                       width=0.8 / len(readouts), label=READOUT_TITLES.get(readout, readout),
+                       width=0.8 / len(readouts), label=READOUT_SHORT.get(readout, readout),
                        color=READOUT_COLOURS.get(readout, figures.COLOR_GRAY))
             else:
-                ax.plot(x, values, linewidth=figures.LINE_REGULAR, label=READOUT_TITLES.get(readout, readout),
+                ax.plot(x, values, linewidth=figures.LINE_REGULAR, label=READOUT_SHORT.get(readout, readout),
                         color=READOUT_COLOURS.get(readout, figures.COLOR_GRAY))
         ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
         if cell.layer_axis == "head":
             # Heads are integers; a fractional tick between two heads names nothing.
             ax.set_xticks(x)
             ax.set_xticklabels([str(int(unit)) for unit in units])
-        ax.set_title(f"layer split per {cell.layer_axis} (source-null baseline)", fontsize=figures.FONT_SMALL)
+        ax.set_title(f"Layer split per {cell.layer_axis}", fontsize=figures.FONT_SMALL)
         ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("readout units (symlog)")
         symlog_axis(ax, pooled["mean"].to_numpy(dtype=np.float64) if not pooled.empty else layer["mean"].to_numpy(dtype=np.float64), headroom=1.0)
@@ -2921,20 +2994,18 @@ def build_layer_figure(
         figures.style_axes(ax)
     ax = axes[0, 1]
     if top_coordinate.empty or "lag_profile" not in top_coordinate.columns:
-        _empty(ax, "how the top divergence coordinate is fed")
+        _empty(ax, "Top $K_{t,d}$ by lag")
     else:
         source = np.abs(np.stack([np.asarray(v, dtype=np.float64) for v in top_coordinate["lag_profile"]], axis=0))
         guids = top_coordinate["guid"].astype(str).to_numpy()
         profile = _per_recording_mean(source, guids, np.ones(len(guids), dtype=bool))
-        ax.plot(lag_seconds, profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_REGULAR,
-                label=f"{len(top_coordinate)} anchors, {len(np.unique(guids))} recordings")
-        ax.set_title("top coordinate $K_{t,d}$: source |attribution| by lag (source-null)", fontsize=figures.FONT_SMALL)
+        ax.plot(lag_seconds, profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_REGULAR)
+        ax.set_title("Top $K_{t,d}$ by lag", fontsize=figures.FONT_SMALL)
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("|attribution| (nats, symlog)")
         symlog_axis(ax, profile, headroom=1.0)
-        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
         figures.style_axes(ax)
-    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
     return figure
 
 
@@ -2948,7 +3019,7 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
 
     Args:
         null: The null table, one row per (class, readout).
-        caveat: The sentence printed under the figure.
+        caveat: The one-line note printed under the figure (:data:`ATTRIBUTION_NOTE`).
 
     Returns:
         The figure.
@@ -2956,13 +3027,13 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
     figure, axes = figures.new_figure(1, 2, height_per_row=3.2, width=12.0)
     for col, (baseline, columns, title) in enumerate((
         (BASELINE_SOURCE_NULL,
-         [("value_input_mean", "K_t at the input"), ("value_baseline_mean", "K_t at the null (clock)"),
-          ("attributed_mean", "attributed content (IG sum)"), ("entry_jump_mean", "entry jump")],
-         "divergence, source-null baseline: clock and content"),
+         [("value_input_mean", "$K_t$ at input"), ("value_baseline_mean", "$K_t$ at null"),
+          ("attributed_mean", "IG sum"), ("entry_jump_mean", "Entry jump")],
+         "Source-null: clock and content"),
         (BASELINE_ALL_ZERO,
-         [("target_total_mean", "target attribution"), ("source_total_mean", "source attribution"),
-          ("entry_jump_mean", "entry jump")],
-         "divergence, all-zero baseline: target vs source"),
+         [("target_total_mean", "Target"), ("source_total_mean", "Source"),
+          ("entry_jump_mean", "Entry jump")],
+         "All-zero: target and source"),
     )):
         ax = axes[0, col]
         subset = null[(null["baseline"].astype(str) == baseline) & (null["readout"].astype(str) == READOUT_KLD)] if len(null) else null
@@ -2981,7 +3052,7 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
                            fontsize=figures.FONT_TINY)
         ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
         ax.set_title(title, fontsize=figures.FONT_SMALL)
-        ax.set_ylabel("nats per anchor, mean over recordings")
+        ax.set_ylabel("nats per anchor")
         ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
         figures.style_axes(ax)
     figures.caveat_note(figure, caveat)
@@ -2992,21 +3063,18 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
 #: divergence and the model's own lag readout as heatmaps on one lag axis, the agreement and the
 #: source share as lines, and the readout values behind them.
 TRACE_PANELS: Tuple[Any, ...] = (
-    traces.HeatmapPanel("kld_attribution_lag_map", "|source attribution of $K_t$| by lag (source-null baseline, log)", "",
-                        log=True, lag_axis=True),
-    traces.HeatmapPanel("pred_gap_attribution_lag_map",
-                        "|source attribution of the forecast gap| by lag (source-null baseline, log)", "", log=True,
+    traces.HeatmapPanel("kld_attribution_lag_map", "$K_t$ attribution by lag", "", log=True, lag_axis=True),
+    traces.HeatmapPanel("pred_gap_attribution_lag_map", "Forecast-gap attribution by lag", "", log=True,
                         lag_axis=True),
-    traces.HeatmapPanel("model_lag_map", "The model's own lag readout (log)", "", log=True, lag_axis=True),
-    traces.LinePanel(("kld_lag_corr", "pred_gap_lag_corr"),
-                     "Correlation of the lag-aligned attribution with the model's lag readout", "Pearson $r$",
-                     labels=("$K_t$", "forecast gap")),
-    traces.LinePanel(("kld_source_total", "pred_gap_source_total"), "Source attribution totals",
-                     "nats", labels=("$K_t$", "forecast gap")),
-    traces.LinePanel(("kld_value_input", "kld_value_baseline"), "$K_t$ at the input and at the exact null",
+    traces.HeatmapPanel("model_lag_map", "Model lag readout", "", log=True, lag_axis=True),
+    traces.LinePanel(("kld_lag_corr", "pred_gap_lag_corr"), "Agreement with lag readout", "Pearson $r$",
+                     labels=("$K_t$", "Forecast gap")),
+    traces.LinePanel(("kld_source_total", "pred_gap_source_total"), "Source attribution",
+                     "nats", labels=("$K_t$", "Forecast gap")),
+    traces.LinePanel(("kld_value_input", "kld_value_baseline"), "Divergence $K_t$",
                      "nats", labels=("input", "null")),
     traces.LinePanel(("pred_gap_value_input", "pred_gap_value_baseline"),
-                     "Forecast gap at the input and at the exact null", "nats", labels=("input", "null")),
+                     "Forecast gap", "nats", labels=("input", "null")),
 )
 
 #: The lag families a trace's shape statistics are taken of.
@@ -3060,7 +3128,7 @@ def cost_record(*, elapsed_s: float, n_segments: int, n_rows: int, n_forward_equ
 
 
 __all__ = [
-    "ANALYSIS_DIRNAME", "ANCHORS_PER_SEGMENT", "ATTENTION_CELL", "ATTRIBUTION_CAVEAT",
+    "ANALYSIS_DIRNAME", "ANCHORS_PER_SEGMENT", "ATTENTION_CELL", "ATTRIBUTION_CAVEAT", "ATTRIBUTION_NOTE",
     "AnchorReadout", "AttributionBatch", "BANDS_FILENAME", "BAND_FIGURE", "BASELINES",
     "BASELINE_ALL_ZERO", "BASELINE_ENTRY_FRACTION", "BASELINE_SOURCE_NULL", "CAP_NAME",
     "CellBinding", "DEFAULT_SEGMENTS", "DRAW_SEED_OFFSET", "IG_INTERNAL_BATCH_SIZE", "IG_STEPS",
@@ -3085,7 +3153,7 @@ __all__ = [
     "HORIZON_READOUT_STEPS", "LOG_DECADES", "READOUT_MSE_FULL", "READOUT_MSE_GAP", "READOUT_NLL_HORIZON",
     "UNREAD_COLOUR", "block_sums", "build_block_figure", "build_horizon_figure", "example_variants",
     "horizon_steps", "masked_field", "signed_log_norm", "source_block_split", "symlog_axis",
-    "unsigned_log_norm", "variant_label", "symlog_legend",
+    "unsigned_log_norm", "variant_label", "variant_short", "symlog_legend", "READOUT_SHORT",
     "READOUT_UNITS", "REPARAMETERISATION_SEAMS", "SHARED_SCALE_NOTE", "attributed_forward", "example_norms",
     "input_norm", "readout_unit",
 ]

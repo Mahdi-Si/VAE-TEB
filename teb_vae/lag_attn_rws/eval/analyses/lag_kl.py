@@ -738,7 +738,7 @@ def build_profile_figure(
     axis = axes[0, 0]
     figures.multi_line_panel(
         axis, seconds, np.vstack([raw, corrected]),
-        ["raw attribution (sums to the KL)", "support-corrected (per contributing anchor)"],
+        ["raw", "support-corrected"],
         title="Per-lag KL attribution",
         xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
         ylabel="nats per anchor",
@@ -760,10 +760,11 @@ def build_profile_figure(
     figures.multi_line_panel(
         axes[1, 0], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],
         ["contributing anchors"],
-        title="Anchors contributing to each lag -- the correction's denominator",
+        title="Contributing anchors",
         xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
         ylabel="anchors per segment",
     )
+    figures.drop_legend(axes[1, 0])
     return figure
 
 

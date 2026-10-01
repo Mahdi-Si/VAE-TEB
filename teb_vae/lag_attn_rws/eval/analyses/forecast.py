@@ -318,7 +318,7 @@ def build_baseline_figure(
     Args:
         per_guid: Per-recording means.
         skill_rows: The skill table, as :func:`build_skill_rows` returns it.
-        unit: The unit label the error panel is in.
+        unit: The unit the compared errors are in. Not drawn: the skill is a unit-free ratio.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -330,7 +330,7 @@ def build_baseline_figure(
             name: _finite_column(per_guid, _BLOCK_COLUMN.format(branch=name))
             for name in FORECAST_BRANCHES
         },
-        title="Block score per recording (lower is better)",
+        title="Block score per recording",
         ylabel="nats per anchor",
     )
 
@@ -358,7 +358,7 @@ def build_baseline_figure(
         axis.set_yticklabels(labels, fontsize=figures.FONT_LABEL)
     else:
         axis.text(0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes)
-    axis.set_title(f"Squared-error skill, bootstrap CI over recordings (errors in {unit})")
+    axis.set_title("Squared-error skill")
     axis.set_xlabel("1 - MSE(model) / MSE(baseline)")
     figures.style_axes(axis)
     return figure
@@ -398,9 +398,9 @@ def build_anchor_profile_figure(
                 _finite_column(profile, "nll_full_block"),
             ]
         ),
-        ["target-only (base)", "source-conditioned (full)"],
-        title="Block score against time in segment",
-        xlabel="anchor (decimated steps from the start of the trimmed segment)",
+        ["base", "full"],
+        title="Block score",
+        xlabel="anchor (decimated step)",
         ylabel="nats per anchor",
     )
     figures.multi_line_panel(
@@ -408,10 +408,11 @@ def build_anchor_profile_figure(
         anchors,
         _finite_column(profile, "pred_gap")[None, :],
         ["pred_gap"],
-        title="pred_gap against time in segment",
-        xlabel="anchor (decimated steps from the start of the trimmed segment)",
+        title="pred_gap",
+        xlabel="anchor (decimated step)",
         ylabel="nats per anchor",
     )
+    figures.drop_legend(axes[1, 0])
     for axis in (axes[0, 0], axes[1, 0]):
         for low, high in spans.values():
             if high > low:
@@ -440,24 +441,27 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
     figures.multi_line_panel(
         axes[0, 0], lead,
         np.vstack([_finite_column(curves, "d_base_nats"), _finite_column(curves, "d_full_nats")]),
-        ["target-only (base)", "source-conditioned (full)"],
-        title="Forecast score by lead time (single-draw path)",
+        ["base", "full"],
+        title="Forecast score",
         xlabel="lead time (s)", ylabel="nats per horizon step",
     )
     figures.multi_line_panel(
         axes[1, 0], lead, _finite_column(curves, "gap_nats")[None, :], ["pred_gap"],
-        title="Source contribution by lead time",
+        title="Source contribution",
         xlabel="lead time (s)", ylabel="nats per horizon step",
     )
+    figures.drop_legend(axes[1, 0])
     has_unit = len(curves) and "rmse_unit" in getattr(curves, "columns", [])
     unit = str(curves["rmse_unit"].iloc[0]) if has_unit else NORMALISED_UNIT
     figures.multi_line_panel(
         axes[2, 0], lead,
         np.vstack([_finite_column(curves, f"rmse_{branch}") for branch in MODEL_BRANCHES]),
         list(MODEL_BRANCHES),
-        title="Forecast error by lead time",
+        title="Forecast error",
         xlabel="lead time (s)", ylabel=f"RMSE ({unit})",
     )
+    # The same two keys and colours as the first panel's legend.
+    figures.drop_legend(axes[2, 0])
     for axis in (axes[0, 0], axes[1, 0], axes[2, 0]):
         axis.set_xlim(0.0, float(horizon_steps) * SECONDS_PER_STEP)
     return figure
@@ -491,8 +495,8 @@ def build_overlay_figure(
     unit = NORMALISED_UNIT
     for name, label in (
         ("target", "truth"),
-        ("mu_base", "target-only (base)"),
-        ("mu_full", "source-conditioned (full)"),
+        ("mu_base", "base"),
+        ("mu_full", "full"),
     ):
         block = retained.get(name)
         if block is None or row >= len(block):
@@ -509,7 +513,7 @@ def build_overlay_figure(
         )
         figures.multi_line_panel(
             axis, seconds, np.vstack(curves), labels,
-            title=f"Forecast block, retained sample row {row}, anchor {anchor}",
+            title="Forecast block",
             xlabel="lead time (s)", ylabel=f"FHR ({unit})",
         )
     else:

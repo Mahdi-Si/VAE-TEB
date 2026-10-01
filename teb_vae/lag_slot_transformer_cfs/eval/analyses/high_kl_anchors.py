@@ -21,8 +21,8 @@ largest-proposal lag.
 
 Everything here is a per-lag readout of one fitted parameterisation and not an allocation; the
 proposal map is the head's output at each lag and says nothing about which lag was necessary.
-The hot-lag set is a top-share selection taken deliberately and with its circularity stated on
-every artifact: the set is chosen from the same map it then summarises.
+The hot-lag set is a top-share selection taken deliberately and with its circularity stated in
+the record and the figure guide: the set is chosen from the same map it then summarises.
 
 Reads the per-anchor table and the per-anchor sidecar the collection pass writes, and nothing
 else; a directory collected before the sidecar existed records a skip.
@@ -90,6 +90,12 @@ GROUPED_COLUMNS: tuple = (
 
 #: The two readouts tested on each clock.
 TESTED_COLUMNS: tuple = ("high_anchor_frac", "high_centroid_s")
+
+#: The short panel title of each tested column on a clock page.
+CLOCK_TITLES: Dict[str, str] = {
+    "high_anchor_frac": "High-anchor fraction",
+    "high_centroid_s": "High-anchor centroid",
+}
 
 
 def figure_stem(clock: lag_structure.Clock, suffix: str = "") -> str:
@@ -495,7 +501,7 @@ def build_selection_figure(
             ax.hist(
                 np.log10(values), bins=edges, histtype="stepfilled", alpha=0.35,
                 color=colours.get(group), edgecolor=colours.get(group),
-                linewidth=figures.LINE_HAIRLINE, label=f"{group} ({values.size} anchors)",
+                linewidth=figures.LINE_HAIRLINE, label=str(group),
             )
         for name, style in (("high_nats", "--"), ("top_nats", ":")):
             if thresholds[name] > 0.0:
@@ -503,7 +509,7 @@ def build_selection_figure(
                     np.log10(thresholds[name]), color=figures.COLOR_BLACK, linestyle=style,
                     linewidth=figures.LINE_THIN, label=f"{name[:-5]} threshold",
                 )
-        ax.set_xlabel("$\\log_{10}$ per-anchor divergence (nats)")
+        ax.set_xlabel("$\\log_{10}$ divergence (nats)")
         ax.set_ylabel("anchors")
         ax.legend(fontsize=figures.FONT_SMALL, loc="best")
     else:
@@ -511,7 +517,7 @@ def build_selection_figure(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
             fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
         )
-    ax.set_title("Per-anchor divergence and the selection thresholds")
+    ax.set_title("Per-anchor divergence")
     figures.style_axes(ax)
 
     # b. The pooled proposal profile of each band, hot lags shaded.
@@ -533,15 +539,15 @@ def build_selection_figure(
                 alpha=0.12, linewidth=0, zorder=0,
             )
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("mean proposal norm (latent units)")
+        ax.set_ylabel("proposal norm (latent units)")
         figures.legend_with_headroom(ax, ncol=5)
     else:
         ax.text(
-            0.5, 0.5, "no per-anchor proposal map in the sidecar", transform=ax.transAxes,
+            0.5, 0.5, "no proposal map", transform=ax.transAxes,
             ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
             fontstyle="italic",
         )
-    ax.set_title("Mean proposal profile of each selection (hot lags shaded)")
+    ax.set_title("Proposal profile (hot lags shaded)")
     figures.style_axes(ax)
 
     # c. The share of anchors per decile whose largest proposal sits at each lag.
@@ -552,14 +558,14 @@ def build_selection_figure(
             .reindex(range(axis.n_lags)).to_numpy(dtype=np.float64)
         )
         figures.heatmap_with_colorbar(
-            figure, ax, field[::-1], title="Largest-proposal lag by divergence decile",
+            figure, ax, field[::-1], title="Largest-proposal lag",
             xlabel="divergence decile (low to high)", ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
-            symmetric=False, colorbar_label="share of the decile's anchors",
+            symmetric=False, colorbar_label="share of anchors",
             extent=(-0.5, N_QUANTILES - 0.5, float(axis.seconds[0]) - 0.5, float(axis.seconds[-1]) + 0.5),
             interpolation="none",
         )
     else:
-        ax.set_title("Largest-proposal lag by divergence decile")
+        ax.set_title("Largest-proposal lag")
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
             fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
@@ -578,15 +584,11 @@ def build_selection_figure(
                 reportable[labels.CLASS_COLUMN].astype(str) == group, "difference"
             ].to_numpy(dtype=np.float64)
     figures.violin_panel(
-        ax, samples, title="High-anchor share inside minus outside a contraction window",
-        ylabel="difference in share, per recording",
+        ax, samples, title="Contraction enrichment",
+        ylabel="inside $-$ outside share",
         colors=figures.group_colors(list(samples)), reference=0.0, reference_label="no enrichment",
     )
-    figures.caveat_note(
-        figure,
-        "The hot-lag set is chosen from the same proposal map it summarises, so a share on it "
-        "describes the run's own selection. " + lag_structure.QUALIFICATION,
-    )
+    figures.caveat_note(figure)
     return figure
 
 
@@ -625,7 +627,7 @@ def build_usefulness_figure(
     if groups:
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
         ax.set_xlabel("divergence decile (low to high)")
-        ax.set_ylabel("mean forecast gain (nats per anchor)")
+        ax.set_ylabel("mean gain (nats per anchor)")
         ax.legend(fontsize=figures.FONT_SMALL, loc="best")
     else:
         ax.text(
@@ -644,35 +646,33 @@ def build_usefulness_figure(
             ax.plot([0, 1], [right, left], color=figures.COLOR_LIGHT_GRAY, linewidth=figures.LINE_HAIRLINE)
         ax.plot(
             np.zeros(int(usable.sum())), rest[usable], marker="o", linestyle="none",
-            markersize=figures.MARKER_SMALL, color=figures.COLOR_BLUE, label="rest band",
+            markersize=figures.MARKER_SMALL, color=figures.COLOR_BLUE,
         )
         ax.plot(
             np.ones(int(usable.sum())), high[usable], marker="o", linestyle="none",
-            markersize=figures.MARKER_SMALL, color=figures.COLOR_VERMILLION, label="high band",
+            markersize=figures.MARKER_SMALL, color=figures.COLOR_VERMILLION,
         )
         paired = usefulness["high_minus_rest_paired"]
         interval = usefulness["high_minus_rest_mean_interval"]
         ax.set_xticks([0, 1])
         ax.set_xticklabels(["rest", "high"])
         ax.set_xlim(-0.5, 1.5)
-        ax.set_ylabel("mean forecast gain per recording (nats per anchor)")
+        ax.set_ylabel("mean gain (nats per anchor)")
         ax.text(
             0.02, 0.98,
-            f"paired difference {float(interval.get('point', float('nan'))):.3g} "
+            f"$\\Delta$ {float(interval.get('point', float('nan'))):.3g} "
             f"[{float(interval.get('lo', float('nan'))):.3g}, "
-            f"{float(interval.get('hi', float('nan'))):.3g}]; "
-            f"Wilcoxon p = {float(paired.get('p_value', float('nan'))):.3g} "
-            f"(n = {int(paired.get('n_pairs', 0))})",
+            f"{float(interval.get('hi', float('nan'))):.3g}], "
+            f"p = {float(paired.get('p_value', float('nan'))):.3g}",
             transform=ax.transAxes, ha="left", va="top", fontsize=figures.FONT_TINY,
             color=figures.COLOR_GRAY,
         )
-        ax.legend(fontsize=figures.FONT_SMALL, loc="lower right")
     else:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
             fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
         )
-    ax.set_title("High against rest, paired within recording")
+    ax.set_title("High vs rest, per recording")
     figures.style_axes(ax)
 
     ax = axes[1, 0]
@@ -698,13 +698,13 @@ def build_usefulness_figure(
                 )
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("mean forecast gain (nats per anchor)")
+        ax.set_ylabel("mean gain (nats per anchor)")
     else:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
             fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
         )
-    ax.set_title("Forecast gain by the anchor's largest-proposal lag (anchor counts)")
+    ax.set_title("Gain by largest-proposal lag")
     figures.style_axes(ax)
 
     ax = axes[1, 1]
@@ -722,12 +722,9 @@ def build_usefulness_figure(
     ax.set_xticklabels(["share of high\nin gain", "expected if\nindependent", "Jaccard"])
     ax.set_ylim(0.0, 1.0)
     ax.set_ylabel("share")
-    ax.set_title(
-        f"Overlap of the high and gain selections "
-        f"({overlap.get('n_high', 0)} high, {overlap.get('n_gain', 0)} gain anchors)"
-    )
+    ax.set_title("Selection overlap")
     figures.style_axes(ax)
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 
@@ -748,10 +745,11 @@ def build_clock_figure(
         lag_structure.draw_trajectory_panel(
             axes[index, 0], [row for row in rows if row["metric"] == column],
             axis=labels.CLASS_COLUMN, clock=clock,
-            title=f"{column}: median over recordings per window (tested)",
-            ylabel="share of the segment's anchors" if column.endswith("frac") else "stored-coefficient seconds",
+            title=CLOCK_TITLES.get(column, column),
+            ylabel="share of anchors" if column.endswith("frac") else "stored-coefficient seconds",
+            legend=index == 0,
         )
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 

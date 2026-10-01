@@ -314,7 +314,8 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
 
     Args:
         pit: The PIT table.
-        coverage: The coverage table, marked on the reliability panel.
+        coverage: The coverage table. Not drawn: the observed and nominal coverage per level sit in
+            :data:`COVERAGE_FILENAME`, not in the panel title.
 
     Returns:
         The figure.
@@ -328,14 +329,14 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         axis.bar(centers, density, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85)
         axis.axhline(
             1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
-            label="uniform (calibrated)",
+            label="uniform",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
-    axis.set_title("Probability integral transform of the scored raw samples")
+    axis.set_title("PIT histogram")
     axis.set_xlabel("PIT value")
     axis.set_ylabel("density")
     figures.style_axes(axis)
@@ -353,11 +354,7 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
-    observed = ", ".join(
-        f"{int(row['level_sigma'])}s {float(row['observed']):.4f}/{float(row['nominal']):.4f}"
-        for row in coverage.to_dict("records")
-    ) if len(coverage) else "no coverage measured"
-    axis.set_title(f"Reliability: observed vs nominal ({observed})")
+    axis.set_title("Reliability")
     axis.set_xlabel("nominal cumulative probability")
     axis.set_ylabel("observed")
     figures.style_axes(axis)
@@ -397,8 +394,8 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
     if len(clamp) == 2 and np.isfinite(margin):
         lo, hi = float(clamp[0]), float(clamp[1])
         for position, label in (
-            (lo + margin, f"floor margin {lo + margin:g}"),
-            (hi - margin, f"ceiling margin {hi - margin:g}"),
+            (lo + margin, "floor margin"),
+            (hi - margin, "ceiling margin"),
         ):
             axis.axvline(
                 position, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
@@ -407,7 +404,7 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
         for position in (lo, hi):
             axis.axvline(position, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
-    axis.set_title("Decoder log-variance over the scored raw samples")
+    axis.set_title("Decoder log-variance")
     axis.set_xlabel("log-variance")
     axis.set_ylabel("fraction of raw samples")
     figures.style_axes(axis)

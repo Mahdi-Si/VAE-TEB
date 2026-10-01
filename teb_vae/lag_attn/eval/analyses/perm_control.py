@@ -66,6 +66,10 @@ KL_READOUT_LABEL = (
     "specificity criterion is the prediction-space ordering."
 )
 
+#: The one line the $K_t$ overlay carries under its axes, in place of :data:`KL_READOUT_LABEL`,
+#: which stays in the records. Well under :data:`teb_vae.lag_attn.eval.figures.FOOTNOTE_MAX_CHARS`.
+KL_OVERLAY_NOTE = "$K_{shuffled} \\geq K_{true}$ is expected, not a failure."
+
 
 def source_specificity_verdict(
     l_feat: float, l_base: float, l_shuffled: float
@@ -284,25 +288,15 @@ def _write_figures(
                 )
         ax.set_xticks(positions)
         ax.set_xticklabels([labels[names.index(name)] for name in present], fontsize=7)
-        ax.set_ylabel("per-sample loss")
-        ax.set_title(
-            f"Source-specificity control -- verdict: {verdict.get('verdict', 'n/a')}"
-        )
-        ax.text(
-            0.5, 0.02,
-            f"criterion {verdict.get('criterion', '')}; uplift margin "
-            f"{verdict.get('uplift_margin', float('nan')):.4g}, shuffle penalty "
-            f"{verdict.get('shuffle_penalty_margin', float('nan')):.4g}",
-            transform=ax.transAxes, ha="center", va="bottom", fontsize=6,
-            color=figures.COLOR_GRAY,
-        )
+        ax.set_ylabel("Per-sample loss")
+        # The criterion and the two margins are in ``summary.json`` under the verdict.
+        ax.set_title(f"Specificity: {verdict.get('verdict', 'n/a')}")
         figures.style_axes(ax)
 
         figures.histogram_panel(
             axes[1, 0], frame.get("shuffle_penalty", pd.Series(dtype=float)),
-            title="Per-sample shuffle penalty $L_{feat,shuffled} - L_{base}$ "
-                  "(positive supports specificity)",
-            xlabel="nats", color=figures.COLOR_PURPLE,
+            title="Shuffle penalty",
+            xlabel="Penalty (nats)", color=figures.COLOR_PURPLE,
             reference=0.0, reference_label="no penalty",
         )
         paths.append(str(figures.render_figure(figure, directory / "losses")))
@@ -318,7 +312,7 @@ def _write_figures(
         if true_columns:
             figures.ribbon_plot(
                 ax, steps, frame[true_columns].to_numpy(dtype=np.float64),
-                title="$K_t$ under the matched source and under a deranged one",
+                title="Per-step KL",
                 xlabel="Step $t$ (decimated)", ylabel="$K_t$ (nats)",
                 color=figures.COLOR_BLUE, label="$K_{true}$ median",
             )
@@ -334,16 +328,10 @@ def _write_figures(
         if warmup > 0:
             ax.axvspan(0, warmup, color=figures.COLOR_LIGHT_GRAY, alpha=0.6, zorder=0)
         ax.legend(fontsize=7, loc="best")
-        # The caption is the mitigation for a high-likelihood misreading, so it is part of the
-        # figure rather than of the surrounding prose.
-        ax.text(
-            0.5, 0.02,
-            "K_shuffled >= K_true is EXPECTED and is NOT a failure: a mismatched source is out "
-            "of distribution and moves the posterior more. Specificity is decided in prediction "
-            "space, not here.",
-            transform=ax.transAxes, ha="center", va="bottom", fontsize=6,
-            color=figures.COLOR_VERMILLION, wrap=True,
-        )
+        # The one line that mitigates a high-likelihood misreading stays on the figure, as a
+        # footnote; the argument (a mismatched source is out of distribution, and specificity is
+        # decided in prediction space) is trap 1.1 of ``FIGURE_GUIDE.md``.
+        figures.footnote(figure, KL_OVERLAY_NOTE)
         figures.style_axes(ax)
         paths.append(str(figures.render_figure(figure, directory / "kl_overlay")))
     finally:

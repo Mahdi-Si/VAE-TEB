@@ -208,12 +208,14 @@ def test_the_page_gains_one_row_per_stream_and_is_unchanged_without_them(task, s
             **common, input_streams=input_budget.stream_panels(model, inputs)
         )
         added = [ax.get_title() for ax in with_rows.axes if ax.get_title()]
-        assert sum(title.startswith("Model input — target") for title in added) == 1
-        assert sum(title.startswith("Model input — source") for title in added) == 1
+        assert sum(title.startswith("Target input") for title in added) == 1
+        assert sum(title.startswith("Source input") for title in added) == 1
         # Every other row is the same panel with the same title, in the same order: the two rows
         # are inserted into the page, not a re-layout of it.
         before = [ax.get_title() for ax in without.axes if ax.get_title()]
-        assert [title for title in added if not title.startswith("Model input")] == before
+        assert [
+            title for title in added if not title.startswith(("Target input", "Source input"))
+        ] == before
     finally:
         plt.close(without)
         if with_rows is not None:

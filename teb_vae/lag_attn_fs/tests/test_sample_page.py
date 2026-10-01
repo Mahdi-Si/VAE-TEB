@@ -238,7 +238,7 @@ def test_the_page_still_has_seven_rows_on_one_time_axis(task, patterned_batch):
             assert ax.has_data(), ax.get_title()
         # The five inherited rows, unchanged and drawn by the builder itself.
         for prefix in (
-            "Target-only latent state",
+            "Latent state",
             "Per-dimension source-conditioned KL",
             "$K_t$",
             "Lag attention",
@@ -281,7 +281,7 @@ def test_a_batch_without_the_raw_trace_still_draws_the_other_six_rows(task, patt
         ax = _axes_titled(figure, "Raw target FHR")
 
         assert len(ax.lines) == 0
-        assert [text.get_text() for text in ax.texts] == ["raw traces unavailable in this batch"]
+        assert [text.get_text() for text in ax.texts] == ["raw traces unavailable"]
         assert len([child for child in figure.axes if child.get_title()]) == 7
         assert _axes_titled(figure, "Forecast").has_data()
     finally:
@@ -309,7 +309,6 @@ def test_the_forecast_row_draws_the_channels_the_rule_picks_named_by_declared_in
             sorted(label.split("\n")[0] for label in labels)
             == sorted(f"ch {index}" for index in keep)
         )
-        assert f"3 of {len(keep)} target channels" in ax.get_title()
     finally:
         plt.close(figure)
 

@@ -661,8 +661,8 @@ def test_the_windows_page_is_not_inverted_and_marks_the_onset() -> None:
             assert _zero_lines(figure.axes[index]) == 1, f"panel {index} does not mark the onset"
         assert figure.axes[0].get_xlim() == pytest.approx(figure.axes[1].get_xlim())
         assert (
-            "negative" in figure.axes[1].get_xlabel()
-        ), "the strip does not name the sign convention"
+            figure.axes[1].get_xlabel() == analysis.AXIS_LABEL
+        ), "the strip does not carry the clock's own label"
     finally:
         shared_figures.plt.close(figure)
 
@@ -707,7 +707,7 @@ def test_the_trajectory_figure_names_the_sign_convention_and_marks_the_onset() -
         for ax in figure.axes:
             low, high = ax.get_xlim()
             assert low < high
-            assert "negative" in ax.get_xlabel() and "positive" in ax.get_xlabel()
+            assert ax.get_xlabel() == analysis.AXIS_LABEL
             assert _zero_lines(ax) == 1
         annotations = sorted(text.get_text() for text in figure.axes[0].texts)
     finally:

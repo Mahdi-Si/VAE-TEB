@@ -30,10 +30,9 @@ its global registry, so a leak is measured in hundreds of megabytes rather than 
 
 **The lag axis is this package's own.** A lag index $\ell$ is not seconds: the seconds figure is
 $\tau_{\mathrm{compensated}} = 4(\ell + \delta)$, the lag on the canonical stored timeline with
-the causal input delay $\delta$ added back. There is no second, "sensor-timeline" figure: the
-dataset builder's UP shift is part of the stored signal and is never undone downstream.
-:data:`COMPENSATED_LAG_AXIS_LABEL` names the quantity, and it is bound here so that a figure drawn
-through this seam and the number reported beside it cannot disagree about what is shown.
+the causal input delay $\delta$ added back. :data:`COMPENSATED_LAG_AXIS_LABEL` names the quantity,
+and it is bound here so that a figure drawn through this seam and the number reported beside it
+cannot disagree about what is shown.
 """
 from __future__ import annotations
 
@@ -165,6 +164,22 @@ def style_axes(ax, *, grid: str = "major") -> None:
             linewidth=plt.rcParams["grid.linewidth"],
             color=figures.COLOR_LIGHT_GRAY,
         )
+
+
+def drop_legend(ax) -> None:
+    """Remove an axes' legend, for a panel whose keys the figure's first legend already names.
+
+    A figure carries one legend when its panels share their keys, and a one-series panel carries
+    none: the shared panels draw a legend unconditionally, so a builder that follows that rule
+    takes the legend off afterwards. Safe on an axes that has none.
+
+    Args:
+        ax: Target axes.
+    """
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
+
 
 #: Figure construction and output. ``render_figure`` tight-layouts, saves at the repository's DPI,
 #: closes the figure and returns the path it wrote.
@@ -418,15 +433,17 @@ def windowed_comparison_figure(
         binned_violin_panel(
             violins, windows, centres,
             groups=order, bin_width=bin_width, min_body_size=min_body_size, colors=colours,
-            title=f"{name} per window, by {labels.CLASS_COLUMN}",
+            title=str(name),
             ylabel=ylabel,
         )
+        # Untitled: the strip sits directly under the violins it tests, which carry the readout's
+        # name, and its y label names the statistic.
         strip = axes[2 * index + 1, 0]
         significance_strip(
             strip, centres, [row.get("p_holm", float("nan")) for row in per_window],
             alpha=float(record.get("alpha", 0.05)),
             bin_width=bin_width,
-            title=f"{name}: cohort difference per window (Kruskal-Wallis, Holm)",
+            title="",
             xlabel=xlabel,
         )
         for axis in (violins, strip):
@@ -443,7 +460,11 @@ def windowed_comparison_figure(
         for key, comparisons in (record.get("pairwise") or {}).items():
             for item in comparisons:
                 effects.append({
-                    "row": f"{name}: {item['left']} vs {item['right']}",
+                    # The readout is named by the violins above when the page has only one.
+                    "row": (
+                        f"{name}: {item['left']} vs {item['right']}" if len(readouts) > 1
+                        else f"{item['left']} vs {item['right']}"
+                    ),
                     # Readout first, then the two cohorts' places on the axis: the row order the
                     # heatmap draws, computed here because this is where both are known.
                     "rank": (
@@ -515,7 +536,7 @@ def _draw_effect_heatmap(
             field[rows.index(str(item["row"])), columns.index(float(item["centre"]))] = item["delta"]
     heatmap_with_colorbar(
         figure, ax, field,
-        title="Cliff's delta for the surviving cohort pairs",
+        title="Cliff's delta",
         symmetric=True, colorbar_label="Cliff's delta",
     )
     figures.label_rows(ax, rows)
@@ -552,6 +573,7 @@ __all__ = [
     "WINDOWS_ROW_HEIGHT",
     "binned_violin_panel",
     "configure_figure_style",
+    "drop_legend",
     "figure_filename",
     "group_colors",
     "grouped_violin_figure",

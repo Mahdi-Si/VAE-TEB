@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     CAUSAL_EXTRA_ROWS,
+    LAG_TIME_CAVEAT,
     _Stitched,
     _window_block_scores,
 )
@@ -605,18 +606,20 @@ def test_the_cancellation_row_carries_both_parts_of_the_ratio() -> None:
 # =================================================================================================
 # What the page costs the fit
 # =================================================================================================
-def test_the_captions_stay_inside_the_page() -> None:
-    """A character count is not a measurement, so the rendered width is asserted rather than
-    assumed: too generous and the caption runs off the page, which no exception reports."""
-    figure = _render(build_task(), StubBatch())
+def test_the_page_carries_one_note_line_inside_the_page() -> None:
+    """One short note under the lag rows, and the suptitle names the epoch, the recording and
+    its subgroup only. The rendered width is asserted rather than assumed: a note that runs off
+    the page raises nothing."""
+    figure = _render(build_task(), StubBatch(), cohort="healthy_bg_no_cs")
     try:
         figure.canvas.draw()
         renderer = figure.canvas.get_renderer()
-        # Every figure-level text except the two-line suptitle, which is placed by its own rule.
-        footnotes = [text for text in figure.texts if text is not figure._suptitle]
-        assert len(footnotes) == 2, "both captions must be on the page"
+        # Every figure-level text except the suptitle, which is placed by its own rule.
+        notes = [text for text in figure.texts if text is not figure._suptitle]
+        assert [text.get_text() for text in notes] == [LAG_TIME_CAVEAT]
+        assert figure._suptitle.get_text() == "epoch 0, guid guid-0, subgroup healthy_bg_no_cs"
         width = figure.get_size_inches()[0] * figure.dpi
-        for text in footnotes:
+        for text in [*notes, figure._suptitle]:
             assert text.get_window_extent(renderer).width <= width
     finally:
         plt.close(figure)

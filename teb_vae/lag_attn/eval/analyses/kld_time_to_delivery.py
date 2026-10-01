@@ -393,7 +393,7 @@ def _draw_trajectory_panel(ax: Any, trajectory: pd.DataFrame, axis: str, title: 
         )
         ax.plot(
             x, cell["median"].to_numpy(dtype=np.float64), marker="o", markersize=3,
-            color=colour, linewidth=1.4, label=f"{group} (n={int(cell['n'].sum())})",
+            color=colour, linewidth=1.4, label=str(group),
         )
     ax.set_title(title)
     ax.set_xlabel("Time before delivery (hours)")
@@ -422,11 +422,11 @@ def _write_trajectory_figure(
     try:
         _draw_trajectory_panel(
             axes[0, 0], by_class, labels.CLASS_COLUMN,
-            "Per-segment KL vs time before delivery, by clinical class",
+            "By clinical class",
         )
         _draw_trajectory_panel(
             axes[1, 0], by_subgroup, labels.SUBGROUP_COLUMN,
-            "Per-segment KL vs time before delivery, by subgroup",
+            "By subgroup",
         )
         return str(figures.render_figure(figure, directory / "trajectory"))
     finally:
@@ -451,11 +451,12 @@ def _write_significance_figure(record: Dict[str, Any], directory: Path) -> str:
     figure, axes = figures.new_figure(2, height_per_row=3.2)
     try:
         if not record.get("tested"):
+            # The reason (too few classes, no epoch field) is in the record, not on the page.
             axes[0, 0].text(
-                0.5, 0.5, record.get("reason", figures.EMPTY_NOTE), transform=axes[0, 0].transAxes,
+                0.5, 0.5, "not tested", transform=axes[0, 0].transAxes,
                 ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
             )
-            axes[0, 0].set_title("Class trajectory significance (not tested)")
+            axes[0, 0].set_title("Class difference by window")
             figures.style_axes(axes[0, 0])
             axes[1, 0].axis("off")
             return str(figures.render_figure(figure, directory / "significance"))
@@ -470,18 +471,12 @@ def _write_significance_figure(record: Dict[str, Any], directory: Path) -> str:
             [row["p_holm"] for row in record["per_bin"]],
             alpha=float(record["alpha"]),
             bin_width=float(record["bin_width_hours"]),
-            title="Class difference by time window (Kruskal-Wallis, Holm)",
+            title="Class difference by window",
             xlabel="Time before delivery (hours)",
         )
         if drawn:
             # Delivery sits at the right, so the eye reads left to right toward it.
             axes[0, 0].invert_xaxis()
-        else:
-            # The panel already says it has no finite value to draw; what only this analysis knows
-            # is *why*, and the title is where it fits without a second note beside the first.
-            axes[0, 0].set_title(
-                "Class difference by time window -- no window had two testable classes"
-            )
 
         _draw_pairwise_heatmap(figure, axes[1, 0], record)
         return str(figures.render_figure(figure, directory / "significance"))
@@ -509,7 +504,7 @@ def _draw_pairwise_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None
     if not rows:
         figures.heatmap_with_colorbar(
             figure, ax, np.zeros((0, 0)),
-            title="Cliff's delta (no window survived Holm)",
+            title="Pairwise effect size",
             symmetric=True, colorbar_label="Cliff's delta",
         )
         return
@@ -520,7 +515,7 @@ def _draw_pairwise_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None
     for row in rows:
         field[pairs.index(row["pair"]), centres.index(row["bin_center_h"])] = row["cliffs_delta"]
     figures.heatmap_with_colorbar(
-        figure, ax, field, title="Cliff's delta for surviving class pairs",
+        figure, ax, field, title="Pairwise effect size",
         symmetric=True, colorbar_label="Cliff's delta",
     )
     figures.label_rows(ax, pairs)

@@ -34,9 +34,11 @@ three coincide and the restriction costs nothing; at a negative one it costs the
 Either way all three profiles travel together.
 
 **The axis is stored-coefficient time**, and
-:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` travels under every figure here and
-in the emitted record: the coefficients come from a one-sided bank whose composed group delay is
-the same order as the lag search, so an attention peak's position is not a physiological latency.
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` travels in the emitted record, and
+every figure here carries its one-line form,
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`: the coefficients come from a
+one-sided bank whose composed group delay is the same order as the lag search, so an attention
+peak's position is not a physiological latency.
 
 The lag heatmap needs the attention weights themselves, $(T, M, L)$ per sample, and they are
 therefore retained only under ``eval_config.caps.attention``. A run that did not ask for them
@@ -398,11 +400,7 @@ def build_profile_figure(
                 profile_column(profile, "attention_untruncated", n_lags),
             ]
         ),
-        [
-            "head-averaged (raw)",
-            "head-averaged, support-corrected",
-            "head-averaged, untruncated anchors only",
-        ],
+        ["raw", "support-corrected", "untruncated"],
         title="Attention over lags",
         xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         ylabel="attention weight",
@@ -453,7 +451,7 @@ def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any])
     axis.axvspan(
         float(seconds[first]), float(seconds[-1]),
         color=figures.COLOR_LIGHT_GRAY, alpha=0.35, zorder=0,
-        label=f"lags truncated at {n_truncated} of the decoded anchors",
+        label="lags truncated",
     )
     axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
 
@@ -480,13 +478,15 @@ def build_heatmap_figure(
         row: Which retained sample to draw.
         delay_steps: The causal input delay, for the lag axis.
         geometry: The collection record's geometry block, for the time axis.
-        identity: Which recording and segment the row is -- GUID, subgroup, class and position --
-            for the title. Empty falls back to the retained row index.
+        identity: Which recording the row is -- GUID, subgroup and class -- for the figure title.
+            Empty falls back to the retained row index.
 
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(1)
+    # Taller than the shared default: the page carries a title over it and a note under it, and on
+    # the default height the field is left a sliver between them.
+    figure, axes = figures.new_figure(1, height_per_row=3.0)
     field = np.asarray(attention[row], dtype=np.float64)
     if field.ndim == 3:
         field = field.mean(axis=1)
@@ -501,10 +501,7 @@ def build_heatmap_figure(
     # the training callback's lag panels already use.
     figures.heatmap_with_colorbar(
         figure, axes[0, 0], field.T[::-1],
-        title=(
-            "Attention by anchor and lag, head-averaged: "
-            + (identity or f"retained sample row {row}")
-        ),
+        title="Head-averaged attention",
         xlabel="time in segment (s)",
         ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         symmetric=False,
@@ -528,6 +525,9 @@ def build_heatmap_figure(
             floor * step_seconds, color=figures.COLOR_BLACK,
             linewidth=figures.LINE_THIN, linestyle="--",
         )
+    # The recording is named once, over the page, because a retained row index identifies nothing
+    # outside the run.
+    figure.suptitle(identity or f"retained sample {row}")
     figures.caveat_note(figure)
     return figure
 
@@ -703,7 +703,7 @@ def _emit_heatmap(
 
 
 def retained_identity(collection: Any, quantity: str, row: int) -> str:
-    """Name the segment one retained row is: GUID, subgroup, clinical class and clock position.
+    """Name the recording one retained row is: GUID, subgroup and clinical class.
 
     Through the retained ``<quantity>_sample_index`` array, which maps a retained row onto the
     per-sample table's ``sample_index`` -- the only key a retained array carries.
@@ -714,8 +714,8 @@ def retained_identity(collection: Any, quantity: str, row: int) -> str:
         row: The retained row.
 
     Returns:
-        ``"<guid> (<subgroup>, <class>), segment starting <h> h before delivery"``, or an empty
-        string when the row cannot be traced.
+        ``"guid <guid>, subgroup <subgroup>, class <class>"``, or an empty string when the row
+        cannot be traced. A cohort the row does not carry is left out.
     """
     retained = dict(getattr(collection, "retained", None) or {})
     positions = retained.get(f"{quantity}_sample_index")
@@ -729,12 +729,9 @@ def retained_identity(collection: Any, quantity: str, row: int) -> str:
     if match.empty:
         return ""
     first = match.iloc[0]
-    cohorts = ", ".join(
-        str(first[name]) for name in ("subgroup", "clinical_class")
+    parts = [f"guid {first.get('guid', '?')}"] + [
+        f"{word} {first[name]}"
+        for word, name in (("subgroup", "subgroup"), ("class", "clinical_class"))
         if name in match.columns and isinstance(first[name], str)
-    )
-    text = str(first.get("guid", "?")) + (f" ({cohorts})" if cohorts else "")
-    epoch = pd.to_numeric(pd.Series([first.get("epoch")]), errors="coerce").iloc[0]
-    if np.isfinite(epoch):
-        text += f", segment starting {-float(epoch) / 3600.0:.2f} h before delivery"
-    return text
+    ]
+    return ", ".join(parts)

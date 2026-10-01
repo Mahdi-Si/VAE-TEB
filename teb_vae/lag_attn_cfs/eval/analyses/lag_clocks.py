@@ -62,8 +62,9 @@ shared one, and its per-recording table is already written by ``second_stage`` -
 carries the counts rather than a second copy of that table, and declares itself ``capped`` so the
 coverage block reads it as a different population by design rather than as a disagreement.
 
-**The axis is stored-coefficient time.** Every lag figure and every record here carries
-:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT`: a centroid that moves by ninety
+**The axis is stored-coefficient time.** Every record here carries
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` and every figure the one-line
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`: a centroid that moves by ninety
 seconds is a shift in the attribution over the axis the coefficients are stored on, not a
 physiological latency.
 
@@ -82,6 +83,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
+from matplotlib.lines import Line2D
 
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
@@ -385,7 +387,7 @@ class Clock:
         binner: The shared binning function for this landmark.
         bin_column: The window index column it adds.
         center_column: The window centre column travelling with it.
-        axis_label: The x-axis label, naming the sign convention outright.
+        axis_label: The x-axis label.
         inverted: Whether the axis is drawn with the landmark at the right. True for time before
             delivery, which decreases toward the event; false for the signed second-stage axis,
             which reads naturally left to right with the onset marked where it falls.
@@ -411,9 +413,8 @@ class Clock:
 
 
 #: The two clocks. The axis labels are restated here rather than imported because an analysis may
-#: not import another and ``cohort.py`` owns the arithmetic rather than the captions; the second
-#: one names its sign convention outright, because a reader who takes a negative value for "after"
-#: reads the whole trajectory backwards and nothing on the page would contradict them.
+#: not import another and ``cohort.py`` owns the arithmetic rather than the captions. The second
+#: axis is signed, negative before the onset, and the dotted line at zero marks the onset.
 CLOCKS: Tuple[Clock, ...] = (
     Clock(
         name="time_to_delivery",
@@ -432,7 +433,7 @@ CLOCKS: Tuple[Clock, ...] = (
         binner=cohort.add_second_stage_bins,
         bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
         center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
-        axis_label="Hours from second-stage onset (negative = before onset, positive = after)",
+        axis_label="Hours from second-stage onset",
         inverted=False,
         figure="lag_second_stage",
         windows_figure="lag_second_stage_windows",
@@ -1137,10 +1138,7 @@ def build_profile_figure(
             # the top of the extent -- which with an increasing seconds extent would put lag 0 at
             # the largest label and silently invert the whole panel.
             field.share[::-1],
-            title=(
-                f"{field.group}: share of the KL attribution by lag and window "
-                f"(n={int(field.n_recordings)} deliveries)"
-            ),
+            title=f"{field.group} (n = {int(field.n_recordings)})",
             ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
             symmetric=False,
             vlimits=(0.0, limit) if limit > 0.0 else None,
@@ -1166,14 +1164,71 @@ def build_profile_figure(
     for offset, feature in enumerate(READOUTS):
         _draw_trajectory_panel(
             axes[max(len(fields), 1) + offset, 0], clock, rows, feature,
-            title=f"{feature.column} against the clock, by {labels.CLASS_COLUMN}",
+            title=readout_title(feature), legend=offset == 0,
         )
     figures.caveat_note(figure)
     return figure
 
 
+#: How a profile is named on a panel or a legend: the source key is a column-name fragment.
+PROFILE_TITLES: Dict[str, str] = {"kl": "KL", "attn": "Attention"}
+
+#: A drawn statistic's panel title where the key alone would read as a column name; a key not
+#: listed is shown with its underscores spaced.
+STATISTIC_TITLES: Dict[str, str] = {
+    "iqr": "IQR", "peak": "Peak lag", "peak_degenerate": "Degenerate peaks",
+    "median": "Median lag", "skewness": "Skewness", "entropy": "Entropy",
+}
+
+
+def readout_title(feature: Feature) -> str:
+    """Name a readout as a figure shows it, for example ``KL centroid``.
+
+    Args:
+        feature: The readout.
+
+    Returns:
+        The profile's title and the statistic's key, in words.
+    """
+    return f"{PROFILE_TITLES.get(feature.source, feature.source)} {feature.statistic}"
+
+
+def statistic_title(statistic: Statistic) -> str:
+    """Name a statistic as a panel title.
+
+    Args:
+        statistic: The statistic.
+
+    Returns:
+        Its entry of :data:`STATISTIC_TITLES`, else its key with underscores spaced and the first
+        letter capitalised.
+    """
+    return STATISTIC_TITLES.get(statistic.key, statistic.key.replace("_", " ").capitalize())
+
+
+def _key_legend(ax: Any, solid: Optional[str], dashed: str) -> None:
+    """Draw the panel's one legend: the classes, then what the dashed line is.
+
+    The classes carry their own colour, so the line-style entries are neutral: a legend entry
+    coloured by one class would read as that class's alone.
+
+    Args:
+        ax: Target axes, whose labelled lines are the classes.
+        solid: Name of the solid line, or ``None`` when the panel title already names it.
+        dashed: Name of the dashed line.
+    """
+    handles, names = ax.get_legend_handles_labels()
+    for style, name in (("-", solid), ("--", dashed)):
+        if name:
+            handles.append(Line2D([], [], color=figures.COLOR_GRAY, linestyle=style,
+                                  linewidth=figures.LINE_THIN))
+            names.append(name)
+    ax.legend(handles, names, fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+
+
 def _draw_trajectory_panel(
-    ax: Any, clock: Clock, rows: Sequence[Dict[str, Any]], feature: Feature, *, title: str
+    ax: Any, clock: Clock, rows: Sequence[Dict[str, Any]], feature: Feature, *, title: str,
+    legend: bool = True,
 ) -> int:
     """Draw one readout's class trajectories: median centroid with its ribbon, and the spread.
 
@@ -1187,6 +1242,8 @@ def _draw_trajectory_panel(
         rows: This clock's trajectory rows, both features and every cohort axis.
         feature: The centroid feature to draw; its cohort's spread is drawn beside it.
         title: Panel title.
+        legend: Whether to draw the legend. It is the same on every trajectory panel of a page, so
+            the caller draws it once.
 
     Returns:
         The number of cohorts drawn. Zero draws the empty note instead.
@@ -1213,9 +1270,6 @@ def _draw_trajectory_panel(
     # From this package's one cohort palette, so a class is the same green / amber / red here as on
     # every other figure this evaluation draws of it.
     colours = figures.group_colors(groups)
-    # The dashed convention is named once rather than per cohort: three more legend entries saying
-    # the same thing would cover the lines the panel exists to show.
-    spread_labelled = False
     for group in groups:
         cell = sorted(
             (row for row in centroid_rows if row["group"] == group),
@@ -1234,7 +1288,7 @@ def _draw_trajectory_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} centroid (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
+            label=str(group),
         )
         for row in cell:
             ax.annotate(
@@ -1252,9 +1306,7 @@ def _draw_trajectory_panel(
                 np.array([row["bin_center_h"] for row in spread_cell], dtype=np.float64),
                 np.array([row["median"] for row in spread_cell], dtype=np.float64),
                 linestyle="--", color=colour, linewidth=figures.LINE_THIN,
-                label="median spread (dashed)" if not spread_labelled else "_nolegend_",
             )
-            spread_labelled = True
     ax.set_title(title)
     ax.set_xlabel(clock.axis_label)
     ax.set_ylabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
@@ -1265,7 +1317,8 @@ def _draw_trajectory_panel(
         ax.axvline(
             0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
         )
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    if legend:
+        _key_legend(ax, None, "spread")
     figures.style_axes(ax)
     return len(groups)
 
@@ -1294,7 +1347,7 @@ def build_windows_figure(
         # Aligned with the record's own window list by construction rather than by agreement, so a
         # window the test skipped cannot shift the cells drawn under the windows after it.
         order = [int(row["time_bin"]) for row in record.get("per_window") or []]
-        readouts.append((feature.column, [samples.get(key, {}) for key in order], record))
+        readouts.append((readout_title(feature), [samples.get(key, {}) for key in order], record))
 
     figure = figures.windowed_comparison_figure(
         readouts,
@@ -1355,7 +1408,8 @@ def build_features_figure(clock: Clock, rows: Sequence[Dict[str, Any]]) -> Any:
             rows,
             statistic,
             annotate=PANEL_ANNOTATIONS.get(statistic.key),
-            title=f"{statistic.key} against the clock, by {labels.CLASS_COLUMN}",
+            title=statistic_title(statistic),
+            legend=index == 0,
         )
     figures.caveat_note(figure)
     return figure
@@ -1369,6 +1423,7 @@ def _draw_feature_panel(
     *,
     annotate: Optional[str],
     title: str,
+    legend: bool = True,
 ) -> int:
     """Draw one statistic's class trajectories, both profiles on one axis.
 
@@ -1381,6 +1436,8 @@ def _draw_feature_panel(
             the primary profile's line, or ``None``. Used for the peak, whose position means
             nothing in a window where most segments were degenerate.
         title: Panel title.
+        legend: Whether to draw the legend. It is the same on every panel of a page, so the caller
+            draws it once.
 
     Returns:
         The number of cohorts drawn. Zero draws the empty note instead.
@@ -1417,9 +1474,6 @@ def _draw_feature_panel(
         return 0
 
     colours = figures.group_colors(groups)
-    # The dashed convention is named once rather than per cohort: three more legend entries saying
-    # the same thing would cover the lines the panel exists to show.
-    companion_labelled = False
     for group in groups:
         cell = sorted(
             (row for row in primary_rows if row["group"] == group),
@@ -1438,7 +1492,7 @@ def _draw_feature_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} {primary.key} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
+            label=str(group),
         )
         companion_cell = sorted(
             (row for row in companion_rows if row["group"] == group),
@@ -1449,9 +1503,7 @@ def _draw_feature_panel(
                 np.array([row["bin_center_h"] for row in companion_cell], dtype=np.float64),
                 np.array([row["median"] for row in companion_cell], dtype=np.float64),
                 linestyle="--", color=colour, linewidth=figures.LINE_THIN,
-                label=f"{companion.key} (dashed)" if not companion_labelled else "_nolegend_",
             )
-            companion_labelled = True
         if annotated_rows:
             # Keyed on the window rather than zipped, so a window one statistic could not be
             # computed in cannot shift every annotation after it onto the wrong point.
@@ -1481,7 +1533,8 @@ def _draw_feature_panel(
         ax.axvline(
             0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
         )
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    if legend:
+        _key_legend(ax, "KL", "attention")
     figures.style_axes(ax)
     return len(groups)
 

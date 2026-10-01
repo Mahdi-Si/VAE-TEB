@@ -1264,7 +1264,7 @@ lives at short lags would publish the longest lags as the important ones. There 
 named `most_damaging_band`; that phrase has no correct reading under a keep-mask. The summary
 reports both ends explicitly — `most_sufficient_band` ($\min$ of `feat_mse_delta`) and
 `least_sufficient_band` ($\max$) — plus a `semantics` string that travels with the numbers and
-spells the reading out. Both figure titles read "with ONLY this lag band kept".
+spells the reading out. Both figure titles end "band kept alone".
 
 **Necessity is not measured anywhere in this pipeline.** It would need a keep-mask over the band's
 *complement*, and no analysis constructs one.

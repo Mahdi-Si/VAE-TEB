@@ -20,22 +20,22 @@ from teb_vae.lag_attn.plotting import (  # noqa: E402
     _build_diagnostic_figure,
 )
 
-# The fixed prefix of every row title, in top-to-bottom order, for a batch that carries raw signals
-# and up_st. Dynamic tails (d_z, L, H_d, channel counts, vmax) are excluded so the check pins the
-# panel identity without pinning a runtime number.
+# The prefix of every row title, in top-to-bottom order, for a batch that carries raw signals and
+# up_st. The titles name the quantity only, so this pins the panel identity and its order; the
+# shapes (block widths, channel counts) are checked from the tensors where they are drawn.
 _TITLE_PREFIXES_WITH_RAW = (
     "Raw FHR / UP signals",
-    "FHR features — scattering (rows 0-",
-    "UP features — scattering (rows 0-",
-    "Latent z (d_z=",
-    "Posterior vs Prior means (TEB residual = posterior − prior)",
-    "KLD per latent dim (d_z=",
-    "Total KL per timestep vs mean attention entropy",
-    "Lag attention — mean over ",
-    "TE lag attribution (KL × mean-α) — p99-clipped ",
-    "TE lag attribution — column-normalised ",
-    "Average forecast μ_full — overlap-averaged per-anchor ",
-    "Single-horizon forecast μ_full — non-overlapping ",
+    "FHR features",
+    "UP features",
+    "Latent $z$",
+    "Posterior and prior mean",
+    "KL per latent dim",
+    "KL and attention entropy",
+    "Lag attention",
+    "TE lag attribution",
+    "Column-normalised TE attribution",
+    "Overlap-averaged forecast",
+    "Non-overlapping forecast",
 )
 
 
@@ -90,27 +90,29 @@ def _build(model, outs, tensors, *, up_st, fhr_raw, up_raw):
     return fig
 
 
-def test_the_feature_row_ranges_are_derived_from_the_tensors(prod_kwargs):
-    """The row ranges in the two heatmap titles must come from the data, not from a literal.
+def test_the_feature_blocks_are_named_at_their_centres_from_the_tensor_widths(prod_kwargs):
+    """The block names on the two heatmaps must sit where the tensors put the blocks, not where a
+    literal does.
 
-    They were literals once ("rows 43-86", "rows 43-100") and went stale when the dataset's
-    phase-harmonic selection changed the widths -- a heatmap mislabelling 15 rows as "43-100" is
-    invisible in a loss curve. ``_TITLE_PREFIXES_WITH_RAW`` deliberately pins only the static
-    part of these titles, so this is the test that would catch a re-hardcoded range.
+    The row ranges were literals once ("rows 43-86", "rows 43-100") and went stale when the
+    dataset's phase-harmonic selection changed the widths -- a heatmap mislabelling 15 rows as
+    "43-100" is invisible in a loss curve. The blocks are now named on the y axis at each block's
+    centre row, derived from the widths, and this is the test that would catch a re-hardcoded one.
     """
     model, outs, tensors = _forward(prod_kwargs)
     y_st, y_ph, up_st, up_ph = tensors[0], tensors[1], tensors[2], tensors[3]
     fig = _build(model, outs, tensors, up_st=True, fhr_raw=True, up_raw=True)
     try:
-        titles = [ax.get_title() for ax in _titled_axes(fig)]
-        st, c_y = y_st.shape[-1], y_st.shape[-1] + y_ph.shape[-1]
-        up_st_ch, c_u = up_st.shape[-1], up_st.shape[-1] + up_ph.shape[-1]
-        fhr_expected = f"scattering (rows 0-{st - 1})  |  phase (rows {st}-{c_y - 1})"
-        up_expected = (
-            f"scattering (rows 0-{up_st_ch - 1})  |  self-phase (rows {up_st_ch}-{c_u - 1})"
-        )
-        assert any(fhr_expected in t for t in titles), f"{fhr_expected!r} not in {titles}"
-        assert any(up_expected in t for t in titles), f"{up_expected!r} not in {titles}"
+        rows = {ax.get_title(): ax for ax in _titled_axes(fig)}
+        st, ph = int(y_st.shape[-1]), int(y_ph.shape[-1])
+        up_st_ch, up_ph_ch = int(up_st.shape[-1]), int(up_ph.shape[-1])
+        for title, names, (first, second) in (
+            ("FHR features", ["scattering", "phase"], (st, ph)),
+            ("UP features", ["scattering", "self-phase"], (up_st_ch, up_ph_ch)),
+        ):
+            ax = rows[title]
+            assert [t.get_text() for t in ax.get_yticklabels()] == names
+            assert list(ax.get_yticks()) == [0.5 * (first - 1), first + 0.5 * (second - 1)]
     finally:
         plt.close(fig)
 
@@ -143,13 +145,14 @@ def test_the_raw_row_drops_out_when_raw_signals_are_absent(prod_kwargs):
         plt.close(fig)
 
 
-def test_the_up_feature_title_collapses_without_up_st(prod_kwargs):
-    """With up_st absent the UP row shows self-phase only and says so."""
+def test_the_up_feature_row_names_self_phase_alone_without_up_st(prod_kwargs):
+    """With up_st absent the UP row shows the self-phase block only and names just that block."""
     model, outs, tensors = _forward(prod_kwargs)
     fig = _build(model, outs, tensors, up_st=False, fhr_raw=True, up_raw=True)
     try:
-        up_titles = [ax.get_title() for ax in _titled_axes(fig) if ax.get_title().startswith("UP features")]
-        assert up_titles == ["UP features — self-phase only (up_st absent)"]
+        up = [ax for ax in _titled_axes(fig) if ax.get_title() == "UP features"]
+        assert len(up) == 1
+        assert [t.get_text() for t in up[0].get_yticklabels()] == ["self-phase"]
     finally:
         plt.close(fig)
 
@@ -192,9 +195,10 @@ def test_the_companion_covers_every_channel_and_finds_the_worst(prod_kwargs):
         kld_shuffled_scalar=0.01,
     )
     try:
-        titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
-        assert any(f"across all {c_y} channels" in t for t in titles), titles
-        assert any(f"worst: ch {sabotaged}" in t for t in titles), titles
-        assert any(f"worst channel {sabotaged}" in t for t in titles), titles
+        panels = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
+        # Every channel is scored: one histogram count and one line point per channel.
+        assert sum(p.get_height() for p in panels["Coverage distribution"].patches) == c_y
+        assert panels["Coverage by channel"].lines[0].get_xdata().size == c_y
+        assert any(t.startswith(f"Worst channel {sabotaged},") for t in panels), list(panels)
     finally:
         plt.close(fig)

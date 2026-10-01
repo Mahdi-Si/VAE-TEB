@@ -392,25 +392,27 @@ def _write_figures(frame: pd.DataFrame, directory: Path) -> list:
     """
     ablated = frame[frame["band"] != BASELINE_NAME].sort_values("lag_lo").reset_index(drop=True)
     positions = np.arange(len(ablated))
-    # Dual labelling: the model-lag band is what the tensor is indexed by, the physical seconds
-    # are what a reader wants, and the excluded-anchor count is what makes the bars comparable.
+    # Dual labelling: the model-lag band is what the tensor is indexed by and the seconds are what
+    # a reader wants. The excluded-anchor count that makes the bars comparable is in
+    # ``summary.json`` (``anchors_excluded``), not on the axis.
     labels = [
         f"{row.band}\n$\\ell$ {int(row.lag_lo)}-{int(row.lag_hi)}\n"
-        f"{row.seconds_lo:.0f}-{row.seconds_hi:.0f} s\n"
-        f"({int(row.anchors_excluded)} anchors given up)"
+        f"{row.seconds_lo:.0f}-{row.seconds_hi:.0f} s"
         for row in ablated.itertuples()
     ]
 
     paths = []
+    # "Kept alone" is the load-bearing phrase: the mask keeps a band rather than removing it, so a
+    # short bar means the band alone suffices (``FIGURE_GUIDE.md``).
     for filename, column, title, ylabel, color in (
         (
             "forecast_degradation", "feat_mse_delta",
-            "Forecast degradation with ONLY this lag band kept (lower = this band alone suffices)",
+            "Forecast MSE, band kept alone",
             "$\\Delta$ feature MSE vs unmasked", figures.COLOR_VERMILLION,
         ),
         (
             "kl_change", "kld_delta",
-            "Change in $K_t$ with ONLY this lag band kept, recomputed on the common support",
+            "$K_t$ change, band kept alone",
             "$\\Delta$ KL (nats)", figures.COLOR_PURPLE,
         ),
     ):
@@ -431,14 +433,6 @@ def _write_figures(frame: pd.DataFrame, directory: Path) -> list:
             ax.set_xticklabels(labels, fontsize=6)
             ax.set_title(title)
             ax.set_ylabel(ylabel)
-            ax.text(
-                0.5, 0.98,
-                f"All bands and the unmasked baseline scored on the same "
-                f"{int(ablated['anchors_scored'].iloc[0]) if len(ablated) else 0} anchors; "
-                f"lag axis is the stored timeline, {metrics.STEP_SECONDS:g} s per lag.",
-                transform=ax.transAxes, ha="center", va="top", fontsize=6,
-                color=figures.COLOR_GRAY,
-            )
             figures.style_axes(ax)
             paths.append(str(figures.render_figure(figure, directory / filename)))
         finally:

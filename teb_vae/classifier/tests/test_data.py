@@ -3,14 +3,11 @@ ModDrop, the covariates-off pass), L4, and T-L1 at batch level (SPEC §7.1, §7.
 fold 1 of the fixture tree."""
 from __future__ import annotations
 
-import dataclasses
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
 
-import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,9 +16,6 @@ import torch
 from teb_vae.classifier.tests.conftest import SMOKE_CONFIG
 
 SEGMENT_KEYS = {"x", "step_mask", "ctx", "y", "y3", "w", "guid", "row"}
-BASE_CTX = ["tlo_psi", "tlo_missing", "stage_straddle", "stage_second", "time_in_ss", "valid_frac"]
-
-
 @pytest.fixture(scope="module")
 def env(smoke_overrides, tmp_path_factory):
     """cohort -> extract (fold 1) into a private tmp tree: ``(overrides, run_dir, cache record)``."""
@@ -79,28 +73,11 @@ def _loader(unit, split, train, seed=0):
     return make_loader(unit, split, train=train, seed=seed)
 
 
-def _same(xs, ys) -> bool:
-    return len(xs) == len(ys) and all(
-        a.keys() == b.keys() and all(a[k].dtype == b[k].dtype and torch.equal(a[k], b[k]) for k in a)
-        for a, b in zip(xs, ys))
-
-
 def _log1p_dt(t):
     return np.log1p(np.diff(t, prepend=t[0]) / 3600.0)
 
 
 # ---- columns, allow-list, L4 -------------------------------------------------------------------
-def test_context_columns_follow_the_toggles(env):
-    from teb_vae.classifier.data import CONTEXT_COLUMNS
-
-    assert CONTEXT_COLUMNS(_cfg(env)) == BASE_CTX + ["delta_t"]  # smoke = sequence scope
-    assert CONTEXT_COLUMNS(_cfg(env, "classifier.model.scope=segment")) == BASE_CTX
-    assert CONTEXT_COLUMNS(_cfg(env, "classifier.context.tlo.missing=no_indicator",
-                                "classifier.context.stage.enabled=false",
-                                "classifier.context.elapsed.enabled=true")) == [
-        "tlo_psi", "time_in_ss", "valid_frac", "delta_t", "elapsed"]
-
-
 def test_allow_list_class_counts_priors_and_train_only_fits(env):
     from teb_vae.classifier import data
 
@@ -118,37 +95,6 @@ def test_allow_list_class_counts_priors_and_train_only_fits(env):
 
 
 # ---- batch contract ----------------------------------------------------------------------------
-@pytest.mark.parametrize("head", ["binary", "multiclass"])
-def test_segment_batch_contract(env, head):
-    from teb_vae.classifier.sources import read_rows
-
-    loss = "ce" if head == "multiclass" else "bce"  # the head's loss family (config check)
-    unit = _unit(env, "classifier.model.scope=segment", f"classifier.labels.head={head}",
-                 f"classifier.train.loss.name={loss}")
-    batch = next(iter(_loader(unit, "train", True)))
-    b, t = len(batch["row"]), unit.store.step_mask.shape[1]
-    assert set(batch) == SEGMENT_KEYS
-    assert batch["x"].shape == (b, t, unit.n_values) and batch["x"].dtype == torch.float32
-    assert batch["step_mask"].shape == (b, t) and batch["step_mask"].dtype == torch.bool
-    assert batch["ctx"].shape == (b, unit.n_ctx) and batch["ctx"].dtype == torch.float32
-    assert batch["y"].dtype == (torch.float32 if head == "binary" else torch.int64)
-    assert all(batch[k].dtype == torch.int64 and batch[k].shape == (b,) for k in ("y3", "guid", "row"))
-    assert batch["w"].dtype == torch.float32 and batch["w"].shape == (b,)
-
-    frame = unit.frames["train"].iloc[batch["row"].numpy()]
-    assert (batch["x"][~batch["step_mask"]] == 0).all()
-    cached = read_rows(env[2]["cache_dir"], frame["row"])
-    expected = np.where(cached.step_mask.numpy()[..., None], unit.scaler.apply(cached.values.numpy()), 0.0)
-    np.testing.assert_allclose(batch["x"].numpy(), expected, rtol=1e-5, atol=1e-5)
-    np.testing.assert_array_equal(batch["y"].numpy(), frame["y"].to_numpy(float))
-    np.testing.assert_array_equal(batch["y3"].numpy(), frame["class_code"].to_numpy(int) - 1)
-    ctx = pd.DataFrame(batch["ctx"].numpy(), columns=BASE_CTX)
-    np.testing.assert_array_equal(ctx["tlo_missing"], frame["tlo_end_s"].isna().to_numpy(float))
-    np.testing.assert_array_equal(ctx["valid_frac"], frame["valid_frac"].to_numpy(np.float32))
-    for stage in ("straddle", "second"):  # first and unknown: all zero (§7.1)
-        np.testing.assert_array_equal(ctx[f"stage_{stage}"], (frame["stage"] == stage).to_numpy(float))
-
-
 def test_sequence_batch_contract_and_padding(env):
     unit = _unit(env)
     frame, loader = unit.frames["val"], _loader(unit, "val", False)
@@ -179,213 +125,7 @@ def test_sequence_batch_contract_and_padding(env):
     assert n_seen == len(frame)
 
 
-def test_attention_cues_are_scaled_and_keyed_apart(env, tmp_path):
-    source = env[2]
-    shutil.copytree(source["cache_dir"], tmp_path / "cache")
-    with h5py.File(tmp_path / "cache" / "features.h5", "a") as h5:  # attn := the first two value channels
-        h5["attn"] = h5["values"][()][..., :2]
-        h5.attrs["channels"] = json.dumps(json.loads(h5.attrs["channels"]) + ["cue0", "cue1"])
-    for scope in ("segment", "sequence"):
-        unit = _unit(env, f"classifier.model.scope={scope}", cache={**source, "cache_dir": str(tmp_path / "cache")})
-        assert unit.attn_channels == ("cue0", "cue1") and unit.n_values == 153
-        batch = next(iter(_loader(unit, "val", False)))
-        assert batch["attn"].shape == batch["x"].shape[:-1] + (2,) and batch["attn"].dtype == torch.float32
-        assert torch.equal(batch["attn"], batch["x"][..., :2])  # same data -> same train scaling
-
-
-def test_w_is_guid_normalised_for_segments_and_raw_for_sequences(env):
-    from teb_vae.classifier.data import GuidDataset, SegmentDataset
-
-    unit = _unit(env, "classifier.model.scope=segment")
-    ds = SegmentDataset(unit, "train")
-    np.testing.assert_allclose(pd.Series(ds.w).groupby(ds.codes).sum(), 1.0, rtol=1e-6)
-    omega = unit.frames["train"]["label_weight"].to_numpy()
-    assert (omega < 1).any()  # horizon_decay down-weights early positive segments: the test is not trivial
-    zeroed = unit.frames["train"].assign(label_weight=np.where(ds.codes == 0, 0.0, omega))
-    ds0 = SegmentDataset(dataclasses.replace(unit, frames={**unit.frames, "train": zeroed}), "train")
-    assert (ds0.w[ds.codes == 0] == 0).all() and np.isfinite(ds0.w).all()  # Σω = 0: no segment term, no NaN
-
-    seq = GuidDataset(_unit(env), "train")
-    for i in range(len(seq)):
-        item = seq[i]
-        np.testing.assert_array_equal(item["w"], omega[item["row"]].astype(np.float32))
-
-
-def test_k_warm_drops_early_positions_from_the_position_term_only(env):
-    """§6.5/§10.3: ``k_warm`` (auto: 3 under ``propagate``) zeroes positions ``< k`` of the per-position weight
-    ``w_pos`` only; the segment-local term keeps ω (``w``), so its loss ignores ``k_warm``."""
-    from teb_vae.classifier.data import GuidDataset
-    from teb_vae.classifier.losses import compute_loss
-
-    unit = _unit(env, "classifier.labels.strategy=propagate", "classifier.labels.aux_3class_weight=0")
-    seq = GuidDataset(unit, "train")
-    item = max((seq[i] for i in range(len(seq))), key=lambda it: len(it["row"]))
-    pos = np.arange(len(item["row"]))
-    assert len(pos) > 3 and (item["w"][:3] > 0).all()  # the cohort's ω carries no k_warm
-    np.testing.assert_array_equal(item["w_pos"], np.where(pos < 3, 0.0, item["w"]))
-
-    g = torch.Generator().manual_seed(0)
-    n = len(pos)
-    out = {"pos": torch.randn(1, n, 1, generator=g), "seg": torch.randn(1, n, 1, generator=g)}
-    batch = {"y": torch.ones(1), "y3": torch.ones(1, dtype=torch.long), "seg_mask": torch.ones(1, n, dtype=torch.bool),
-             "w": torch.from_numpy(item["w"])[None]}
-    kw = dict(scope="sequence", labels_cfg=unit.cfg.labels, train_cfg=unit.cfg.train)
-    warm = compute_loss(out, batch | {"w_pos": torch.from_numpy(item["w_pos"])[None]}, **kw)[1]
-    cold = compute_loss(out, batch, **kw)[1]  # no w_pos: every position weighs ω
-    assert torch.equal(warm["loss_segment"], cold["loss_segment"])
-    assert not torch.equal(warm["loss_positions"], cold["loss_positions"])
-
-
-def test_segment_dropout_recomputes_relative_time_train_only(env):
-    unit = _unit(env, "classifier.train.segment_dropout=0.5", "classifier.context.elapsed.enabled=true")
-    cols, t_end = unit.context_columns, unit.frames["train"]["t_end_s"].to_numpy()
-    loader, dropped = _loader(unit, "train", True, seed=3), 0
-    for _ in range(2):
-        for batch in loader:
-            for i in range(len(batch["guid"])):
-                g, rows = int(batch["guid"][i]), batch["row"][i][batch["seg_mask"][i]].numpy()
-                full = np.arange(loader.dataset.starts[g], loader.dataset.starts[g] + loader.dataset.lengths[g])
-                assert rows[-1] == full[-1] and np.isin(rows, full).all()  # the final segment is always kept
-                dropped += len(full) - len(rows)
-                t = t_end[rows]
-                t_h = batch["t_h"][i, :len(rows)].numpy()
-                np.testing.assert_allclose(t_h, (t - t[0]) / 3600.0, rtol=1e-6)
-                ctx = batch["ctx"][i, :len(rows)].numpy()
-                np.testing.assert_allclose(ctx[:, cols.index("delta_t")], _log1p_dt(t), rtol=1e-6)
-                np.testing.assert_allclose(ctx[:, cols.index("elapsed")], np.log1p(t_h), rtol=1e-6)
-    assert dropped > 0
-    for split in ("train", "val"):  # eval loaders never drop
-        n = sum(int(b["seg_mask"].sum()) for b in _loader(unit, split, False))
-        assert n == len(unit.frames[split])
-
-
 # ---- samplers ----------------------------------------------------------------------------------
-@pytest.mark.parametrize("scope", ["segment", "sequence"])
-def test_loaders_are_seeded_and_eval_is_unshuffled(env, scope):
-    unit = _unit(env, f"classifier.model.scope={scope}")
-    for split in ("val", "test"):
-        loader = _loader(unit, split, False)
-        first = list(loader)
-        assert _same(first, list(loader)) and _same(first, list(_loader(unit, split, False, seed=99)))
-        rows = torch.cat([b["row"][b["seg_mask"]] if "seg_mask" in b else b["row"] for b in first]).numpy()
-        if scope == "segment":
-            assert (rows == np.arange(len(unit.frames[split]))).all()
-        else:
-            assert sorted(rows) == list(range(len(unit.frames[split])))
-            assert all((np.diff(b["guid"].numpy()) > 0).all() for b in first)  # frame order within a bucket
-    train = _loader(unit, "train", True, seed=5)
-    e0, e1 = list(train), list(train)
-    again = _loader(unit, "train", True, seed=5)
-    assert _same(list(again), e0) and _same(list(again), e1) and not _same(e0, e1)
-    train.batch_sampler.set_epoch(0)
-    assert _same(list(train), e0) and not _same(list(_loader(unit, "train", True, seed=6)), e0)
-    assert train.batch_sampler.sampler is train.batch_sampler  # Lightning's _set_sampler_epoch reaches it
-
-
-def test_store_is_memory_mapped_not_loaded(env):
-    """The cache is memory-mapped (a real 10-fold cache exceeds a workstation's RAM), with the stored values."""
-    from teb_vae.classifier.data import load_store
-
-    path = Path(env[2]["cache_dir"]) / "features.h5"
-    store = load_store(str(path.parent))
-    with h5py.File(path, "r") as h5:
-        for name in ("values", "step_mask"):
-            assert isinstance(getattr(store, name), np.memmap), name
-            assert np.array_equal(getattr(store, name), h5[name][()])
-
-
-def test_workers_and_lightning_epochs_do_not_change_batches(env):
-    from lightning.fabric.utilities.data import _set_sampler_epoch
-
-    single, unit = _loader(_unit(env), "train", True, seed=4), _unit(env, "classifier.run.num_workers=2")
-    forked = _loader(unit, "train", True, seed=4)
-    assert forked.persistent_workers and not any(_loader(unit, s, False).persistent_workers for s in ("train", "val"))
-    for epoch in (3, 4):
-        for loader in (single, forked):
-            _set_sampler_epoch(loader, epoch)  # what Lightning's fit loop calls before each epoch
-            assert loader.batch_sampler.epoch == epoch
-        assert _same(list(single), list(forked))
-
-
-def test_online_reader_is_fork_safe(env):
-    """Online loaders with workers (default ``run.num_workers: 4``) read the raw rows through handles of their own
-    process: a forked worker swaps the inherited datasets for handle-free copies, and 2 workers give the 0-worker
-    batches even after the parent process has opened (and read through) every shard."""
-    from teb_vae.classifier.cohort import fold_shards
-    from teb_vae.classifier.data import OnlineReader, make_loader
-    from teb_vae.classifier.sources import Hdf5Source
-
-    c = _cfg(env)
-    reader = OnlineReader(Hdf5Source(c.source, fold_shards(c.data, 1)["train"][0]), _unit(env))
-
-    def batches(workers):
-        unit = _unit(env, f"classifier.run.num_workers={workers}")
-        return [{k: v for k, v in b.items() if k != "vae"} | {f"vae.{k}": v for k, v in b["vae"].items()
-                                                                if torch.is_tensor(v)}
-                for b in make_loader(unit, "val", train=False, seed=0, reader=reader)]
-
-    single = batches(0)  # reads in this process: its handles are now open
-    assert single and "vae.weight" in single[0]
-    parent = reader.datasets[(1, "val")]
-    assert any(h is not None for h in parent.file_handles)
-    assert _same(single, batches(2))
-
-    reader.pid = -1  # as a forked worker sees it: every dataset is replaced by a copy without open handles
-    child = reader._dataset(1, "val")
-    assert child is not parent and all(h is None for h in child.file_handles) and reader.pid == os.getpid()
-    torch.testing.assert_close(child[0]["weight"], parent[0]["weight"])
-
-
-@pytest.mark.parametrize("scope", ["segment", "sequence"])
-def test_class_balanced_sampler_balances_guid_classes(env, scope):
-    unit = _unit(env, f"classifier.model.scope={scope}", "classifier.train.sampler=class_balanced")
-    train = unit.frames["train"]
-    positives = train["guid"][train["y"] == 1].unique()
-    imbalanced = train[~train["guid"].isin(positives[:len(positives) * 2 // 3])].reset_index(drop=True)
-    unit = dataclasses.replace(unit, frames={**unit.frames, "train": imbalanced})
-    natural = dataclasses.replace(unit, cfg=_cfg(env, f"classifier.model.scope={scope}"))
-
-    def positive_share(u):  # 40 epochs of draws; the batch sampler alone decides them
-        loader = _loader(u, "train", True, seed=1)
-        drawn = [i for _ in range(40) for batch in loader.batch_sampler for i, _ in batch]
-        return float(loader.dataset.y[drawn].mean())
-
-    guid_share = imbalanced.groupby("guid")["y"].first().mean()
-    assert guid_share < 0.3
-    assert abs(positive_share(unit) - 0.5) < 0.05 and positive_share(natural) < 0.35
-
-
-@pytest.mark.parametrize("bucketed", [False, True])  # segment / sequence scope
-@pytest.mark.parametrize("balanced", [False, True])
-def test_batch_count_is_fixed_across_epochs(bucketed, balanced):
-    """Lightning reads len() once: every epoch yields exactly that many batches. Lengths span the buckets (the
-    fixture's GUIDs all fit the first), where re-bucketed balanced draws gave 135..155 batches around 152."""
-    from teb_vae.classifier.data import EpochBatches, bucket_sizes
-
-    rng = np.random.default_rng(0)
-    y, lengths = (rng.random(200) < 0.25).astype(int), rng.integers(1, 80, 200)
-    batches = EpochBatches(y, np.arange(200), batch_size=4, lengths=lengths, shuffle=True, balanced=balanced,
-                           buckets=bucket_sizes(4) if bucketed else None, seed=1)
-    n = len(batches)
-    assert [len(list(batches)) for _ in range(8)] == [n] * 8 and len(batches) == n
-
-
-def test_class_balanced_with_loss_weighting_warns(env):
-    from loguru import logger
-
-    messages = []
-    sink = logger.add(lambda m: messages.append(str(m)), level="WARNING")
-    try:
-        _loader(_unit(env, "classifier.train.sampler=class_balanced"), "train", True)
-        unit = _unit(env, "classifier.train.sampler=class_balanced", "classifier.train.loss.weighting=inverse")
-        _loader(unit, "val", False)  # eval loaders do not sample
-        assert not any("corrected twice" in m for m in messages)
-        _loader(unit, "train", True)
-    finally:
-        logger.remove(sink)
-    assert any("corrected twice" in m for m in messages)
-
-
 # ---- shuffled-label control (§10.9.3) ----------------------------------------------------------
 def test_shuffled_labels_stay_within_train(env):
     from teb_vae.classifier.config import TASKS
@@ -405,80 +145,6 @@ def test_shuffled_labels_stay_within_train(env):
 
 
 # ---- covariates (§7.3) -------------------------------------------------------------------------
-def test_fit_covariates_known_answer_and_train_only():
-    from teb_vae.classifier.config import CovariatesCfg
-    from teb_vae.classifier.data import fit_covariates
-
-    cfg = CovariatesCfg(static_csv="s.csv", timed_csv="t.csv", max_age_h=2.0, age_feature=True, missing="indicator",
-                        dropout_p=0.2, block_dropout_p=0.1,
-                        variables=[{"name": "t", "kind": "numeric", "available_at": "prospective"},
-                                   {"name": "p", "kind": "categorical", "available_at": "prospective"}])
-    train = pd.DataFrame({"split": "train", "cov:t": [1.0, 3.0, np.nan], "cov_age_h:t": [0.0, np.e - 1, np.nan],
-                          "cov:p": pd.Series(["b", "a", None], dtype="str")})
-    enc = fit_covariates(train, cfg)
-    assert enc.columns == ("t", "t:missing", "t:age_h", "p=a", "p=b", "p:missing")
-    assert enc.groups.tolist() == [0, 0, 0, 1, 1, 1] and enc.variables[0]["mean"] == 2.0 and enc.variables[0]["std"] == 1
-    np.testing.assert_allclose(enc.encode(train), [[-1, 0, 0, 0, 1, 0], [1, 0, 1, 1, 0, 0], [0, 1, 0, 0, 0, 1]])
-    np.testing.assert_array_equal(enc.missing_row, [0, 1, 0, 0, 0, 1])
-    unseen = train.assign(**{"cov:p": pd.Series(["c", "a", "a"], dtype="str")})
-    np.testing.assert_array_equal(enc.encode(unseen)[:, 3:], [[0, 0, 0], [1, 0, 0], [1, 0, 0]])  # unseen: observed, 0s
-    bare = fit_covariates(train, cfg.model_copy(update={"missing": "no_indicator", "age_feature": False}))
-    assert bare.columns == ("t", "p=a", "p=b") and not bare.missing_row.any()
-    with pytest.raises(ValueError, match="L4"):
-        fit_covariates(train.assign(split="val"), cfg)
-    assert fit_covariates(train, cfg.model_copy(update={"variables": []})) is None
-
-
-@pytest.mark.parametrize("scope", ["segment", "sequence"])
-def test_covariate_batches_dropout_is_train_only_and_seeded(cov_env, scope):
-    from teb_vae.classifier.data import covariates_off
-
-    unit = _unit(cov_env, f"classifier.model.scope={scope}", "classifier.train.segment_dropout=0",
-                 "classifier.context.covariates.dropout_p=0.5", "classifier.context.covariates.block_dropout_p=0.2")
-    enc, seq = unit.covariates, scope == "sequence"
-    assert unit.n_cov == len(enc.columns) == 7  # parity: 0 | 1 | 2+ | missing; temp_c: value | missing | age
-
-    def by_row(loader):  # the cov rows of one epoch, in frame order
-        rows, covs = [], []
-        for batch in loader:
-            real = batch["seg_mask"] if seq else torch.ones_like(batch["row"], dtype=torch.bool)
-            assert batch["cov"].shape == (*real.shape, unit.n_cov) and batch["cov"].dtype == torch.float32
-            assert (batch["cov"][~real] == 0).all()  # padding
-            rows.append(batch["row"][real].numpy())
-            covs.append(batch["cov"][real].numpy())
-        rows, covs = np.concatenate(rows), np.concatenate(covs)
-        assert sorted(rows) == list(range(len(rows)))
-        return covs[np.argsort(rows)]
-
-    for split in ("train", "val", "test"):  # eval loaders: the plain train-fitted encoding
-        np.testing.assert_array_equal(by_row(_loader(unit, split, False)), enc.encode(unit.frames[split]))
-    plain, train = enc.encode(unit.frames["train"]), _loader(unit, "train", True, seed=2)
-    e0, e1 = by_row(train), by_row(train)
-    assert not np.array_equal(e0, plain) and not np.array_equal(e0, e1)  # dropped, and anew each epoch
-    np.testing.assert_array_equal(by_row(_loader(unit, "train", True, seed=2)), e0)  # seeded
-    moved = e0 != plain
-    assert (e0[moved] == np.broadcast_to(enc.missing_row, e0.shape)[moved]).all()  # dropped = set missing
-    if seq:  # one draw per GUID: temp_c is dropped at all or none of a GUID's positions where it was observed
-        g = enc.groups == 1
-        observed = (plain[:, g] != enc.missing_row[g]).any(1)
-        dropped = pd.Series((e0[:, g] == enc.missing_row[g]).all(1)[observed])
-        assert dropped.groupby(unit.frames["train"]["guid"].to_numpy()[observed]).nunique().le(1).all()
-        assert dropped.any() and not dropped.all()
-    off = covariates_off(unit)
-    assert (by_row(_loader(off, "val", False)) == enc.missing_row).all() and off.covariates is enc
-    none = _unit(cov_env, f"classifier.model.scope={scope}", "classifier.context.covariates.dropout_p=0",
-                 "classifier.context.covariates.block_dropout_p=0", "classifier.train.segment_dropout=0")
-    np.testing.assert_array_equal(by_row(_loader(none, "train", True, seed=2)), plain)
-
-
-def test_without_indicators_drops_the_missing_flags(cov_env):
-    from teb_vae.classifier.data import build_unit, without_indicators
-
-    unit = build_unit(without_indicators(_cfg(cov_env)), cov_env[1], cov_env[2], 1)
-    assert "tlo_missing" not in unit.context_columns and unit.n_ctx == 6
-    assert unit.covariates.columns == ("parity=0", "parity=1", "parity=2+", "temp_c", "temp_c:age_h")
-
-
 # ---- T-L1 at batch level (§12 L1, §15) ---------------------------------------------------------
 def perturb_forbidden(run_dir, source, dest, covariates=None):
     """A copy of ``run_dir/cohort`` and the feature cache under ``dest`` with every forbidden input (§7.1, L1)

@@ -18,6 +18,10 @@ Two figures per validation sample, from a single forward pass:
    :func:`~teb_vae.lag_attn.nets.controls.perm_kl_from_forward`; it is only drawn when the batch is
    large enough to derange (:math:`B \geq 2`).
 
+Both figures carry short titles naming the quantity and a one-line identity suptitle,
+``epoch N, sample i, guid G, subgroup S``; what used to be printed around the panels (row ranges,
+loss readouts, calibration statistics) is in the docstrings below and in the run's logged metrics.
+
 The callback never raises into the training loop: it wraps generation in a broad ``try/except`` and
 only warns, and every saved file is routed to MLflow through the rank-0 artifact seam
 :func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer, not
@@ -117,6 +121,45 @@ def _guid_of(batch: Any, index: int = 0) -> str:
     return str(field)
 
 
+def _cohort_of(batch: Any, index: int = 0) -> Optional[str]:
+    """Extract the cohort (subgroup) label of sample ``index``, when the batch carries one.
+
+    Read off a ``subgroup`` field first and a ``source_file_basename`` field second, the shard
+    stem the evaluation derives the subgroup from.
+
+    Args:
+        batch: A batch from the data module.
+        index: Sample index within the batch.
+
+    Returns:
+        The label, or ``None`` when the batch carries neither field.
+    """
+    for name in ("subgroup", "source_file_basename"):
+        field = _get_field(batch, name)
+        if field is None or isinstance(field, torch.Tensor):
+            continue
+        if isinstance(field, (list, tuple)):
+            return str(field[index % len(field)]) if field else None
+        return str(field)
+    return None
+
+
+def _identity(epoch: int, sample_idx: int, guid: str, cohort: Optional[str]) -> str:
+    """The one-line figure title: epoch, sample, GUID and, when known, its subgroup.
+
+    Args:
+        epoch: Current training epoch.
+        sample_idx: Index into the batch.
+        guid: Recording identifier.
+        cohort: The recording's subgroup, or ``None``.
+
+    Returns:
+        ``epoch N, sample i, guid G[, subgroup S]``.
+    """
+    subgroup = f", subgroup {cohort}" if cohort else ""
+    return f"epoch {epoch}, sample {sample_idx}, guid {guid}{subgroup}"
+
+
 # =============================================================================
 # Figure builders
 # =============================================================================
@@ -141,6 +184,7 @@ def _build_diagnostic_figure(
     base_loss: float,
     kld_loss: float,
     step_seconds: float = 4.0,
+    cohort: Optional[str] = None,
 ) -> Any:
     """Build the full diagnostic figure for one validation sample.
 
@@ -148,6 +192,10 @@ def _build_diagnostic_figure(
     :class:`GridSpec` — column 0 hosts the main axes, column 1 is a narrow fixed-width slot for the
     colorbar axes. Line-plot rows hide their reserved cax so the main-axes widths stay perfectly
     aligned row-to-row regardless of whether a colorbar is visible.
+
+    The row titles name the quantity only. Feature rows stack the scattering block above the phase
+    block (the UP row may hold the self-phase block alone) and name each block on the y axis; the
+    TE-lag row is clipped at its 99th percentile and the next row is normalised per column.
 
     Args:
         outs: Forward-output dict from the model's ``forward``.
@@ -162,11 +210,13 @@ def _build_diagnostic_figure(
         guid: GUID string for the figure title.
         warmup: Warmup period ``T_w`` (for shading invalid regions).
         horizon: Decimated forecast horizon ``H_d``.
-        beta: Scheduled KL weight for this epoch.
-        feat_loss: Current ``L_feat`` (full-forecast reconstruction).
-        base_loss: Current ``L_base`` (baseline-forecast reconstruction).
-        kld_loss: Current ``L_KL`` (mean KL).
+        beta: Scheduled KL weight for this epoch. Accepted so the callback's call is unchanged; not
+            drawn, because the run's logs carry it by epoch.
+        feat_loss: Current ``L_feat``. Accepted and not drawn, for the same reason.
+        base_loss: Current ``L_base``. Accepted and not drawn.
+        kld_loss: Current ``L_KL``. Accepted and not drawn.
         step_seconds: Decimated step duration in seconds (for the lag second-axis).
+        cohort: The recording's subgroup, printed beside the GUID; ``None`` prints nothing extra.
 
     Returns:
         The constructed :class:`matplotlib.figure.Figure`. The caller is responsible for saving and
@@ -300,6 +350,12 @@ def _build_diagnostic_figure(
             ax.spines[spine].set_color(COLOR_BLACK)
             ax.spines[spine].set_linewidth(0.6)
 
+    def _name_blocks(ax: Any, names: Tuple[str, ...], sizes: Tuple[int, ...]) -> None:
+        """Name the stacked feature blocks on the y axis, each at the centre row of its block."""
+        starts = np.cumsum((0, *sizes[:-1]))
+        ax.set_yticks([start + 0.5 * (size - 1) for start, size in zip(starts, sizes)])
+        ax.set_yticklabels(names, fontsize=7)
+
     def _finalise_time_axis(ax: Any) -> None:
         """Every row ends with this so all panels line up column-for-column."""
         ax.set_xlim(0.0, t_max)
@@ -340,16 +396,15 @@ def _build_diagnostic_figure(
         vmin=-vabs_fhr, vmax=vabs_fhr,
         extent=[0.0, t_max, fhr_stack.shape[0] - 0.5, -0.5],
     )
-    # Row ranges are derived, not written down: they moved once already when the dataset's
-    # phase-harmonic channel selection changed, and a stale label on a heatmap is invisible.
-    ax.set_title(
-        f"FHR features — scattering (rows 0-{st_ch - 1})  |  phase (rows {st_ch}-{C_y - 1})",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("FHR features", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Channel", fontsize=8)
     if fhr_sep is not None:
         ax.axhline(fhr_sep + 0.5, color="white", linewidth=1.2, linestyle="--")
+    # The block boundaries are derived from the tensors, not written down: they moved once already
+    # when the dataset's phase-harmonic channel selection changed, and a stale label on a heatmap
+    # is invisible.
+    _name_blocks(ax, ("scattering", "phase"), (st_ch, C_y - st_ch))
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Value")
     _finalise_time_axis(ax)
@@ -358,26 +413,24 @@ def _build_diagnostic_figure(
     ax, cax = row_axes("up_feats")
     if up_st_np is not None:
         up_stack, up_sep = stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (c_u, T)
-        up_st_ch = int(up_st_np.shape[-1])
-        up_ch = up_st_ch + int(up_ph_np.shape[-1])
-        title_up = (
-            f"UP features — scattering (rows 0-{up_st_ch - 1})  |  "
-            f"self-phase (rows {up_st_ch}-{up_ch - 1})"
+        up_blocks = (
+            ("scattering", "self-phase"), (int(up_st_np.shape[-1]), int(up_ph_np.shape[-1]))
         )
     else:
         up_stack, up_sep = up_ph_np.T, None                               # (c_u, T)
-        title_up = "UP features — self-phase only (up_st absent)"
+        up_blocks = (("self-phase",), (int(up_ph_np.shape[-1]),))
     vabs_up = safe_vabs(up_stack)
     im = ax.imshow(
         up_stack, aspect="auto", cmap="bwr", origin="upper",
         vmin=-vabs_up, vmax=vabs_up,
         extent=[0.0, t_max, up_stack.shape[0] - 0.5, -0.5],
     )
-    ax.set_title(title_up, fontsize=9, pad=6)
+    ax.set_title("UP features", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Channel", fontsize=8)
     if up_sep is not None:
         ax.axhline(up_sep + 0.5, color="white", linewidth=1.2, linestyle="--")
+    _name_blocks(ax, *up_blocks)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Value")
     _finalise_time_axis(ax)
@@ -391,7 +444,7 @@ def _build_diagnostic_figure(
         vmin=-vabs_z, vmax=vabs_z,
         extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
-    ax.set_title(f"Latent z (d_z={d_z})", fontsize=9, pad=6)
+    ax.set_title("Latent $z$", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Latent dim", fontsize=8)
     _style_heatmap_spines(ax)
@@ -411,10 +464,7 @@ def _build_diagnostic_figure(
     ax.set_yticks([d_z // 2, d_z + d_z // 2])
     ax.set_yticklabels(["Posterior μ", "Prior μ⁰"])
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_title(
-        "Posterior vs Prior means (TEB residual = posterior − prior)",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Posterior and prior mean", fontsize=9, pad=6)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Value")
     _finalise_time_axis(ax)
@@ -431,10 +481,7 @@ def _build_diagnostic_figure(
         vmin=0.0, vmax=vmax_kld,
         extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
-    ax.set_title(
-        f"KLD per latent dim (d_z={d_z} rows) — max={kld_max:.3f} nats",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("KL per latent dim", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Latent dim", fontsize=8)
     _style_heatmap_spines(ax)
@@ -456,9 +503,7 @@ def _build_diagnostic_figure(
     )
     ax2.set_ylabel("Attention entropy (nats)", fontsize=8, color=COLOR_ORANGE)
     ax2.tick_params(axis="y", labelcolor=COLOR_ORANGE)
-    ax.set_title(
-        "Total KL per timestep vs mean attention entropy", fontsize=9, pad=6,
-    )
+    ax.set_title("KL and attention entropy", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -481,11 +526,7 @@ def _build_diagnostic_figure(
         time_dec, argmax_lag, color=COLOR_VERMILLION,
         linewidth=0.9, alpha=0.9, label="argmax lag",
     )
-    ax.set_title(
-        f"Lag attention — mean over {attn_np.shape[1]} heads "
-        f"(L={L} = 0..{L - 1})",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Lag attention", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     attach_lag_seconds_axis(ax, step_seconds)
@@ -516,11 +557,7 @@ def _build_diagnostic_figure(
         extent=[0.0, t_max, -0.5, L - 0.5],
         vmin=0.0, vmax=vmax_te_p99,
     )
-    ax.set_title(
-        "TE lag attribution (KL × mean-α) — p99-clipped "
-        f"(vmax={vmax_te_p99:.3e}, max={te_global_max:.3e})",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("TE lag attribution, p99 clip", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     attach_lag_seconds_axis(ax, step_seconds)
@@ -539,11 +576,7 @@ def _build_diagnostic_figure(
         extent=[0.0, t_max, -0.5, L - 0.5],
         vmin=0.0, vmax=1.0,
     )
-    ax.set_title(
-        "TE lag attribution — column-normalised "
-        "(dominant lag per time step, independent of KL magnitude)",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Column-normalised TE attribution", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     attach_lag_seconds_axis(ax, step_seconds)
@@ -575,11 +608,7 @@ def _build_diagnostic_figure(
         extent=[0.0, t_max, C_y - 0.5, -0.5],
     )
     ax.axhline(st_ch - 0.5, color="white", linewidth=1.2, linestyle="--")
-    ax.set_title(
-        "Average forecast μ_full — overlap-averaged per-anchor "
-        f"horizons (all {C_y} channels, H_d={H_d})",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Overlap-averaged forecast", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Feature ch", fontsize=8)
     _style_heatmap_spines(ax)
@@ -594,11 +623,7 @@ def _build_diagnostic_figure(
         extent=[0.0, t_max, C_y - 0.5, -0.5],
     )
     ax.axhline(st_ch - 0.5, color="white", linewidth=1.2, linestyle="--")
-    ax.set_title(
-        "Single-horizon forecast μ_full — non-overlapping "
-        f"concat (stride H_d={H_d}, all {C_y} channels)",
-        fontsize=9, pad=6,
-    )
+    ax.set_title("Non-overlapping forecast", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Feature ch", fontsize=8)
     _style_heatmap_spines(ax)
@@ -607,10 +632,7 @@ def _build_diagnostic_figure(
 
     # ---- Super title -------------------------------------------------------
     fig.suptitle(
-        f"LagAttn diagnostics  —  epoch {epoch}  sample {sample_idx}  "
-        f"guid {guid}  •  β={beta:.4g}  "
-        f"L_feat={feat_loss:.4f}  L_base={base_loss:.4f}  KL={kld_loss:.4e}",
-        fontsize=11, color=COLOR_PURPLE, y=1.002,
+        _identity(epoch, sample_idx, guid, cohort), fontsize=11, color=COLOR_PURPLE, y=1.002
     )
     return fig
 
@@ -629,8 +651,14 @@ def _build_companion_figure(
     forecast_anchor_frac: float,
     kld_active_frac: float,
     kld_shuffled_scalar: float,
+    cohort: Optional[str] = None,
 ) -> Any:
     r"""Build the three-panel companion figure for one sample (G4, G6, G7).
+
+    The panel titles name the quantity only. The histogram and the per-channel line are the
+    $2\sigma$ coverage over every supervised anchor; the third panel draws the band of the
+    worst-calibrated channel at one anchor; the control's shaded spans are the warm-up and the
+    last $H_d$ steps, outside the training KL support.
 
     Args:
         outs: Forward-output dict from the model's ``forward``.
@@ -645,8 +673,12 @@ def _build_companion_figure(
         horizon: Decimated forecast horizon ``H_d``.
         forecast_anchor_frac: Fractional position of the anchor whose predictive band is
             drawn for the worst-calibrated channel.
-        kld_active_frac: Fraction of latent dims above the activity threshold.
-        kld_shuffled_scalar: The support-masked mean shuffled KL, for the ratio annotation.
+        kld_active_frac: Fraction of latent dims above the activity threshold. Accepted and not
+            drawn: the bars already colour each dimension by activity, and the evaluation records
+            the fraction.
+        kld_shuffled_scalar: The support-masked mean shuffled KL. Accepted and not drawn: the two
+            curves carry the comparison, and the evaluation records the ratio.
+        cohort: The recording's subgroup, printed beside the GUID; ``None`` prints nothing extra.
 
     Returns:
         The constructed :class:`matplotlib.figure.Figure`.
@@ -687,10 +719,10 @@ def _build_companion_figure(
     ax.hist(coverage, bins=np.linspace(0.0, 1.0, 41), color=COLOR_BLUE,
             edgecolor=COLOR_BLACK, linewidth=0.4)
     ax.axvline(_NOMINAL_2SIGMA, color=COLOR_VERMILLION, linestyle="--", linewidth=1.4,
-               label=rf"nominal $2\sigma$ = {_NOMINAL_2SIGMA:.1%}")
+               label=f"nominal {_NOMINAL_2SIGMA:.1%}")
     ax.axvline(median_cover, color=COLOR_ORANGE, linestyle=":", linewidth=1.6,
                label=f"median {median_cover:.1%}")
-    ax.set_title(rf"$2\sigma$ coverage across all {n_channels} channels, {hi - lo} anchors")
+    ax.set_title("Coverage distribution")
     ax.set_xlabel(r"per-channel $2\sigma$ coverage")
     ax.set_ylabel("channels")
     ax.legend(loc="best", frameon=False, fontsize=8)
@@ -701,12 +733,11 @@ def _build_companion_figure(
     channels = np.arange(n_channels)
     ax.plot(channels, coverage, color=COLOR_BLUE, linewidth=0.9)
     ax.axhline(_NOMINAL_2SIGMA, color=COLOR_VERMILLION, linestyle="--", linewidth=1.4,
-               label=rf"nominal $2\sigma$")
+               label="nominal")
     if 0 < st_ch < n_channels:
-        ax.axvline(st_ch - 0.5, color=COLOR_GRAY, linewidth=1.2,
-                   label=f"scattering | phase ({st_ch})")
+        ax.axvline(st_ch - 0.5, color=COLOR_GRAY, linewidth=1.2, label="scattering | phase")
     ax.set_ylim(0.0, 1.02)
-    ax.set_title(f"coverage by channel  (worst: ch {worst} at {coverage[worst]:.0%})")
+    ax.set_title("Coverage by channel")
     ax.set_xlabel("feature channel")
     ax.set_ylabel(r"$2\sigma$ coverage")
     ax.legend(loc="best", frameon=False, fontsize=8)
@@ -722,8 +753,7 @@ def _build_companion_figure(
                     alpha=0.22, linewidth=0, label=r"$\mu \pm 2\sigma$")
     ax.plot(steps, mu_c, color=COLOR_BLUE, linewidth=1.6, label=r"$\mu_{\mathrm{full}}$")
     ax.plot(steps, y_c, color=COLOR_VERMILLION, linewidth=1.4, linestyle="--", label=r"$Y^{+}$")
-    at_anchor = float(np.mean(np.abs(y_c - mu_c) <= 2 * sd_c))
-    ax.set_title(f"worst channel {worst} @ anchor {anchor}  (here {at_anchor:.0%})")
+    ax.set_title(f"Worst channel {worst}, anchor {anchor}")
     ax.set_xlabel("horizon step $h$")
     ax.set_ylabel("feature value")
     ax.legend(loc="best", frameon=False, fontsize=8)
@@ -740,9 +770,9 @@ def _build_companion_figure(
     colors = [COLOR_ORANGE if v > _KLD_ACTIVE_EPS else COLOR_GRAY for v in per_dim]
     ax.bar(dims, per_dim, color=colors, edgecolor=COLOR_BLACK, linewidth=0.4)
     ax.axhline(_KLD_ACTIVE_EPS, color=COLOR_VERMILLION, linestyle=":", linewidth=1.2,
-               label=rf"active threshold $\epsilon={_KLD_ACTIVE_EPS}$")
+               label="active threshold")
     ax.set_yscale("symlog", linthresh=_KLD_ACTIVE_EPS)
-    ax.set_title(f"raw per-dim KL   (active fraction {kld_active_frac:.2f})")
+    ax.set_title("KL per latent dim")
     ax.set_xlabel("latent dim $j$")
     ax.set_ylabel(r"$\overline{K_j}$ [nats]")
     ax.legend(loc="best", frameon=False, fontsize=8)
@@ -755,26 +785,16 @@ def _build_companion_figure(
     t_axis = np.arange(T)
     ax.plot(t_axis, k_true, color=COLOR_BLUE, linewidth=1.4, label=r"$K_{\mathrm{true}}$")
     ax.plot(t_axis, k_shuf, color=COLOR_VERMILLION, linewidth=1.2, alpha=0.85,
-            label=r"$K_{\mathrm{shuffled}}$ (deranged UP)")
+            label=r"$K_{\mathrm{shuffled}}$")
     ax.axvspan(0, warmup, color=COLOR_GRAY, alpha=0.15, linewidth=0)
     ax.axvspan(max(T - horizon, 0), T, color=COLOR_GRAY, alpha=0.15, linewidth=0)
-    in_support = k_true[warmup:max(T - horizon, warmup)]
-    k_true_mean = float(np.mean(in_support)) if in_support.size else 0.0
-    ratio = kld_shuffled_scalar / max(k_true_mean, 1e-8)
-    ax.set_title(
-        "source-permutation control  "
-        rf"($K_{{\mathrm{{shuffled}}}}/K_{{\mathrm{{raw}}}} \approx {ratio:.2f}$; "
-        "shaded = outside the training KL support)"
-    )
+    ax.set_title("Source-permutation control")
     ax.set_xlabel("time step $t$")
     ax.set_ylabel(r"$K_t$ [nats]")
     ax.legend(loc="best", frameon=False, fontsize=8)
     style_axes(ax)
 
-    fig.suptitle(
-        f"SeqVaeLagAttn diagnostics — epoch {epoch}, sample {sample_idx}, guid {guid[:16]}",
-        fontsize=12,
-    )
+    fig.suptitle(_identity(epoch, sample_idx, guid, cohort), fontsize=12)
     return fig
 
 
@@ -922,7 +942,7 @@ class LagAttnPlotCallback(Callback):
                     fhr_raw=_get_field(batch, "fhr"), up_raw=_get_field(batch, "up"),
                     sample_idx=s, epoch=epoch, guid=guid, warmup=warmup, horizon=horizon,
                     beta=beta, feat_loss=feat_loss, base_loss=base_loss, kld_loss=kld_loss,
-                    step_seconds=step_seconds,
+                    step_seconds=step_seconds, cohort=_cohort_of(batch, s),
                 )
                 path = self.output_dir / (
                     f"lag_attn_epoch{epoch:04d}_sample{s}_{guid[:16]}.{self.file_format}"
@@ -939,6 +959,7 @@ class LagAttnPlotCallback(Callback):
                     forecast_anchor_frac=self.forecast_anchor_frac,
                     kld_active_frac=kld_active_frac,
                     kld_shuffled_scalar=float(perm_out["kld_shuffled"]),
+                    cohort=_cohort_of(batch, s),
                 )
                 path = self.output_dir / (
                     f"lag_attn_epoch{epoch:04d}_sample{s}_{guid[:16]}"

@@ -310,11 +310,7 @@ def build_profile_figure(
                 profile_column(profile, "attention_untruncated", n_lags),
             ]
         ),
-        [
-            "head-averaged (raw)",
-            "head-averaged, support-corrected",
-            "head-averaged, untruncated anchors only",
-        ],
+        ["raw", "support-corrected", "untruncated"],
         title="Attention over lags",
         xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
         ylabel="attention weight",
@@ -333,23 +329,28 @@ def build_profile_figure(
         axes[1, 0], seconds,
         np.vstack(curves) if curves else np.zeros((0, n_lags)),
         [f"head {head}" for head in heads],
-        title="Attention over lags, per head",
+        title="Attention per head",
         xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
         ylabel="attention weight",
     )
-    _shade_truncated(axes[1, 0], seconds, truncation)
+    _shade_truncated(axes[1, 0], seconds, truncation, labelled=False)
     return figure
 
 
-def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any]) -> None:
+def _shade_truncated(
+    axis: Any, seconds: np.ndarray, truncation: Dict[str, Any], *, labelled: bool = True
+) -> None:
     """Shade the lags only the untruncated anchors could have contributed to.
 
-    Structural rather than a finding, which is why it is drawn on both panels and labelled.
+    Structural rather than a finding, which is why it is drawn on both panels; it is named in one
+    legend, the first panel's.
 
     Args:
         axis: Target axes, whose x-axis is the compensated-seconds lag axis.
         seconds: That axis's values.
         truncation: The truncated-anchor accounting.
+        labelled: Whether the span gets a legend entry. The figure's second panel shares the span
+            and leaves it unnamed.
     """
     n_truncated = int(truncation.get("n_truncated_anchors") or 0)
     if n_truncated <= 0 or seconds.size == 0:
@@ -361,9 +362,10 @@ def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any])
     axis.axvspan(
         float(seconds[first]), float(seconds[-1]),
         color=figures.COLOR_LIGHT_GRAY, alpha=0.35, zorder=0,
-        label=f"lags truncated at {n_truncated} of the trained anchors",
+        label="truncated lags" if labelled else None,
     )
-    axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
+    if labelled:
+        axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
 
 
 def build_heatmap_figure(
@@ -402,7 +404,7 @@ def build_heatmap_figure(
     # the training callback's lag panels already use.
     figures.heatmap_with_colorbar(
         figure, axes[0, 0], field.T[::-1],
-        title=f"Attention by anchor and lag, retained sample row {row} (head-averaged)",
+        title="Attention by anchor and lag",
         xlabel="time in segment (s)",
         ylabel=figures.COMPENSATED_LAG_AXIS_LABEL,
         symmetric=False,

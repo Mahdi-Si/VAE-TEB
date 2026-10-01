@@ -358,7 +358,7 @@ def test_the_profile_figure_draws_against_the_coefficient_time_axis() -> None:
 
     figure = lag_kl.build_profile_figure(profile, lag, delay_steps=0, n_lags=9)
     try:
-        drawn = _figure_lines(figure)["raw attribution (sums to the KL)"]
+        drawn = _figure_lines(figure)["raw"]
         x_values = np.asarray(drawn.get_xdata(), dtype=float)
         label = figure.axes[0].get_xlabel()
         n_curves = len(
@@ -390,7 +390,7 @@ def test_rebuilding_at_a_nonzero_delay_shifts_every_drawn_second() -> None:
         try:
             drawn.append(
                 np.asarray(
-                    _figure_lines(figure)["raw attribution (sums to the KL)"].get_xdata(),
+                    _figure_lines(figure)["raw"].get_xdata(),
                     dtype=float,
                 )
             )

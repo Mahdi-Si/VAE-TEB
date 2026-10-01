@@ -120,8 +120,8 @@ PAGE_SCALARS: Tuple[str, ...] = (
 #: variants of its segment, and **whose** it is -- the dataset index the filename carries, the
 #: recording, the cohort it belongs to on both axes, its segment epoch in seconds and its place
 #: before delivery in hours -- followed by :data:`PAGE_SCALARS`. The identity travels here so a
-#: directory of pages can be filtered by subgroup without opening one, and so a page whose
-#: filename carries only the GUID can be traced back to its cohort.
+#: directory of pages can be filtered by subgroup and class without opening one, and so the
+#: sanitised subgroup in a filename can be read back as the label it was drawn from.
 MANIFEST_COLUMNS: Tuple[str, ...] = (
     "selection", "variant", "file", "full_file", "compact_file", "dataset_index", "guid",
     labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN, "epoch", "hours_before_delivery",
@@ -180,11 +180,14 @@ EXPECTED_PAGE_ROWS = 15
 #: the only index a reader has: a GUID carrying a path separator, a space or a non-ASCII character
 #: must not be able to write outside the directory or produce a name a shell cannot address.
 #:
+#: The subgroup follows the GUID, sanitised by the same rule, so a page lifted out of its
+#: directory still names the cohort its recording came from.
+#:
 #: The optional ``_compact`` tail is the **reduced** page of the same segment, written beside the
 #: full one. A suffix rather than a directory on purpose: the two pages are one segment's, and a
 #: reader who has found the segment has found both.
 FILENAME_PATTERN = re.compile(
-    r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)(_compact)?"
+    r"sample\d{4}_[A-Za-z0-9_-]{1,32}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)(_compact)?"
 )
 
 #: The ``variant`` values the manifest records, and the tail that distinguishes the reduced
@@ -303,24 +306,29 @@ def shared_row_limits(collection: Any) -> Dict[str, float]:
     return limits
 
 
-def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -> str:
+def page_filename(
+    index: int, guid: Any, subgroup: Any, epoch: Any, *, compact: bool = False
+) -> str:
     """Return the filename one page is written as.
 
     Args:
         index: The sample's index in the evaluation dataset.
         guid: Its recording identifier.
+        subgroup: Its subgroup, or ``None``/``NaN`` for a row that carries none. Sanitised by the
+            GUID's rule, so the name stays addressable whatever the label holds.
         epoch: Its ``epoch``, or anything non-finite for a segment that carries none.
         compact: Whether this is the reduced page. The two variants of one segment differ by
             :data:`COMPACT_SUFFIX` alone, so they sort together in a directory listing and a
             reader who has found one has found the other.
 
     Returns:
-        ``sample<index>_<guid>_epoch<epoch|na>[_compact]``, a stem; ``render_figure``
-        appends the run's configured format.
+        ``sample<index>_<guid>_<subgroup|na>_epoch<epoch|na>[_compact]``, a stem;
+        ``render_figure`` appends the run's configured format.
     """
     stamp = epoch_stamp(epoch)
+    cohort = "na" if subgroup is None or pd.isna(subgroup) else sanitise_guid(subgroup)
     return (
-        f"sample{int(index):04d}_{sanitise_guid(guid)}_"
+        f"sample{int(index):04d}_{sanitise_guid(guid)}_{cohort}_"
         f"epoch{'na' if stamp is None else stamp}"
         f"{COMPACT_SUFFIX if compact else ''}"
     )
@@ -504,7 +512,8 @@ def render_pages(
         files: Dict[str, Path] = {}
         for variant, page_rows, log_lag_attention in PAGE_VARIANTS:
             name = page_filename(
-                index, row["guid"], row["epoch"], compact=variant == COMPACT_VARIANT
+                index, row["guid"], _label(row, labels.SUBGROUP_COLUMN), row["epoch"],
+                compact=variant == COMPACT_VARIANT,
             )
             try:
                 figure = build_diagnostic_figure(
@@ -597,11 +606,13 @@ def hours_before_delivery(epoch: Any) -> float:
 
 
 def page_title(row: Any, index: int) -> str:
-    """The first line of a page's title: which segment of which recording, from which cohort.
+    """The page's one-line title: which segment of which recording, from which cohort.
 
     The dataset index is the one in the filename, so a page and its file name agree; the
     subgroup and the clinical class are both named, because a page of an extreme is read for
-    whose it is before anything else; and the epoch is given with its place before delivery.
+    whose it is before anything else; and the epoch is the segment's own. Its place before
+    delivery, $h = -\\mathrm{epoch}/3600$, is in the manifest (``hours_before_delivery``), not on
+    the page.
 
     Args:
         row: The resolved row the page is drawn from.
@@ -611,14 +622,11 @@ def page_title(row: Any, index: int) -> str:
         The line.
     """
     stamp = epoch_stamp(row["epoch"])
-    when = (
-        "epoch n/a" if stamp is None
-        else f"epoch {stamp} s ({hours_before_delivery(stamp):.2f} h before delivery)"
-    )
+    when = "epoch n/a" if stamp is None else f"epoch {stamp} s"
     return (
-        f"dataset sample {int(index):04d} — guid {row['guid']} — subgroup "
-        f"{_label(row, labels.SUBGROUP_COLUMN) or 'n/a'} — class "
-        f"{_label(row, labels.CLASS_COLUMN) or 'n/a'} — {when}"
+        f"sample {int(index):04d}, guid {row['guid']}, subgroup "
+        f"{_label(row, labels.SUBGROUP_COLUMN) or 'n/a'}, class "
+        f"{_label(row, labels.CLASS_COLUMN) or 'n/a'}, {when}"
     )
 
 
@@ -636,12 +644,15 @@ def page_record(row: Any, variant: str, file: str) -> Dict[str, Any]:
         record names its compact twin and the other way round.
     """
     index = int(row["dataset_index"])
+    subgroup = _label(row, labels.SUBGROUP_COLUMN)
     return {
         "variant": variant,
         "file": file,
-        "full_file": figures.figure_filename(page_filename(index, row["guid"], row["epoch"])),
+        "full_file": figures.figure_filename(
+            page_filename(index, row["guid"], subgroup, row["epoch"])
+        ),
         "compact_file": figures.figure_filename(
-            page_filename(index, row["guid"], row["epoch"], compact=True)
+            page_filename(index, row["guid"], subgroup, row["epoch"], compact=True)
         ),
         **page_identity(row),
         "dataset_index": index,

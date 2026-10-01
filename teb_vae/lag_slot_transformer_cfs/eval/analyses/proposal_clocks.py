@@ -102,6 +102,21 @@ def tracked_columns(
 # =============================================================================
 # The figures
 # =============================================================================
+def _centroid_title(column: str) -> str:
+    """The short panel title of a tested centroid column, e.g. ``Centroid, proposal norm``.
+
+    Args:
+        column: A tested column, ``<statistic>_<profile key>``.
+
+    Returns:
+        The title: the statistic and the profile's short name.
+    """
+    source = next(
+        (item for item in lag_structure.PROFILE_SOURCES if column.endswith(f"_{item.key}")), None
+    )
+    return "Centroid" if source is None else f"Centroid, {source.title.lower()}"
+
+
 def build_profile_figure(
     clock: lag_structure.Clock,
     shares: Mapping[str, Any],
@@ -116,7 +131,8 @@ def build_profile_figure(
 
     One heatmap per class -- lag down, clock across, colour the class's share of the profile in
     that lag -- on one shared colour scale, then one panel per tested centroid with the median
-    over recordings and its inter-quartile ribbon.
+    over recordings and its inter-quartile ribbon. Each heatmap is titled by its class and its
+    recording count; the cohort legend sits on the first trajectory panel alone.
 
     Args:
         clock: The clock.
@@ -149,14 +165,11 @@ def build_profile_figure(
         ax = axes[index, 0]
         figures.heatmap_with_colorbar(
             figure, ax, np.asarray(field["share"])[::-1],
-            title=(
-                f"{group}: share of the {source.label} by lag and window "
-                f"(n={int(field['n_recordings'])} recordings)"
-            ),
+            title=f"{group} (n={int(field['n_recordings'])})",
             ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
             symmetric=False,
             vlimits=(0.0, limit) if limit > 0.0 else None,
-            colorbar_label="share of the profile",
+            colorbar_label="share of profile",
             extent=extent,
             interpolation="none",
         )
@@ -177,10 +190,10 @@ def build_profile_figure(
             axes[max(len(fields), 1) + offset, 0],
             [row for row in rows if row["metric"] == column],
             axis=labels.CLASS_COLUMN, clock=clock,
-            title=f"{column}: median over recordings per window (tested)",
-            ylabel="stored-coefficient seconds",
+            title=_centroid_title(column),
+            ylabel="stored-coefficient seconds", legend=offset == 0,
         )
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 
@@ -194,7 +207,8 @@ def build_bands_figure(
 
     One column per profile and one row per band, in the profile's own unit -- the magnitude the
     share heatmaps divide out. A line moving between rows is the informative past moving; a line
-    moving within a row is that band's magnitude changing.
+    moving within a row is that band's magnitude changing. The cohort legend sits on the first
+    panel alone.
 
     Args:
         clock: The clock.
@@ -215,11 +229,11 @@ def build_bands_figure(
                 axes[row, column],
                 [item for item in rows if item["metric"] == name],
                 axis=labels.CLASS_COLUMN, clock=clock,
-                title=f"{band}: {source.label} in the band",
-                ylabel=source.unit, zero=source.signed,
+                title=f"{band}: {source.title.lower()}",
+                ylabel=source.unit, zero=source.signed, legend=row == 0 and column == 0,
             )
             axes[row, column].set_title(
-                f"{band}: {source.label} in the band", color=BAND_COLORS[row % len(BAND_COLORS)]
+                f"{band}: {source.title.lower()}", color=BAND_COLORS[row % len(BAND_COLORS)]
             )
     if not bands or not sources:
         axes[0, 0].text(
@@ -227,7 +241,7 @@ def build_bands_figure(
             va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
         )
         figures.style_axes(axes[0, 0])
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 

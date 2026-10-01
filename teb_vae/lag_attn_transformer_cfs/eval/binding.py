@@ -55,10 +55,12 @@ TIME_POOLING_PROOF = (
 #: is a silent no-op rather than a refusal. ``tests/test_eval_binding.py`` asserts both halves
 #: against the class and against this package's shipped ``configs/default.yaml``.
 #:
-#: The cfs cell's sixteen **minus** ``causal_norm`` **plus** this architecture's seven, giving
-#: twenty-two. ``causal_norm`` is not merely irrelevant here: the constructor does not accept it, so
-#: a config carrying it is already a ``TypeError`` at rebuild and reconciling it could only ever
-#: compare a key against nothing.
+#: The cfs cell's tuple **minus** ``causal_norm`` **plus** this architecture's seven encoder keys and
+#: ``forecast_ar_residual``, the one density key only this cell's final revision configures, with
+#: the shared keys in the cfs cell's order. ``tests/test_eval_binding.py`` asserts that relation
+#: rather than a count. ``causal_norm`` is not merely irrelevant here: the constructor does not
+#: accept it, so a config carrying it is already a ``TypeError`` at rebuild and reconciling it could
+#: only ever compare a key against nothing.
 #:
 #: The seven are not documentation. Each one changes what the numbers mean: the stem schedule and the
 #: block counts set how much history a state summarises, the head count and the feed-forward width
@@ -263,9 +265,10 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
 #: ever come to differ from the one the comparison model runs under, and the two ``summary.json``
 #: files would stop being readable side by side long before anyone noticed.
 #:
-#: They carry the parent's four cfs-only analyses (``warmup``, ``source_null``, ``lag_clocks``
-#: and ``spectral_skill``) and their headline scalars, so the second cell reports the same twenty
-#: analyses and the same headline surface as the first. That is what makes the cross-cell table
+#: They carry every analysis the parent registers beyond the shared ones (``warmup``,
+#: ``source_null``, ``time_shift``, ``occlusion``, the lag readouts and ``spectral_skill`` among
+#: them) and their headline scalars, so the second cell reports the same analyses and the same
+#: headline surface as the first. That is what makes the cross-cell table
 #: possible: a column present on one side and missing on the other is not a comparison.
 #: ``tests/test_eval_binding.py`` asserts the identity, and that
 #: ``merged_analysis_functions`` returns the same key set in the same order for both bindings.

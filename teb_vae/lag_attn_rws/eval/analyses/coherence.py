@@ -864,7 +864,7 @@ def build_lead_time_figure(frame: pd.DataFrame, *, raw_per_step: int) -> Any:
     grid = full.pivot_table(index="freq_hz", columns="tau", values="coherence").to_numpy()
     _frequency_lead_map(
         figure, axes[0, 0], grid, frequencies,
-        title="Forecast-truth coherence by frequency and lead time (source-conditioned)",
+        title="Coherence, full",
         colorbar_label="coherence",
         symmetric=False,
         raw_per_step=raw_per_step,
@@ -877,7 +877,7 @@ def build_lead_time_figure(frame: pd.DataFrame, *, raw_per_step: int) -> Any:
     ).to_numpy()
     _frequency_lead_map(
         figure, axes[1, 0], delta, frequencies,
-        title="What the source added, per frequency and lead time (full minus base)",
+        title="Full minus base",
         colorbar_label="coherence added",
         symmetric=True,
         raw_per_step=raw_per_step,
@@ -903,8 +903,8 @@ def build_spectrum_figure(
     chosen = [tau for tau in (0, horizon) if tau in set(frame["tau"].unique())]
     panels = (
         ("coherence", "coherence", None),
-        ("gain", "spectral gain (forecast / truth amplitude)", 1.0),
-        ("phase_rad", "cross-spectral phase (rad); negative = forecast lags", 0.0),
+        ("gain", "spectral gain", 1.0),
+        ("phase_rad", "phase (rad)", 0.0),
     )
     for row, (metric, ylabel, reference) in enumerate(panels):
         axis = axes[row, 0]
@@ -925,6 +925,9 @@ def build_spectrum_figure(
             xlabel="frequency (Hz)", ylabel=ylabel,
         )
         axis.set_xscale("log")
+        if row:
+            # The same four keys and colours as the first panel's legend.
+            figures.drop_legend(axis)
         if reference is not None:
             axis.axhline(reference, color="0.4", linewidth=figures.LINE_HAIRLINE, linestyle="--")
         for value in seam_frequencies:
@@ -958,7 +961,7 @@ def build_spectrum_figure(
     axis.set_xscale("log")
     axis.set_xlabel("frequency (Hz)")
     axis.set_ylabel("coherence")
-    axis.set_title("By clinical class, pooled over lead time (descriptive, not a test)")
+    axis.set_title("By clinical class")
     axis.legend(fontsize=figures.FONT_SMALL)
     figures.style_axes(axis)
     return figure
@@ -976,7 +979,7 @@ def build_bands_figure(frame: pd.DataFrame) -> Any:
     panels = (
         ("full", "coherence", "coherence"),
         ("full", "gain", "spectral gain"),
-        ("full", "delta_coherence", "coherence added by the source"),
+        ("full", "delta_coherence", "coherence added"),
     )
     for row, (branch, metric, ylabel) in enumerate(panels):
         axis = axes[row, 0]
@@ -999,6 +1002,9 @@ def build_bands_figure(frame: pd.DataFrame) -> Any:
             axis, leads, np.vstack(curves), names,
             xlabel="lead time (s)", ylabel=ylabel,
         )
+        if row:
+            # The same band keys and colours as the first panel's legend.
+            figures.drop_legend(axis)
         if metric == "gain":
             axis.axhline(1.0, color="0.4", linewidth=figures.LINE_HAIRLINE, linestyle="--")
         if metric == "delta_coherence":
@@ -1036,7 +1042,7 @@ def build_decomposition_figure(bands: pd.DataFrame, spectrum: pd.DataFrame) -> A
             ordered["freq_hz"].to_numpy(),
             np.vstack([ordered[name].to_numpy() for name in terms]),
             list(terms),
-            title="Normalised residual spectrum at the nearest lead time",
+            title="Residual spectrum",
             xlabel="frequency (Hz)",
             ylabel="share of the truth's power",
         )
@@ -1058,10 +1064,12 @@ def build_decomposition_figure(bands: pd.DataFrame, spectrum: pd.DataFrame) -> A
         ordered["lead_seconds"].to_numpy(),
         np.vstack([ordered[name].to_numpy() for name in terms]),
         list(terms),
-        title=f"The same budget against lead time, {HEADLINE_BAND} band",
+        title=f"{HEADLINE_BAND} band",
         xlabel="lead time (s)",
         ylabel="share of the truth's power",
     )
+    # The same three terms and colours as the first panel's legend.
+    figures.drop_legend(axis)
     figures.style_axes(axis)
     return figure
 
@@ -1091,8 +1099,8 @@ def build_source_figure(frame: pd.DataFrame) -> Any:
     if curves and leads is not None:
         figures.multi_line_panel(
             axis, leads, np.vstack(curves), names,
-            title=f"UP coherence in the {HEADLINE_BAND} band: the record, and each forecast",
-            xlabel="lead time (s)", ylabel="coherence with uterine pressure",
+            title=f"UP coherence, {HEADLINE_BAND} band",
+            xlabel="lead time (s)", ylabel="coherence with UP",
         )
         figures.style_axes(axis)
     else:
@@ -1110,10 +1118,10 @@ def build_source_figure(frame: pd.DataFrame) -> Any:
         axis,
         np.arange(len(ordered), dtype=np.float64),
         np.vstack([ordered[column].to_numpy() for column in ordered.columns]),
-        list(ordered.columns),
-        title="Fraction of the record's UP coherence each forecast reproduces",
+        [str(column).replace("preservation_", "") for column in ordered.columns],
+        title="Preserved UP coherence",
         xlabel="",
-        ylabel="branch coherence / truth coherence",
+        ylabel="share of truth coherence",
     )
     axis.set_xticks(np.arange(len(ordered)))
     axis.set_xticklabels(list(ordered.index))
@@ -1143,8 +1151,8 @@ def build_seam_figure(frame: pd.DataFrame) -> Any:
     if curves:
         figures.multi_line_panel(
             axis, harmonics.astype(np.float64), np.vstack(curves), names,
-            title="Seam power against neighbouring bins (truth is the control)",
-            xlabel="harmonic of the token-seam frequency",
+            title="Seam power",
+            xlabel="seam harmonic",
             ylabel="power / median of neighbours",
         )
         axis.axhline(1.0, color="0.4", linewidth=figures.LINE_HAIRLINE, linestyle="--")
@@ -1165,9 +1173,11 @@ def build_seam_figure(frame: pd.DataFrame) -> Any:
     if curves and leads is not None:
         figures.multi_line_panel(
             axis, leads, np.vstack(curves), names,
-            title="The fundamental against lead time",
+            title="Fundamental",
             xlabel="lead time (s)", ylabel="power / median of neighbours",
         )
+        # The same three series and colours as the first panel's legend.
+        figures.drop_legend(axis)
         axis.axhline(1.0, color="0.4", linewidth=figures.LINE_HAIRLINE, linestyle="--")
         figures.style_axes(axis)
     else:

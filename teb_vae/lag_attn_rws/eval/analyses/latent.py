@@ -197,15 +197,15 @@ def build_spectrum_figure(
         axis.bar(positions, values, color=figures.COLOR_BLUE, alpha=0.85, width=0.8)
         axis.axhline(
             float(threshold), color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
-            label=f"activity threshold {float(threshold):g} nats",
+            label="activity threshold",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
-    axis.set_title("Per-dimension KL, sorted")
-    axis.set_xlabel("latent dimension, ordered by the KL it carries")
+    axis.set_title("Per-dimension KL")
+    axis.set_xlabel("latent dimension (sorted)")
     axis.set_ylabel("nats per anchor")
     figures.style_axes(axis)
     return figure

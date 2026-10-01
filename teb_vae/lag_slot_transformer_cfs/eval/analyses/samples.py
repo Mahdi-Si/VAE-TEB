@@ -125,7 +125,9 @@ def render_pages(
             continue
         n_input_rows = len(panels)
 
-        name = page_filename(index, row["guid"], row["epoch"])
+        name = page_filename(
+            index, row["guid"], page_identity(row)[labels.SUBGROUP_COLUMN], row["epoch"]
+        )
         try:
             figure = build_residual_page(
                 outs=outs,

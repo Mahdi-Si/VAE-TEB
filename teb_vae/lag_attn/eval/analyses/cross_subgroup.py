@@ -359,7 +359,7 @@ def _write_figure(record: Dict[str, Any], directory: Path) -> Optional[str]:
             axes[0, 0].axvline(
                 -np.log10(float(record["alpha"])), color=figures.COLOR_VERMILLION,
                 linestyle="--", linewidth=1.2,
-                label=f"alpha = {float(record['alpha']):g} (Holm-adjusted)",
+                label=f"$\\alpha$ = {float(record['alpha']):g}",
             )
             axes[0, 0].legend(fontsize=7, loc="best")
             axes[0, 0].invert_yaxis()
@@ -368,9 +368,7 @@ def _write_figure(record: Dict[str, Any], directory: Path) -> Optional[str]:
                 0.5, 0.5, figures.EMPTY_NOTE, transform=axes[0, 0].transAxes,
                 ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
             )
-        axes[0, 0].set_title(
-            f"Omnibus significance by {record['group_column']} (Kruskal-Wallis, Holm)"
-        )
+        axes[0, 0].set_title(f"Significance by {str(record['group_column']).replace('_', ' ')}")
         axes[0, 0].set_xlabel("$-\\log_{10}$ Holm-adjusted $p$")
         figures.style_axes(axes[0, 0])
 
@@ -384,7 +382,7 @@ def _write_figure(record: Dict[str, Any], directory: Path) -> Optional[str]:
                 ] = row.cliffs_delta
             figures.heatmap_with_colorbar(
                 figure, axes[1, 0], field,
-                title="Cliff's delta for the pairs of every surviving metric",
+                title="Pairwise effect size",
                 xlabel="", ylabel="", symmetric=True, colorbar_label="Cliff's delta",
             )
             figures.label_rows(axes[1, 0], metrics)
@@ -393,7 +391,7 @@ def _write_figure(record: Dict[str, Any], directory: Path) -> Optional[str]:
         else:
             figures.heatmap_with_colorbar(
                 figure, axes[1, 0], np.zeros((0, 0)),
-                title="Cliff's delta (no metric survived Holm)",
+                title="Pairwise effect size",
                 symmetric=True, colorbar_label="Cliff's delta",
             )
         return str(figures.render_figure(figure, directory / "cross_subgroup"))

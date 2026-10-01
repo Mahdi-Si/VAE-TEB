@@ -10,18 +10,23 @@ involved. Class colouring, captions and explained-variance labels are consistent
 because all three read the same :data:`CAPTIONS` and the same
 :func:`~teb_vae.lag_attn.eval.figures.group_colors` mapping the training plots use.
 
+**Text on the figures.** A figure carries panel titles of a few words, a short legend, axis labels
+with units and at most one note line from :data:`NOTES` (or a note built from the run's own counts).
+The full :data:`CAPTIONS` are not drawn: :func:`build_report` prints each beside its figure, which is
+where the methodological sentences and the interpretation limits live.
+
 **Figure 1 -- the latent space before and after.** The single label-free training PCA from
 ``analyze.py``, applied to both models with **identical axes** on the two panels, showing final-hour
 recording bags coloured healthy / acidosis / HIE with a deterministic subset of paired before/after
-arrows. Explained variance is stated. The same map is reused for the trajectories, so the two figures
-share one coordinate system.
+arrows. Explained variance is on the axis labels. The same map is reused for the trajectories, so the
+two figures share one coordinate system.
 
 **Figure 2 -- separation along the learned direction.** Test distributions of $w^\top S(v) + b$ before
-and after, labelled explicitly as a **supervised** axis, with recording-level AUROC, average precision
-and counts. Separation can be visible here while the leading principal components carry other large
-sources of variation. The score is not an independently discovered biomarker, its sigmoid is not
-calibrated severity, and the two models' logit scales are not comparable as distances -- a caption
-states so rather than leaving the reader to infer it.
+and after, labelled explicitly as a **supervised** axis, with the recording-level AUROC in each panel
+title and the class counts on the tick labels. Separation can be visible here while the leading
+principal components carry other large sources of variation. The score is not an independently
+discovered biomarker, its sigmoid is not calibrated severity, and the two models' logit scales are
+not comparable as distances -- the figure note says the last, the report caption says all three.
 
 **Figure 3 -- evolution over the last three hours.** Group means with GUID-bootstrap bands over the
 six bins, the recording count at the foot of each bin, the supervised final hour marked, and signed hours $-3$ to
@@ -163,7 +168,8 @@ CAPTIONS: Dict[str, str] = {
     FIGURE_ROC_BINS: (
         "The ROC of every time bin that carried both outcome groups, nearest delivery first. A "
         "bin with no adverse recording has no panel rather than a diagonal that was never "
-        "measured, so the panel count is itself a statement about coverage."
+        "measured, so the panel count is itself a statement about coverage. A star on a panel "
+        "title marks a bin inside the supervised window."
     ),
     FIGURE_COUNTS_TIME: (
         "What the rates of the previous figure are rates of: the four confusion cells per bin at "
@@ -171,6 +177,39 @@ CAPTIONS: Dict[str, str] = {
         "one measured on thirty read identically as a rate and differently here."
     ),
 }
+
+#: The one line each figure prints under its axes, at most
+#: :data:`~teb_vae.lag_attn.eval.figures.FOOTNOTE_MAX_CHARS` characters. What a reader needs to read
+#: *these* panels correctly and nothing more; the sentence :data:`CAPTIONS` holds for the same figure
+#: is printed in the report, not on the figure. A note that needs the run's own counts is built in
+#: its figure function from this one's fragments.
+NOTES: Dict[str, str] = {
+    FIGURE_LATENT_SPACE: (
+        "Both panels share one PCA map; arrows join the same recording before and after."
+    ),
+    FIGURE_COVERAGE_SPACE: "Colour marks ascertainment and coverage, not outcome.",
+    FIGURE_SUPERVISED_AXIS: (
+        "Each panel uses its own model's logit scale; the scales are not comparable."
+    ),
+    FIGURE_TRAJECTORIES: (
+        "Numbers: recordings per bin. Each panel uses its own model's logit scale."
+    ),
+    FIGURE_ROC_PR: "Dots: validation-selected threshold.",
+    FIGURE_CONFUSION: "Counts are recordings; all panels share one colour scale.",
+    FIGURE_METRICS_TIME: (
+        "Numbers: adverse/total recordings per bin. Dashed: chance. Shaded: supervised window."
+    ),
+    FIGURE_ROC_BINS: "Titles: hours before delivery, adverse/total recordings.",
+    FIGURE_COUNTS_TIME: (
+        "Confusion cells at each model's validation threshold. Shaded: supervised window."
+    ),
+}
+
+#: The label of the score axis: the logit $w^\top S(v) + b$ of the model's own fitted head.
+SCORE_LABEL = r"Logit $w^{\top}S(v)+b$"
+
+#: The x label every time-resolved panel shares. Signed: negative is before delivery.
+TIME_LABEL = "Time from delivery (h)"
 
 
 def _figures() -> Any:
@@ -236,6 +275,9 @@ def class_palette(names: Sequence[str] = PLOT_CLASSES) -> Dict[str, str]:
 def variance_caption(projection: Any) -> str:
     """Name the share of weighted training variance each projection axis carries.
 
+    Not drawn on the figures, whose axis labels (:func:`axis_label`) already carry each share;
+    kept for the records and any caller that wants the sentence.
+
     Args:
         projection: The fitted :class:`~latent_pilot.analyze.Projection`.
 
@@ -279,14 +321,15 @@ def score_scale_note(model: str, *, short: bool = False) -> str:
 
     Args:
         model: The model's name.
-        short: The panel-sized form, which fits on an axis label. The long form goes in the report
-            and the figure caption, where there is room to say why.
+        short: The panel-sized form, which fits on one line. The long form goes in the report
+            and the figure caption, where there is room to say why. The figures themselves print
+            the model-free :data:`NOTES` line, so neither form is drawn on a panel.
 
     Returns:
         The disclosure.
     """
     if short:
-        return f"{model}'s own logit scale -- not comparable across models"
+        return f"{model}'s own logit scale, not comparable across models"
     return (
         f"scores are {model}'s own fitted logits w'S(v)+b; the scale belongs to that head, so a "
         f"shift against another model's axis is a difference of two fitted heads and not latent or "
@@ -421,7 +464,7 @@ def _class_of(frame: pd.DataFrame) -> List[str]:
 # =============================================================================
 def _scatter_panel(
     ax: Any, points: np.ndarray, labels: Sequence[str], *,
-    palette: Mapping[str, str], projection: Any, title: str,
+    palette: Mapping[str, str], projection: Any, title: str, legend: bool = True,
 ) -> None:
     """Draw one projected cloud, one colour per label, on the shared map's axes.
 
@@ -436,6 +479,8 @@ def _scatter_panel(
         palette: Label to colour.
         projection: The fitted map, for the axis labels and their explained variance.
         title: Panel title.
+        legend: Draw the legend. Off on the panels of a figure whose panels share their keys, so
+            the keys are written once; the per-label counts are in the report, not the legend.
     """
     figures = _figures()
     values = [str(label) for label in labels]
@@ -446,12 +491,13 @@ def _scatter_panel(
             s=18.0, alpha=0.8, linewidths=0.3,
             edgecolors=figures.COLOR_BLACK,
             color=palette.get(label, figures.COLOR_GRAY),
-            label=f"{label or 'unlabelled'} (n={len(rows)})",
+            label=label or "unlabelled",
         )
     ax.set_title(title)
     ax.set_xlabel(axis_label(projection, 0))
     ax.set_ylabel(axis_label(projection, 1))
-    ax.legend(loc="best", fontsize=6.0)
+    if legend:
+        ax.legend(loc="best", fontsize=6.0)
     figures.style_axes(ax)
 
 
@@ -468,6 +514,8 @@ def figure_latent_space(
     Both panels are drawn on the axes :func:`~latent_pilot.analyze.fit_projection` fitted once, on
     training data, without labels -- and on **identical limits**, computed over every point of every
     panel. Two panels with their own limits would show a movement that was a change of axis range.
+    The panels share their class keys, so the first panel carries the one legend; the panel title
+    is the version's name and there is no figure title.
 
     Args:
         versions: ``{name: (frame, standardized values)}``, one entry per model version, each frame
@@ -514,7 +562,7 @@ def figure_latent_space(
         _scatter_panel(
             axes[0, column], coordinates[name], _class_of(versions[name][0]),
             palette=palette, projection=projection,
-            title=f"{name}: final-hour recording bags",
+            title=str(name), legend=column == 0,
         )
 
     # Paired arrows, on the last panel: the same recording before and after, for a seeded subset.
@@ -557,9 +605,8 @@ def figure_latent_space(
             axes[0, column].set_xlim(finite[:, 0].min() - pad[0], finite[:, 0].max() + pad[0])
             axes[0, column].set_ylim(finite[:, 1].min() - pad[1], finite[:, 1].max() + pad[1])
 
-    fig.suptitle(f"Latent space, shared map -- {variance_caption(projection)}")
-    fig.text(0.01, 0.005, CAPTIONS[FIGURE_LATENT_SPACE], fontsize=6.0, wrap=True)
-    return figures.render_figure(fig, _figure_dir(directory) / FIGURE_LATENT_SPACE)
+    # The note speaks of shared panels and arrows, which a one-version figure has neither of.
+    return _render_with_note(fig, directory, FIGURE_LATENT_SPACE, None if len(names) >= 2 else "")
 
 
 def coverage_groupings(frame: pd.DataFrame) -> Dict[str, List[str]]:
@@ -589,20 +636,24 @@ def coverage_groupings(frame: pd.DataFrame) -> Dict[str, List[str]]:
     finite = hours[np.isfinite(hours)] if hours.size else hours
     observed: List[str]
     if finite.size < 3:
-        observed = ["last observed: not stratified"] * len(frame)
+        observed = ["not stratified"] * len(frame)
     else:
         low, high = np.quantile(finite, [1.0 / 3.0, 2.0 / 3.0])
         if not (low < high):
-            observed = ["last observed: not stratified"] * len(frame)
+            observed = ["not stratified"] * len(frame)
         else:
             observed = [
-                "last observed: unknown" if not np.isfinite(value)
-                else "last observed: nearest delivery" if value <= low
-                else "last observed: middle" if value <= high
-                else "last observed: earliest"
+                "unknown" if not np.isfinite(value)
+                else "nearest delivery" if value <= low
+                else "middle" if value <= high
+                else "earliest"
                 for value in hours.tolist()
             ]
     return {"ascertainment": strata, "coverage": observed}
+
+
+#: The panel title of each :func:`coverage_groupings` variable.
+COVERAGE_TITLES: Dict[str, str] = {"ascertainment": "Ascertainment", "coverage": "Last observed"}
 
 
 def figure_coverage_space(
@@ -617,7 +668,8 @@ def figure_coverage_space(
 
     One model version, because the question is not before-and-after: it is whether the separation a
     reader sees in Figure 1 tracks how these recordings were selected and how much of them survived.
-    It is drawn on the **same** saved projection, so the two figures are the same coordinates.
+    It is drawn on the **same** saved projection, so the two figures are the same coordinates. The
+    two panels colour by different variables, so each keeps its own legend.
 
     Args:
         frame: The recording table the values belong to.
@@ -645,11 +697,9 @@ def figure_coverage_space(
         _scatter_panel(
             axes[0, column], points, labels,
             palette=palette, projection=projection,
-            title=f"coloured by {name}",
+            title=COVERAGE_TITLES.get(str(name), str(name).capitalize()),
         )
-    fig.suptitle(f"The same map, by ascertainment and coverage -- {variance_caption(projection)}")
-    fig.text(0.01, 0.005, CAPTIONS[FIGURE_COVERAGE_SPACE], fontsize=6.0, wrap=True)
-    return figures.render_figure(fig, _figure_dir(directory) / FIGURE_COVERAGE_SPACE)
+    return _render_with_note(fig, directory, FIGURE_COVERAGE_SPACE)
 
 
 # =============================================================================
@@ -666,15 +716,18 @@ def figure_supervised_axis(
     """Draw each model's held-out score distribution, split by clinical class.
 
     One panel per model, and each panel's y-axis is that model's **own** logit scale -- which is why
-    the panels are not given shared limits and why every one of them carries
-    :func:`score_scale_note`. The threshold drawn on each is the one chosen on validation.
+    the panels are not given shared limits and why the figure note says the scales are not
+    comparable (:func:`score_scale_note` holds the long form for the report). The threshold drawn
+    on each is the one chosen on validation; the panels share that key, so the first carries its
+    legend.
 
     Args:
         frame: One row per held-out recording, carrying the GUID, the outcome and the class name.
         columns: ``{model name: logits}``, each aligned with ``frame``.
         directory: The run directory.
-        metrics: ``{model name: recording_metrics record}``, printed in the panel titles. Absent
-            metrics leave the title without them rather than with invented ones.
+        metrics: ``{model name: recording_metrics record}``; the AUROC is printed in the panel
+            title. Absent metrics leave the title as the bare model name rather than with
+            invented ones.
         thresholds: ``{model name: threshold}``, drawn as a reference line where supplied.
 
     Returns:
@@ -691,6 +744,7 @@ def figure_supervised_axis(
 
     names = list(columns)
     fig, axes = figures.new_figure(max(len(names), 1), 1, height_per_row=3.2, width=9.0)
+    keyed = False
     for row, name in enumerate(names):
         values = np.asarray(columns[name], dtype=np.float64).reshape(-1)
         if values.size != len(frame):
@@ -704,33 +758,29 @@ def figure_supervised_axis(
             ]
             for label in order
         }
-        measured = dict((metrics or {}).get(name) or {})
-        headline = " ".join(
-            part for part in (
-                f"AUROC {_num(measured.get('auroc'), 3)}",
-                f"AP {_num(measured.get('average_precision'), 3)}",
-                f"(prevalence {_num(measured.get('prevalence'), 3)})",
-                f"n={_int(measured.get('n_recordings'))}",
-            ) if part
-        ) if measured else "metrics not supplied"
+        auroc = dict((metrics or {}).get(name) or {}).get("auroc")
         figures.violin_panel(
             axes[row, 0],
             samples,
-            title=f"{name}: supervised axis -- {headline}",
-            ylabel="w'S(v) + b",
+            title=(
+                str(name) if auroc is None or not np.isfinite(float(auroc))
+                else f"{name}, AUROC {float(auroc):.3f}"
+            ),
+            ylabel=SCORE_LABEL,
             colors={
                 key: palette.get(key.split(" (")[0], figures.COLOR_GRAY) for key in samples
             },
             reference=None if thresholds is None else thresholds.get(name),
-            reference_label="validation threshold",
+            reference_label="threshold",
         )
-        # On the axis label rather than floating below the axes: an annotation outside the axes
-        # is invisible to tight_layout and lands on the next panel's title.
-        axes[row, 0].set_xlabel(score_scale_note(name, short=True))
+        legend = axes[row, 0].get_legend()
+        if legend is not None:
+            # The threshold key is the same in every panel: written once, in the first to have one.
+            if keyed:
+                legend.remove()
+            keyed = True
 
-    fig.suptitle("Separation along each model's own supervised direction")
-    fig.text(0.01, 0.005, CAPTIONS[FIGURE_SUPERVISED_AXIS], fontsize=6.0, wrap=True)
-    return figures.render_figure(fig, _figure_dir(directory) / FIGURE_SUPERVISED_AXIS)
+    return _render_with_note(fig, directory, FIGURE_SUPERVISED_AXIS)
 
 
 # =============================================================================
@@ -803,6 +853,10 @@ def figure_trajectories(
 ) -> Path:
     """Draw group means, bands, counts and a seeded sample of individual traces per model.
 
+    One panel per model, titled with its name; the panels draw the same keys, so the first carries
+    the one legend, and only the last row carries the time label. A raw-excerpt panel is titled
+    with its recording's GUID and subgroup (:func:`_excerpt_title`).
+
     Args:
         versions: ``{name: (bands, scored)}`` -- the band table from
             :func:`~latent_pilot.analyze.group_bands` and the scored bin table from
@@ -817,8 +871,9 @@ def figure_trajectories(
             models.
         seed: Seeds the trace selection.
         excerpts: Optional ``{guid: {'hours': ..., 'fhr': ..., 'up': ...}}`` raw signal excerpts,
-            each on the same signed-hour axis. Recordings without an excerpt are simply not drawn
-            one; nothing is resampled or extended to fill the panel.
+            each on the same signed-hour axis, plus an optional ``'subgroup'`` for the panel
+            title. Recordings without an excerpt are simply not drawn one; nothing is resampled or
+            extended to fill the panel.
 
     Returns:
         The written path.
@@ -838,9 +893,8 @@ def figure_trajectories(
         traces = select_traces(unique, n=int(n_traces), seed=int(seed))
 
     excerpt_guids = [guid for guid in traces if guid in dict(excerpts or {})]
-    fig, axes = figures.new_figure(
-        max(len(names), 1) + len(excerpt_guids), 1, height_per_row=3.0, width=9.0
-    )
+    n_rows = max(len(names), 1) + len(excerpt_guids)
+    fig, axes = figures.new_figure(n_rows, 1, height_per_row=3.0, width=9.0)
 
     for row, name in enumerate(names):
         ax = axes[row, 0]
@@ -850,7 +904,7 @@ def figure_trajectories(
         ax.axvspan(
             -float(supervised_hours), 0.0,
             color=figures.COLOR_LIGHT_GRAY, alpha=0.5, linewidth=0.0,
-            label=f"supervised window (final {supervised_hours:g} h)",
+            label="supervised window",
         )
         for guid in traces:
             block = scored[scored[data.GUID_COLUMN].astype(str) == str(guid)]
@@ -889,12 +943,13 @@ def figure_trajectories(
                 )
 
         ax.set_xlim(-float(window_hours), 0.0)
-        ax.set_title(f"{name}: frozen final-hour head applied to every occupied bin")
-        ax.set_xlabel(
-            f"hours before delivery (delivery at 0) -- {score_scale_note(name, short=True)}"
-        )
-        ax.set_ylabel("w'S(v) + b")
-        ax.legend(loc="best", fontsize=6.0)
+        ax.set_title(str(name))
+        if row == n_rows - 1:
+            ax.set_xlabel(TIME_LABEL)
+        ax.set_ylabel(SCORE_LABEL)
+        if row == 0:
+            # Every model panel draws the same keys, so the first carries the one legend.
+            ax.legend(loc="best", fontsize=6.0)
         figures.style_axes(ax)
 
     for offset, guid in enumerate(excerpt_guids):
@@ -910,27 +965,45 @@ def figure_trajectories(
             twin.plot(hours, up, color=figures.COLOR_ORANGE, linewidth=0.6, label="UP")
             twin.set_ylabel("UP")
         ax.set_xlim(-float(window_hours), 0.0)
-        ax.set_title(f"raw excerpt -- {guid}")
-        ax.set_xlabel("hours before delivery (delivery at 0)")
+        ax.set_title(_excerpt_title(guid, excerpt, versions[names[0]][1] if names else None))
+        if len(names) + offset == n_rows - 1:
+            ax.set_xlabel(TIME_LABEL)
         ax.set_ylabel("FHR")
         figures.style_axes(ax)
 
-    fig.suptitle(
-        f"Score over the last {float(window_hours):g} hours, "
-        f"with per-bin recording counts"
-    )
-    fig.text(
-        0.01, 0.005,
-        CAPTIONS[FIGURE_TRAJECTORIES].format(
-            supervised_hours=float(supervised_hours), bin_hours=float(bin_hours)
-        ),
-        fontsize=6.0, wrap=True,
-    )
     logger.info(
         f"figure 3: {len(names)} model panel(s), {len(traces)} seeded individual trace(s), "
         f"{len(excerpt_guids)} raw excerpt(s)"
     )
-    return figures.render_figure(fig, _figure_dir(directory) / FIGURE_TRAJECTORIES)
+    return _render_with_note(fig, directory, FIGURE_TRAJECTORIES)
+
+
+def _excerpt_title(guid: str, excerpt: Mapping[str, Any], scored: Optional[pd.DataFrame]) -> str:
+    """Name the recording a raw-excerpt panel shows: its GUID, always followed by its subgroup.
+
+    The subgroup comes from the excerpt record, else from the scored table's subgroup column; where
+    neither carries one the recording's clinical class is named instead and called a class, so the
+    title never claims a subgroup that was not read.
+
+    Args:
+        guid: The recording.
+        excerpt: The recording's excerpt record, which may carry a ``'subgroup'`` entry.
+        scored: The scored bin table of the first model, or ``None``.
+
+    Returns:
+        ``'guid X, subgroup Y'``, ``'guid X, class Y'`` or ``'guid X'``.
+    """
+    block = (
+        scored[scored[data.GUID_COLUMN].astype(str) == str(guid)] if scored is not None
+        else pd.DataFrame()
+    )
+    subgroup = excerpt.get("subgroup")
+    if subgroup is None and labels.SUBGROUP_COLUMN in block.columns and not block.empty:
+        subgroup = block[labels.SUBGROUP_COLUMN].iloc[0]
+    if subgroup is not None and not pd.isna(subgroup):
+        return f"guid {guid}, subgroup {subgroup}"
+    name = _class_of(block)[0] if not block.empty else ""
+    return f"guid {guid}, class {name}" if name else f"guid {guid}"
 
 
 # =============================================================================
@@ -941,6 +1014,15 @@ ROC_GRID_COLUMNS = 4
 
 #: The metrics Figure 6 draws against time, one panel each, in this order.
 TIME_METRICS: Tuple[str, ...] = ("auroc", "average_precision", "f1", "balanced_accuracy")
+
+#: The y label of each of those panels. The panel title is left to the panel letter, so the label
+#: is the one place the metric is named.
+TIME_METRIC_LABELS: Dict[str, str] = {
+    "auroc": "AUROC",
+    "average_precision": "Average precision",
+    "f1": r"$F_1$",
+    "balanced_accuracy": "Balanced accuracy",
+}
 
 #: How each of those panels marks the level a useless ranker would reach. ``prevalence`` names the
 #: per-bin column to read, because average precision has no fixed chance level; ``None`` means the
@@ -961,35 +1043,31 @@ COUNT_STACK: Tuple[Tuple[str, str], ...] = (
 )
 
 
-#: Share of the figure height reserved below the axes for the caption. Figures 1-3 are single
-#: columns of tall panels, where a caption at the very bottom clears the last x-label on its own.
-#: These are grids, whose bottom row of x-labels sits far lower, so the space is reserved
-#: explicitly rather than left to collide.
-CAPTION_BAND = 0.05
+def _render_with_note(
+    fig: Any, directory: Any, stem: str, note: Optional[str] = None
+) -> Path:
+    """Write the figure's one-line note under its axes, lay it out around the note, and save.
 
-
-def _render_with_caption(fig: Any, directory: Any, stem: str) -> Path:
-    """Lay the figure out above its caption, write the caption, and save.
-
-    ``tight_layout`` knows nothing about a ``fig.text`` placed in figure coordinates, so it is
-    given an explicit rectangle to lay the axes into and :func:`render_figure` is asked not to run
-    it a second time -- which would undo the reservation.
+    The note goes through :func:`~teb_vae.lag_attn.eval.figures.footnote`, which reserves the room
+    it needs, and :func:`~teb_vae.lag_attn.eval.figures.render_figure` lays the axes out around
+    that reservation and around any figure title. The long :data:`CAPTIONS` sentence of the same
+    figure is not drawn: the report prints it beside the figure.
 
     Args:
         fig: The figure.
         directory: The run directory.
-        stem: The figure-name constant, which is also its :data:`CAPTIONS` key.
+        stem: The figure-name constant, which is also its :data:`NOTES` and :data:`CAPTIONS` key.
+        note: The note to print. ``None`` takes :data:`NOTES` ``[stem]``; an empty string prints
+            none.
 
     Returns:
         The path written, extension included.
     """
     figures = _figures()
-    try:
-        fig.tight_layout(rect=(0.0, CAPTION_BAND, 1.0, 1.0))
-    except Exception:  # noqa: BLE001 - a layout warning must not lose a completed figure
-        pass
-    fig.text(0.01, 0.005, CAPTIONS[stem], fontsize=6.0, wrap=True)
-    return figures.render_figure(fig, _figure_dir(directory) / stem, tight=False)
+    text = NOTES.get(stem, "") if note is None else note
+    if text:
+        figures.footnote(fig, text)
+    return figures.render_figure(fig, _figure_dir(directory) / stem)
 
 
 def _empty_panel(ax: Any, message: str) -> None:
@@ -1048,7 +1126,9 @@ def figure_roc_pr(
     Each model's **validation-selected operating point** is marked on both curves, at
     ``(1 - specificity, sensitivity)`` and ``(sensitivity, precision)``. That point is the only
     place a threshold enters this figure; the curves themselves are threshold-free, which is why
-    they can be compared between two models whose logit scales are not comparable.
+    they can be compared between two models whose logit scales are not comparable. The legend
+    entry is the model's name and its AUROC (or average precision) to two decimals; the cohort
+    counts are in the note line.
 
     Args:
         curves: ``{model: {'roc': ..., 'pr': ...}}`` as
@@ -1056,8 +1136,9 @@ def figure_roc_pr(
             :func:`~latent_pilot.evaluate.pr_points` return them.
         metrics: ``{model: recording_metrics}``, for the operating point and the counts.
         directory: The run directory; the figure lands in its ``figures`` subdirectory.
-        intervals: ``paired_bootstrap``'s ``models`` block, for the legend intervals. Optional --
-            a run whose bootstrap could not be estimated still gets the curves.
+        intervals: ``paired_bootstrap``'s ``models`` block. Not drawn: the legend carries the
+            point estimate alone, and the interval is in the report. Kept so the caller's
+            signature does not move.
 
     Returns:
         The path written.
@@ -1077,10 +1158,7 @@ def figure_roc_pr(
         if false_positive.size == 0:
             continue
         colour = palette.get(name, figures.COLOR_GRAY)
-        label = (
-            f"{name}: AUROC {float(record.get('auroc', float('nan'))):.3f}"
-            f"{_interval_text(intervals, name, 'auroc')}"
-        )
+        label = f"{name} {float(record.get('auroc', float('nan'))):.2f}"
         roc_ax.plot(false_positive, true_positive, color=colour, linewidth=1.2, label=label)
         measured = dict(metrics.get(name) or {})
         specificity, sensitivity = measured.get("specificity"), measured.get("sensitivity")
@@ -1092,14 +1170,14 @@ def figure_roc_pr(
                 marker="o", markersize=4.0, color=colour, linestyle="none",
             )
         drawn_roc += 1
+    roc_ax.set_title("ROC")
     if not drawn_roc:
-        _empty_panel(roc_ax, "no held-out population carried both classes")
+        _empty_panel(roc_ax, "one class only")
     else:
         roc_ax.set_xlim(0.0, 1.0)
         roc_ax.set_ylim(0.0, 1.0)
-        roc_ax.set_title("ROC, held-out final-hour bags")
-        roc_ax.set_xlabel("false positive rate (1 - specificity)")
-        roc_ax.set_ylabel("true positive rate (sensitivity)")
+        roc_ax.set_xlabel("False positive rate")
+        roc_ax.set_ylabel("True positive rate")
         roc_ax.legend(loc="lower right", fontsize=6.0)
         figures.style_axes(roc_ax)
 
@@ -1113,10 +1191,7 @@ def figure_roc_pr(
             continue
         prevalence = float(record.get("prevalence", float("nan")))
         colour = palette.get(name, figures.COLOR_GRAY)
-        label = (
-            f"{name}: AP {float(record.get('average_precision', float('nan'))):.3f}"
-            f"{_interval_text(intervals, name, 'average_precision')}"
-        )
+        label = f"{name} {float(record.get('average_precision', float('nan'))):.2f}"
         # ``post`` because precision-recall is a step function of the threshold: joining the
         # points with straight lines draws interpolated operating rules that do not exist.
         pr_ax.step(recall, precision, where="post", color=colour, linewidth=1.2, label=label)
@@ -1130,29 +1205,29 @@ def figure_roc_pr(
                 marker="o", markersize=4.0, color=colour, linestyle="none",
             )
         drawn_pr += 1
+    pr_ax.set_title("Precision-recall")
     if not drawn_pr:
-        _empty_panel(pr_ax, "no held-out population carried both classes")
+        _empty_panel(pr_ax, "one class only")
     else:
         if np.isfinite(prevalence):
             pr_ax.axhline(
                 prevalence, color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--",
-                label=f"chance = prevalence {prevalence:.3f}",
+                label=f"prevalence {prevalence:.2f}",
             )
         pr_ax.set_xlim(0.0, 1.0)
         pr_ax.set_ylim(0.0, 1.0)
-        pr_ax.set_title("Precision-recall, held-out final-hour bags")
-        pr_ax.set_xlabel("recall (sensitivity)")
-        pr_ax.set_ylabel("precision")
+        pr_ax.set_xlabel("Recall")
+        pr_ax.set_ylabel("Precision")
         pr_ax.legend(loc="best", fontsize=6.0)
         figures.style_axes(pr_ax)
 
     counts = dict(metrics.get(names[0]) or {}) if names else {}
-    fig.suptitle(
-        f"Held-out discrimination: {int(counts.get('n_recordings', 0))} recording(s), "
-        f"{int(counts.get('n_adverse', 0))} adverse; dots mark the validation-selected threshold"
-    )
     logger.info(f"figure 4: {drawn_roc} ROC curve(s), {drawn_pr} PR curve(s)")
-    return _render_with_caption(fig, directory, FIGURE_ROC_PR)
+    return _render_with_note(
+        fig, directory, FIGURE_ROC_PR,
+        f"Held-out final-hour bags: {int(counts.get('n_recordings', 0))} recordings, "
+        f"{int(counts.get('n_adverse', 0))} adverse. {NOTES[FIGURE_ROC_PR]}",
+    )
 
 
 def figure_confusion(
@@ -1234,7 +1309,9 @@ def figure_confusion(
                 MISSING if value is None or not np.isfinite(float(value))
                 else f"{float(value):.3f}"
             )
-            lines.append(f"  {metric}: {text}{_interval_text(intervals, name, metric)}")
+            lines.append(
+                f"  {metric.replace('_', ' ')}: {text}{_interval_text(intervals, name, metric)}"
+            )
         lines.append("")
     ax.axis("off")
     ax.text(
@@ -1245,9 +1322,8 @@ def figure_confusion(
     for column in range(len(names) + 1, axes.shape[1]):
         axes[0, column].axis("off")
 
-    fig.suptitle("Confusion counts and derived rates at the validation-selected threshold")
     logger.info(f"figure 5: {len(names)} confusion matrix panel(s)")
-    return _render_with_caption(fig, directory, FIGURE_CONFUSION)
+    return _render_with_note(fig, directory, FIGURE_CONFUSION)
 
 
 def _metric_curve(
@@ -1335,6 +1411,7 @@ def figure_metrics_vs_time(
     columns = 2 if len(wanted) > 1 else 1
     rows = int(np.ceil(len(wanted) / columns))
     fig, axes = figures.new_figure(rows, columns, height_per_row=2.8, width=9.0)
+    keyed = False
 
     for position, metric in enumerate(wanted):
         ax = axes[position // columns, position % columns]
@@ -1372,29 +1449,25 @@ def figure_metrics_vs_time(
             reference = _metric_curve(
                 bin_metrics[bin_metrics["model"] == names[0]], metric, x
             )["chance"]
-            ax.plot(
-                x, reference, color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--",
-                label="chance = prevalence",
-            )
+            ax.plot(x, reference, color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--")
+        ax.set_ylabel(TIME_METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()))
         if not drawn:
-            _empty_panel(ax, f"no bin carried both classes for {metric}")
+            _empty_panel(ax, "no estimable bin")
             continue
         ax.set_xlim(-float(window_hours), 0.0)
-        ax.set_title(metric.replace("_", " "))
-        ax.set_xlabel("hours before delivery (delivery at 0)")
-        ax.set_ylabel(metric.replace("_", " "))
-        ax.legend(loc="best", fontsize=6.0)
+        if position + columns >= len(wanted):
+            ax.set_xlabel(TIME_LABEL)
+        if not keyed:
+            # Every panel draws the same model keys, so the first to draw any carries the legend.
+            ax.legend(loc="best", fontsize=6.0)
+            keyed = True
         figures.style_axes(ax)
 
     for position in range(len(wanted), rows * columns):
         axes[position // columns, position % columns].axis("off")
 
-    fig.suptitle(
-        f"Discrimination over the last {float(window_hours):g} hours; "
-        f"counts are adverse/total recordings per bin"
-    )
     logger.info(f"figure 6: {len(wanted)} metric panel(s) over {len(names)} model(s)")
-    return _render_with_caption(fig, directory, FIGURE_METRICS_TIME)
+    return _render_with_note(fig, directory, FIGURE_METRICS_TIME)
 
 
 def figure_roc_by_bin(
@@ -1408,7 +1481,9 @@ def figure_roc_by_bin(
 
     Only bins that carried both classes appear: a bin with no adverse recording has no ROC, and a
     panel drawn for it would show a diagonal that was never measured. The panel count is therefore
-    itself a statement about coverage, and the title of each panel carries the counts it rests on.
+    itself a statement about coverage, and the title of each panel carries the counts it rests on
+    (adverse/total), with a star on the bins inside the supervised window. The axes are labelled on
+    the outer panels only.
 
     Args:
         bin_curves: The long curve table from :func:`~latent_pilot.analyze.bin_roc_points`.
@@ -1422,9 +1497,9 @@ def figure_roc_by_bin(
     figures = _figures()
     if bin_curves.empty:
         fig, axes = figures.new_figure(1, 1, height_per_row=3.0, width=9.0)
-        _empty_panel(axes[0, 0], "no time bin carried both binary classes")
-        fig.suptitle("ROC by time bin")
-        return _render_with_caption(fig, directory, FIGURE_ROC_BINS)
+        _empty_panel(axes[0, 0], "no estimable bin")
+        axes[0, 0].set_title("ROC by time bin")
+        return _render_with_note(fig, directory, FIGURE_ROC_BINS, "")
 
     bins = sorted({int(value) for value in bin_curves[data.BIN_COLUMN]})
     names = sorted({str(value) for value in bin_curves["model"]})
@@ -1432,6 +1507,13 @@ def figure_roc_by_bin(
     columns = int(min(max(n_cols, 1), len(bins)))
     rows = int(np.ceil(len(bins) / columns))
     fig, axes = figures.new_figure(rows, columns, height_per_row=2.4, width=9.0)
+    # The bins the classifier was fitted on, starred in their panel titles.
+    inside: set = set()
+    if not bin_metrics.empty and "supervised_window" in bin_metrics.columns:
+        inside = {
+            int(row[data.BIN_COLUMN]) for _index, row in bin_metrics.iterrows()
+            if bool(row["supervised_window"])
+        } & set(bins)
 
     for position, index in enumerate(bins):
         ax = axes[position // columns, position % columns]
@@ -1455,27 +1537,22 @@ def figure_roc_by_bin(
             )
         ax.set_xlim(0.0, 1.0)
         ax.set_ylim(0.0, 1.0)
-        ax.set_title(f"{label} h before delivery, {counts}", fontsize=7.0)
-        ax.set_xlabel("false positive rate")
-        ax.set_ylabel("true positive rate")
+        ax.set_title(f"{label} h, {counts}{' *' if index in inside else ''}", fontsize=7.0)
+        if position + columns >= len(bins):
+            ax.set_xlabel("False positive rate")
+        if position % columns == 0:
+            ax.set_ylabel("True positive rate")
         ax.legend(loc="lower right", fontsize=5.5)
         figures.style_axes(ax)
 
     for position in range(len(bins), rows * columns):
         axes[position // columns, position % columns].axis("off")
 
-    supervised = ""
-    if not bin_metrics.empty and "supervised_window" in bin_metrics.columns:
-        inside = sorted({
-            int(row[data.BIN_COLUMN]) for _index, row in bin_metrics.iterrows()
-            if bool(row["supervised_window"])
-        })
-        supervised = f"; bins {inside} lie inside the supervised window" if inside else ""
-    fig.suptitle(
-        f"ROC in each time bin, nearest delivery first; titles carry adverse/total{supervised}"
-    )
     logger.info(f"figure 7: {len(bins)} estimable bin panel(s)")
-    return _render_with_caption(fig, directory, FIGURE_ROC_BINS)
+    return _render_with_note(
+        fig, directory, FIGURE_ROC_BINS,
+        f"{NOTES[FIGURE_ROC_BINS]} * supervised window." if inside else None,
+    )
 
 
 def figure_counts_vs_time(
@@ -1512,7 +1589,7 @@ def figure_counts_vs_time(
     fig, axes = figures.new_figure(max(len(names), 1), 1, height_per_row=2.6, width=9.0)
 
     if not names:
-        _empty_panel(axes[0, 0], "no model produced a per-bin cell")
+        _empty_panel(axes[0, 0], "no estimable bin")
     for row, name in enumerate(names):
         ax = axes[row, 0]
         ax.axvspan(
@@ -1535,17 +1612,17 @@ def figure_counts_vs_time(
             )
             bottom = bottom + heights[cell]
         ax.set_xlim(-float(window_hours), 0.0)
-        ax.set_title(f"{name}: confusion cells per bin at its validation threshold")
-        ax.set_xlabel("hours before delivery (delivery at 0)")
-        ax.set_ylabel("recordings")
-        ax.legend(loc="upper left", fontsize=6.0, ncol=4)
+        ax.set_title(str(name))
+        if row == len(names) - 1:
+            ax.set_xlabel(TIME_LABEL)
+        ax.set_ylabel("Recordings")
+        if row == 0:
+            # Every model row stacks the same four cells, so the first carries the one legend.
+            ax.legend(loc="upper left", fontsize=6.0, ncol=4)
         figures.style_axes(ax)
 
-    fig.suptitle(
-        f"What the rates are rates of, over the last {float(window_hours):g} hours"
-    )
     logger.info(f"figure 8: {len(names)} model panel(s)")
-    return _render_with_caption(fig, directory, FIGURE_COUNTS_TIME)
+    return _render_with_note(fig, directory, FIGURE_COUNTS_TIME)
 
 
 # =============================================================================
@@ -2186,16 +2263,31 @@ def _subgroup_section(record: Mapping[str, Any]) -> List[str]:
 
 
 def _figures_section(record: Mapping[str, Any]) -> List[str]:
-    """The figures this run wrote, each with the caption it carries."""
+    """The figures this run wrote, each with its caption.
+
+    The figures print a short note only; the full :data:`CAPTIONS` sentence is here. A caption
+    that is a format template is filled from the run's own recorded window settings, and left as
+    written where the record carries none.
+    """
     lines = ["## Figures"]
     figures_written = dict(record.get("figures") or {})
     if not figures_written:
         lines.append(_missing("figures", "no figure was rendered for this run."))
         return lines
+    windows = dict(
+        dict(dict(record.get("protocol") or {}).get("settings") or {}).get("windows") or {}
+    )
     for name, path in figures_written.items():
         lines.append(f"- `{path}`")
         caption = CAPTIONS.get(str(name))
         if caption:
+            try:
+                caption = caption.format(
+                    supervised_hours=float(windows["supervised_hours"]),
+                    bin_hours=float(windows["bin_hours"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
             lines.append(f"  - {caption}")
     return lines
 

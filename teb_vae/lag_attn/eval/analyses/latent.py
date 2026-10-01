@@ -163,13 +163,10 @@ def _write_per_dim_figure(
         )
         ax.axhline(
             threshold, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
-            label=f"active threshold {threshold:g}",
+            label="active threshold",
         )
         ax.set_yscale("symlog", linthresh=threshold)
-        ax.set_title(
-            f"Per-dimension mean KL over the support -- "
-            f"{int(active.sum())} of {per_dim_mean.size} active"
-        )
+        ax.set_title(f"Per-dimension KL, {int(active.sum())} of {per_dim_mean.size} active")
         ax.set_xlabel("Latent dimension $d$")
         ax.set_ylabel("$\\overline{KL}_d$ (nats)")
         ax.legend(fontsize=7, loc="best")
@@ -201,10 +198,10 @@ def _write_per_dim_figure(
             )
         ax.axhline(
             threshold, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
-            label=f"active threshold {threshold:g}",
+            label="active threshold",
         )
         ax.set_yscale("symlog", linthresh=threshold)
-        ax.set_title("Per-dimension KL, distribution across samples")
+        ax.set_title("Per-dimension KL distribution")
         ax.set_xlabel("Latent dimension $d$")
         ax.set_ylabel("$\\overline{KL}_d$ (nats)")
         ax.legend(fontsize=7, loc="best")
@@ -242,9 +239,9 @@ def _write_kt_figure(
         ax = axes[0, 0]
         figures.ribbon_plot(
             ax, figures.sequence_axis(seq_len), curves,
-            title="$K_t$ over the recording, with the out-of-support region shaded",
+            title="Per-step KL",
             xlabel="Step $t$ (decimated)", ylabel="$K_t$ (nats)",
-            label="median over samples",
+            label="median",
         )
         if warmup > 0:
             ax.axvspan(0, warmup, color=figures.COLOR_LIGHT_GRAY, alpha=0.6, zorder=0)

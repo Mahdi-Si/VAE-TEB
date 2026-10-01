@@ -18,11 +18,13 @@ here would be a second set of thresholds for two cells that exist to be compared
 
     python -m teb_vae.lag_attn_transformer_cfs.eval.verify --runs <dir> --out RESULTS_arms.md
 
-What is local is which axis this cell was swept on, and the comparison the package exists to make.
-This cell ships **one** ``sweep_*.yaml`` arm -- ``anchor_stride`` -- against the conv-LSTM cell's
-four, so its own sweep section is one table; beside it the cfs cell's cross-cell table puts runs of
-*both* architectures side by side, keyed by the ``model_class`` each run recorded in its own
-``run_context``.
+What is local is which leaves this cell was swept on, and the comparison the package exists to make.
+The ``anchor_stride`` arm gets the cfs cell's tiling table; every other ``sweep_*.yaml`` arm this
+cell's ``configs/`` ships is a single-leaf change restoring an earlier choice, and all of them are
+read off one **arm leaves** table (:data:`SWEPT_ARM_LEAVES`) that prints each run's value of every
+such leaf, so a row is identified by what it changed rather than by its directory name. Beside them
+the cfs cell's cross-cell table puts runs of *both* architectures side by side, keyed by the
+``model_class`` each run recorded in its own ``run_context``.
 
 The cfs cell's four sourcing rules hold here unchanged and are inherited rather than restated: arms
 are keyed by the value read from each run's own ``resolved_config.yaml`` and never from a directory
@@ -41,7 +43,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from teb_vae.lag_attn_cfs.eval import launch, verify as shared
 
@@ -61,11 +63,30 @@ ANCHORS_PER_SAMPLE_COLUMN = shared.ANCHORS_PER_SAMPLE_COLUMN
 #: rather than as the parser's default, so a path in :data:`RUN_ARGS` is reachable.
 DEFAULT_ARMS_OUT = "RESULTS_arms.md"
 
-#: The one axis this cell ships an arm for. The other three the cfs cell sweeps -- the floor, the
-#: horizon and the decoder depth -- are properties of the shared target-domain half rather than of
-#: these encoders, so this package ships no arm on them and renders no section for them: a table
-#: whose every row read ``(absent)`` would be a sweep nobody ran, printed as though somebody had.
+#: The tiling axis, rendered in the cfs cell's own table because its column (the evaluated anchor
+#: count) is specific to it. The floor, the horizon and the decoder depth the cfs cell also
+#: tabulates have no arm here.
 SWEPT_ANCHOR_STRIDE = shared.SWEPT_ANCHOR_STRIDE
+
+#: The leaves the other shipped ``sweep_*.yaml`` arms change, one column each in the arm leaves
+#: table. Each arm restores one earlier choice at one leaf (``sweep_legacy_dualref_physclock``
+#: changes several; its phase-operator leaf is the one that identifies it), so a run's row reads as
+#: the shipped value everywhere except the column its arm moved. A leaf the run's config does not
+#: carry renders ``(absent)``, which is how a conv-LSTM run in the same directory reads.
+#: ``tests/test_eval_run.py`` asserts every shipped arm's leaf is listed here.
+SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
+    (leaf, ("model_config", "VAE_model", leaf))
+    for leaf in (
+        "lag_kv_source",
+        "forecast_ar_residual",
+        "target_phase_fast_horizon",
+        "source_dropout",
+        "alibi_slope_scale",
+        "causal_align_reference",
+        "causal_target_forecast_clock",
+        "causal_phase_operator",
+    )
+)
 
 
 # =============================================================================
@@ -136,7 +157,7 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
 
     lines += ["", "## Anchor tiling sweep (`anchor_stride`)", ""]
     lines += [
-        "The one axis this cell ships an arm for. The stride is a *training* setting: every run "
+        "The one axis this cell tabulates. The stride is a *training* setting: every run "
         f"here was evaluated at the dense anchor set, so `{ANCHORS_PER_SAMPLE_COLUMN}` should read "
         "identically down this column and a row that does not is a run scored over another "
         "population.",
@@ -157,6 +178,23 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
                 shared._collapsed_cell(arm),
             ],
         ),
+    )
+
+    lines += ["", "## Arm leaves", ""]
+    lines += [
+        "One row per run, one column per leaf a shipped `sweep_*.yaml` arm changes, read from the "
+        f"run's own `{RESOLVED_CONFIG_FILENAME}`. The column that departs from the shipped value "
+        "names the arm; its numbers are the same run's row in the cross-cell table below.",
+        "",
+    ]
+    lines += shared._table(
+        ["Run", "Model", *(f"`{leaf}`" for leaf, _ in SWEPT_ARM_LEAVES)],
+        [
+            [arm["run"], arm["model_class"],
+             *(shared._render(shared._dig_config(arm["config"], path))
+               for _, path in SWEPT_ARM_LEAVES)]
+            for arm in sorted(arms, key=lambda record: record["run"])
+        ],
     )
 
     lines += shared.build_cross_cell_table(arms)

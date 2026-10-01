@@ -317,9 +317,13 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     the empirical CDF of the PIT against the diagonal it should lie on, which is the same
     departure integrated and is what the reported deviation measures.
 
+    The coverage levels (observed against nominal at $1\\sigma$, $2\\sigma$, $3\\sigma$) are in
+    ``coverage`` and the summary record, not on the figure.
+
     Args:
         pit: The PIT table.
-        coverage: The coverage table, marked on the reliability panel.
+        coverage: The coverage table. Unused by the drawing; kept so the builder's signature
+            matches the record it is called with.
 
     Returns:
         The figure.
@@ -336,14 +340,14 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         )
         axis.axhline(
             1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
-            label="uniform (calibrated)",
+            label="calibrated",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
-    axis.set_title("Probability integral transform of the scored coefficients")
+    axis.set_title("PIT histogram")
     axis.set_xlabel("PIT value")
     axis.set_ylabel("density")
     figures.style_axes(axis)
@@ -364,12 +368,8 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
-    observed = ", ".join(
-        f"{int(row['level_sigma'])}$\\sigma$ {float(row['observed']):.4f}/{float(row['nominal']):.4f}"
-        for row in coverage.to_dict("records")
-    ) if len(coverage) else "no coverage measured"
-    axis.set_title(f"Reliability: observed vs nominal ({observed})")
-    axis.set_xlabel("nominal cumulative probability")
+    axis.set_title("Reliability")
+    axis.set_xlabel("nominal probability")
     axis.set_ylabel("observed")
     figures.style_axes(axis)
     return figure
@@ -422,7 +422,7 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
             axis.axvline(position, color=figures.COLOR_GRAY, linestyle=":",
                          linewidth=figures.LINE_REGULAR)
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
-    axis.set_title("Decoder log-variance over the scored coefficients")
+    axis.set_title("Decoder log-variance")
     axis.set_xlabel("log-variance")
     axis.set_ylabel("fraction of coefficients")
     figures.style_axes(axis)

@@ -399,7 +399,7 @@ LEGEND_HEADROOM_FRACTION = 0.24
 #: The y label, which is where the two levels are named. Not the title: the nested figure puts
 #: three cells across a 13-inch page, and a title long enough to explain both levels overflows its
 #: column and collides with its neighbours. A label is compact, vertical, and on every panel.
-DENSITY_YLABEL = "density (bars); recordings (strip)"
+DENSITY_YLABEL = "density; recording strip"
 
 #: How opaque a cohort's filled body is. Faint on purpose: up to four cohorts are drawn on top of
 #: one another in a single panel, and a fill heavy enough to read on its own hides whatever is
@@ -434,6 +434,7 @@ def draw_density_panel(
     title: str,
     xlabel: str,
     reference: Optional[float] = None,
+    legend: bool = True,
 ) -> int:
     """Draw the segment-level density per cohort, with the recording-level spread above it.
 
@@ -464,7 +465,10 @@ def draw_density_panel(
         groups: The cohorts, in the order they should be drawn and legended.
         title: Panel title.
         xlabel: X-axis label, carrying the unit.
-        reference: Optional vertical line -- a null, or a calibrated value.
+        reference: Optional vertical line -- a null, or a calibrated value. Unlabelled: it sits
+            at its own tick.
+        legend: Whether to draw the cohort legend. A figure whose panels share their cohorts draws
+            it once, in the first panel, rather than in every one.
 
     Returns:
         The number of cohorts that contributed at least one finite segment value. Zero draws the
@@ -511,10 +515,7 @@ def draw_density_panel(
             values, bins=edges, density=True, histtype="stepfilled",
             color=to_rgba(colour, FILL_ALPHA), edgecolor=colour,
             linewidth=figures.LINE_HAIRLINE, zorder=FILL_ZORDER,
-            label=(
-                f"{group} ({values.size} seg / "
-                f"{recording_by_group.get(group, np.zeros(0)).size} rec)"
-            ),
+            label=group,
         )
         # The same staircase re-stroked above every fill, and deliberately unlabelled so the legend
         # keeps one row per cohort. Identical geometry, colour and weight to the border above, so
@@ -530,9 +531,9 @@ def draw_density_panel(
     if reference is not None and np.isfinite(reference):
         ax.axvline(
             float(reference), color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR,
-            label=f"reference {float(reference):g}",
         )
-    ax.legend(fontsize=figures.FONT_SMALL, loc="upper right", framealpha=0.85)
+    if legend:
+        ax.legend(fontsize=figures.FONT_SMALL, loc="upper right", framealpha=0.85)
     figures.style_axes(ax)
     return len(drawn)
 
@@ -610,8 +611,9 @@ def build_class_figure(
             {group: _series(recording, axis, group, metric.name) for group in groups},
             groups,
             title=_panel_title(metric),
-            xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
+            xlabel=units.get(metric.name, metric.unit),
             reference=metric.reference,
+            legend=row == 0,
         )
     return figure
 
@@ -648,14 +650,15 @@ def build_subgroup_figure(
                 {group: _series(recording, axis, group, metric.name) for group in groups},
                 groups,
                 title=_panel_title(metric, prefix=f"{class_name}: "),
-                xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
+                xlabel=units.get(metric.name, metric.unit),
                 reference=metric.reference,
+                legend=row == 0,
             )
         if not classes:
             draw_density_panel(
                 axes[row, 0], {}, {}, [],
                 title=_panel_title(metric),
-                xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
+                xlabel=units.get(metric.name, metric.unit),
                 reference=metric.reference,
             )
     return figure

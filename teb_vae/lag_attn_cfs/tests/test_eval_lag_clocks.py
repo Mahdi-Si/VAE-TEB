@@ -498,7 +498,7 @@ def test_the_features_page_draws_every_untested_statistic_with_both_profiles() -
     # Every panel names its own unit: half of what is drawn here is not in seconds, and a panel
     # inheriting the lag axis label would state the wrong one rather than none.
     for statistic in analysis.DRAWN_STATISTICS:
-        title = f"{statistic.key} against the clock, by {labels.CLASS_COLUMN}"
+        title = analysis.statistic_title(statistic)
         assert labelled[title] == (
             statistic.unit or COEFFICIENT_LAG_AXIS_LABEL
         ), title
@@ -529,7 +529,7 @@ def test_the_windows_page_rows_read_more_severe_against_less_severe() -> None:
         shared_figures.plt.close(figure)
 
     expected = [
-        f"{feature.column}: {left} vs {right}"
+        f"{analysis.readout_title(feature)}: {left} vs {right}"
         for feature in analysis.READOUTS
         for left, right in (("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"))
     ]

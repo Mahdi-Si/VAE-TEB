@@ -208,24 +208,24 @@ def test_ascertainment_labels_name_both_flags():
 def test_coverage_labels_split_the_cohort_into_thirds():
     frame = pd.DataFrame({"last_anchor_hours": [0.1, 0.2, 0.5, 0.6, 0.9, 1.0]})
     observed = report.coverage_groupings(frame)["coverage"]
-    assert observed[0].endswith("nearest delivery")
-    assert observed[-1].endswith("earliest")
+    assert observed[0] == "nearest delivery"
+    assert observed[-1] == "earliest"
     assert len(set(observed)) == 3
 
 
 def test_a_cohort_too_small_to_stratify_says_so_rather_than_inventing_thirds():
     frame = pd.DataFrame({"last_anchor_hours": [0.4, 0.4, 0.4, 0.4]})
     observed = report.coverage_groupings(frame)["coverage"]
-    assert set(observed) == {"last observed: not stratified"}
+    assert set(observed) == {"not stratified"}
     assert set(report.coverage_groupings(pd.DataFrame({"a": [1, 2]}))["coverage"]) == {
-        "last observed: not stratified"
+        "not stratified"
     }
 
 
 def test_an_unknown_last_observed_time_is_its_own_group():
     frame = pd.DataFrame({"last_anchor_hours": [0.1, 0.5, 0.9, float("nan")]})
     observed = report.coverage_groupings(frame)["coverage"]
-    assert observed[-1] == "last observed: unknown"
+    assert observed[-1] == "unknown"
 
 
 # =============================================================================
