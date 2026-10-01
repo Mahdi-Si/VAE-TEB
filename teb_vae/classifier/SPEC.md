@@ -327,7 +327,7 @@ Two pilot ideas carry over as-is:
 - **Select checkpoints on total loss while AUROC peaks elsewhere**, with no class balancing and tuning via optimizer brakes. → early-stop on GUID-level validation log loss or AUROC (§10.5).
 - **Use a signed `ψ(second_stage_onset)` input.** It leaks time-to-delivery before second stage. Keeping the second-stage zero-sentinel GUIDs in training leaks `epoch` directly. → §2.4 and §12.
 - **Filter evaluation cohorts after training.** Dropping GUIDs without second stage from val/test biases the CS/HIE strata. → report cohorts, never silently filter them (§11.6).
-- **Widen the test window relative to val** (`epoch_min_test`). Committed FPR accumulates with exposure, so test FPR overshoots the cap. → one window for all splits.
+- **Widen the test window relative to val** (`epoch_min_test`). Committed FPR accumulates with exposure, so test FPR overshoots the cap. → one window for val and test; only the training window may differ (`train_epoch_min_s`, L6).
 - **Gap-fill epochs** in evaluation. `fill_missing_epochs` dropped real off-grid rows and moved alarms. → never impute rows; use running-max scores (§11.2).
 - **Let the threshold search fall back silently to 0.5.** → raise instead.
 - **Headline averages over time bins.** → report metrics at named checkpoints.
@@ -545,7 +545,7 @@ teb_vae/classifier/
 - `duplicate_epoch` (keep the first, report the count)
 - `crosses_delivery` (`t_end_s > 0`)
 - `low_valid_frac` (`valid_frac < data.min_valid_frac`)
-- `outside_window` (`epoch_s < data.epoch_min_s`)
+- `outside_window` (`epoch_s < data.epoch_min_s` on val and test; on train `data.train_epoch_min_s` when set)
 - `label_conflict`
 - `no_valid_steps`: the cached `step_mask` has no usable step (warm-up / `min_step` masking can empty a segment whose raw `valid_frac` passes). Applied where cohort rows are joined to the feature cache (`baselines.fold_frame`), so baselines and neural models see the same population; `cohort.min_segments_per_guid` is re-applied after the drop. Counts per split in `baselines/fold_<k>/*_fit.json`, surfaced by evaluate in `inclusion.csv` (analysis `no_valid_steps`) and `summary.md` §2
 
@@ -1563,7 +1563,7 @@ This section carries over and extends the previous pipeline's 22-filter subgroup
   - paired GUID bootstrap on pooled OOF test (ΔAUROC, Δsensitivity at each policy);
   - DeLong on pooled GUID-level scores (a fast DeLong implementation, ~40 lines, written from the paper, not copied from an unlicensed repo): `p_delong` on every `delta_auroc` row;
   - Nadeau–Bengio corrected resampled t-test on per-fold AUROCs, with variance factor `(1/k + 1/(k−1))`, k = number of folds: `p_nb` on the whole-population `delta_auroc` row.
-- A comparison refuses to run if the cohort digests differ.
+- A comparison refuses to run if the cohort digests differ. The digest covers the retained val and test GUIDs only, so runs that differ in their training window (`data.train_epoch_min_s`) pair.
 
 ### 11.9 `evaluation/tables/metrics.parquet` schema (long format)
 
@@ -1890,7 +1890,7 @@ These follow `teb_vae/lag_attn_cfs/eval/run.py` and `teb_vae/lag_attn/eval/repor
 | L3 | VAE pretraining GUIDs ∩ classification test GUIDs = ∅ | §6.7. Hard error unless explicitly allowed; always in the manifest |
 | L4 | Scalers, covariate vocabularies, class weights and priors fit on **train** only | Fit functions take a train-only frame and assert `split == 'train'` |
 | L5 | Early stopping, calibration, thresholds and alarm-rule parameters fit on **val** only | Test predictions are written only after `selection_lock.json` (config digest + best checkpoint digest per fold/seed) exists, following `latent_pilot/config.py:1409-1492`. `--stage predict --split test` refuses otherwise |
-| L6 | One window (`epoch_min_s`) for all splits | Config has a single key; no per-split override exists |
+| L6 | One evaluation window (`epoch_min_s`) for val and test | Val and test read the same key; only train may narrow or widen its window (`train_epoch_min_s`, null = `epoch_min_s`); there is no val- or test-only override |
 | L7 | Second-stage sentinel (onset exactly at delivery) treated as unknown | `cohort.py`, counted in the manifest |
 | L8 | Segments crossing delivery excluded | `crosses_delivery` exclusion |
 | L9 | Duplicate (guid, epoch) rows removed | `duplicate_epoch` exclusion |
@@ -1927,7 +1927,8 @@ classifier:
     split_dirs: {train: train, val: val, test: test}
     subgroups: all                  # or list of shard basenames
     stride_s: auto                  # inferred; error if multimodal
-    epoch_min_s: -44640             # one window for every split (L6)
+    epoch_min_s: -44640             # evaluation window, s before delivery (segment start): val and test share it (L6)
+    train_epoch_min_s: null         # training window; null = epoch_min_s (e.g. -21600: train on the last 6 h only)
     min_valid_frac: 0.1
     patient_map: null               # JSON guid -> patient id
     shared_test_policy: first_fold  # first_fold | exclude

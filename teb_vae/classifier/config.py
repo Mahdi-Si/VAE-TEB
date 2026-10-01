@@ -92,7 +92,8 @@ class DataCfg(_Block):
     split_dirs: SplitDirs
     subgroups: Union[Literal["all"], List[str]]
     stride_s: Union[Literal["auto"], float]
-    epoch_min_s: float
+    epoch_min_s: float  # evaluation window: val and test share it (L6); train too unless train_epoch_min_s
+    train_epoch_min_s: Optional[float]  # training window; null = epoch_min_s
     min_valid_frac: Unit
     patient_map: Optional[str]
     shared_test_policy: Literal["first_fold", "exclude"]
