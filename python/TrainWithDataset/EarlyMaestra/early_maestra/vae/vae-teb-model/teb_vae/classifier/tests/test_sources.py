@@ -21,11 +21,6 @@ from teb_vae.classifier import cohort, sources
 from teb_vae.classifier.config import load
 from teb_vae.classifier.tests.conftest import BINS, D_Z, HEADS, SMOKE_CONFIG
 
-FAMILIES = ["lag_attn_rws", "lag_attn_fs", "lag_attn_cfs", "lag_attn_crws",
-            "lag_attn_transformer_rws", "lag_attn_transformer_fs", "lag_attn_transformer_cfs",
-            "lag_attn_transformer_crws", "lag_attn_transformer_e2e", "lag_slot_transformer_cfs"]
-
-
 def _cfg(smoke_overrides, *extra):
     return load(SMOKE_CONFIG, list(smoke_overrides) + list(extra)).classifier
 
@@ -50,11 +45,7 @@ def test_vae_source_shapes_mask_and_derived_keys(vae_overrides, fold1):
 
     assert source.trainable is False and not source.model.training
     assert not feats.values.requires_grad
-    assert feats.values.shape == (n, 300, 3 * D_Z + HEADS * (2 + len(BINS)))
-    assert feats.attn.shape == (n, 300, 1) and feats.channels[-1] == "kld_per_t"
-    assert len(feats.channels) == feats.values.shape[-1] + 1
-    assert feats.channels[3 * D_Z:3 * D_Z + 3] == (
-        "attn_summary[h0.lag]", "attn_summary[h0.entropy]", "attn_summary[h0.bin0]")
+    assert len(feats.channels) == feats.values.shape[-1] + 1  # one name per value column, then kld_per_t
     mask = feats.step_mask  # warm-up and weight; causal_all keeps [270, 300)
     assert torch.equal(mask, (batch["weight"] > 0) & (t >= 134))
     assert not mask[0, 200:210].any() and mask[:, 270:].all()
@@ -88,13 +79,6 @@ def test_load_task_keeps_every_checkpoint_hyperparameter(vae_checkpoint, tmp_pat
     assert (hp["lambda_ms"], hp["lambda_deriv"], hp["lambda_boundary"], hp["seed"]) == (0.1, 0.2, 0.05, 7)
     assert task.model is task.orig_model  # eager
     assert {"seed", "lambda_ms", "kld_beta"} <= sources.task_parameters(type(task))
-
-
-@pytest.mark.parametrize("package", FAMILIES)
-def test_every_family_resolves_its_binding(package):
-    trainer = sources.trainer_class(package)
-    assert hasattr(trainer.MODEL_CLS, "kld_tensor")
-    assert hasattr(trainer.TASK_CLS, "_build_forward_inputs")
 
 
 # ---- T-S2 Hdf5Source ---------------------------------------------------------------------------

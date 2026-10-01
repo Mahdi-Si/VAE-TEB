@@ -17,6 +17,20 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.data import PilotConfigError
 
 # ---- the fixture tree --------------------------------------------------------------------------
 # ---- T-C1 --------------------------------------------------------------------------------------
+def test_tc1_training_window_moves_only_the_train_split(fixture_segments, smoke_config):
+    """L6: ``train_epoch_min_s`` narrows the train split's window; val and test keep ``epoch_min_s``."""
+    base, data = fixture_segments[0], smoke_config.data
+    floor = float(base["epoch_s"].median())
+    shards = {(k, s): p for k in (1, 2, 3) for s, p in cohort.fold_shards(data, k).items()}
+    seg, _ = cohort.segment_table(shards, trim_minutes=1.0, stride_s=data.stride_s, epoch_min_s=data.epoch_min_s,
+                                  train_epoch_min_s=floor, min_valid_frac=data.min_valid_frac)
+    train = seg["split"] == "train"
+    early = train & (seg["epoch_s"] < floor) & (base["exclusion_reason"] != "duplicate_epoch")
+    assert early.any() and (seg.loc[early, "exclusion_reason"] == "outside_window").all()
+    unchanged = ~train | (seg["epoch_s"] >= floor)
+    pd.testing.assert_series_equal(seg.loc[unchanged, "exclusion_reason"], base.loc[unchanged, "exclusion_reason"])
+
+
 # ---- T-C2 --------------------------------------------------------------------------------------
 @pytest.mark.parametrize("task", sorted(config.TASKS))
 def test_tc2_task_targets_and_exclusions(fixture_segments, smoke_config, task):

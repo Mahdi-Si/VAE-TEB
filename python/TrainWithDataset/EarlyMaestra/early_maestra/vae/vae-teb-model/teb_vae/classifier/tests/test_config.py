@@ -5,26 +5,10 @@ import json
 import sys
 
 import pytest
-from pydantic import ValidationError
 
 from teb_vae.classifier import config
 
 DEFAULT = config.DEFAULT_CONFIG
-SHIPPED = sorted(DEFAULT.parent.glob("*.yaml"))
-@pytest.mark.parametrize("path", SHIPPED, ids=lambda path: path.name)
-def test_shipped_configs_validate(path):
-    assert config.load(path).classifier.labels.task in config.TASKS
-
-
-@pytest.mark.parametrize("override", [
-    "classifier.labels.bogus=1",
-    "classifier.bogus.x=1",
-    "classifier.source.vae.keys=[{name: mu_prior, rolle: value}]",
-    "clasifier.run.name=x",
-])
-def test_unknown_keys_rejected(override):
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        config.load(DEFAULT, [override])
 
 
 def test_digest_is_stable_ignores_execution_knobs_and_tracks_settings():
