@@ -21,7 +21,8 @@ classifier:
     split_dirs: {train: train, val: val, test: test}
     subgroups: all                  # or list of shard basenames
     stride_s: auto                  # inferred; error if multimodal
-    epoch_min_s: -44640             # one window for every split (L6)
+    epoch_min_s: -44640             # evaluation window, s before delivery (segment start): val and test share it (L6)
+    train_epoch_min_s: null         # training window; null = epoch_min_s (e.g. -21600: train on the last 6 h only)
     min_valid_frac: 0.1
     patient_map: null               # JSON guid -> patient id
     shared_test_policy: first_fold  # first_fold | exclude

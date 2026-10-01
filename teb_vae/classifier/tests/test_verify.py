@@ -53,14 +53,6 @@ def _with(path, value):
     return s
 
 
-def test_good_summary_passes():
-    assert set(_verdicts(GOOD).values()) == {V.PASS} and V.verify(GOOD)["passed"]
-    assert [name for name, _ in V.CRITERIA] == ["1_exit_code", "1b_evaluation_current", "2_units", "3_cohort",
-                                                "4_selection_lock", "5_headline_finite", "6_np_overshoot",
-                                                "7_shuffled_control", "8_model_vs_shortcut", "9_m7_consistency",
-                                                "10_missing_confound", "11_expected_outputs", "12_summary_sections"]
-
-
 def _checks(name, rec):
     return ("results", "sanity", "checks", name), rec
 

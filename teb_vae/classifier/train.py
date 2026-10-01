@@ -498,7 +498,7 @@ class ClassifierPlotCallback(Callback):
             ax[0, 2].hist(s[y == k], bins=20, alpha=0.6, label=name)
         ax[0, 2].axvline(thr, color="k", ls="--", label="threshold")
         ax[0, 2].set(title="GUID score by class", xlabel="logit")
-        ax[0, 2].legend()
+        ax[0, 2].legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))  # outside: never over the histograms
         frac, mean_p = calibration_curve(y, 1 / (1 + np.exp(-s)), n_bins=max(2, min(10, len(y) // 5)),
                                          strategy="quantile")
         ax[1, 0].plot(mean_p, frac, "o-")

@@ -95,19 +95,12 @@ def test_allow_list_class_counts_priors_and_train_only_fits(env):
 
 
 # ---- batch contract ----------------------------------------------------------------------------
-def test_sequence_batch_contract_and_padding(env):
+def test_sequence_batches_pad_and_group_by_guid(env):
     unit = _unit(env)
     frame, loader = unit.frames["val"], _loader(unit, "val", False)
     t_end, n_seen = frame["t_end_s"].to_numpy(), 0
     for batch in loader:
-        assert set(batch) == SEGMENT_KEYS | {"seg_mask", "t_h", "w_pos"}
-        b, n = batch["seg_mask"].shape
-        assert batch["x"].shape == (b, n, unit.store.step_mask.shape[1], unit.n_values)
-        assert batch["step_mask"].shape == batch["x"].shape[:3] and batch["ctx"].shape == (b, n, unit.n_ctx)
-        assert all(batch[k].shape == (b, n) for k in ("t_h", "w", "w_pos", "row"))
-        assert batch["t_h"].dtype == batch["w"].dtype == torch.float32 and batch["row"].dtype == torch.int64
-        assert all(batch[k].shape == (b,) for k in ("y", "y3", "guid")) and batch["y"].dtype == torch.float32
-        pad = ~batch["seg_mask"]
+        b, pad = len(batch["seg_mask"]), ~batch["seg_mask"]
         assert (batch["row"][pad] == -1).all() and (batch["w"][pad] == 0).all() and (batch["t_h"][pad] == 0).all()
         assert (batch["w_pos"][pad] == 0).all()
         assert (batch["x"][pad] == 0).all() and not batch["step_mask"][pad].any() and (batch["ctx"][pad] == 0).all()

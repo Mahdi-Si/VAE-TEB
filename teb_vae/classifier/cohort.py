@@ -147,6 +147,7 @@ def stage_of(ss_rel_s: Any, lead_s: float, end_s: float) -> np.ndarray:
 
 def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minutes: float = 1.0,
                   stride_s: Any = "auto", epoch_min_s: float = -44640.0,
+                  train_epoch_min_s: Optional[float] = None,
                   min_valid_frac: float = 0.1) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Build the segment table with segment-level exclusions (§6.1), no fold validation.
 
@@ -154,7 +155,9 @@ def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minut
         shards: ``{(fold, split): [shard paths]}``; any labels, e.g. ``{(0, "test"): [path]}``.
         trim_minutes: Loader trim; sets the observed window.
         stride_s: ``"auto"`` (inferred) or seconds.
-        epoch_min_s: Segments starting earlier are ``outside_window`` (one window, L6).
+        epoch_min_s: The evaluation window: val and test segments starting earlier are ``outside_window``
+            (one window for val and test, L6).
+        train_epoch_min_s: The training window, the same rule on the train split; ``None`` uses ``epoch_min_s``.
         min_valid_frac: Segments with a lower mean weight are ``low_valid_frac``.
 
     Returns:
@@ -193,8 +196,10 @@ def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minut
     seg["hours_to_delivery"] = -seg["t_end_s"] / 3600.0
 
     duplicate = seg.assign(_e=seg["epoch_s"].round()).duplicated(KEYS + ["_e"])  # L9, keep first
+    floor = np.where(seg["split"] == "train", epoch_min_s if train_epoch_min_s is None else train_epoch_min_s,
+                     epoch_min_s)
     reason = np.select(
-        [duplicate, seg["epoch_s"] < epoch_min_s, seg["t_end_s"] > 0,  # L6, L8
+        [duplicate, seg["epoch_s"] < floor, seg["t_end_s"] > 0,  # L6, L8
          seg["valid_frac"] < min_valid_frac],
         ["duplicate_epoch", "outside_window", "crosses_delivery", "low_valid_frac"], "")
     seg["exclusion_reason"] = pd.Series(reason, index=seg.index, dtype=str)
@@ -559,7 +564,7 @@ def build_cohort(cfg: Classifier, out_dir: Any) -> Dict[str, Any]:
     shards = {(k, s): p for k in cfg.run.folds for s, p in fold_shards(cfg.data, k).items()}
     seg, info = segment_table(shards, trim_minutes=cfg.source.hdf5.trim_minutes,
                               stride_s=cfg.data.stride_s, epoch_min_s=cfg.data.epoch_min_s,
-                              min_valid_frac=cfg.data.min_valid_frac)
+                              train_epoch_min_s=cfg.data.train_epoch_min_s, min_valid_frac=cfg.data.min_valid_frac)
     seg, guids = guid_table(seg, cfg.labels, cfg.cohort)
     guids, checks = validate_folds(guids, task=cfg.labels.task, patient_map=cfg.data.patient_map)
     exposure = pretrain_exposure(guids, cfg.source, allow_overlap=cfg.data.allow_pretrain_overlap)

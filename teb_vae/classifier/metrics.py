@@ -1038,8 +1038,12 @@ def unique_cohort(run_dir: Any) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
     co = Path(run_dir) / "cohort"
     seg, gd = pd.read_parquet(co / "segments.parquet"), pd.read_parquet(co / "guids.parquet")
     kept = seg[~seg["excluded"].astype(bool)]
-    # the reason is part of the key so a `duplicate_epoch` row survives next to the row it duplicates
-    return (seg.drop_duplicates(["guid", "epoch_s", "exclusion_reason"]), kept.drop_duplicates(["guid", "epoch_s"]),
+    # the reason is part of the key so a `duplicate_epoch` row survives next to the row it duplicates; any other
+    # exclusion of a segment another split retains is split-local (data.train_epoch_min_s, L6), not the cohort's
+    local = (seg["excluded"].astype(bool) & (seg["exclusion_reason"] != "duplicate_epoch")
+             & pd.MultiIndex.from_frame(seg[["guid", "epoch_s"]]).isin(
+                 pd.MultiIndex.from_frame(kept[["guid", "epoch_s"]])))
+    return (seg[~local].drop_duplicates(["guid", "epoch_s", "exclusion_reason"]), kept.drop_duplicates(["guid", "epoch_s"]),
             gd[~gd["excluded"].astype(bool)].drop_duplicates("guid"))
 
 
@@ -3842,16 +3846,18 @@ def nadeau_bengio_p(d: Any) -> float:
 
 
 def cohort_digest(run_dir: Any) -> str:
-    """SHA-256 of the retained (not ``excluded``) :data:`COHORT_KEY` rows of ``<run>/cohort/guids.parquet``, sorted,
-    with ``patient`` the bootstrap cluster (:func:`cluster`) and ``y`` the adverse outcome ``y > 0``.
+    """SHA-256 of the retained (not ``excluded``) val and test :data:`COHORT_KEY` rows of
+    ``<run>/cohort/guids.parquet``, sorted, with ``patient`` the bootstrap cluster (:func:`cluster`) and ``y`` the
+    adverse outcome ``y > 0``.
 
-    Equal digests mean the same GUIDs of the same patients in the same folds and splits, against the same binary
-    outcome, so the runs' GUID-level rows pair. Label weights, labeling strategies and covariates stay out, so their
-    ablations compare. A ``three_class`` run (``y`` = class index 0-2) pairs with an ``adverse_vs_healthy`` one: its
-    binary rows are the collapsed adverse score (§11.3). ``hie_vs_rest`` does not (another outcome).
+    Equal digests mean the same val and test GUIDs of the same patients in the same folds, against the same binary
+    outcome, so the runs' GUID-level rows pair. Label weights, labeling strategies, covariates and the train split
+    (``data.train_epoch_min_s`` can drop train GUIDs) stay out, so their ablations compare. A ``three_class`` run
+    (``y`` = class index 0-2) pairs with an ``adverse_vs_healthy`` one: its binary rows are the collapsed adverse score
+    (§11.3). ``hie_vs_rest`` does not (another outcome).
     """
     g = pd.read_parquet(Path(run_dir) / "cohort" / "guids.parquet")
-    g = g[~g["excluded"].astype(bool)]
+    g = g[~g["excluded"].astype(bool) & (g["split"] != "train")]
     key = g.assign(patient=cluster(g), y=(g["y"].astype(int) > 0).astype(int))[list(COHORT_KEY)]
     return hashlib.sha256(key.sort_values(["fold", "split", "guid"]).to_csv(index=False).encode()).hexdigest()
 

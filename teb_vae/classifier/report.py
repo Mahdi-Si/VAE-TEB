@@ -156,8 +156,12 @@ def _models(*frames: pd.DataFrame) -> List[tuple]:
 
 
 def _legend(ax: Any, **kw: Any) -> None:
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(fontsize=_seam().FONT_SMALL, **kw)
+    """The legend of ``ax`` outside it, one column top-aligned on its right edge, so no key covers the data. The place
+    is fixed here (no ``loc``); ``kw`` carries explicit ``handles``/``labels``. A page laid out by :func:`_laid_out`
+    reserves its width there; on any other page :func:`_render` keeps it right of a single column of panels and moves
+    it under its axes when there are several (:func:`_legends_below`), and the seam's tight layout and crop make room."""
+    if kw.get("handles") or ax.get_legend_handles_labels()[0]:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=_seam().FONT_SMALL, **kw)
 
 
 class _Once:
@@ -167,15 +171,12 @@ class _Once:
     def __init__(self) -> None:
         self.done = False
 
-    def __call__(self, ax: Any, headroom: Optional[float] = None, **kw: Any) -> None:
-        """Legend of ``ax`` unless an earlier call drew one; ``headroom`` makes room above the data for it."""
+    def __call__(self, ax: Any, **kw: Any) -> None:
+        """:func:`_legend` of ``ax`` unless an earlier call drew one."""
         if self.done or not ax.get_legend_handles_labels()[0]:
             return
         self.done = True
-        if headroom is None:
-            _legend(ax, **kw)
-        else:
-            _seam().legend_with_headroom(ax, headroom=headroom, fontsize=_seam().FONT_SMALL, **kw)
+        _legend(ax, **kw)
 
 
 def _class_hist(ax: Any, frame: pd.DataFrame, col: str, xlabel: str, legend: bool = True) -> None:
@@ -267,7 +268,7 @@ def _cohort_time_bins(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
             bottom += t[g].to_numpy()
         ax.invert_xaxis()
         ax.set(xlabel="hours before delivery", ylabel="segments")
-        _legend(ax, ncol=2)
+        _legend(ax)
         fs.style_axes(ax)
     return fig
 
@@ -286,8 +287,8 @@ def _cohort_ranked_lengths(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> An
     colors = fs.group_colors(cls.dropna().unique())
     ax.bar(np.arange(len(n)), n, width=1.0, color=[colors.get(k, fs.COLOR_GRAY) for k in cls])
     ax.axhline(n.mean(), ls="--", color=fs.COLOR_BLACK)
-    ax.legend(handles=[Patch(color=colors[k], label=k) for k in _order(colors, "clinical_class")]
-              + [ax.lines[-1]], labels=[*_order(colors, "clinical_class"), f"mean {n.mean():.1f}"], fontsize=fs.FONT_SMALL)
+    _legend(ax, handles=[Patch(color=colors[k], label=k) for k in _order(colors, "clinical_class")] + [ax.lines[-1]],
+            labels=[*_order(colors, "clinical_class"), f"mean {n.mean():.1f}"])
     ax.set(xlabel="GUID (ranked)", ylabel="segments")
     fs.style_axes(ax)
     return fig
@@ -323,9 +324,8 @@ def _cohort_coverage(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
         ax.axhline(e, color=fs.COLOR_BLACK, lw=fs.LINE_THIN)
     ax.set_yticks(edges - np.diff(np.r_[0, edges]) / 2, classes)
     ax.set(xlabel="hours before delivery", ylabel="GUIDs, longest span first")
-    ax.legend(handles=[Patch(color=fs.COLOR_BLUE, label="present"), Patch(color=fs.COLOR_VERMILLION, label="excluded"),
-                       Patch(facecolor="white", edgecolor=fs.COLOR_GRAY, label="absent")],
-              fontsize=fs.FONT_SMALL, loc="lower left")
+    _legend(ax, handles=[Patch(color=fs.COLOR_BLUE, label="present"), Patch(color=fs.COLOR_VERMILLION, label="excluded"),
+                         Patch(facecolor="white", edgecolor=fs.COLOR_GRAY, label="absent")])
     return fig
 
 
@@ -465,7 +465,7 @@ def _roc_guid(T: Dict[str, Any], c: Dict[str, Any], split: str = "test", fold: O
         ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         ax.set(xlabel="FPR (1 - specificity)", ylabel="sensitivity", xlim=(0, 1), ylim=(0, 1.02),
                title=f"{m} (seed {sd})")
-        _legend(ax, loc="lower right")
+        _legend(ax)
         fs.style_axes(ax)
     _policy_key(fig, c, policies)
     _tag(fig, split=split, fold=fold)
@@ -501,7 +501,7 @@ def _pr_guid(T: Dict[str, Any], c: Dict[str, Any], split: str = "test", **_: Any
             continue
         ax.set(xlabel="recall (sensitivity)", ylabel="precision (PPV)", xlim=(0, 1), ylim=(0, 1.02),
                title=f"{m} (seed {sd})")
-        _legend(ax, loc="lower left")
+        _legend(ax)
         fs.style_axes(ax)
     _tag(fig, split=split)
     return fig
@@ -542,7 +542,7 @@ def _threshold_drift(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
             fs.style_axes(ax)
         row[0].set_title(f"{m} (seed {sd})")
         _alpha_lines(row[1], thr, m, sd)
-        key(row[0], loc="lower right")
+        key(row[0])
         if row[2].lines:
             row[2].axhline(0, ls="--", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
             row[2].set_xticks(range(len(pids)), pids, rotation=35, ha="right", fontsize=fs.FONT_SMALL)
@@ -600,6 +600,11 @@ def _pids(c: Dict[str, Any], present: Any) -> List[str]:
     return [p["id"] for p in c["eval"]["thresholds"] if p["id"] in set(present)]
 
 
+#: Row height (in) of the ``metric_types/`` pages: three times :func:`_stack`'s default, so the rate rows read; their n
+#: strip takes ratio 0.15, which keeps it at the default page's 0.45 x 1.15 in.
+METRIC_TYPES_ROW_H = 3 * 1.15
+
+
 def _stack(n_blocks: int, ratios: tuple, *, sharex: bool = True, height: float = 1.15,
            width: Optional[float] = None) -> tuple:
     """The samples-page layout: ``n_blocks`` blocks of full-width rows (``ratios``) on one shared x axis;
@@ -613,15 +618,34 @@ def _stack(n_blocks: int, ratios: tuple, *, sharex: bool = True, height: float =
     return fig, axes[:, 0].reshape(n_blocks, len(ratios))
 
 
+def _legend_room(fig: Any) -> tuple:
+    """Inches the outside legends of ``fig`` (:func:`_legend`) need right of their axes: ``(last column, any other
+    column)``. A legend's size does not depend on where its axes sit, so it is measured before the layout."""
+    side = inner = 0.0
+    for ax in fig.axes:
+        leg, spec = ax.get_legend(), ax.get_subplotspec()
+        if leg is None or spec is None:
+            continue
+        need = leg.get_window_extent().width / fig.dpi + 0.15  # the legend's pad off the axes, and clearance
+        if spec.colspan.stop == spec.get_gridspec().ncols:
+            side = max(side, need)
+        else:
+            inner = max(inner, need)
+    return side, inner
+
+
 def _laid_out(fig: Any, gap: float = 0.36, wgap: float = 0.6) -> Any:
     """Fixed margins instead of ``tight_layout`` (half the render of a 12-row page): ``gap`` / ``wgap``
-    (in) between rows / columns hold the titles, ticks and labels. Everything stays inside the
-    figure, so :func:`_draw` saves it uncropped (the seam's ``crop=False``), skipping another pass."""
+    (in) between rows / columns hold the titles, ticks and labels; the right margin and ``wgap`` widen to hold the
+    outside legends (:func:`_legend_room`). Everything stays inside the figure, so :func:`_draw` saves it uncropped
+    (the seam's ``crop=False``), skipping another pass."""
     fs = _seam()
     w, h = fig.get_size_inches()
     nr, nc = fig.axes[0].get_subplotspec().get_gridspec().get_geometry()
+    side, inner = _legend_room(fig)
+    wgap = max(wgap, inner)
     _, bottom, _, top = fs.figures.layout_rect(fig)  # the footnote and suptitle reservations
-    bottom, top, left, right = bottom + 0.45 / h, top - 0.4 / h, 0.85 / w, 1 - 0.3 / w
+    bottom, top, left, right = bottom + 0.45 / h, top - 0.4 / h, 0.85 / w, 1 - max(0.3, side) / w
     fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top,
                         hspace=gap * nr / max((top - bottom) * h - gap * (nr - 1), 0.1),
                         wspace=wgap * nc / max((right - left) * w - wgap * (nc - 1), 0.1))
@@ -750,9 +774,9 @@ def _n_strip(ax: Any, f: pd.DataFrame, c: Dict[str, Any], unit: str = "GUIDs", l
         ax.plot(f["t"].astype(float), f[y].astype(float), marker=marker, ms=1.5, lw=fs.LINE_THIN, color=color, label=name)
     ax.axhline(c["eval"]["min_bin_class_n"], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
     top = float(np.nanmax(f[["n_pos", "n_neg"]].astype(float).to_numpy(), initial=1.0))
-    ax.set(ylim=(0, 2.0 * top), yticks=[0, top], ylabel=f"{unit}\nper bin")
+    ax.set(ylim=(0, 1.15 * top), yticks=[0, top], ylabel=f"{unit}\nper bin")
     if legend:
-        ax.legend(loc="upper right", ncol=2, fontsize=fs.FONT_SMALL)
+        _legend(ax)
     fs.style_axes(ax)
 
 
@@ -774,7 +798,7 @@ def _metric_types(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, pid: str, 
     models = _models(d)
     if not models:
         return _all_empty()
-    fig, grid = _stack(len(models), (1, 1, 1, 0.45))
+    fig, grid = _stack(len(models), (1, 1, 1, 0.15), height=METRIC_TYPES_ROW_H)
     _xlim(grid, d["t"], axis, pol)
     for i, (rows, (m, sd)) in enumerate(zip(grid, models)):
         x = _sel(d, model_id=m, seed=sd)
@@ -783,7 +807,7 @@ def _metric_types(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, pid: str, 
             _time_lines(ax, axis, pol)
             ax.set(ylabel=TYPE_LABEL[mt])
         rows[0].set_title(f"{m} (seed {sd})")
-        key(rows[0], headroom=0.5, ncol=4)
+        key(rows[0])
         _n_strip(rows[3], _sel(x, metric_type="instantaneous", metric="underpowered", fold=one), c, legend=i == 0)
         _time_lines(rows[3], axis, pol)
     _x_time(grid[-1, -1], axis)
@@ -803,7 +827,7 @@ def _segment_instantaneous(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, s
     models = _models(d)
     if not models:
         return _all_empty()
-    fig, grid = _stack(len(models), (1, 1, 0.45))
+    fig, grid = _stack(len(models), (1, 1, 0.15), height=METRIC_TYPES_ROW_H)
     _xlim(grid, d["t"], axis, pol)
     for i, ((a, b, strip), (m, sd)) in enumerate(zip(grid, models)):
         x = _sel(d, model_id=m, seed=sd)
@@ -822,7 +846,7 @@ def _segment_instantaneous(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, s
             _time_lines(ax, axis, pol)
         a.set(ylabel="rate", title=f"{m} (seed {sd})")
         b.set(ylabel="AUROC")
-        key(a, headroom=0.3, ncol=4)
+        key(a)
     _x_time(grid[-1, -1], axis)
     _tag(fig, split=split, fold=fold)
     _under_note(fig, c)
@@ -858,7 +882,7 @@ def _auroc_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
             _empty(a)
         a.set(ylabel="AUROC", title=f"{m} (seed {sd})")
         _time_lines(a, axis)
-        key(a, loc="lower left")
+        key(a)
         _n_strip(strip, _sel(snap, fold=one), c, legend=i == 0)
         _time_lines(strip, axis)
     _x_time(grid[-1, -1], axis)
@@ -900,7 +924,7 @@ def _roc_checkpoints(T: Dict[str, Any], c: Dict[str, Any], *, kind: str, pr: boo
         if not pr:
             ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         ax.set(xlabel="recall (sensitivity)" if pr else "FPR", ylabel="precision" if pr else "sensitivity")
-        _legend(ax, loc="lower left" if pr else "lower right")
+        _legend(ax)
         fs.style_axes(ax)
     for ax in axes.flat[len(ats):]:
         ax.set_visible(False)
@@ -942,7 +966,7 @@ def _decision_horizon(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional[st
             b.axhline(al, ls="--", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         if b.lines and not key.done:
             b.plot([], [], ls="--", marker="o", mfc="none", mec=fs.COLOR_GRAY, color=fs.COLOR_GRAY, label="dashed: val")
-        key(b, loc="upper left", ncol=4)
+        key(b)
     _x_time(grid[-1, -1], "to_delivery")
     grid[-1, -1].set_xlabel("decision time (h before delivery)")
     _tag(fig, fold=fold)
@@ -1013,7 +1037,7 @@ def _threshold_stability(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional
         if row[2].lines and not key.done:
             row[2].plot([], [], ls="--", marker="o", mfc="none", mec=fs.COLOR_GRAY, color=fs.COLOR_GRAY,
                         label="dashed: val")
-        key(row[2], loc="best")
+        key(row[2])
     _tag(fig, fold=fold)
     return _laid_out(fig, 0.8, 0.75)
 
@@ -1057,7 +1081,7 @@ def _metric_type_comparison(T: Dict[str, Any], c: Dict[str, Any], *, split: str 
                        title=f"{m} (seed {sd}), {mt.replace('_', ' ')}" if met == "sens" else None)
                 fs.style_axes(ax)
     if models and axes[0, 0].lines:
-        _legend(axes[0, 0], loc="lower left", ncol=2)
+        _legend(axes[0, 0])
     _tag(fig, split=split, fold=fold)
     return _laid_out(fig, 0.45, 0.45)
 
@@ -1113,7 +1137,7 @@ def _alarms(T: Dict[str, Any], c: Dict[str, Any], *, what: str, split: str = "te
             ax.set(ylabel=ylabel)
             fs.style_axes(ax)
         rows[0].set_title(f"{m} (seed {sd})")
-        key(curve_ax, loc="upper left")
+        key(curve_ax)
         curve_ax.set_ylim(-0.02, 1.02)
         if not lead:  # own x axes per row
             _x_time(curve_ax, "to_delivery")
@@ -1143,8 +1167,32 @@ def _draw(stem: str, T: Dict[str, Any], c: Dict[str, Any], path: Path) -> None:
     """Render one registry stem: ``val/<stem>`` is the validation split, ``fold_<k>/<stem>`` one fold."""
     head, _, rest = stem.partition("/")
     kw = {"split": "val"} if head == "val" else {"fold": head[len("fold_"):]} if head.startswith("fold_") else {}
-    fig = _figure_set(c)[rest if kw else stem](T, c, **kw)
+    _render(_figure_set(c)[rest if kw else stem](T, c, **kw), path)
+
+
+def _legends_below(fig: Any) -> None:
+    """On a tight-laid-out figure with several panel columns, each :func:`_legend` key moves from the right of its
+    axes to under it, below its tick labels and x label: right of every panel, the keys would squeeze the columns
+    to slivers. The drop is in points, so it holds wherever the tight layout then puts the axes."""
+    from matplotlib.transforms import offset_copy
+
+    axes = [ax for ax in fig.axes if ax.get_legend() is not None and ax.get_subplotspec() is not None]
+    if all(ax.get_subplotspec().get_gridspec().ncols == 1 for ax in axes):
+        return
+    for ax in axes:
+        under = ax.xaxis.get_tightbbox()
+        drop = 0.0 if under is None else max(0.0, ax.bbox.y0 - under.y0) * 72.0 / fig.dpi
+        leg = ax.get_legend()
+        leg.set_bbox_to_anchor((0.5, 0.0), transform=offset_copy(ax.transAxes, fig=fig, y=-drop, units="points"))
+        leg.set_loc("upper center")
+
+
+def _render(fig: Any, path: Path) -> None:
+    """Save ``fig`` at the stem ``path``: a self-laid-out page (:func:`_laid_out`) uncropped, as laid out; any other
+    after :func:`_legends_below`, tight-laid-out and cropped by the seam."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not getattr(fig, "uncropped", False):
+        _legends_below(fig)
     _seam().render_figure(fig, path, crop=not getattr(fig, "uncropped", False))
 
 
@@ -1992,7 +2040,7 @@ def _covariate_strata(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
             fs.style_axes(ax)
     if not fams:
         return _all_empty(2, 1)
-    _legend(axes[0, 0], loc="lower left")
+    _legend(axes[0, 0])
     fs.caveat_note(fig, text=f"{UNDER_BIN.format(n=c['eval']['min_subgroup_n'])}.")
     return fig
 
@@ -2023,7 +2071,7 @@ def _roc_subgroups(T: Dict[str, Any], c: Dict[str, Any], *, family: str, **_: An
     pm = primary_model(_models(r))
     ax.set(xlabel="FPR (1 - specificity)", ylabel="sensitivity", xlim=(0, 1), ylim=(0, 1.02),
            title=f"{family.replace('_', ' ')}, {pm[0]} (seed {pm[1]})")
-    _legend(ax, loc="lower right")
+    _legend(ax)
     fs.style_axes(ax)
     return fig
 
@@ -2055,7 +2103,7 @@ def _calibration_subgroups(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> An
         ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         ax.set(xlim=(0, 1), ylim=(-0.02, 1.02), xlabel="mean predicted probability", title=fam.replace("_", " "),
                ylabel="observed fraction" if ax is axes[0, 0] else None)
-        _legend(ax, loc="lower right")
+        _legend(ax)
         fs.style_axes(ax)
     if not fams:
         _empty(axes[0, 0])
@@ -2254,7 +2302,7 @@ def _rel_frame(ax: Any, title: str, ylabel: str = "observed fraction", key: Opti
     fs = _seam()
     ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
     ax.set(xlim=(0, 1), ylim=(-0.02, 1.02), ylabel=ylabel, title=title)
-    (key or _legend)(ax, loc="upper left")
+    (key or _legend)(ax)
     fs.style_axes(ax)
 
 
@@ -2297,7 +2345,7 @@ def _calibration_guid(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "tes
             if (y == flag).any():
                 hist.hist(p[y == flag], bins=np.linspace(0, 1, 21), histtype="step", color=color, label=name)
         hist.set(ylabel="GUIDs")
-        hist_key(hist, loc="upper center", ncol=2)
+        hist_key(hist)
         fs.style_axes(hist)
     grid[-1, -1].set_xlabel("predicted probability")
     _tag(fig, split=split, fold=fold)
@@ -2370,7 +2418,7 @@ def _calibration_folds(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "te
                 ax.set_xscale("symlog", linthresh=1.0)  # separated folds fit slopes and intercepts in the hundreds
             ax.set_yticks(list(ys.values()), ticks if met == "calib_slope" else [""] * len(ys))
             ax.set(xlabel=f"calibration {name}")
-            key(ax, loc="best")
+            key(ax)
             fs.style_axes(ax)
         row[0].set_title(f"{m} (seed {sd})")
         temps = [(f, _unit_calibration(T, m, sd, f).get("temperature")) for f in folds[:-1]]
@@ -2440,7 +2488,7 @@ def _prevalence_shift(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional[st
             if what == "ppv":
                 if not ppv_key.done:
                     ax.plot([], [], "o", ms=4, mfc="none", mec=fs.COLOR_GRAY, ls="none", label="hollow: val π")
-                ppv_key(ax, loc="upper left", ncol=2)
+                ppv_key(ax)
             fs.style_axes(ax)
     _tag(fig, fold=fold)
     return fig
@@ -2473,7 +2521,7 @@ def _decision_curve(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test"
         top = float(np.nanmax([p["net_benefit"].max(), p["treat_all"].max(), 0.01]))
         ax.set(xlim=(p["pt"].min(), p["pt"].max()), ylim=(-0.25 * top, 1.15 * top), xlabel="threshold probability p_t",
                ylabel="net benefit", title=f"{m} (seed {sd})")
-        key(ax, loc="upper right")
+        key(ax)
         fs.style_axes(ax)
     for ax in axes.flat[len(models):]:
         ax.set_visible(False)
@@ -2513,7 +2561,7 @@ def _brier_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
             _empty(a)
         a.set(ylabel="Brier score", title=f"{m} (seed {sd})")
         _time_lines(a, axis)
-        key(a, loc="upper left", ncol=2)
+        key(a)
         _n_strip(strip, _sel(x, metric="brier", fold=one), c, legend=i == 0)
         _time_lines(strip, axis)
     _x_time(grid[-1, -1], axis)
@@ -2581,8 +2629,8 @@ def _fold_forest(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", *
             ax.set_yticks(list(ys.values()), ticks if ax is row[0] else [""] * len(ys))
             ax.set_ylim(min(ys.values()) - 0.5, 0.5)
             fs.style_axes(ax)
-        key(row[0], loc="lower left")
-        pol_key(row[1], loc="best", ncol=2)
+        key(row[0])
+        pol_key(row[1])
     _tag(fig, split=split)
     return fig
 
@@ -2610,7 +2658,7 @@ def _seed_spread(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", *
                 val, lo, hi = (float(p[k].iloc[0]) for k in ("value", "ci_lo", "ci_hi"))
                 ax.errorbar(i, val, yerr=np.clip([[val - lo], [hi - val]], 0, None), fmt="o", ms=5, color=color, capsize=2,
                             label="pooled, 95% CI" if first else None)
-        key(ax, loc="lower left")
+        key(ax)
         ax.set_xticks(range(len(seeds)), seeds, fontsize=fs.FONT_SMALL)
         ax.set(xlabel="seed", ylabel="AUROC", title=m)
         fs.style_axes(ax)
@@ -2648,7 +2696,7 @@ def _roc_stage(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", fol
             continue
         ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         ax.set(xlabel="FPR", ylabel="sensitivity")
-        _legend(ax, loc="lower right")
+        _legend(ax)
         fs.style_axes(ax)
     for ax in axes.flat[len(ats):]:
         ax.set_visible(False)
@@ -2752,6 +2800,9 @@ def _score_windows(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
     fig = fs.windowed_comparison_figure(readouts, groups=order, bin_width=width,
                                         min_body_size=stats.MIN_GROUP_SIZE, xlabel=AXIS_LABEL.get(axis, axis),
                                         ylabel="P(adverse), calibrated", delivery_orientation=axis == "to_delivery")
+    for ax in fig.axes:  # the shared panels key inside the axes (loc="best"); moved out like every other legend here
+        if ax.get_legend():
+            _legend(ax)
     _tag(fig, split=split, fold=fold)
     return fig
 
@@ -2978,9 +3029,9 @@ def _class_strip(ax: Any, wc: Optional[Tuple[pd.DataFrame, np.ndarray]], c: Dict
         ax.plot(t[o], n[o, k], marker="o", ms=1.5, lw=fs.LINE_THIN, color=colors[name], label=name)
     ax.axhline(c["eval"]["min_bin_class_n"], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
     top = float(np.nanmax(n, initial=1.0))
-    ax.set(ylim=(0, 2.0 * top), yticks=[0, top], ylabel="GUIDs\nper bin")
+    ax.set(ylim=(0, 1.15 * top), yticks=[0, top], ylabel="GUIDs\nper bin")
     if legend:
-        ax.legend(loc="upper right", ncol=3, fontsize=fs.FONT_SMALL)
+        _legend(ax)
     fs.style_axes(ax)
 
 
@@ -3117,7 +3168,7 @@ def _ovr_curves(T: Dict[str, Any], c: Dict[str, Any], *, pr: bool, split: str = 
                 ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
             ax.set(xlabel="recall (sensitivity)" if pr else "FPR", ylabel="precision" if pr else "sensitivity",
                    xlim=(0, 1), ylim=(0, 1.02), title=f"{m} ({sd}), " + (f"{name} vs rest" if k < 3 else "macro"))
-            _legend(ax, loc="lower left" if pr else "lower right")
+            _legend(ax)
             fs.style_axes(ax)
     _tag(fig, split=split)
     return fig
@@ -3161,7 +3212,7 @@ def _per_class_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split
         if rows[0].lines and not key.done:  # the line styles of the one-vs-rest rows, beside the class colours
             rows[0].plot([], [], "o-", ms=3, color=fs.COLOR_GRAY, label="sensitivity")
             rows[0].plot([], [], "^--", ms=3, color=fs.COLOR_GRAY, label="FPR")
-        key(rows[0], headroom=0.3, ncol=5)
+        key(rows[0])
         _class_strip(rows[4], wc, c, fold, legend=i == 0)
     _x_time(grid[-1, -1], axis)
     _tag(fig, split=split, fold=fold)
@@ -3193,7 +3244,7 @@ def _per_class_auroc_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str,
             _empty(a)
         a.set(ylabel="snapshot AUROC", title=f"{m} (seed {sd})")
         _time_lines(a, axis)
-        key(a, loc="lower left", ncol=3)
+        key(a)
         _class_strip(strip, _argmax_wide(_sel(d, model_id=m, seed=sd, policy_id="argmax")), c, fold, legend=i == 0)
     _x_time(grid[-1, -1], axis)
     _tag(fig, split=split, fold=fold)
@@ -3231,7 +3282,7 @@ def _f1_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: str =
                 continue
             ax.set_ylim(-0.02, 1.02)
             _time_lines(ax, axis)
-            key(ax, loc="upper left", ncol=3)
+            key(ax)
             fs.style_axes(ax)
         _class_strip(strip, wc, c, fold, legend=i == 0)
     _x_time(grid[-1, -1], axis)
@@ -3271,7 +3322,7 @@ def _collapse_vs_binary(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "t
             ("disagreement", "disagreement"))), transform=ax.transAxes, va="top", fontsize=fs.FONT_SMALL)
         ax.set(xlabel="aux collapse (rank)", ylabel="binary head (rank)", title=f"{m} (seed {sd})", xlim=(0, 1.02),
                ylim=(0, 1.02))
-        key(ax, loc="lower right")
+        key(ax)
         fs.style_axes(ax)
     for ax in axes.flat[len(models):]:
         ax.set_visible(False)
@@ -3643,7 +3694,7 @@ def _trajectory_page(g: pd.DataFrame, feats: Optional[Tuple[np.ndarray, np.ndarr
                    label="first alarm")
     symlog_axis(ax, s, r, list(thresholds.values()))
     ax.set(title="Online risk", ylabel="logit (symlog)")
-    ax.legend(fontsize=fs.FONT_SMALL, ncol=4, loc="upper left")
+    _legend(ax)
 
     ax = axes[1][0]
     seg = o["logit_seg_cal"].to_numpy(np.float64)
@@ -3661,7 +3712,7 @@ def _trajectory_page(g: pd.DataFrame, feats: Optional[Tuple[np.ndarray, np.ndarr
         for a, marker in zip(attn, "os^"):
             ax.plot(x_end, o[a].to_numpy(np.float64), marker, ms=fs.MARKER_SMALL + 1, label=a)
         ax.set(ylim=(-0.02, 1.02), title="Pooling attention", ylabel="0-1")
-        ax.legend(fontsize=fs.FONT_SMALL, ncol=3, loc="upper left")
+        _legend(ax)
 
     maps = axes[len(specs) - len(groups):]
     if feats is None:
@@ -3904,7 +3955,7 @@ def _compare_roc(R: List[Dict[str, Any]], c: Dict[str, Any]) -> Any:
             continue
         ax.plot([0, 1], [0, 1], ls=":", color=fs.COLOR_GRAY, lw=fs.LINE_HAIRLINE)
         ax.set(xlabel="FPR", ylabel="sensitivity")
-        _legend(ax, loc="lower right")
+        _legend(ax)
         fs.style_axes(ax)
     for ax in axes.flat[len(ats):]:
         ax.set_visible(False)
@@ -3938,8 +3989,7 @@ def _compare_metric_types(R: List[Dict[str, Any]], c: Dict[str, Any], *, axis: s
             _empty(ax)
         _time_lines(ax, axis, pol)
         ax.set(ylabel=TYPE_LABEL[mt])
-    if rows[0].get_legend_handles_labels()[0]:
-        fs.legend_with_headroom(rows[0], ncol=4, headroom=0.9, fontsize=fs.FONT_SMALL)
+    _legend(rows[0])
     _n_strip(rows[3], _sel(d[0], metric_type="instantaneous", metric="underpowered"), c)
     _time_lines(rows[3], axis, pol)
     _x_time(grid[-1, -1], axis)
@@ -3988,7 +4038,7 @@ def _compare_forest(Q: pd.DataFrame, c: Dict[str, Any], names: List[str], *, pid
         fs.style_axes(ax)
         if not drawn:
             _empty(ax)
-    _legend(axes[0, 0], loc="lower right")
+    _legend(axes[0, 0])
     fs.caveat_note(fig, text=f"Filled: Holm p < 0.05. Hollow: not significant or n < {c['eval']['min_subgroup_n']} per class.")
     return fig
 
@@ -4060,9 +4110,7 @@ def comparison_md(R: List[Dict[str, Any]], Q: pd.DataFrame, out: Path, *, pid: s
 
 
 def _render_compare(build: Callable[[], Any], path: Path) -> None:
-    fig = build()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _seam().render_figure(fig, path, crop=not getattr(fig, "uncropped", False))
+    _render(build(), path)
 
 
 def compare_report(run_dirs: Any, out: Any, *, policy: Optional[str] = None) -> int:
