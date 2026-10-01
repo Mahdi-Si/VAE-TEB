@@ -257,9 +257,9 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 
 #: The **shared** analysis names, in run order, for a reader and for the second cfs cell to merge
 #: its own onto. Deliberately not what ``--only`` and ``--skip`` accept: selection runs against the
-#: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own four are
-#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from
-#: more names than this tuple holds.
+#: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own analyses
+#: are registered on ``CFS_BINDING`` (its ``EXTRA_ANALYSES``) rather than above, so a run of this
+#: package selects from more names than this tuple holds.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
 
 
@@ -1891,7 +1891,7 @@ def build_parser() -> argparse.ArgumentParser:
     #
     # Interpolated from the registry the *default binding* merges rather than from the shared
     # ANALYSES tuple, because that merged registry is what `main` selects against: this cell's own
-    # four analyses are registered on CFS_BINDING, so a help text built from the shared sixteen
+    # analyses are registered on CFS_BINDING, so a help text built from the shared tuple alone
     # would tell an operator that `--only warmup` is invalid while the run accepts it.
     selectable = ", ".join(merged_analysis_functions(CFS_BINDING)) or "(none registered yet)"
     parser.add_argument(
@@ -2050,6 +2050,11 @@ RUN_ARGS: Dict[str, Any] = {
     #                     lag warmth, and the two FAIL-able geometry guards.
     #   source_null:      How much of the coupling readout survives zeroing the source -- the
     #                     availability-clock hazard no permutation of rows can see.
+    #   time_shift:       Is it the source at the right MOMENT. Each segment's posterior posed
+    #                     again on the nearest non-overlapping segment of the same recording's
+    #                     source; the aligned-minus-shifted KL and forecast gap, bootstrapped over
+    #                     recordings. Reported beside the acceptance verdicts, not among them.
+    #                     Needs a checkpoint.
     #   occlusion:        When the source mattered, asked by removing it: the per-horizon-step
     #                     forecast cost of zeroing each configured lag band. Needs a checkpoint.
     #   lag_clocks:       Where the informative past sits, against both clinical clocks: the

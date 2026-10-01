@@ -464,9 +464,11 @@ def emit_grouped_variants(
             }
             for metric in present
         }
+        # No title prefix: the tick labels name the cohorts and the file name names the axis, so a
+        # "by <axis>:" clause would only repeat them on every stacked panel.
         figure, _ = figures.grouped_violin_figure(
             values_by_metric, groups,
-            title_prefix=f"by {group_column}: ", references=references,
+            references=references,
             colors=None if group_palette is None else group_palette(groups),
         )
         try:

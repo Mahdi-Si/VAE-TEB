@@ -587,7 +587,7 @@ def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
         return
     axis.axvspan(
         float(low), float(high), color=figures.COLOR_ORANGE, alpha=0.25, zorder=0,
-        label=f"95% CI of the mean [{float(low):.4g}, {float(high):.4g}]",
+        label="95% CI of the mean",
     )
     axis.legend(fontsize=figures.FONT_LABEL, loc="best")
 
@@ -662,8 +662,9 @@ def _draw_agreement_panel(
     The panel exists because the estimators can disagree in **sign** on the same recording, and
     a pair of histograms cannot show that: each histogram says how many recordings sit above zero
     under its own estimator, and nothing about whether they are the same recordings. Here the
-    four quadrants are the finding. The title carries Spearman's $\rho$ over recordings and the
-    share of recordings on which the two agree in sign, both descriptive.
+    four quadrants are the finding. The title carries Spearman's $\rho$ over recordings; the share
+    of recordings on which the two agree in sign is in the record (``same_sign_share``) and in
+    ``FIGURE_GUIDE.md``. Both are descriptive.
 
     Args:
         ax: Target axes.
@@ -678,7 +679,10 @@ def _draw_agreement_panel(
     x = finite_column(per_guid, columns[x_estimator])
     y = finite_column(per_guid, columns[y_estimator])
     both = np.isfinite(x) & np.isfinite(y)
-    title = f"{y_estimator} against {x_estimator}, per recording"
+    title = "Estimator agreement"
+    # Named before the empty test, so two empty panels still say which pair each one is.
+    ax.set_xlabel(f"{x_estimator} (nats per anchor)")
+    ax.set_ylabel(f"{y_estimator} (nats per anchor)")
     if not both.any():
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
@@ -705,12 +709,7 @@ def _draw_agreement_panel(
     # The same numbers the record and the summary CSV carry, from the one function that computes
     # them, so the panel title cannot quote a different agreement from the table beside it.
     agreement = pair_agreement(per_guid, x_estimator, y_estimator)
-    ax.set_title(
-        f"{title}\nSpearman rho = {agreement['spearman_rho']:.2f}, same sign on "
-        f"{agreement['same_sign_share']:.0%} of {x.size} recordings (descriptive)"
-    )
-    ax.set_xlabel(f"{x_estimator} (nats per anchor)")
-    ax.set_ylabel(f"{y_estimator} (nats per anchor)")
+    ax.set_title(f"{title}, $\\rho$ = {agreement['spearman_rho']:.2f}")
     ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return int(x.size)
@@ -753,14 +752,7 @@ def build_distribution_figure(
         figures.histogram_panel(
             axis,
             finite_column(per_guid, column),
-            title=(
-                f"{name} per recording, n = {int(row.get('n_recordings_scored') or 0)}: "
-                f"{ESTIMATOR_LABELS.get(name, name)}"
-                + (
-                    f"; positive in {float(row['positive_fraction']):.0%}"
-                    if np.isfinite(float(row.get("positive_fraction", float("nan")))) else ""
-                )
-            ),
+            title=name,
             xlabel="nats per anchor",
             color=ESTIMATOR_COLORS.get(name, figures.COLOR_BLUE),
             reference=0.0,
@@ -771,7 +763,7 @@ def build_distribution_figure(
     figures.violin_panel(
         figure.add_subplot(grid[n_estimators, :]),
         {name: finite_column(per_guid, column) for name, column, _ in PRED_GAP_COLUMNS},
-        title="pred_gap per recording, by estimator",
+        title="pred_gap by estimator",
         ylabel="nats per anchor",
         colors=ESTIMATOR_COLORS,
         reference=0.0,
@@ -815,11 +807,8 @@ def build_percent_figure(
     figures.histogram_panel(
         axis,
         finite_column(per_guid, HEADLINE_PERCENT),
-        title=(
-            f"{HEADLINE_PERCENT} per recording, "
-            f"n = {int(headline.get('n_recordings_scored') or 0)}"
-        ),
-        xlabel="percent of the target-only forecast error removed",
+        title=HEADLINE_PERCENT,
+        xlabel="error removed (%)",
         reference=0.0,
         reference_label="no improvement",
     )
@@ -828,8 +817,8 @@ def build_percent_figure(
     figures.violin_panel(
         axes[1, 0],
         {name: finite_column(per_guid, name) for name in ERROR_SPACE_PERCENTS},
-        title="error space: percent of the forecast error the source removed",
-        ylabel="percent",
+        title="Error space",
+        ylabel="error removed (%)",
         reference=0.0,
         reference_label="no improvement",
     )
@@ -840,11 +829,8 @@ def build_percent_figure(
     figures.violin_panel(
         axes[2, 0],
         {name: finite_column(per_guid, name) for name in LIKELIHOOD_SPACE_PERCENTS},
-        title=(
-            "likelihood space: extra density on each observed target coefficient, "
-            "marginalised and mean-decoded"
-        ),
-        ylabel="percent",
+        title="Likelihood space",
+        ylabel="extra density (%)",
         colors={
             LIKELIHOOD_SPACE_PERCENT: ESTIMATOR_COLORS["pred_gap_mc_nats"],
             MEAN_LIKELIHOOD_SPACE_PERCENT: ESTIMATOR_COLORS["pred_gap_mean_nats"],

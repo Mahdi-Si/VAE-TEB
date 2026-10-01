@@ -44,7 +44,7 @@ HEAD_LOSSES: Dict[str, Tuple[str, ...]] = {
 }
 
 #: Execution knobs that never change a result, so they are left out of the digest (§14.1 resume).
-_UNDIGESTED_RUN_KEYS = ("device", "num_workers", "report_workers")
+_UNDIGESTED_RUN_KEYS = ("device", "devices", "num_workers", "report_workers")
 #: Run-dir schema version, hashed into :func:`digest`, so a run dir written under an older schema is refused on
 #: resume. Bump it whenever a run-dir schema changes (cohort/prediction columns, context width, file layout).
 SCHEMA_VERSION = 5  # 3: raw covariate columns in cohort/segments.parquet, covariate_availability.parquet (P5);
@@ -71,6 +71,9 @@ class RunCfg(_Block):
     seeds: List[int] = Field(min_length=1)
     folds: List[int] = Field(min_length=1)
     device: str
+    # §14.4 fold-parallel train and predict: one fold process per slot (a device may repeat); [] runs folds serially
+    # on `device`. Execution only, like `device`: not digested, so a run can resume serially or on other GPUs.
+    devices: List[Annotated[str, Field(pattern=r"^(cpu|cuda:\d+)$")]] = []
     num_workers: NonNegativeInt
     report_workers: NonNegativeInt  # figure processes of `report`; 0 renders serially
     fail_fast: bool

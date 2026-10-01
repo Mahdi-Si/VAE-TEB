@@ -491,8 +491,8 @@ def test_the_page_carries_both_input_rows_and_the_run_warns_about_neither(fit, t
     try:
         assert messages == []
         titles = [ax.get_title() for ax in figures[0].axes if ax.get_title()]
-        assert sum(title.startswith("Model input — target") for title in titles) == 1
-        assert sum(title.startswith("Model input — source") for title in titles) == 1
+        assert sum(title.startswith("Target input") for title in titles) == 1
+        assert sum(title.startswith("Source input") for title in titles) == 1
         # The sibling's seven, the two input rows, and the six of ``CAUSAL_EXTRA_ROWS``. Counted
         # from the constant so a row added to one of the two halves and not the other fails here.
         assert len(titles) == 7 + 2 + len(causal_page.CAUSAL_EXTRA_ROWS)

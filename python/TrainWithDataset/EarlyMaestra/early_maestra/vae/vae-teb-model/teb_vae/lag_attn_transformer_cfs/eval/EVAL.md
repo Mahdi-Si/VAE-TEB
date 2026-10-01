@@ -1,11 +1,14 @@
 # The evaluation contract
 
-Short by design. `SeqVaeLagAttnTrfCfs` is `SeqVaeLagAttnCfs` with both history encoders replaced and
-nothing else changed, so it is evaluated by *that* pipeline rather than by a copy of it, and this
-document says only what is true of this package. **The contract is
-`teb_vae/lag_attn_cfs/eval/EVAL.md`** — what a run is, the output layout, the four layers, the
-configuration reference, one section per registered analysis, how the output is misread, and the
-guard recovery table are all there and are not restated here.
+Short by design. `SeqVaeLagAttnTrfCfs` is `SeqVaeLagAttnCfs` with both history encoders replaced, so
+it is evaluated by *that* pipeline rather than by a copy of it, and this document says only what is
+true of this package. The pipeline is documented in three companion files, none restated here:
+
+| Document | What it covers |
+|---|---|
+| `teb_vae/lag_attn_cfs/eval/EVAL.md` | **The contract**: what a run is, the output layout, the layers, the configuration reference, one section per registered analysis, how the output is misread, and the guard recovery table. |
+| `teb_vae/lag_attn_cfs/eval/FIGURE_GUIDE.md` | Every figure a run writes: what each panel shows, how to read it, how it is misread. `figure_manifest.json` beside it lists the fixed names and filename families. |
+| `teb_vae/lag_attn_cfs/eval/ATTRIBUTION.md` | The Captum attribution pass: readouts, baselines, checks, outputs and its figures. |
 
 ## What this package supplies
 
@@ -14,9 +17,9 @@ Four files, and each holds a fact the shared pipeline cannot derive:
 | File | What it carries |
 |---|---|
 | `binding.py` | `TRF_CFS_BINDING`: the classes to rebuild from a checkpoint, the `geometry_keys` reconciled against it, this encoder's own causality disclosure, and the override path below. |
-| `configs/eval_overrides.yaml` | The causal holdout split and the evaluation-only settings — deliberately the cfs cell's file key for key and value for value, so a difference between the two cells' summaries is never a difference between their configurations. |
-| `run.py` | The command line. It supplies the binding, a `prog=` string, and enumerates its own flags for one reason: `--only` and `--skip` must name *this* model's registry. |
-| `verify.py` | The acceptance gate, delegated in full, beside the sweep axes this cell ships arms for and the cross-cell table the two cfs cells are read down. |
+| `configs/eval_overrides.yaml` | The causal holdout split and the evaluation-only settings. It is the cfs cell's file key for key, and value for value **except where a value is a function of the lag window**: `occlusion_bands` is cut to this cell's own `max_lag`, because a band reaching past the window is refused at config load. |
+| `run.py` | The command line. It supplies the binding, a `prog=` string, and enumerates its own flags for one reason: `--only` and `--skip` must name *this* model's registry (`--help` lists it). |
+| `verify.py` | The acceptance gate, delegated in full, beside the tables for the sweep arms this cell ships and the cross-cell table the two cfs cells are read down. |
 
 Launch from the repository root:
 
@@ -26,127 +29,130 @@ python -m teb_vae.lag_attn_transformer_cfs.eval.verify <run>/eval_results/summar
 python -m teb_vae.lag_attn_transformer_cfs.eval.verify --runs <dir-of-runs> --out RESULTS_arms.md
 ```
 
+Or with no command line at all: `run.py` and `verify.py` each carry a `RUN_ARGS` dictionary at the
+bottom of the file. Edit the values there and press the IDE's Run button; a flag given on the
+command line wins over the dictionary, and the console line prints where each value came from.
+
 ## What resolves to the parent
 
 Everything else. The preflight guards and their recovery table, the population and forward-contract
-probe, the collection pass and its five branches, every registered analysis, the readouts, the
-ten-verdict registry, the headline registry, the sanity block, the figure seam and the gate's
-criteria come from `teb_vae.lag_attn_cfs.eval` unchanged and are reached through the binding. The
-analyses only a causal cell can have — `warmup`, `source_null`, `occlusion`, `lag_clocks`,
-`lag_kld_scaled`, `lag_high_kl` and `spectral_skill` — are registered on the *cfs* binding and
-picked up here by binding that pipeline rather than by re-registering them, so an eighth would
-reach this cell from one place.
+probe, the collection pass and its branches, every registered analysis, the readouts, the
+ten-verdict registry, the headline registry (the Monte Carlo error block included), the sanity
+block, the figure seam and the gate's criteria come from `teb_vae.lag_attn_cfs.eval` unchanged and
+are reached through the binding. The analyses only a causal cell can have (`warmup`,
+`source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `lag_high_kl` and
+`spectral_skill`) are registered on the *cfs* binding's `EXTRA_ANALYSES` and picked up here by
+binding that object rather than by re-registering it, so an analysis added there reaches this cell
+from one place. `tests/test_eval_binding.py` asserts the identity.
 
 **`occlusion` is the one that most needs saying here.** It is the interventional half of the lag
 question: it removes the source's *values* in a lag band, leaves the availability announcement
 untouched, re-encodes through the run's own K/V path and reports the per-horizon-step forecast cost.
-That makes it the readout on which this cell's shipped `lag_kv_source: conv_stem` arm is genuinely
-informative — this architecture's local stem reaches 21 steps against a 91-lag window where the
-conv-LSTM cell's reaches 387 — and it is registered on the shared binding precisely so the two cells'
-band deltas are produced by one implementation and remain comparable as levels across the encoder
-edge.
+Under the shipped `lag_kv_source: adapter` the keys and values are the projected source stream
+itself, whose reach is one step, so any lag structure the attention reports is the attention's own
+and not something a history encoder already aligned; the `sweep_lag_kv_conv_stem` arm restores a
+local stem whose reach is its receptive field. `preflight.json` records the reach beside the
+furthest searched lag (`source_reach_vs_lag_range`), which is the comparison that matters, rather
+than either number alone.
+
+The implementation is shared, so the two cfs cells' band deltas are computed identically. The
+**bands are not**: each cell cuts them to its own lag window, so a band named `far` covers
+different lags in the two cells. Compare the band deltas across cells by the lag spans the
+occlusion table records, never by band name.
 
 **This package defines no numeric function.** Not "few": none. `binding.py` is a frozen record,
 `run.py` and `verify.py` delegate to the shared implementations, and there is no module here that
 computes a quantity a summary reports. That is asserted about the code in
 `tests/test_eval_binding.py` and `tests/test_eval_run.py` rather than promised by this paragraph,
-because a prose claim of
-delegation is exactly the claim that decays first: the moment one number is computed locally the two
-cells stop being measured by one implementation, and their difference stops being attributable to the
-encoder.
+because a prose claim of delegation is exactly the claim that decays first.
 
 `geometry_keys` is the one declaration that differs and it is written out rather than derived. It is
-the cfs cell's tuple **minus** `causal_norm` — not a constructor parameter of this model, because
-these encoders carry no time-pooling normaliser to causalise — **plus** the seven this architecture
-adds: `encoder_conv_kernels`, `encoder_conv_dilations`, `encoder_num_heads`, `encoder_d_ff`,
-`target_attention_blocks`, `source_attention_blocks` and `source_attention_window` — and, since the
-final revision, `forecast_ar_residual`, which only this cell configures. Each must be both
-a constructor parameter and a config key, because `preflight.reconcile` silently skips any key absent
-from either, so a key that is only one of the two is a reconciliation that never happens and never
-says so. The count is left to the code, which is where a reader can check it.
+the cfs cell's tuple **minus** `causal_norm` (not a constructor parameter of this model, because
+these encoders carry no time-pooling normaliser to causalise) **plus** this architecture's encoder
+keys (`encoder_conv_kernels`, `encoder_conv_dilations`, `encoder_num_heads`, `encoder_d_ff`,
+`target_attention_blocks`, `source_attention_blocks`, `source_attention_window`) **plus**
+`forecast_ar_residual`, which only this cell configures. Each must be both a constructor parameter
+and a config key, because `preflight.reconcile` silently skips any key absent from either, so a key
+that is only one of the two is a reconciliation that never happens and never says so. The count is
+left to the code, which is where a reader can check it.
 
-**Three architecture switches are in both cells' tuples and a fourth is deliberately not.**
-`prior_availability_input`, `lag_kv_source` and `persistence_residual` are reconciled, because the
-evaluation rebuilds the architecture from the checkpoint's own `model_kwargs`: a config disagreeing
-about one of them would not fail — it would report one architecture's numbers under another's stated
-name, and every `nll_*`, every skill comparison and every lag readout would be measured on a
-different predictor. `horizon_weight_halflife_steps` is **absent**, on the same ground as the
-objective weights: it re-weights the *training* criterion's horizon axis, and no evaluated readout
-applies it, since this pipeline scores every block unweighted.
+**Four switches that change what a number means are reconciled, and one is deliberately not.**
+`prior_availability_input`, `lag_kv_source`, `persistence_residual` and `forecast_ar_residual` are
+in the tuple, because the evaluation rebuilds the architecture from the checkpoint's own
+`model_kwargs`: a config disagreeing about one of them would not fail, it would report one
+architecture's (or one likelihood's) numbers under another's stated name. The other density term,
+the per-channel scored horizon `target_scored_horizon`, is a resolved vector with no config key, so
+the preflight re-resolves it from the config and compares it instead. `horizon_weight_halflife_steps`
+is **absent**, on the same ground as the objective weights: it re-weights the *training* criterion's
+horizon axis, and no evaluated readout applies it, since this pipeline scores every block
+unweighted.
 
-**Two of the seven encoder keys apply to the `encoder` K/V arm alone.**
-`source_attention_blocks` and `source_attention_window` describe the deep source encoder, which the
-shipped `lag_kv_source: conv_stem` does not build; the stem reads `encoder_conv_kernels` and
-`encoder_conv_dilations` instead. They stay in the tuple because they are exactly what the `encoder`
-comparison arm reconciles against, and because removing them would make the leaf-for-leaf config
-parity check read a divergence where there is none.
+**Two of the encoder keys describe a stack the shipped arm does not build.**
+`source_attention_blocks` and `source_attention_window` describe the deep source encoder, which
+exists only under `lag_kv_source: encoder`; neither the shipped `adapter` nor the `conv_stem` arm
+constructs it. They stay in the tuple because they are exactly what an `encoder` arm reconciles
+against, and the causality disclosure reports zero source blocks, not the configured count, when
+that encoder was not built.
 
-## What the encoder edge means, and what it does not
+## What the scored likelihood is
 
-The cross-cell table exists to make one comparison readable and to make the other one unavailable.
-The two are **not symmetric**, and reading either as the other is the misreading this section exists
-to foreclose.
+Since the final revision (`DESIGN.md`, amendment of 2026-09-23) this cell scores a forecast cell
+$(\tau, c)$ only while $\tau < H_c$, the channel's own scored horizon, and scores its residual
+under an AR(1) innovation with the per-channel coefficient $\phi_c$ when `forecast_ar_residual` is
+on. Every density readout (block NLLs, `pred_gap`, the matched Monte Carlo gap, the splits and both
+baselines) is scored under the checkpoint's own $H_c$ and $\phi_c$, read from the model rather than
+configured, and `summary.json` states both under `likelihood_structure`. The `sweep_all_cells_scored`
+and `sweep_factorised_likelihood` arms restore the previous choice of each.
 
-**Against `lag_attn_cfs`, a loss level *is* comparable.** Both cells sum the same
-$H \cdot C_{\mathrm{keep}} = 2940$ target coefficients over the same 136 dense anchors under the
-same objective, from the same shards at the same warm-up budget. Only the two history encoders
-differ. So
-`d_base_mc_nats`, `pred_gap_mc_nats`, `source_conditioned_kl_raw_nats` and
-`coupling_minus_clock_nats` can be put in one table and read as levels, and a difference between the
-rows is attributable to the encoder. That is the whole reason this cell exists, and it is why the
-pipeline was bound rather than forked a second time.
+## What the cross-cell table can and cannot say
 
-Two conditions on that, and both are now load-bearing rather than incidental. The two cells must ship
-the **same objective weights** — the same horizon half-life and the same persistence state — because
-a level comparison across two differently weighted criteria compares nothing; and the *lag* readouts
-must be read knowing that the two cells' local K/V stems are not the same size, 21 steps here against
-387 there, so a difference in a lag profile across this edge is about the stems as much as about the
-encoders. Both `DESIGN.md` records say so at the point where the difference is priced.
+The cross-cell table puts runs of this cell and of `lag_attn_cfs` side by side, keyed by the
+`model_class` each run recorded. Whether a *level* in one row can be compared with a level in the
+other depends on the two runs, not on the two cells, and the test is mechanical:
 
-*Amendment (2026-09-05).* The figures above describe the edge as built. Since this date both cfs
-cells forecast $H = 10$ steps over $156$ dense anchors (block $10 \times 76 = 760$) under the same
-weights, so the condition still holds and the level comparison stands; `preflight.json` records a
-run's own `horizon`, `anchors_per_sample` and `block_width`.
+* **A level is comparable only when the scored block is the same.** A block score is a sum over the
+  scored cells of a block, $\sum_{c} \min(H_c, H)$ coefficients, so its scale is set by the horizon
+  $H$, the per-channel scored horizons $H_c$, the kept channel budget $C_{\mathrm{keep}}$ and the
+  likelihood's AR term before the model is reached. Compare `preflight.json` (`horizon`,
+  `anchors_per_sample`, `block_width`, the warm-up budget) and `summary.json`
+  (`likelihood_structure`) between the two runs. Only when they match does a difference in
+  `d_base_mc_nats`, `pred_gap_mc_nats`, `source_conditioned_kl_raw_nats` or
+  `coupling_minus_clock_nats` measure the encoder.
+* **At the shipped leaves they do not match.** The final revision changed this cell's horizon,
+  stride, lag window, K/V arm and likelihood; the conv-LSTM cell was not revised. The shipped pair is
+  therefore two different predictors scored on two different blocks, and the cross-cell table reads
+  as signs and orderings only (does `pred_gap` have the same sign, does the verdict agree), with the
+  level columns ignored. Rebuilding the level comparison needs a run of one cell at the other's
+  geometry and likelihood.
+* The *lag* readouts compare less still: the two cells search different lag windows through
+  different K/V representations, so a lag-profile difference is about the K/V arm and the window as
+  much as about the encoders.
 
-**Against `lag_attn_transformer_fs`, a loss level is *not* comparable**, and the asymmetry is
-structural rather than a matter of care. That cell is the same architecture over the **two-sided**
-transform: its blocks are 2340 coefficients against this cell's 2940, at the same horizon of 30 steps against
-15, and its channel set was never pruned by a warm-up budget at all. A block score is a sum over the
-coefficients in a block, so its scale is set by the block before the model is reached; two such
-numbers do not become comparable by being placed in adjacent columns. If that edge is ever wanted it
-must be a signs-and-orderings table with the level columns removed — and that is a different table,
-not this one with a caveat attached.
+**Against `lag_attn_transformer_fs` no level is comparable at any leaves.** That cell is the same
+architecture over the **two-sided** transform: its channel set was never pruned by a warm-up budget
+and its coefficients are not causal, so its block is a different sum over different quantities. If
+that edge is ever wanted it must be a signs-and-orderings table with the level columns removed, and
+that is a different table, not this one with a caveat attached.
 
-The same rule holds one step further out and is stated in the shared contract rather than here: the
-percentage columns are **budget-local**, because $C_{\mathrm{keep}}$ is whatever the warm-up budget
-decided, so two arms of *either* cfs cell at two budgets are non-comparable to each other as well.
+The same rule holds one step further out and is stated in the shared contract: the percentage
+columns are **budget-local**, because $C_{\mathrm{keep}}$ is whatever the warm-up budget decided, so
+two arms of *either* cfs cell at two budgets are non-comparable to each other as well.
 
 ## Which alignment a checkpoint was built at
 
 `causal_align_reference` and `causal_align_reference_source` are deliberately **not** among the
 `geometry_keys`, and they cannot be: both are config keys that name no constructor parameter, so
-`preflight.reconcile` would skip them silently. What reaches the checkpoint is their consequence —
-the two shift vectors in `model_kwargs` — and `preflight.check_warmup_budget_matches_checkpoint`
-re-resolves both references against the shards this run is about to read and compares all six
-resolved tuples. The alignment is therefore checked, just not by name.
+`preflight.reconcile` would skip them silently. What reaches the checkpoint is their consequence,
+the two shift vectors in `model_kwargs`, and `preflight.check_warmup_budget_matches_checkpoint`
+re-resolves both references against the shards this run is about to read and compares the resolved
+tuples. The alignment is therefore checked, just not by name. The shipped configuration is
+unaligned; the `sweep_align_target_max` and `sweep_target_clock_input` arms are the aligned ones.
 
-**And it is now printed by name as well**, on the console block beside the delay and in
-`summary.run_arm`, in three readings kept separate: the *configured* reference label and source
-reference, the *built* `lag_kv_source`, and the *resolved* target clock, source clock and
-inter-stream offset in seconds. Three because a config naming one arm while the checkpoint carries
-another is exactly what the re-resolution guard above catches structurally and what this line makes
-visible on the page.
-
-That guard is what refuses a checkpoint built at another alignment than the run's shards
-resolve, by naming the disagreeing tuples rather than by loading it and moving the numbers.
-
-## The final revision (2026-09-23)
-
-`DESIGN.md` (amendment of this date) records it. Two consequences for a summary: every density
-readout -- block NLLs, `pred_gap`, the matched MC gap, the splits, the baselines -- is scored
-under the checkpoint's own per-channel scored horizon and AR(1) residual, read from the model
-rather than configured, and `summary.json` states both under `likelihood_structure`; and the
-encoder edge above no longer holds, because the conv-LSTM cell was not revised.
+**It is also printed by name**, on the console block and in `summary.run_arm`, in three readings kept
+separate: the *configured* reference label and source reference, the *built* `lag_kv_source`, and the
+*resolved* target clock, source clock and inter-stream offset in seconds. Three because a config
+naming one arm while the checkpoint carries another is exactly what the re-resolution guard above
+catches structurally and what this line makes visible on the page.
 
 ## The gate
 

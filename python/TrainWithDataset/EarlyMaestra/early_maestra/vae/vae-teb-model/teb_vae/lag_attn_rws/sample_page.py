@@ -164,9 +164,10 @@ NORMALISED_LIMITS: Tuple[float, float] = (-3.0, 3.0)
 
 #: The two x labels a row can carry, naming the clock its columns are on. Only the raw row is in
 #: physical time; every model row is drawn at its step index $t$, i.e. at $t\Delta$ seconds, so a
-#: column is one anchor on all of them.
-RAW_TIME_LABEL = "Time (s) — raw samples, physical time"
-STEP_TIME_LABEL = "Time (s) — step index, $t\\Delta$"
+#: column is one anchor on all of them. Kept to the quantity and its unit: the rule behind the
+#: distinction is this module's docstring, not the axis.
+RAW_TIME_LABEL = "Time (s)"
+STEP_TIME_LABEL = "Step time (s)"
 
 #: The lag panels' secondary axis label when no input delay is added, i.e. the axis is $\Delta\ell$.
 LAG_SECONDS_LABEL = "lag (s)"
@@ -179,15 +180,15 @@ _LAG_TICKS = 5
 #: this is what decides whether a reader can take in a row at once.
 _ROW_INCHES = 1.8
 
-#: Vertical strip reserved above the first panel for the two-line title, in inches.
-_HEADER_INCHES = 0.75
+#: Vertical strip reserved above the first panel for the one-line title, in inches.
+_HEADER_INCHES = 0.5
 
 #: Vertical strip reserved below the last panel, in inches, for its time-axis label and for
 #: whatever a caller writes into the figure's bottom margin -- the causal pages put their
-#: lag-time caveat there. Physical rather than fractional for the header's reason and applied as
-#: a FLOOR on the fractional margin: 3% of a short page is under half an inch, and the caveat
+#: one-line lag caveat there. Physical rather than fractional for the header's reason and applied
+#: as a FLOOR on the fractional margin: 3% of a short page is under half an inch, and the caveat
 #: would land on top of the last row's axis label.
-_FOOTER_INCHES = 1.3
+_FOOTER_INCHES = 0.8
 
 #: Interpolation for every heatmap on the page. ``'none'`` rather than matplotlib's default
 #: ``'antialiased'``: a resampled heatmap invents intermediate values between two anchors or two
@@ -209,7 +210,7 @@ _LOG_ATTENTION_FLOOR = 1e-4
 #: staircase for a different quantity -- its warm-up, before which the coefficient exists but is a
 #: function of assumed pre-recording history -- and a row that called that a delay would name the
 #: wrong thing on the only axis the row is read by.
-DELAY_STAIRCASE_LABEL = "guard: first step with data, $\\delta_c$"
+DELAY_STAIRCASE_LABEL = "guard delay $\\delta_c$"
 
 
 def top_down_extent(x_left: float, x_right: float, n_channels: int) -> List[float]:
@@ -289,8 +290,8 @@ class InputStreamPanel:
             ``nan`` where the channel has none (the order-$0$ scattering low-pass).
         blocks: ``(name, start, stop)`` per stored block, as half-open ranges **into the
             surviving channels**, for the row's dividers and its y-axis labels.
-        title: The panel title, which is where the budget, the surviving counts and the delay
-            range are stated.
+        title: The panel title: the stream and how many of its declared channels survive. The
+            budget and the delay range are the run-level budget figure's.
         delay_label: Legend label of the staircase drawn at :attr:`delays`. Defaults to
             :data:`DELAY_STAIRCASE_LABEL`, the reach guard's reading; a builder whose staircase is
             some other per-channel boundary supplies its own, because the label is the only thing
@@ -359,7 +360,7 @@ def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int =
         ],
         fontsize=6,
     )
-    secondary.set_ylabel("channel centre freq. (Hz)", fontsize=7)
+    secondary.set_ylabel("Centre freq. (Hz)", fontsize=7)
     secondary.grid(False)
     return secondary
 
@@ -450,10 +451,7 @@ def _input_stream_row(
             np.asarray(time_s, dtype=float) + float(panel.raw_delay_s),
             np.asarray(raw_values, dtype=float),
             color=COLOR_BLACK, linewidth=0.5, alpha=0.75,
-            label=(
-                f"raw {panel.raw_field} as the encoder receives it "
-                f"(delayed {float(panel.raw_delay_s):.0f} s)"
-            ),
+            label=f"raw {panel.raw_field}, delayed {float(panel.raw_delay_s):.0f} s",
         )
         twin.set_ylabel(f"raw {panel.raw_field} ({unit})", fontsize=7)
         twin.tick_params(axis="y", labelsize=6)
@@ -659,7 +657,7 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
             up_np = candidate
 
     ax.plot(rows.time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7, label=f"FHR ({unit})")
-    ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
+    ax.set_title("Raw target FHR and source UP", fontsize=9, pad=6)
     ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
     _pin_trace_limits(ax, "fhr", unit)
@@ -690,7 +688,7 @@ def log_attention_norm(
 ) -> Optional[LogNorm]:
     r"""Return a log colour normaliser over a lag panel's positive mass, or ``None``.
 
-    Attention is a softmax over lags, so every weight is non-negative and the mass is spread
+    Attention is a normalised map over lags (softmax or entmax), so every weight is non-negative and the mass is spread
     over $L$ lags -- on a linear scale one dominant lag flattens the rest of the panel into the
     bottom colour, which is the reason to read it logarithmically at all.
 
@@ -803,28 +801,21 @@ def raw_forecast_rows(rows: ForecastRowInputs) -> None:
     ax.fill_between(time_raw, base_lo, base_hi, color=COLOR_GRAY, alpha=0.22, linewidth=0)
     ax.plot(
         time_raw, base_mean, color=COLOR_GRAY, linewidth=0.8, linestyle="--",
-        label="base ($z^p$, target-only)",
+        label="base ($z^p$)",
     )
     ax.fill_between(
         time_raw, full_lo, full_hi, color=COLOR_VERMILLION, alpha=0.18, linewidth=0
     )
     ax.plot(
         time_raw, full_mean, color=COLOR_VERMILLION, linewidth=0.8,
-        label="full ($z^q$, source-conditioned)",
+        label="full ($z^q$)",
     )
     # Where one forecast ends and the next begins. Without them the tiling reads as a single
     # continuous prediction, which is exactly what it is not: each window is decoded from one
     # latent and never sees the window before it.
     for edge in window_edges:
         ax.axvline(edge, color=COLOR_GRAY, linewidth=0.5, linestyle="--", alpha=0.7, zorder=1)
-    window_seconds = horizon * raw_per_step / _FS_RAW
-    ax.set_title(
-        f"Forecast — {len(tile_anchors)} consecutive non-overlapping {window_seconds:.0f} s "
-        f"windows from the first trained anchor, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$ "
-        f"({horizon}$\\times${raw_per_step} = {horizon * raw_per_step} raw samples each; "
-        f"dashed: window edges)",
-        fontsize=9, pad=6,
-    )
+    ax.set_title(f"Forecast, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$", fontsize=9, pad=6)
     ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8)
     _pin_trace_limits(ax, "fhr", unit)
@@ -885,13 +876,16 @@ def build_diagnostic_figure(
         sample_index: Which sample of the batch to draw.
         epoch: Current epoch, for the title.
         guid: Recording identifier, for the title.
-        beta: The KL weight **resolved for this epoch**, not the raw hyperparameter.
+        beta: The KL weight resolved for this epoch. Accepted so every caller is unchanged; the
+            title no longer prints it, because the run's logs carry it by epoch.
         cohort: The cohort the recording belongs to -- its subgroup stem, which names the
             clinical class as its prefix -- printed beside the GUID so a page lifted out of its
             directory still says where the recording came from. ``None``, the default, prints
             nothing extra, which is what a training batch that carries no cohort label gets.
-        scalars: Loss readouts for the title (``nll_base_block``, ``nll_full_block``,
-            ``pred_gap``, ``source_conditioned_kl_raw``); missing keys are skipped.
+        scalars: Loss readouts (``nll_base_block``, ``nll_full_block``, ``pred_gap``,
+            ``source_conditioned_kl_raw``). Accepted so every caller is unchanged; the page no
+            longer prints them, because they are the run's logged metrics and the evaluation's
+            ``sample_pages.csv`` carries them per page.
         up_raw: The raw source $(B, L_{\mathrm{raw}})$ in loader units, or ``None``. The model
             never sees it -- it consumes the decimated UP feature blocks -- so it is passed in
             beside the target rather than read off the forward dict.
@@ -931,11 +925,10 @@ def build_diagnostic_figure(
             through :attr:`ForecastRowInputs.row_limits`. ``None`` or a missing
             key scales that row to this page alone, which is right for a training callback and
             wrong for a directory of pages somebody compares.
-        page_title: The first line of the title, naming the sample. ``None`` -- the training
-            callback's case -- writes ``epoch``, the batch position ``sample_index``, the GUID,
-            the cohort and ``beta``; an evaluation passes its own line, because there the segment
-            is identified by its dataset index and its place before delivery, and ``beta`` is not
-            resolved per epoch.
+        page_title: The title, naming the sample. ``None`` -- the training callback's case --
+            writes ``epoch``, the batch position ``sample_index``, the GUID and the cohort; an
+            evaluation passes its own line, because there the segment is identified by its
+            dataset index and its place before delivery.
 
     Raises:
         ValueError: If ``rows`` names a row this page does not reserve.
@@ -1211,11 +1204,7 @@ def build_diagnostic_figure(
             ax.set_yticks([0.5 * d_z - 0.5, 1.5 * d_z - 0.5])
             ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
             ax.set_ylabel("Latent dim", fontsize=8)
-            ax.set_title(
-                "Target-only latent state $\\mu^p$ and the source-derived shift "
-                "$\\mu^q-\\mu^p$ (each on its own colour scale; trained anchors only)",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("Latent state", fontsize=9, pad=6)
             ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             heatmap_spines(ax)
             finalise_time_axis(ax, tail=True)
@@ -1241,10 +1230,7 @@ def build_diagnostic_figure(
                     if limits.get("kld_dims") else {}
                 ),
             )
-            ax.set_title(
-                "Per-dimension source-conditioned KL (nats, trained anchors only)",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("Per-dimension source-conditioned KL", fontsize=9, pad=6)
             ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("Latent dim", fontsize=8)
             heatmap_spines(ax)
@@ -1262,10 +1248,7 @@ def build_diagnostic_figure(
             ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
             if limits.get("kld_total"):
                 ax.set_ylim(0.0, float(limits["kld_total"]))
-            ax.set_title(
-                "$K_t$ — total source-conditioned KL per step (trained anchors only)",
-                fontsize=9, pad=6,
-            )
+            ax.set_title("$K_t$, source-conditioned KL", fontsize=9, pad=6)
             ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("nats", fontsize=8)
             style_axes(ax, grid="both")
@@ -1289,7 +1272,7 @@ def build_diagnostic_figure(
                 else (Normalize(0.0, float(shared)) if shared else None)
             )
             image = lag_panel(
-                ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis",
+                ax, alpha_np, "Lag attention and argmax", "viridis",
                 drop_tail=False, norm=attention_norm,
             )
             attn_trained, _ = trained_columns(alpha_np, drop_tail=False)
@@ -1317,7 +1300,7 @@ def build_diagnostic_figure(
         if "kl_lag_map" in included:
             ax, cax = row_axes("kl_lag_map")
             image = lag_panel(
-                ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma",
+                ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$, KL by lag", "magma",
                 drop_tail=True,
                 norm=(
                     Normalize(0.0, float(limits["kl_lag_map"]))
@@ -1326,26 +1309,15 @@ def build_diagnostic_figure(
             )
             attach_cbar(cax, image, "nats")
 
-        readouts = "  ".join(
-            f"{name}={float(scalars[name]):.4g}"
-            for name in (
-                "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
-                "source_conditioned_kl_raw",
-            )
-            if name in scalars
-        )
         # The cohort sits directly after the GUID, because the two are read together: a GUID
         # alone says which recording, and only the subgroup says which population it was drawn
         # from -- which is the first thing a reader of an extreme page wants to know.
-        cohort_text = f" — subgroup {cohort}" if cohort else ""
+        cohort_text = f", subgroup {cohort}" if cohort else ""
         header = (
-            f"epoch {epoch} — sample {i} — guid {guid}{cohort_text} — beta={beta:.4g}"
+            f"epoch {epoch}, sample {i}, guid {guid}{cohort_text}"
             if page_title is None else str(page_title)
         )
-        fig.suptitle(
-            f"{header}\n{readouts}",
-            fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
-        )
+        fig.suptitle(header, fontsize=10, y=1.0 - 0.1 / figure_height, va="top")
         return fig
     except BaseException:
         plt.close(fig)

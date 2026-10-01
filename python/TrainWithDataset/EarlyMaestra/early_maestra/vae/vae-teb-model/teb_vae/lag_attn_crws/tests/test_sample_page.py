@@ -46,7 +46,7 @@ _FS_RAW = 4.0
 _STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}}
 
 #: The two rows this cell's borrowed input builder adds, by title prefix.
-_INPUT_ROWS = ("Model input — target", "Model input — source")
+_INPUT_ROWS = ("Target input", "Source input")
 
 #: Every titled row of this package's page: the sibling's seven plus the two input rows. Stated as
 #: arithmetic rather than as ``9`` so a row added to the drawing without one added to the layout --

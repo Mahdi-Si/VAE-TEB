@@ -6,7 +6,9 @@ classifier:
     out_root: runs/classifier
     seeds: [42]
     folds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    device: cuda:0
+    device: cuda:0                  # cohort, extract, evaluate; train and predict too while `devices` is empty
+    devices: []                     # fold-parallel train + predict (SPEC §14.4): one fold process per slot, e.g.
+                                    # [cuda:0, cuda:1, cuda:2, cuda:3]; a repeated device runs two folds on it; not digested
     num_workers: 4
     report_workers: 4                # figure processes in `report`, each with its own copy of the tables
                                      # (~3-5 GB at full scale); 0 renders serially (one copy)

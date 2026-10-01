@@ -243,9 +243,8 @@ def _write_figures(
         )
         figures.ribbon_plot(
             ax, centres, density,
-            title="PIT reliability -- flat at 1.0 is calibrated; "
-                  "$\\cup$ over-confident, $\\cap$ over-dispersed",
-            xlabel="PIT value", ylabel="density", label="median over samples",
+            title="PIT reliability",
+            xlabel="PIT value", ylabel="Density", label="median",
         )
         ax.axhline(
             1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
@@ -280,10 +279,10 @@ def _write_figures(
         )
         axes[0, 0].set_xticks(positions)
         axes[0, 0].set_xticklabels(
-            [f"{label}\n(nominal {nominal[label]:.4f})" for label in labels], fontsize=7
+            [label.replace("sigma", r"$\sigma$") for label in labels], fontsize=7
         )
-        axes[0, 0].set_title("Central-interval coverage against the exact nominal")
-        axes[0, 0].set_ylabel("coverage")
+        axes[0, 0].set_title("Central-interval coverage")
+        axes[0, 0].set_ylabel("Coverage")
         axes[0, 0].legend(fontsize=7, loc="best")
         figures.style_axes(axes[0, 0])
 
@@ -294,11 +293,11 @@ def _write_figures(
             if horizon_columns
             else np.zeros((0, 0)),
             title="$2\\sigma$ coverage by horizon step",
-            xlabel="Horizon step $h$", ylabel="coverage", label="median over samples",
+            xlabel="Horizon step $h$", ylabel="Coverage", label="median",
         )
         axes[1, 0].axhline(
             metrics.nominal_central_coverage(2.0), color=figures.COLOR_VERMILLION,
-            linestyle="--", linewidth=1.2, label="nominal 0.9545",
+            linestyle="--", linewidth=1.2, label="nominal",
         )
         axes[1, 0].legend(fontsize=7, loc="best")
         figures.style_axes(axes[1, 0])
@@ -310,19 +309,19 @@ def _write_figures(
     try:
         figures.histogram_panel(
             axes[0, 0], frame.get("mean_logvar", pd.Series(dtype=float)),
-            title="Sharpness: per-sample mean predictive $\\log\\sigma^2$",
-            xlabel="$\\log\\sigma^2$",
+            title="Sharpness",
+            xlabel="Mean predictive $\\log\\sigma^2$",
             reference=(
                 float(frame["homoscedastic_logvar"].mean())
                 if "homoscedastic_logvar" in frame
                 else None
             ),
-            reference_label="homoscedastic reference",
+            reference_label="homoscedastic",
         )
         figures.histogram_panel(
             axes[1, 0], frame.get("nll_gain", pd.Series(dtype=float)),
-            title="NLL gain over the homoscedastic reference (positive is better)",
-            xlabel="nats", color=figures.COLOR_GREEN,
+            title="NLL gain",
+            xlabel="Gain (nats)", color=figures.COLOR_GREEN,
             reference=0.0, reference_label="no gain",
         )
         paths.append(str(figures.render_figure(figure, directory / "sharpness")))

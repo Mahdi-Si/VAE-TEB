@@ -128,7 +128,8 @@ def _no_seams() -> Dict[str, Any]:
     ids=["separator", "space", "non-ascii", "empty", "overlong"],
 )
 def test_a_page_filename_is_always_addressable_whatever_the_guid_holds(guid) -> None:
-    name = samples_analysis.page_filename(7, guid, -1200.0)
+    # The subgroup is sanitised by the GUID rule, so the same hostile text is tried in both slots.
+    name = samples_analysis.page_filename(7, guid, guid, -1200.0)
 
     assert samples_analysis.FILENAME_PATTERN.fullmatch(name), name
     assert "/" not in name and "\\" not in name and " " not in name
@@ -136,9 +137,18 @@ def test_a_page_filename_is_always_addressable_whatever_the_guid_holds(guid) -> 
 
 
 def test_a_segment_with_no_epoch_is_named_na_rather_than_nan() -> None:
-    name = samples_analysis.page_filename(3, "g0", float("nan"))
+    name = samples_analysis.page_filename(3, "g0", "acidosis_cs", float("nan"))
 
-    assert name == "sample0003_g0_epochna"
+    assert name == "sample0003_g0_acidosis_cs_epochna"
+    assert samples_analysis.FILENAME_PATTERN.fullmatch(name)
+
+
+@pytest.mark.parametrize("subgroup", [None, float("nan")], ids=["none", "nan"])
+def test_a_row_with_no_subgroup_is_named_na(subgroup) -> None:
+    """A missing subgroup is ``na`` in the name, never ``None`` or ``nan``."""
+    name = samples_analysis.page_filename(3, "g0", subgroup, -600.0, compact=True)
+
+    assert name == "sample0003_g0_na_epoch-600_compact"
     assert samples_analysis.FILENAME_PATTERN.fullmatch(name)
 
 
@@ -576,7 +586,7 @@ def test_one_failing_page_is_recorded_by_index_and_the_rest_still_render(
     # The full page of the segment whose reduced page failed is still there, and every record
     # carries the recording's identity beside the file.
     assert any(
-        record["variant"] == "full" and record["file"] == "sample0001_g1_epoch-1000.pdf"
+        record["variant"] == "full" and record["file"] == "sample0001_g1_na_epoch-1000.pdf"
         and record["guid"] == "g1"
         for record in written
     )
@@ -621,7 +631,7 @@ def test_a_segment_two_draws_picked_is_drawn_once_and_copied(tmp_path, monkeypat
     assert record["dataset_index"] == 1
 
 
-def test_the_page_title_names_the_segment_its_cohort_and_its_place_before_delivery() -> None:
+def test_the_page_title_names_the_segment_its_cohort_and_its_epoch() -> None:
     """The title carries the dataset index the filename carries -- not the batch position, which
     is always 0 on a page drawn one segment at a time -- and both cohort labels."""
     row = pd.Series({
@@ -632,7 +642,7 @@ def test_the_page_title_names_the_segment_its_cohort_and_its_place_before_delive
 
     assert "sample 0024" in title and "guid G1" in title
     assert "subgroup hie_cs" in title and "class hie" in title
-    assert "2.50 h before delivery" in title
+    assert "epoch -9000 s" in title and "h before delivery" not in title
 
 
 def test_the_shared_limits_come_from_the_whole_split() -> None:
@@ -701,11 +711,18 @@ def test_the_pages_of_a_real_run_name_the_recordings_they_were_selected_from(
     assert len(manifest) > 0
     for _, row in manifest.iterrows():
         match = re.fullmatch(
-            r"sample(\d{4})_([A-Za-z0-9_-]{1,32})_epoch(-?\d+|na)(_compact)?\.pdf",
+            r"sample(\d{4})_([A-Za-z0-9_-]{1,32}_[A-Za-z0-9_-]{1,32})_epoch(-?\d+|na)"
+            r"(_compact)?\.pdf",
             str(row["file"]),
         )
         assert match, row["file"]
-        assert match.group(2) in known
+        # GUID then subgroup: both may hold underscores, so the pair is checked as one prefix.
+        guid = samples_analysis.sanitise_guid(row["guid"])
+        subgroup = (
+            "na" if pd.isna(row["subgroup"]) else samples_analysis.sanitise_guid(row["subgroup"])
+        )
+        assert guid in known
+        assert match.group(2) == f"{guid}_{subgroup}", row["file"]
         # The name's tail and the recorded variant are one fact, written twice.
         expected = (
             samples_analysis.COMPACT_VARIANT if match.group(4)

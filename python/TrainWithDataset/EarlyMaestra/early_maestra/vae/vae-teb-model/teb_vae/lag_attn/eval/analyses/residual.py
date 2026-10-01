@@ -144,15 +144,15 @@ def run_residual_analysis(
     try:
         figures.histogram_panel(
             axes[0, 0], ratios,
-            title="Per-sample residual ratio $\\mathrm{rms}(\\delta\\mu_{src}) / "
-                  "\\mathrm{rms}(\\mu_{full})$",
-            xlabel="residual_ratio", reference=threshold, reference_label="collapse threshold",
+            title="Residual ratio",
+            xlabel="$\\mathrm{rms}(\\delta\\mu_{src}) / \\mathrm{rms}(\\mu_{full})$",
+            reference=threshold, reference_label="collapse threshold",
         )
         figures.ribbon_plot(
             axes[1, 0], figures.sequence_axis(traces.shape[1] if traces.size else 0), traces,
             title="Residual magnitude by anchor position",
             xlabel="Anchor $t$ (decimated steps)",
-            ylabel="$\\mathrm{rms}(\\delta\\mu_{src})$", label="median over samples",
+            ylabel="$\\mathrm{rms}(\\delta\\mu_{src})$", label="median",
         )
         figure_path = str(figures.render_figure(figure, directory / "residual"))
     finally:

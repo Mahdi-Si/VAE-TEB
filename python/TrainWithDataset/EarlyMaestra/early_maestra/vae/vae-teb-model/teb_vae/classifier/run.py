@@ -1,7 +1,8 @@
 r"""Classifier CLI and run directory (SPEC §14).
 
     python -m teb_vae.classifier.run --config teb_vae/classifier/configs/smoke.yaml --stage cohort \
-        [--set classifier.data.kfold_root=/path ...] [--run-dir PATH] [--folds 1,2] [--device cpu]
+        [--set classifier.data.kfold_root=/path ...] [--run-dir PATH] [--folds 1,2] [--device cpu] \
+        [--devices cuda:0,cuda:1,...]
 
     python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--policy np30] --out DIR   # §11.8, block Q
 
@@ -23,6 +24,11 @@ missingness confound under ``context.auto_ablate_missing``, the ``noind`` ablati
 one is recorded (exit code 1; ``run.fail_fast`` raises instead) and ``evaluate`` refuses the run
 unless ``--allow-partial``. Per-unit status: ``stage_state.json["train"]["units"]``. MLflow (§10.10.5):
 one parent run per run directory, fail-closed; units nest under it; ``report`` logs the results to it.
+
+Fold-parallel (§14.4): with ``run.devices`` (``--devices cuda:0,cuda:1,...``) the per-fold part of ``train`` and
+``predict`` runs in one spawned process per fold, one device slot each (:mod:`~teb_vae.classifier.parallel`); the
+parent keeps the baselines and the MLflow parent, merges each fold as its process ends, and runs ``evaluate``,
+``report`` and ``verify`` once over every fold, exactly as the serial path does.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -55,7 +62,8 @@ import yaml  # noqa: E402
 from loguru import logger  # noqa: E402
 from scipy.special import logsumexp  # noqa: E402
 
-from teb_vae.classifier import baselines, cohort, metrics, report, sources, verify  # noqa: E402
+from teb_vae.classifier import baselines, cohort, metrics, parallel, report, sources, verify  # noqa: E402
+from teb_vae.classifier import train as classifier_train  # noqa: E402
 from teb_vae.classifier.baselines import (  # noqa: E402
     GUID_COLUMNS, LOCK, SEGMENT_COLUMNS, THREE_CLASS_COLUMNS, label_rows, lock_problem, read_lock, write_lock,
 )
@@ -270,57 +278,72 @@ def neural_predict(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], spli
     ``eval.covariates_off`` and covariates, every non-shuffled unit is also scored with every covariate missing
     (§7.3.5), under its own locked calibration and thresholds, as ``model_id = <kind>_covoff``. A kind with several
     seeds adds its seed ensemble (:func:`ensembles`) as ``seed='ens'`` rows under the ensemble's own lock, which is
-    read before any row of the fold is scored; a failed member makes the ensemble ``missing``."""
+    read before any row of the fold is scored; a failed member makes the ensemble ``missing``. One fold at a time
+    (:func:`predict_fold_rows`)."""
+    segs, gds, thr, units, missing = [], [], {}, [], []
+    for fold in cfg.classifier.run.folds:
+        s, g, t, u, m = predict_fold_rows(cfg, run_dir, manifest, fold, splits)
+        segs += s
+        gds += g
+        thr |= t
+        units += u
+        missing += m
+    return segs, gds, thr, units, missing
+
+
+def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int,
+                      splits: Sequence[str] = ("val", "test")
+                      ) -> Tuple[list, list, Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    """:func:`neural_predict` of one fold, in the same row order: what a fold process scores (§14.4)."""
     c, want, source = cfg.classifier, digest(cfg), manifest["source"]
     index, n_valid = _cache_rows(source)
     segs, gds, thr, units, missing = [], [], {}, [], []
     ens = ensembles(c, manifest.get("confound"))
-    for fold in c.run.folds:
-        built, labels, ens_locks, scored = {}, None, {}, {}
-        for kind, seeds in ens.items():
-            if any(_read_json(d / "fold_results.json").get("status") == "failed"
-                   for d in [ens_dir(run_dir, fold, kind), *(unit_dir(run_dir, fold, s, kind) for s in seeds)]):
-                logger.warning(f"ensemble {kind}|ens|{fold} or a member failed in train: no ensemble rows")
-                missing.append(f"{kind}|ens|{fold}")
-            else:
-                ens_locks[kind] = read_lock(ens_dir(run_dir, fold, kind), want)  # L5
-        for kind, seed in neural_units(c, manifest.get("confound")):
-            out, key = unit_dir(run_dir, fold, seed, kind), f"{kind}|{seed}|{fold}"
-            if _read_json(out / "fold_results.json").get("status") == "failed":
-                logger.warning(f"unit {key} failed in train: no prediction rows")
-                missing.append(key)
-                continue
-            lock = read_lock(out, want)  # before any test row is scored (L5)
-            unit = _fold_unit(cfg, run_dir, source, fold, kind, built)
-            if labels is None:
-                labels = label_rows(run_dir, fold, index, splits, n_valid, c.cohort.min_segments_per_guid,
-                                    strategy=c.labels.strategy)
-            cal = json.loads((out / "calibration.json").read_text())
-            passes = [(kind, unit)]
-            if c.eval.covariates_off and unit.n_cov and kind != "shuffled":
-                passes.append((f"{kind}_covoff", covariates_off(unit)))
-            for model_id, u in passes:
-                for split in splits:
-                    sc = score_split(out, u, split)
-                    if kind in ens_locks:
-                        scored.setdefault((model_id, split), []).append(sc)
-                    s, g = unit_rows(labels[labels["split"] == split], sc, cal, model_id, seed)
-                    segs.append(s)
-                    gds.append(g)
-                thr[f"{model_id}|{seed}|{fold}"] = json.loads((out / "thresholds.json").read_text())
-                units.append({"model_id": model_id, "seed": str(seed), "fold": fold,
-                              "lock_written_at": lock["locked_utc"]})
-        for kind, lock in ens_locks.items():
-            out = ens_dir(run_dir, fold, kind)
-            cal = json.loads((out / "calibration.json").read_text())
-            for model_id in dict.fromkeys(m for m, _ in scored if m in (kind, f"{kind}_covoff")):
-                for split in splits:
-                    s, g = unit_rows(labels[labels["split"] == split], ensemble_scores(scored[model_id, split]), cal,
-                                     model_id, "ens")
-                    segs.append(s)
-                    gds.append(g)
-                thr[f"{model_id}|ens|{fold}"] = json.loads((out / "thresholds.json").read_text())
-                units.append({"model_id": model_id, "seed": "ens", "fold": fold, "lock_written_at": lock["locked_utc"]})
+    built, labels, ens_locks, scored = {}, None, {}, {}
+    for kind, seeds in ens.items():
+        if any(_read_json(d / "fold_results.json").get("status") == "failed"
+               for d in [ens_dir(run_dir, fold, kind), *(unit_dir(run_dir, fold, s, kind) for s in seeds)]):
+            logger.warning(f"ensemble {kind}|ens|{fold} or a member failed in train: no ensemble rows")
+            missing.append(f"{kind}|ens|{fold}")
+        else:
+            ens_locks[kind] = read_lock(ens_dir(run_dir, fold, kind), want)  # L5
+    for kind, seed in neural_units(c, manifest.get("confound")):
+        out, key = unit_dir(run_dir, fold, seed, kind), f"{kind}|{seed}|{fold}"
+        if _read_json(out / "fold_results.json").get("status") == "failed":
+            logger.warning(f"unit {key} failed in train: no prediction rows")
+            missing.append(key)
+            continue
+        lock = read_lock(out, want)  # before any test row is scored (L5)
+        unit = _fold_unit(cfg, run_dir, source, fold, kind, built)
+        if labels is None:
+            labels = label_rows(run_dir, fold, index, splits, n_valid, c.cohort.min_segments_per_guid,
+                                strategy=c.labels.strategy)
+        cal = json.loads((out / "calibration.json").read_text())
+        passes = [(kind, unit)]
+        if c.eval.covariates_off and unit.n_cov and kind != "shuffled":
+            passes.append((f"{kind}_covoff", covariates_off(unit)))
+        for model_id, u in passes:
+            for split in splits:
+                sc = score_split(out, u, split)
+                if kind in ens_locks:
+                    scored.setdefault((model_id, split), []).append(sc)
+                s, g = unit_rows(labels[labels["split"] == split], sc, cal, model_id, seed)
+                segs.append(s)
+                gds.append(g)
+            thr[f"{model_id}|{seed}|{fold}"] = json.loads((out / "thresholds.json").read_text())
+            units.append({"model_id": model_id, "seed": str(seed), "fold": fold,
+                          "lock_written_at": lock["locked_utc"]})
+    for kind, lock in ens_locks.items():
+        out = ens_dir(run_dir, fold, kind)
+        cal = json.loads((out / "calibration.json").read_text())
+        for model_id in dict.fromkeys(m for m, _ in scored if m in (kind, f"{kind}_covoff")):
+            for split in splits:
+                s, g = unit_rows(labels[labels["split"] == split], ensemble_scores(scored[model_id, split]), cal,
+                                 model_id, "ens")
+                segs.append(s)
+                gds.append(g)
+            thr[f"{model_id}|ens|{fold}"] = json.loads((out / "thresholds.json").read_text())
+            units.append({"model_id": model_id, "seed": "ens", "fold": fold, "lock_written_at": lock["locked_utc"]})
     return segs, gds, thr, units, missing
 
 
@@ -499,105 +522,152 @@ def stage_extract(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
                                          dtype=c.source.cache_dtype)
 
 
-def stage_train(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
-    """§14.1 train per fold: the sklearn baselines, then every neural unit (§10.10.1); 1 iff a unit failed."""
+def train_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int, parent: Optional[str], *,
+               state: Optional[Callable[..., None]] = None,
+               progress: Optional[Callable[[Mapping[str, Any]], None]] = None) -> Dict[str, Any]:
+    """§10.10.1 for one fold: every neural unit (a locked one is skipped), then the fold's seed ensembles (§10.7).
+
+    Args:
+        cfg: The run's config.
+        run_dir: The run directory.
+        manifest: The run manifest (``source``, ``confound``).
+        fold: The fold.
+        parent: The MLflow parent run id; None trains every unit with MLflow off when MLflow is enabled (F9).
+        state: ``state(key, **fields)`` records a unit's status; default :func:`_unit_state` (``stage_state.json``).
+        progress: ``progress(record)`` records a unit trained here; default :func:`_progress` (``kfold_progress.log``).
+            A fold process (§14.4) passes its own pair, because only the parent writes run-level files.
+
+    Returns:
+        ``{"records": [...], "ens_failed": [...]}``: the ``fold_results.json`` record of every unit, trained here or
+        skipped as locked, and for each seed ensemble selected here whether it failed.
+    """
     c = cfg.classifier
-    manifest["baselines"] = baselines.train(cfg, run_dir, manifest["source"])
-    parent = mlflow_parent(cfg, run_dir, manifest)
+    state = state or (lambda key, **fields: _unit_state(run_dir, key, **fields))
+    progress = progress or (lambda rec: _progress(cfg, run_dir, rec))
     ucfg = cfg if parent or not _mlflow(cfg).get("enabled") else _mlflow_off(cfg)  # F9: fail-closed
     want, source = digest(cfg), manifest["source"]
     index, n_valid = _cache_rows(source)
     records, ens_failed = [], []
-    for fold in c.run.folds:
-        built, labels = {}, None  # the fold's data per context variant, shared by every seed (and by val selection)
-        for kind, seed in neural_units(c, manifest.get("confound")):
-            out, key = unit_dir(run_dir, fold, seed, kind), f"{kind}|{seed}|{fold}"
-            if (out / LOCK).is_file():
-                read_lock(out, want)  # a lock under another config or with changed files raises (L5)
-                logger.info(f"unit {key}: locked at digest {want[:12]}, skipped")
-                _unit_state(run_dir, key, status="done", digest=want)
-                records.append(_read_json(out / "fold_results.json"))
-                continue
-            unit = _fold_unit(cfg, run_dir, source, fold, kind, built)
-            if labels is None:
-                labels = label_rows(run_dir, fold, index, ["val"], n_valid, c.cohort.min_segments_per_guid,
-                                    strategy=c.labels.strategy)
-            _unit_state(run_dir, key, status="running", started=_now(), finished=None, digest=want)
-            rec = {"fold": fold, "seed": seed, "kind": kind, "status": "failed"}
-            try:
-                rec = train_unit(ucfg, run_dir, manifest, fold=fold, seed=seed, kind=kind,
-                                 unit=None if kind == "shuffled" else unit, mlflow_parent_id=parent)
-                if rec["status"] == "done":
-                    try:
-                        rec |= lock_unit(cfg, out, unit, labels, kind, seed, rec.get("mlflow_run_id"))
-                    except Exception:
-                        logger.exception(f"unit {key}: calibration / threshold selection failed")
-                        rec |= {"status": "failed", "error": traceback.format_exc()}
-                        (out / "fold_results.json").write_text(json.dumps(json_safe(rec), indent=2))
-                        if c.run.fail_fast:
-                            raise
-            finally:
-                _unit_state(run_dir, key, status=rec["status"], finished=_now())
-                _progress(cfg, run_dir, rec)
-            records.append(rec)
-        for kind, seeds in ensembles(c, manifest.get("confound")).items():  # §10.7, once every member is locked
-            out, key = ens_dir(run_dir, fold, kind), f"{kind}|ens|{fold}"
-            if not all((unit_dir(run_dir, fold, s, kind) / LOCK).is_file() for s in seeds):
-                logger.warning(f"ensemble {key}: a member is not locked (it failed); no ensemble")
-                continue
-            if lock_problem(out, want) is None:  # a retrained member changed its lock: re-select below
-                logger.info(f"ensemble {key}: locked at digest {want[:12]}, skipped")
-                _unit_state(run_dir, key, status="done", digest=want)
-                continue
-            if labels is None:
-                labels = label_rows(run_dir, fold, index, ["val"], n_valid, c.cohort.min_segments_per_guid,
-                                    strategy=c.labels.strategy)
-            _unit_state(run_dir, key, status="running", started=_now(), finished=None, digest=want)
-            rec = {"fold": fold, "seed": "ens", "kind": kind, "status": "failed"}
-            out.mkdir(parents=True, exist_ok=True)
-            try:
-                (out / LOCK).unlink(missing_ok=True)
-                rec |= lock_ensemble(cfg, run_dir, _fold_unit(cfg, run_dir, source, fold, kind, built), labels, kind,
-                                     seeds) | {"status": "done"}
-            except Exception:
-                logger.exception(f"ensemble {key}: calibration / threshold selection failed")
-                rec["error"] = traceback.format_exc()
-                if c.run.fail_fast:
-                    raise
-            finally:
-                _write_json(out / "fold_results.json", rec)
-                _unit_state(run_dir, key, status=rec["status"], finished=_now())
-            ens_failed.append(rec["status"] != "done")
+    built, labels = {}, None  # the fold's data per context variant, shared by every seed (and by val selection)
+    for kind, seed in neural_units(c, manifest.get("confound")):
+        out, key = unit_dir(run_dir, fold, seed, kind), f"{kind}|{seed}|{fold}"
+        if (out / LOCK).is_file():
+            read_lock(out, want)  # a lock under another config or with changed files raises (L5)
+            logger.info(f"unit {key}: locked at digest {want[:12]}, skipped")
+            state(key, status="done", digest=want)
+            records.append(_read_json(out / "fold_results.json"))
+            continue
+        unit = _fold_unit(cfg, run_dir, source, fold, kind, built)
+        if labels is None:
+            labels = label_rows(run_dir, fold, index, ["val"], n_valid, c.cohort.min_segments_per_guid,
+                                strategy=c.labels.strategy)
+        state(key, status="running", started=_now(), finished=None, digest=want)
+        rec = {"fold": fold, "seed": seed, "kind": kind, "status": "failed"}
+        try:
+            rec = train_unit(ucfg, run_dir, manifest, fold=fold, seed=seed, kind=kind,
+                             unit=None if kind == "shuffled" else unit, mlflow_parent_id=parent)
+            if rec["status"] == "done":
+                try:
+                    rec |= lock_unit(cfg, out, unit, labels, kind, seed, rec.get("mlflow_run_id"))
+                except Exception:
+                    logger.exception(f"unit {key}: calibration / threshold selection failed")
+                    rec |= {"status": "failed", "error": traceback.format_exc()}
+                    (out / "fold_results.json").write_text(json.dumps(json_safe(rec), indent=2))
+                    if c.run.fail_fast:
+                        raise
+        finally:
+            state(key, status=rec["status"], finished=_now())
+            progress(rec)
+        records.append(rec)
+    for kind, seeds in ensembles(c, manifest.get("confound")).items():  # §10.7, once every member is locked
+        out, key = ens_dir(run_dir, fold, kind), f"{kind}|ens|{fold}"
+        if not all((unit_dir(run_dir, fold, s, kind) / LOCK).is_file() for s in seeds):
+            logger.warning(f"ensemble {key}: a member is not locked (it failed); no ensemble")
+            continue
+        if lock_problem(out, want) is None:  # a retrained member changed its lock: re-select below
+            logger.info(f"ensemble {key}: locked at digest {want[:12]}, skipped")
+            state(key, status="done", digest=want)
+            continue
+        if labels is None:
+            labels = label_rows(run_dir, fold, index, ["val"], n_valid, c.cohort.min_segments_per_guid,
+                                strategy=c.labels.strategy)
+        state(key, status="running", started=_now(), finished=None, digest=want)
+        rec = {"fold": fold, "seed": "ens", "kind": kind, "status": "failed"}
+        out.mkdir(parents=True, exist_ok=True)
+        try:
+            (out / LOCK).unlink(missing_ok=True)
+            rec |= lock_ensemble(cfg, run_dir, _fold_unit(cfg, run_dir, source, fold, kind, built), labels, kind,
+                                 seeds) | {"status": "done"}
+        except Exception:
+            logger.exception(f"ensemble {key}: calibration / threshold selection failed")
+            rec["error"] = traceback.format_exc()
+            if c.run.fail_fast:
+                raise
+        finally:
+            _write_json(out / "fold_results.json", rec)
+            state(key, status=rec["status"], finished=_now())
+        ens_failed.append(rec["status"] != "done")
+    return {"records": records, "ens_failed": ens_failed}
+
+
+def stage_train(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
+    """§14.1 train per fold: the sklearn baselines, then every neural unit (§10.10.1), fold after fold on
+    ``run.device`` or, with ``run.devices``, in fold processes (§14.4); 1 iff a unit or a seed ensemble failed."""
+    c = cfg.classifier
+    manifest["baselines"] = baselines.train(cfg, run_dir, manifest["source"])
+    parent = mlflow_parent(cfg, run_dir, manifest)
+    if c.run.devices:
+        results = fan_out(cfg, run_dir, manifest, "train", parent)
+    else:
+        results = {fold: train_fold(cfg, run_dir, manifest, fold, parent) for fold in c.run.folds}
+    records = [rec for fold in c.run.folds for rec in results[fold]["records"]]
     _write_json(run_dir / "kfold_summary.json", kfold_summary(records))
-    return int(any(r.get("status") != "done" for r in records) or any(ens_failed))
+    return int(any(r.get("status") != "done" for r in records)
+               or any(failed for res in results.values() for failed in res["ens_failed"]))
 
 
-def neural_attribution(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], split: str = "test") -> pd.DataFrame:
-    """E6 (§11.12, ``eval.attribution.enabled``): :func:`~teb_vae.classifier.train.attribute_split` of every locked
-    ``model`` unit (each seed; an ensemble's IG is the mean of its members', IG being linear in the score) on
-    ``split``, with ``eval.attribution.n_steps`` quadrature points. A unit that failed in train is skipped (it is
-    already in ``missing_units``); any other must hold its lock (L5)."""
+def attribution_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int,
+                     split: str = "test") -> pd.DataFrame:
+    """E6 (§11.12, ``eval.attribution.enabled``) of one fold: :func:`~teb_vae.classifier.train.attribute_split` of
+    every locked ``model`` unit (each seed; an ensemble's IG is the mean of its members', IG being linear in the score)
+    on ``split``, with ``eval.attribution.n_steps`` quadrature points. A unit that failed in train is skipped (it is
+    already in ``missing_units``); any other must hold its lock (L5). Columns :data:`ATTRIBUTION_COLUMNS`."""
     c, want, source = cfg.classifier, digest(cfg), manifest["source"]
-    frames = []
-    for fold in c.run.folds:
-        built: Dict[bool, UnitData] = {}
-        for seed in c.run.seeds:
-            out = unit_dir(run_dir, fold, seed, "model")
-            if _read_json(out / "fold_results.json").get("status") == "failed":
-                continue
-            read_lock(out, want)
-            unit = _fold_unit(cfg, run_dir, source, fold, "model", built)
-            frames.append(attribute_split(out, unit, split, int(c.eval.attribution["n_steps"]))
-                          .assign(fold=fold, seed=str(seed), split=split))
+    frames, built = [], {}
+    for seed in c.run.seeds:
+        out = unit_dir(run_dir, fold, seed, "model")
+        if _read_json(out / "fold_results.json").get("status") == "failed":
+            continue
+        read_lock(out, want)
+        unit = _fold_unit(cfg, run_dir, source, fold, "model", built)
+        frames.append(attribute_split(out, unit, split, int(c.eval.attribution["n_steps"]))
+                      .assign(fold=fold, seed=str(seed), split=split))
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()).reindex(columns=ATTRIBUTION_COLUMNS)
 
 
+def predict_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int) -> Dict[str, Any]:
+    """The neural part of ``predict`` for one fold: :func:`predict_fold_rows` of val and test as ``segments``,
+    ``guids`` (lists of frames), ``thresholds``, ``units``, ``missing``, plus the fold's ``attribution``
+    (:func:`attribution_fold`; None unless ``eval.attribution.enabled``)."""
+    part = dict(zip(("segments", "guids", "thresholds", "units", "missing"),
+                    predict_fold_rows(cfg, run_dir, manifest, fold)))
+    enabled = cfg.classifier.eval.attribution["enabled"]
+    return part | {"attribution": attribution_fold(cfg, run_dir, manifest, fold) if enabled else None}
+
+
 def stage_predict(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
-    """§11.1: val and test rows of every model into ``predictions/`` with thresholds and provenance (L5)."""
+    """§11.1: val and test rows of every model into ``predictions/`` with thresholds and provenance (L5). The neural
+    units are scored per fold (:func:`predict_fold`), fold after fold or, with ``run.devices``, in fold processes
+    (§14.4); either way the tables are concatenated in fold order, so they are the same rows in the same order."""
+    c = cfg.classifier
     segments, guids, thresholds, units = baselines.predict(cfg, run_dir, manifest["source"])
-    nseg, ngd, nthr, nunits, missing = neural_predict(cfg, run_dir, manifest)
-    segments, guids = pd.concat([segments, *nseg], ignore_index=True), pd.concat([guids, *ngd], ignore_index=True)
-    thresholds, units = thresholds | nthr, units + nunits
+    by_fold = (fan_out(cfg, run_dir, manifest, "predict") if c.run.devices else
+               {fold: predict_fold(cfg, run_dir, manifest, fold) for fold in c.run.folds})
+    parts = [by_fold[fold] for fold in c.run.folds]
+    segments = pd.concat([segments, *(s for p in parts for s in p["segments"])], ignore_index=True)
+    guids = pd.concat([guids, *(g for p in parts for g in p["guids"])], ignore_index=True)
+    thresholds = thresholds | {k: v for p in parts for k, v in p["thresholds"].items()}
+    units, missing = units + [u for p in parts for u in p["units"]], [m for p in parts for m in p["missing"]]
     out, written = run_dir / "predictions", baselines.utc_now()
     for unit in units:  # the lock was checked before any test row was scored; this records the order
         unit["test_written_at"] = written
@@ -608,10 +678,155 @@ def stage_predict(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
     guids.to_parquet(out / "guids.parquet", index=False)
     (out / "thresholds.json").write_text(json.dumps(thresholds, indent=2))  # plain json: -Infinity is legal
     (out / "attribution.parquet").unlink(missing_ok=True)  # never a stale table from an earlier predict
-    if cfg.classifier.eval.attribution["enabled"]:
-        neural_attribution(cfg, run_dir, manifest).to_parquet(out / "attribution.parquet", index=False)
+    if c.eval.attribution["enabled"]:
+        frames = [p["attribution"] for p in parts if len(p["attribution"])]
+        (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()).reindex(
+            columns=ATTRIBUTION_COLUMNS).to_parquet(out / "attribution.parquet", index=False)
     _write_json(out / "provenance.json", {"config_digest": manifest["config_digest"], "run_id": run_dir.name,
                                           "written_at": written, "units": units, "missing_units": missing})
+
+
+# ---- fold processes (§14.4) -----------------------------------------------------------------------
+#: What a fold process runs; everything else (cohort, extract, the sklearn baselines, the MLflow parent, evaluate,
+#: report, verify) runs once, in the parent.
+FOLD_JOBS = ("train", "predict")
+
+
+def worker_dir(run_dir: Path, fold: int, job: str) -> Path:
+    """``<run>/folds/fold_<k>/worker/<job>/``: a fold process's ``output.log`` (stdout and stderr), its loguru pair
+    ``fold.log``/``fold.jsonl``, and its result (``units.json`` + ``part.json`` for train, ``part.pkl`` for predict)."""
+    return Path(run_dir) / "folds" / f"fold_{fold}" / "worker" / job
+
+
+def fold_job(fold: int, device: str, job: str, cfg_json: Dict[str, Any], run_dir: str, manifest: Dict[str, Any],
+             parent: Optional[str]) -> None:
+    """Body of a fold process (:func:`~teb_vae.classifier.parallel.run_folds`): ``job`` of one fold on ``device``.
+
+    ``train`` is :func:`train_fold`: each unit's status goes to ``units.json`` as it changes, the fold's result and
+    the records of the units trained here (for ``kfold_progress.log``) to ``part.json`` at the end. ``predict`` is
+    :func:`predict_fold` into ``part.pkl``, a pickle so the parent concatenates exactly the frames the serial path
+    would. The process writes only under its fold's directories; :func:`fan_out` merges the result.
+
+    Args:
+        fold: The fold.
+        device: This process's device (``run.device`` for everything it runs).
+        job: One of :data:`FOLD_JOBS`.
+        cfg_json: ``cfg.model_dump(mode="json")`` of the run's config.
+        run_dir: The run directory.
+        manifest: The run manifest.
+        parent: The MLflow parent run id (train).
+
+    Raises:
+        RuntimeError: If the config does not reproduce the run's digest.
+    """
+    root = Path(run_dir)
+    work = worker_dir(root, fold, job)
+    classifier_train.PROCESS_LOGS = (str((work / "fold.log").relative_to(root)),
+                                     str((work / "fold.jsonl").relative_to(root)))
+    setup_logging(file_path=str(work / "fold.log"), json_path=str(work / "fold.jsonl"), compression=None)
+    cfg = Config.model_validate(cfg_json)
+    cfg.classifier.run.device = device
+    if digest(cfg) != manifest["config_digest"]:
+        raise RuntimeError(f"fold {fold}: the config reached the fold process with digest {digest(cfg)[:12]}, not "
+                           f"the run's {manifest['config_digest'][:12]}")
+    if job == "train":
+        units: Dict[str, Dict[str, Any]] = {}
+        trained: List[Mapping[str, Any]] = []
+
+        def state(key: str, **fields: Any) -> None:
+            units[key] = {**units.get(key, {}), **fields}
+            _write_json(work / "units.json", units)
+
+        result = train_fold(cfg, root, manifest, fold, parent, state=state, progress=trained.append)
+        _write_json(work / "part.json", result | {"trained": trained, "device": device})
+    elif job == "predict":
+        pd.to_pickle(predict_fold(cfg, root, manifest, fold), work / "part.pkl")
+    else:
+        raise ValueError(f"fold job must be one of {FOLD_JOBS}, got {job!r}")
+    logger.info(f"fold {fold}: {job} done on {device}")
+
+
+def fan_out(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], job: str,
+            parent: Optional[str] = None) -> Dict[int, Any]:
+    """``job`` of every fold of ``run.folds`` in fold processes over ``run.devices`` (§14.4); ``{fold: result}``.
+
+    Each fold's worker dir is emptied first, so no result outlives the process that wrote it. This process stays the
+    only writer of run-level files. ``train``: as each fold process ends, its unit states and trained units are merged
+    into ``stage_state.json`` and ``kfold_progress.log`` (:func:`_merge_train`); a process that died leaves its
+    unlocked units ``failed`` (:func:`_dead_fold`), and under ``run.fail_fast`` the stage raises once every fold has
+    ended. ``predict``: the result is the fold's :func:`predict_fold`; a fold whose process failed makes the stage
+    raise once every fold has ended.
+
+    Raises:
+        RuntimeError: As above, naming each failed fold's ``output.log``.
+    """
+    c = cfg.classifier
+    for fold in c.run.folds:
+        shutil.rmtree(worker_dir(run_dir, fold, job), ignore_errors=True)
+    results: Dict[int, Any] = {}
+
+    def on_exit(fold: int, code: int) -> None:
+        work = worker_dir(run_dir, fold, job)
+        if job == "train":
+            results[fold] = _merge_train(cfg, run_dir, manifest, fold, code, work)
+        elif code == 0:
+            results[fold] = pd.read_pickle(work / "part.pkl")
+            (work / "part.pkl").unlink()  # the rows now live in predictions/; the logs stay
+
+    codes = parallel.run_folds("teb_vae.classifier.run:fold_job", c.run.folds, c.run.devices,
+                               (job, cfg.model_dump(mode="json"), str(run_dir), dict(manifest), parent),
+                               lambda fold: worker_dir(run_dir, fold, job) / "output.log", on_exit)
+    failed = sorted(fold for fold, code in codes.items() if code != 0)
+    if failed and (job == "predict" or c.run.fail_fast):
+        raise RuntimeError(f"{job} failed in the fold process of fold(s) {failed}; see "
+                           f"{[str(worker_dir(run_dir, fold, job) / 'output.log') for fold in failed]}")
+    return results
+
+
+def _merge_train(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int, code: int,
+                 work: Path) -> Dict[str, Any]:
+    """A train fold process's result into the run-level files: its unit states into ``stage_state.json``, then one
+    ``kfold_progress.log`` line per unit it trained. A process that died (non-zero exit, or no ``part.json``) is
+    recorded by :func:`_dead_fold`. Returns the fold's :func:`train_fold` result."""
+    for key, fields in _read_json(work / "units.json").items():
+        _unit_state(run_dir, key, **fields)
+    part = _read_json(work / "part.json") if code == 0 else {}
+    if not part:
+        part = _dead_fold(cfg, run_dir, manifest, fold,
+                          f"fold process exited with code {code} before its result; see {work / 'output.log'}")
+    for rec in part["trained"]:
+        _progress(cfg, run_dir, rec)
+    return part
+
+
+def _dead_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int, error: str) -> Dict[str, Any]:
+    """The train result of a fold whose process died. A unit (or seed ensemble) with an intact lock keeps its record;
+    every other one is recorded ``failed`` with ``error``, in its ``fold_results.json`` and ``stage_state.json``, so
+    ``predict`` lists it as missing instead of refusing an absent lock, and the next ``--stage train`` retrains it."""
+    c, want = cfg.classifier, digest(cfg)
+    records, trained, ens_failed = [], [], []
+    for kind, seed in neural_units(c, manifest.get("confound")):
+        out, key = unit_dir(run_dir, fold, seed, kind), f"{kind}|{seed}|{fold}"
+        if lock_problem(out, want) is None:
+            records.append(_read_json(out / "fold_results.json"))
+            continue
+        rec = _read_json(out / "fold_results.json") | {"fold": fold, "seed": seed, "kind": kind, "status": "failed",
+                                                        "error": error}
+        out.mkdir(parents=True, exist_ok=True)
+        _write_json(out / "fold_results.json", rec)
+        _unit_state(run_dir, key, status="failed", finished=_now())
+        records.append(rec)
+        trained.append(rec)
+    for kind in ensembles(c, manifest.get("confound")):
+        out, key = ens_dir(run_dir, fold, kind), f"{kind}|ens|{fold}"
+        if lock_problem(out, want) is None:
+            continue
+        out.mkdir(parents=True, exist_ok=True)
+        _write_json(out / "fold_results.json", {"fold": fold, "seed": "ens", "kind": kind, "status": "failed",
+                                                "error": error})
+        _unit_state(run_dir, key, status="failed", finished=_now())
+        ens_failed.append(True)
+    return {"records": records, "ens_failed": ens_failed, "trained": trained}
 
 
 def stage_evaluate(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
@@ -652,7 +867,7 @@ RERUNNABLE = ("evaluate", "report", "verify")
 
 def main(*, config: str, stage: str = "all", overrides: Optional[List[str]] = None,
          run_dir: Optional[str] = None, folds: Optional[str] = None,
-         device: Optional[str] = None, only: Optional[str] = None,
+         device: Optional[str] = None, devices: Optional[str] = None, only: Optional[str] = None,
          skip: Optional[str] = None, allow_partial: bool = False) -> Path:
     """Run ``stage`` (or every stage) into ``run_dir``; returns the run directory.
 
@@ -663,6 +878,8 @@ def main(*, config: str, stage: str = "all", overrides: Optional[List[str]] = No
         run_dir: Existing or new directory; default ``<out_root>/<stamp>-<run.name>``.
         folds: Comma-separated fold ids, overriding ``run.folds``.
         device: Overrides ``run.device`` (not part of the digest).
+        devices: Comma-separated device slots overriding ``run.devices`` (not part of the digest), e.g.
+            ``cuda:0,cuda:1``: train and predict run one fold process per slot (§14.4).
         only: Comma-separated analysis ids for ``evaluate`` (default: all).
         skip: Comma-separated analysis ids ``evaluate`` leaves out.
         allow_partial: Let ``evaluate`` pool a run whose ``train`` had failed units.
@@ -675,6 +892,8 @@ def main(*, config: str, stage: str = "all", overrides: Optional[List[str]] = No
         overrides.append(f"classifier.run.folds=[{folds}]")
     if device:
         overrides.append(f"classifier.run.device={device}")
+    if devices:
+        overrides.append(f"classifier.run.devices=[{devices}]")
     cfg = load(resolve_path(config), overrides)
     run = cfg.classifier.run
     run_path = (Path(run_dir) if run_dir else
@@ -744,6 +963,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", dest="run_dir")
     parser.add_argument("--folds", help="comma-separated fold ids, e.g. 1,2")
     parser.add_argument("--device")
+    parser.add_argument("--devices", help="fold-parallel train and predict, one fold process per slot, e.g. "
+                                          "cuda:0,cuda:1,cuda:2,cuda:3 (a repeated device takes two folds)")
     parser.add_argument("--only", help="evaluate: comma-separated analysis ids, e.g. metrics,R1")
     parser.add_argument("--skip", help="evaluate: comma-separated analysis ids to leave out")
     parser.add_argument("--allow-partial", dest="allow_partial", action="store_true", default=None,
@@ -793,18 +1014,67 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     return max(codes, default=0)
 
 
-#: Arguments for an argument-less launch (the IDE Run button); the command line wins per key. ``compare`` is not a
-#: stage: ``python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--policy np30] --out DIR``.
+#: Arguments for an argument-less launch (the IDE Run button): edit the values below and press Run. On a command-line
+#: launch the command line wins per key, and a key left at None here is simply not set. ``compare`` is not a stage and
+#: has no entry here: ``python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--policy np30] --out DIR``.
 RUN_ARGS: Dict[str, Any] = {
+    # YAML config, relative to the repo root or absolute. Shipped (teb_vae/classifier/configs/), each `base:
+    # default.yaml` plus a delta:
+    #   default.yaml        trf_cfs VAE latents, sequence scope, binary adverse_vs_healthy; the reference setup
+    #   segment_scope.yaml  one score per segment; GUID scores from post-hoc aggregators (max, mean, lse, ...)
+    #   three_class.yaml    healthy / acidosis / HIE with a softmax head and sqrt-inverse class weights
+    #   st_ph.yaml          ST/PH coefficients straight from the shards instead of the VAE (the no-VAE comparison)
+    #   cotrain.yaml        co-train the classifier with the VAE objective (the fragile end; read against frozen)
+    #   smoke.yaml          CPU, 2 folds, tiny model on the generated fixture tree; for checking the pipeline only
     "config": "teb_vae/classifier/configs/default.yaml",
+    # Which stage to run: "cohort" | "extract" | "train" | "predict" | "evaluate" | "report" | "verify" | "all".
+    #   cohort    segment/GUID tables, labels, fold checks (fast; run it first on new data and read the counts)
+    #   extract   one VAE pass over every unique segment into the feature cache (GPU: `device`)
+    #   train     sklearn baselines, then every neural unit per fold (fold-parallel with `devices`)
+    #   predict   val and test rows of every model; refused for a unit without its selection lock
+    #   evaluate  every analysis, pooled over all folds (CPU)
+    #   report    figures and summary.md from the evaluation tables
+    #   verify    the pass/fail gate over the evaluation
+    #   all       every stage in that order; a stage already done in `run_dir` is skipped, so "all" also resumes
+    # Naming evaluate, report or verify re-runs it even when done; any stage that runs marks the later ones pending.
     "stage": "cohort",
-    # e.g. ["classifier.data.kfold_root=/data/.../k_fold_cross_validation_dataset"]
+    # None or a list of "classifier.<path>=<value>" strings; each value is parsed as YAML, so numbers, lists and
+    # dicts work. Anything in the config can be set this way. The ones a real run needs:
+    #   ["classifier.data.kfold_root=/data/.../k_fold_cross_validation_dataset",
+    #    "classifier.source.vae.checkpoint=/runs/.../model_checkpoints/best.ckpt"]
+    # Others often touched: "classifier.run.num_workers=2" (loader workers per fold process),
+    # "classifier.run.seeds=[42,43,44]" (a seed ensemble), "classifier.labels.task=hie_vs_rest",
+    # "advanced_config.tracking.mlflow.enabled=true". Settings that change results are part of the config digest.
     "overrides": None,
+    # None starts a new run directory, <run.out_root>/<YYYY-mm-dd--HH-MM-SS>-<run.name>. An existing run directory
+    # resumes it: finished stages and locked units are skipped. It must have been run with the same config digest;
+    # otherwise it is refused (use a new directory for a new setting).
     "run_dir": None,
+    # None = every fold in run.folds (1-10 in default.yaml). A comma-separated subset, e.g. "1" for a quick look or
+    # "1,2,3". Part of the digest: a run directory holds one fold set.
     "folds": None,
+    # None keeps run.device (cuda:0 in default.yaml). "cpu" or "cuda:<k>": the device of extract, and of train and
+    # predict too while `devices` is None. Not part of the digest.
     "device": None,
+    # None runs the folds one after another on `device`. A comma-separated list of device slots runs train and
+    # predict with one process per fold, one fold per slot (SPEC §14.4), e.g.
+    #   "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"   8 folds at once, one per GPU
+    #   "cuda:0,cuda:0"                                             2 folds sharing one GPU
+    #   "cpu,cpu"                                                   2 folds at once on CPU
+    # Each fold process starts run.num_workers loader workers (Linux only when > 0). Not part of the digest, so a run
+    # can resume on other GPUs or serially.
+    "devices": None,
+    # evaluate only: None runs every analysis. A comma-separated subset of analysis ids runs only those, as a
+    # partial look in evaluation/partial_<stamp>/ (the full evaluation, report and verify are left as they were).
+    # Ids (SPEC §11.12): C cohort, metrics, R1 R2 R5 R8 R9 R10 R11 R12 ROC/PR, T1-T4 thresholds, B1 baselines,
+    # M time-resolved, A alarms, S1 S2 S4 S5 S6 subgroups, K K3 K7 calibration, X X9 X10 3-class, H heterogeneity,
+    # E errors, E6 attribution, VF regime vs frozen. E.g. "metrics,R1".
     "only": None,
+    # evaluate only: None skips nothing; a comma-separated list of analysis ids to leave out (also a partial look),
+    # e.g. "S1,S2,S4,S5,S6" to skip the subgroup analyses.
     "skip": None,
+    # evaluate only: None or False refuses to pool a run in which some unit failed in train; True pools the rest
+    # anyway (the failed units are listed as missing, and verify reports INCONCLUSIVE instead of PASS).
     "allow_partial": None,
 }
 

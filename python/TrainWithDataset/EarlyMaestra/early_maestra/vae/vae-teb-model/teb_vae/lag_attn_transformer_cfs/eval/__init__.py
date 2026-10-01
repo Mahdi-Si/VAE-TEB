@@ -13,15 +13,17 @@ Local, because each is a fact about *this* model that no shared module can compu
   keys reconciled against it, this encoder's own causality disclosure, and this package's override
   delta;
 * ``configs/eval_overrides.yaml`` -- the causal holdout split and the evaluation-only settings,
-  deliberately the cfs cell's file key for key and value for value;
+  deliberately the cfs cell's file key for key and value for value, except the occlusion bands,
+  which are rescaled to lie inside this cell's own ``max_lag``;
 * :mod:`.run` -- the command line, which supplies the binding and a ``prog=`` string and enumerates
   its own flags for one reason: ``--only`` and ``--skip`` must name *this* model's registry;
-* :mod:`.verify` -- the acceptance gate, delegated in full, beside the one sweep axis this cell
-  ships an arm for (``anchor_stride``) and the cross-cell table the two cfs cells are read down.
+* :mod:`.verify` -- the acceptance gate, delegated in full, beside this cell's own sweep table
+  (``anchor_stride``) and the cross-cell table the two cfs cells are read down.
 
-Everything else -- the preflight guards, the probe, the collection pass, the nineteen analyses, the
-readouts, the verdict registry and the gate's criteria -- comes from the cfs pipeline unchanged,
-reached through the binding.
+Everything else -- the preflight guards, the probe, the collection pass, every registered analysis
+(the shared ones and the cfs parent's own, merged through the binding), the readouts, the verdict
+registry and the gate's criteria -- comes from the cfs pipeline unchanged, reached through the
+binding.
 
 **Why the binding lands before the runner does.** ``SeqVaeLagAttnTrfCfs`` is a constructor over the
 transformer encoders plus the same two target-domain mixins, so its binding is a set of

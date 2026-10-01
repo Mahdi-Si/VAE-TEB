@@ -92,6 +92,12 @@ GROUP_DELAY_CAVEAT = (
     f"is therefore not a physiological latency and not a transfer entropy"
 )
 
+#: The one line a **figure** carries in place of :data:`GROUP_DELAY_CAVEAT`. A journal figure holds
+#: a short note and leaves the argument to its caption, so the full sentence stays in the records
+#: (``axis_caveat``), ``preflight.json`` and ``FIGURE_GUIDE.md`` and the image keeps only the claim
+#: a reader must not make from it. The axis label already says "stored-coefficient time".
+GROUP_DELAY_NOTE = "Lag is stored-coefficient time, not a physiological latency."
+
 
 def compensated_seconds_axis(n_lags: int, delay_steps: int) -> np.ndarray:
     r"""The lag axis in compensated seconds: $\tau_\ell = 4(\ell + \delta)$.

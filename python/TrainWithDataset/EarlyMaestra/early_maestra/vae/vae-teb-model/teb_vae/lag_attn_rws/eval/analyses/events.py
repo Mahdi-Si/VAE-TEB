@@ -624,9 +624,9 @@ def build_deceleration_figure(skill: pd.DataFrame) -> Any:
     """Draw hit rate, false-alarm rate and lead-time error against lead time in seconds."""
     figure, axes = figures.new_figure(3)
     panels = (
-        ("hit_rate", "Deceleration hit rate by lead time", "fraction of true events found"),
-        ("false_alarm_rate", "False-alarm rate by lead time", "fraction of forecast events unmatched"),
-        ("lead_time_abs_error_s", "Timing error of matched events", "seconds"),
+        ("hit_rate", "Hit rate", "fraction of events found"),
+        ("false_alarm_rate", "False-alarm rate", "fraction unmatched"),
+        ("lead_time_abs_error_s", "Timing error", "seconds"),
     )
     for index, (column, title, ylabel) in enumerate(panels):
         axis = axes[index, 0]
@@ -643,6 +643,9 @@ def build_deceleration_figure(skill: pd.DataFrame) -> Any:
         ])
         figures.multi_line_panel(axis, lead, series, list(BRANCHES), title=title,
                                  xlabel="lead time (s)", ylabel=ylabel)
+        if index:
+            # The same branch keys and colours as the first panel's legend.
+            figures.drop_legend(axis)
     return figure
 
 
@@ -662,15 +665,18 @@ def build_triggered_figure(record: Dict[str, Any]) -> Any:
         low = np.asarray(block["null_lo"], dtype=np.float64)
         high = np.asarray(block["null_hi"], dtype=np.float64)
         axis.fill_between(seconds, low, high, color=figures.COLOR_GRAY, alpha=0.3, linewidth=0,
-                          label=f"random-trigger null ({NULL_BAND_SIGMAS:g} sd)")
+                          label="null band")
         axis.plot(seconds, np.asarray(block["null_mean"], dtype=np.float64),
                   color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN, linestyle="--", label="null mean")
-        axis.plot(seconds, mean, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label=name)
+        axis.plot(seconds, mean, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR,
+                  label="observed")
         axis.axvspan(*RESPONSE_WINDOW_S, color=figures.COLOR_ORANGE, alpha=0.12, zorder=0)
-        axis.set_title(f"Contraction-triggered {name}, n = {int(record.get('n_triggers') or 0)}")
+        axis.set_title(str(name))
         axis.set_xlabel("time after contraction onset (s)")
         axis.set_ylabel("bpm" if name != "difference" else "bpm (full - base)")
-        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
+        if index == 0:
+            # Every row carries the same three keys; the title names which curve it is.
+            axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(axis)
     if not curves:
         axes[0, 0].text(0.5, 0.5, figures.EMPTY_NOTE, transform=axes[0, 0].transAxes,
@@ -708,11 +714,13 @@ def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
             }
         figures.violin_panel(
             axis, values or {"all": np.zeros(0)},
-            title=f"{metric}: anchors near a contraction minus control anchors",
-            ylabel="difference (nats per anchor)",
+            title=metric,
+            ylabel="event minus control (nats)",
             colors=figures.group_colors(list(values)),
-            reference=0.0, reference_label="no conditioning effect",
+            reference=0.0, reference_label="no effect",
         )
+        if index:
+            figures.drop_legend(axis)
     return figure
 
 

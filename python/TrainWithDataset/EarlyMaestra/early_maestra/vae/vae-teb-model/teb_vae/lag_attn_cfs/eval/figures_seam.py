@@ -47,6 +47,7 @@ from teb_vae.lag_attn_cfs.eval._reuse import figures, labels
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     COEFFICIENT_LAG_AXIS_LABEL,
     GROUP_DELAY_CAVEAT,
+    GROUP_DELAY_NOTE,
 )
 
 #: Drawn on an axes that had no finite data, in place of an empty frame that reads as a bug.
@@ -114,22 +115,24 @@ mark_laid_out = figures.mark_laid_out
 legend_with_headroom = figures.legend_with_headroom
 
 
-def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> float:
-    """Print a caveat under a figure, so a lag-resolved artifact carries it on its face.
+def caveat_note(figure, text: str = GROUP_DELAY_NOTE) -> float:
+    """Print a one-line note under a figure, so a lag-resolved artifact carries its claim limit.
 
     A figure is the artifact most likely to be lifted out of a run directory and shown on its own,
-    and a lag peak read off one without :data:`GROUP_DELAY_CAVEAT` beside it is read as a
+    and a lag peak read off one without :data:`GROUP_DELAY_NOTE` beside it is read as a
     physiological latency -- which is the one claim this axis cannot support. Drawn rather than
-    left to the guide, because the guide does not travel with the image.
+    left to the guide, because the guide does not travel with the image; but kept to one line
+    (:data:`~teb_vae.lag_attn.eval.figures.FOOTNOTE_MAX_CHARS`), because the argument for it is
+    :data:`GROUP_DELAY_CAVEAT`, which lives in the records and the guide.
 
-    Written through the shared :func:`~teb_vae.lag_attn.eval.figures.footnote`, which wraps the
-    sentence to the figure's width and reserves the room it needs, so the caveat sits under the
-    axes rather than across their x label; ``render_figure`` lays the figure out around it.
+    Written through the shared :func:`~teb_vae.lag_attn.eval.figures.footnote`, which reserves the
+    room it needs, so the note sits under the axes rather than across their x label;
+    ``render_figure`` lays the figure out around it.
 
     Args:
         figure: The figure to annotate.
-        text: The sentence. Defaults to the group-delay caveat, which is the one every
-            lag-resolved artifact in this package carries.
+        text: The note. Defaults to the group-delay note, which is the one every lag-resolved
+            artifact in this package carries.
 
     Returns:
         The fraction of the figure height the footnote reserved, for a builder that lays its
@@ -392,7 +395,7 @@ def windowed_comparison_figure(
         binned_violin_panel(
             violins, windows, centres,
             groups=order, bin_width=bin_width, min_body_size=min_body_size, colors=colours,
-            title=f"{name} per window, by {labels.CLASS_COLUMN}",
+            title=str(name),
             # Every panel names the clock, not only the strip under it: a panel lifted out of the
             # page, or read on its own, is otherwise an unlabelled axis in hours.
             xlabel=xlabel,
@@ -403,7 +406,8 @@ def windowed_comparison_figure(
             strip, centres, [row.get("p_holm", float("nan")) for row in per_window],
             alpha=float(record.get("alpha", 0.05)),
             bin_width=bin_width,
-            title=f"{name}: cohort difference per window (Kruskal-Wallis, Holm)",
+            # Untitled: the strip sits directly under the violins it tests, and its y label says
+            # what the bars are; the test and the correction are in the record and the guide.
             xlabel=xlabel,
         )
         for axis in (violins, strip):
@@ -484,14 +488,13 @@ def _draw_effect_heatmap(
         reverse=bool(descending),
     )
     if not rows or not columns:
-        ax.set_title("Cliff's delta for the surviving cohort pairs")
+        ax.set_title("Effect size")
         ax.set_xlabel(xlabel)
         ax.set_xticks([])
         ax.set_yticks([])
         ax.text(
             0.5, 0.5,
-            "no cohort pair survived Holm in any window" if testable
-            else "no testable window: no cohort comparison could be made",
+            "no pair significant" if testable else "not testable",
             transform=ax.transAxes, ha="center", va="center", fontstyle="italic",
             fontsize=FONT_NOTE, color=COLOR_GRAY,
         )
@@ -504,8 +507,8 @@ def _draw_effect_heatmap(
             field[rows.index(str(item["row"])), columns.index(float(item["centre"]))] = item["delta"]
     heatmap_with_colorbar(
         figure, ax, field,
-        title="Cliff's delta for the surviving cohort pairs",
-        symmetric=True, colorbar_label="Cliff's delta",
+        title="Effect size",
+        symmetric=True, colorbar_label="Cliff's $\\delta$",
     )
     figures.label_rows(ax, rows)
     ax.set_xticks(np.arange(len(columns)))
@@ -517,6 +520,7 @@ __all__ = [
     "CLINICAL_CLASS_COLORS",
     "COEFFICIENT_LAG_AXIS_LABEL",
     "GROUP_DELAY_CAVEAT",
+    "GROUP_DELAY_NOTE",
     "COLOR_BLACK",
     "COLOR_BLUE",
     "COLOR_GRAY",

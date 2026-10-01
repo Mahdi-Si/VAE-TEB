@@ -273,7 +273,7 @@ def test_the_profile_figure_draws_against_the_compensated_seconds_axis(delay_ste
 
     figure = lag_kl.build_profile_figure(profile, lag, delay_steps=delay_steps, n_lags=9)
     try:
-        drawn = _figure_lines(figure)["raw attribution (sums to the KL)"]
+        drawn = _figure_lines(figure)["raw"]
         x_values = np.asarray(drawn.get_xdata(), dtype=float)
     finally:
         plt.close(figure)

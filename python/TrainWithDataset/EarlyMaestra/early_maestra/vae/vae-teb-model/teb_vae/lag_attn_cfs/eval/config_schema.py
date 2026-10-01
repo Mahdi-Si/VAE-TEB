@@ -32,8 +32,9 @@ analysis, and a table of analyses that do not exist yet would be wrong more ofte
 *values* are checked; an unread cap name is inert, because a cap only ever narrows what an
 analysis retains.
 
-**Forked from** ``teb_vae/lag_attn_rws/eval/config_schema.py``, and the divergence is exactly one
-key: ``clock_margin_min_nats``. Everything else -- the merge, the provenance walk, the forced
+**Forked from** ``teb_vae/lag_attn_rws/eval/config_schema.py``, and the divergence is the
+cfs-only keys: ``clock_margin_min_nats``, ``occlusion_bands``, ``figure_format`` and
+``max_hours_before_delivery`` (see :data:`DEFAULTS`). Everything else -- the merge, the provenance walk, the forced
 single-process loader, the closed key set and each refusal's wording -- is the sibling's, because
 this half of a run's configuration surface says nothing about the target domain.
 """

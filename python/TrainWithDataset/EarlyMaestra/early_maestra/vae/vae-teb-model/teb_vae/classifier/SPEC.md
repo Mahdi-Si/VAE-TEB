@@ -1083,14 +1083,14 @@ The reference pattern is the `lag_attn_rws` family root: `teb_vae/lag_attn_rws/t
 - **Reused unchanged:** `setup_config`, `validate_config`, `configure_determinism`, `_init_mlflow_logger`, `_log_run_metadata_to_mlflow`, provenance tags, `build_trainer`, `upload_run_logs`.
 - **Do not use `train/data_module.py GraphDataModule`.** It assumes VAE shards (`dataset_config.vae_*_datasets`).
 
-**Outer loop** (`run.py`, the `train` stage, sequential over units). Per unit:
+**Outer loop** (`run.py` `train_fold`, the `train` stage, sequential over a fold's units; folds run one after another or in fold processes, §14.4). Per unit:
 1. Derive the framework-shaped unit config (§13.2) and write it to `seed_<s>/model_checkpoints/resolved_config.yaml`.
 2. `ClassifierTrainer(...)` → `setup_config()` → `create_model()` → `train_model()`.
 3. **Teardown.** The base leaks across units within one process:
    - call `gm.upload_run_logs()` explicitly, then `atexit.unregister(gm.upload_run_logs)`;
    - `gm._system_metrics_monitor.finish()` if one exists;
    - `del gm.pl_model`, `gc.collect()`, `torch.cuda.empty_cache()`;
-   - re-run `setup_logging` for the run-level `run.log`, because `setup_logging` replaces all sinks.
+   - re-run `setup_logging` for the process's own log (`train.PROCESS_LOGS`: the run-level `run.log`, or a fold process's `worker/train/fold.log`), because `setup_logging` replaces all sinks.
 4. Fit calibration and thresholds on val (§10.8, §11.3), then write `selection_lock.json`.
 5. Append one line to the run-level `kfold_progress.log`: `ts | fold | seed | kind | status | train_s | best_epoch | best_<monitor> | val/guid_auroc | error`.
 
@@ -1595,11 +1595,11 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
 **Annotations:**
 - Every time-resolved plot follows the old pipeline's orientation: the hours-before-delivery axis is **inverted**, so delivery is on the right.
 - It carries:
-  - a dashed grey vertical line at each **threshold-basis time point** (`at`, e.g. "decision time 1 h");
+  - a dashed grey vertical line at each **threshold-basis time point** (`at`, e.g. "decision 1 h");
   - a dotted zero line on the `rel_second_stage` axis (label "second-stage onset");
   - an **n strip** under the axis (GUIDs per class per bin);
-  - a **footer** with exclusion counts (e.g. "excluded: 41 GUIDs with unknown second stage (NaN 38, sentinel 3)").
-- Legends carry `(N = <GUIDs>)` per line (per fold), or `(N = <GUIDs>, k folds)` (pooled).
+  - one short **note** line under it saying what a hollow marker or a gap means (`Hollow: n < <min_bin_class_n> per class`). The exclusion counts by reason (e.g. "41 GUIDs with unknown second stage") are in `evaluation/tables/inclusion.csv` (L14) and `summary.md`, not on the figure.
+- **Figure text budget.** A figure carries a panel letter and a short noun-phrase panel title (the model as `model (seed 42)`, on the first row of a stacked page), axis labels with units, short legend keys and at most one note line. The figure title names a model or policy, or `validation` / `fold k` off the pooled test set, and is otherwise absent. Legend keys carry no `N = …` and no statistics, and are drawn once per figure when panels share them; the counts, slopes, intercepts, ECE, ICI and CIs are in the tables and `summary.md`, and the definitions of each figure (population, bands, line styles) are in this document.
 - Operating points are drawn as ◦ at the validation-chosen point and ● at the realised test point, with the α line dashed.
 - The previous pipeline's line colours are kept for metric lines: sensitivity `#2ecc71` (circle), specificity `#3498db` (square), FPR `#e74c3c` (triangle). Class colours follow §11.6.2.
 
@@ -1615,7 +1615,7 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
 **Per-fold figure sets** (`eval.per_fold_figures`, default `true`):
 - The **core set** is also rendered per fold under `evaluation/figures/fold_<k>/`: R1, R2, M1, M2, S2 (class family), X1, K1, E1 (§11.12).
 - The full set is rendered for `pooled` only.
-- Validation figures (`split = val`) are rendered with the same stems under `evaluation/figures/val/`. They are labelled "validation (used for selection)".
+- Validation figures (`split = val`) are rendered with the same stems under `evaluation/figures/val/`. They are titled "validation".
 
 **Scale management.** There are no five-variant copies and no per-(subgroup × class × metric-type) PNG explosion. The previous pipeline wrote about 72 + 48 PNGs per fold and about 250 aggregated. Instead:
 - families are **faceted**: rows = subgroup family, columns = metric type, one figure per axis × policy;
@@ -1623,7 +1623,7 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
 
 **Per-GUID pages.**
 - Masking and log-scale helpers come from `teb_vae/lag_attn_cfs/attributions.py:849-927` (`masked_field`, `signed_log_norm`, `unsigned_log_norm`, `symlog_axis`). That module **imports captum at load time**, so these ~40 lines are **ported** into `report.py` with a pointer comment, rather than importing `attributions`.
-- `figures_seam.caveat_note(fig, text=…)` MUST be called with explicit text. Its default describes the VAE lag axis and would mislabel a classifier page. Use: "Input coefficients are one-sided, with a per-channel group delay of up to N s. The time axis is stored time."
+- `figures_seam.caveat_note(fig, text=…)` MUST be called with explicit text. Its default describes the VAE lag axis and would mislabel a classifier page. Use: "Input coefficients are causal: group delay up to N s per channel."
 
 ### 11.11 `summary.md`
 
@@ -1707,7 +1707,7 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
 |---|---|---|---|---|
 | M1 | Metric types vs time | Three stacked rows (instantaneous, committed cumulative, committed overall): sensitivity, specificity and FPR lines with CIs, α line, basis-time line, n strip, × axes × policies (figures for the primary policy and every `*_1h` basis policy; tables for all) | fig `metric_types_<axis>_<policy>` | 5 variants × 3 types, per fold and aggregated |
 | M2 | Checkpoint table | policy × metric type × checkpoint: sens, spec, FPR, PPV, NPV, n, CIs | table + summary §8 | `decision_point_metrics` |
-| M3 | Second-stage axis mirror | M1 on `rel_second_stage`, with the zero line and the exclusion footer by reason | fig `metric_types_rel_second_stage_<policy>` | SSO mirror (without its cohort filter) |
+| M3 | Second-stage axis mirror | M1 on `rel_second_stage`, with the zero line (the exclusion counts by reason are in `inclusion.csv`) | fig `metric_types_rel_second_stage_<policy>` | SSO mirror (without its cohort filter) |
 | M4 | Labour-onset axis | M1 on `from_onset` | fig `metric_types_from_onset_<policy>` | new (TLO was never used) |
 | M5 | Position axis | M1 on `position` (metrics vs segment index) | fig `metric_types_position_<policy>` | new |
 | M6 | Segment-level instantaneous | Every segment in a bin, segment score, GUID-cluster CI | fig `segment_instantaneous_<axis>` | old row-level instantaneous |
@@ -1718,18 +1718,19 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
 | ID | Analysis | Definition | Outputs | Old |
 |---|---|---|---|---|
 | S1 | Subgroup table | For every family member: counts, threshold-free metrics (mixed), sens or spec at every policy with CIs, underpowered flags | `evaluation/tables/subgroups.parquet` | subgroup long CSV (counts lost, A4) |
-| S2 | Subgroup curves vs time | Facet figure: rows = families (class; class_x_cs; healthy_x_bg; healthy_bg_x_cs; stage_last; has_tlo; tertile families), columns = the 3 metric types; lines = members with N in the legend; single-class families show sens or spec per §11.6. × axes, primary policy | fig `subgroups_vs_time_<axis>_<policy>` | 8 subgroup PNGs per type (diagnosis, cs/bg stratifications, healthy combos) |
+| S2 | Subgroup curves vs time | Facet figure: rows = families (class; class_x_cs; healthy_x_bg; healthy_bg_x_cs; stage_last; has_tlo; tertile families), columns = the 3 metric types; lines = members (named in the legend); single-class families show sens or spec per §11.6. × axes, primary policy | fig `subgroups_vs_time_<axis>_<policy>` | 8 subgroup PNGs per type (diagnosis, cs/bg stratifications, healthy combos) |
 | S3 | Subgroup forest | One panel per family: AUROC and pAUC (mixed), sens/spec at the primary policy, calibration slope; CIs, underpowered hollow | fig `subgroup_forest` | new |
 | S4 | Δ vs complement | ΔAUROC and Δsens/Δspec with paired-bootstrap CIs, Holm-adjusted within the family | table + fig `subgroup_delta` | new |
 | S5 | Restricted pairs | healthy∪acidosis, healthy∪hie, acidosis∪hie: AUROC, ROC (R11), subtype sensitivity at each policy, × metric types vs time | fig `restricted_pairs_<axis>` | "binary by underlying class" (sens only) |
 | S6 | Family tests | Kruskal–Wallis → Holm → pairwise Mann–Whitney + Cliff's δ → Holm, on score distributions per class | table `subgroup_tests.parquet` | new (VAE convention) |
+| S8 | Subgroup family pages | One wide page per clinical family (`class`, `class_x_cs`, `healthy_x_bg`, `healthy_bg_x_cs`, `cs`, `bg`): rows = the 3 metric types on hours before delivery, lines = members, sens (solid) where the member holds adverse GUIDs and spec (dashed) where it holds healthy ones; primary model and policy; the S2 rows of that family. Acidosis x BG and HIE x BG are not drawn: every adverse GUID is BG+ (§2.3) | fig `family_<family>_to_delivery` | the previous pipeline's diagnosis, CS, BG and healthy BG x CS plots, one per family |
 | S7 | Covariate availability strata | S1/S3 for `covariate:<name>` and `has_tlo`; with `eval.covariates_off`, the covariate-on vs covariate-off comparison | fig `covariate_strata` | new |
 
 #### Block K — Calibration
 
 | ID | Analysis | Definition | Outputs | Old |
 |---|---|---|---|---|
-| K1 | Reliability (binary) | Equal-mass bins with a count histogram; slope, intercept, ECE, ICI in the legend; before and after calibration | fig `calibration_guid` | new for binary |
+| K1 | Reliability (binary) | Equal-mass bins with a count histogram; slope, intercept, ECE, ICI in `summary.md` §6 and K4; before and after calibration | fig `calibration_guid` | new for binary |
 | K2 | Reliability per class (3-class) | 1×3 panels, equal-mass bins, per-class ECE | fig `calibration_per_class` | `calibration_perclass.png` (equal-width) |
 | K3 | Calibration per subgroup | Reliability curves for cs±, bg±, stage_last, has_tlo; slope and intercept in S3 | fig `calibration_subgroups` | new |
 | K4 | Calibration per fold | Slope and intercept forest across folds; temperature per fold | fig `calibration_folds` | new |
@@ -1914,6 +1915,7 @@ classifier:
     seeds: [42]
     folds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     device: cuda:0
+    devices: []                     # §14.4 fold processes for train + predict, e.g. [cuda:0, cuda:1]; not digested
     num_workers: 4
     fail_fast: false
     plot_frequency: 5               # → general_config.plot_frequency (ClassifierPlotCallback cadence)
@@ -2146,7 +2148,7 @@ The strict pydantic schema validates `classifier:`. The base validates `general_
 python -m teb_vae.classifier.run --config teb_vae/classifier/configs/default.yaml \
        --stage {cohort,extract,train,predict,evaluate,report,verify,all} \
        [--folds 1,2] [--seeds 42,43] [--run-dir PATH] [--set key.path=value ...] [--device cuda:0] \
-       [--only R1,M1,...] [--skip E6,...] [--allow-partial]
+       [--devices cuda:0,cuda:1,...] [--only R1,M1,...] [--skip E6,...] [--allow-partial]
 python -m teb_vae.classifier.verify RUN_DIR [--json-out PATH] [--runs RUN_A RUN_B ...]
 python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--policy np30]
 ```
@@ -2168,8 +2170,7 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
 
 - Each stage is idempotent and skips completed (fold, seed) units whose settings digest matches.
 - A digest mismatch in an existing run directory is an error unless `--run-dir` is new. The digest includes `config.SCHEMA_VERSION`, bumped whenever a run-dir schema changes, so a run dir of an older schema is refused rather than resumed.
-- Folds run sequentially.
-  - `ponytail:` no multi-GPU fold parallelism; add a subprocess pool only if wall-clock matters.
+- Folds run one after another on `run.device`, or with `run.devices` one fold process per device slot (§14.4).
 
 ### 14.2 Run directory
 
@@ -2187,6 +2188,7 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
       shuffled/…                               # shuffled-label control unit (first seed only; frozen regime)
       frozen/…                                 # frozen baseline unit (online regimes, §10.1; every seed)
   folds/fold_<k>/ens[/<kind>]/  calibration.json  thresholds.json  selection_lock.json  fold_results.json   # a kind with >1 seed (§10.7)
+  folds/fold_<k>/worker/{train,predict}/  output.log  fold.log  fold.jsonl  [units.json  part.json]   # run.devices only (§14.4)
   baselines/fold_<k>/  probe.skops  shortcut.skops  probe_fit.json  shortcut_fit.json
   predictions/  segments.parquet  guids.parquet  provenance.json  attribution.parquet (E6, when enabled)
   evaluation/   (§11.13)
@@ -2214,6 +2216,32 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
 - When `advanced_config.tracking.mlflow.enabled`: a parent run with nested child runs per unit, plus the evaluation metrics and artifacts on the parent. The full design is §10.10.5. No autolog (§2.8).
 
 
+
+### 14.4 Fold-parallel execution (`run.devices`, `parallel.py`)
+
+`run.devices` (CLI `--devices cuda:0,cuda:1,...`, `RUN_ARGS["devices"]`) lists device slots. Empty (the default) runs every fold in the main process on `run.device`, one after another. Set, it runs the per-fold part of `train` and `predict` in **one spawned process per fold**, at most one per slot. The next pending fold starts as soon as a slot frees, so $K$ folds on $G$ slots take at most $\lceil K/G \rceil$ rounds. A device may repeat (`[cuda:0, cuda:0]`), which puts two folds on one GPU; the frozen-feature trunk is small enough for that. Like `run.device`, `run.devices` is an execution knob: it is not digested, so a run started on eight GPUs can resume serially, or on other GPUs, in the same run directory.
+
+**What runs where:**
+
+| Process | Work |
+|---|---|
+| parent (once) | `cohort`, `extract` (on `run.device`), the sklearn baselines (train and predict), the MLflow parent, then the merge of every fold, `evaluate`, `report`, `verify` |
+| fold process (per fold) | `train`: `run.train_fold` (every neural unit of the fold, then its seed ensembles). `predict`: `run.predict_fold` (val and test rows of every unit and ensemble, plus the fold's E6 attribution when enabled) |
+
+`evaluate` stays in the parent by design: it is the cross-fold aggregation (per-fold mean ± SD, pooled out-of-fold rows, patient bootstrap, Nadeau–Bengio), so it needs every fold's rows at once.
+
+**Safety rules (enforced in code):**
+- **One writer per file.** A fold process writes only under `folds/fold_<k>/` (its units, its ensembles, `worker/<job>/`). The parent is the only writer of run-level files: `stage_state.json`, `manifest.json`, `kfold_progress.log`, `kfold_summary.json`, `predictions/`, `run.log`. Nothing needs a file lock.
+- **Merge as each fold ends.** A train fold process records unit states in `worker/train/units.json` as they change and its result in `worker/train/part.json`. When the process ends, the parent merges the states into `stage_state.json["train"]["units"]` and one `kfold_progress.log` line per unit trained there, before the next fold starts on the freed slot. A predict fold process leaves `worker/predict/part.pkl` (a pickle, so the parent concatenates exactly the frames the serial path would); the parent reads it, deletes it, and concatenates every fold **in fold order**. The prediction tables are therefore identical to the serial run's (checked on the 3-fold fixture on 2026-09-30: `segments.parquet`, `guids.parquet`, `thresholds.json`, unit states and progress lines all equal; the standing check is the end-to-end test, `test_e2e.py::test_end_to_end_fold_parallel`).
+- **A crash stays in its fold.** A train fold process that dies (OOM kill, segfault, operator kill) before `part.json` leaves each of its units without an intact lock recorded `failed`, with the exit code and log path, in `fold_results.json` and `stage_state.json`. Units it had already locked keep their records. `predict` then lists the failed units as missing, `evaluate` needs `--allow-partial`, and the next `--stage train` retrains only them. Under `run.fail_fast` the stage raises once every fold has ended. A failed predict fold process makes `predict` raise once every fold has ended, since predictions are all or nothing.
+- **Fresh process per fold.** `spawn`, never `fork` (the parent may hold a CUDA context). Each fold gets its own CUDA context, loguru sinks and memory, and is cleaned up when it exits. An interrupt, or an error in the parent, terminates every running fold process, so none is left holding a GPU.
+- **Device pinning.** The fold process's `run.device` is its slot, which `unit_config` turns into Lightning `devices=[k]`, and `torch.cuda.set_device(k)` makes it the current device, so nothing it runs allocates on `cuda:0` by default. `CUDA_VISIBLE_DEVICES` is not used; it would depend on nothing touching CUDA before the variable is read.
+- **HDF5 file locking off in fold processes** (`HDF5_USE_FILE_LOCKING=FALSE` unless the shell sets it). Many processes, each with loader workers, opening the same cache and shards on an NFS mount can deadlock in the NFS lock manager. The previous classifier pipeline hit exactly this. Every access a fold process makes is a read, so the advisory locks protect nothing here.
+- **Logs per fold.** A fold process sends its stdout and stderr, C-level writes included, to `worker/<job>/output.log`, and loguru to `worker/<job>/fold.log` and `fold.jsonl`. `train.PROCESS_LOGS` points the per-unit teardown back at these files, never at the parent's `run.log`. With eight folds running, the terminal shows only the parent's start and end lines per fold.
+- **Same config.** The fold process rebuilds the config from its JSON dump and refuses to run unless it reproduces the run's digest.
+
+**Not parallelised.** `extract` (one VAE pass over every unique segment, into one HDF5 file) runs once on `run.device`. The unit of parallel work is the fold, not (fold, seed): a fold's seed ensemble needs every seed of that fold. MLflow child runs from concurrent fold processes are fine against a tracking server; a `sqlite://` tracking URI serialises the writers and can raise `database is locked` under many folds.
+
 ---
 
 ## 15. Testing (`tests/`, pytest from the repository root, hermetic)
@@ -2225,44 +2253,36 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
 - Reuse `scripts/make_tiny_shard.py` / `latent_pilot/tests/fixtures/generate.py` for the HDF5 writing.
 - A tiny VAE checkpoint comes from the trf_cfs test fixtures (`teb_vae/lag_attn_transformer_cfs/tests/conftest.py`).
 
-**Required tests** (one file per module; known-answer where possible):
+**The suite** (pruned 2026-09-30 at the owner's request: one end-to-end test plus the quick tests that guard correctness; `pytest teb_vae/classifier/tests -m "not slow"` runs in under a minute, the end-to-end test in a few minutes):
 
-| ID | Test |
-|---|---|
-| T-C1 | Segment table on the fixture: slot inference (660 s), stage classification at the trim-aware boundaries, sentinel → unknown, exclusions counted |
-| T-C2 | Task mappings and exclusions; GUID label consistency error |
-| T-C3 | Label strategies: ω values for known Δ (horizon, decay half-life, k_warm) |
-| T-C4 | Fold checks: overlap raises; shared test detected; pretraining overlap raises |
-| T-C5 | Covariate as-of join is causal: an observation after `t_end` is never used; max_age respected |
-| T-S1 | `VaeSource` on the tiny checkpoint: shapes, step mask (warm-up, weight, support), derived keys (`delta_mu = post − prior`, `attn_summary` masses sum to 1) |
-| T-S2 | `Hdf5Source`: cold-cell masking, channel counts read from the file |
-| T-S3 | Cache: extraction once per unique segment; fingerprint mismatch refuses; row alignment |
-| T-S4 | Scaler: train-only assertion; recording weighting; floor |
-| T-M1 | No NaN with fully padded sequences, or with a single-segment GUID |
-| T-M2 | Causal online outputs equal an explicit prefix sweep (atol 1e-5) |
-| T-M3 | CORAL biases stay ordered; P(Y > k) is monotone in k |
-| T-L1 | Forbidden-input invariance (§12, L1) |
-| T-L2 | Test prediction without `selection_lock.json` raises |
-| T-T1 | Empirical FPR cap: validation FPR ≤ α; maximal sensitivity; strict `>` with ties |
-| T-T2 | NP umbrella: k* matches a brute-force binomial sum on a grid of (n, α, δ); raises when n < n_min; simulated population FPR > α with frequency ≤ δ (+ MC tolerance) |
-| T-T4 | Metric types on a hand-built 4-GUID example with known answers. Instantaneous uses raw (unlatched) decisions and one row per GUID per bin. Committed cumulative uses the available denominator. Committed overall is monotone and equals the running-max GUID decision at `end`. The −∞ padding for the `committed_overall` basis gives ⌊α·n_all⌋ alarms |
-| T-T3 | Running-max latch: "alarmed by n" ⇔ r_g(n) > thr; lead time computed from the first crossing |
-| T-E1 | Metric engine matches sklearn on random data (AUROC, AP, pAUC McClish, Brier, kappa) |
-| T-E2 | Pooled confusion equals the sum of per-fold confusions; shared-test dedupe |
-| T-E3 | Bootstrap reproducible given seed; stratified draws keep both classes; undefined draws counted |
-| T-E4 | Prevalence re-weighting formula (known answer) |
-| T-F1 | Config load: every `configs/*.yaml` → resolved → unit config derivation → `make_graph_model` → `validate_config`, with a loguru sink asserting **no** `config:` warnings (the pattern of `teb_vae/lag_attn_transformer_cfs/tests/test_config_load.py:254-323`). Also the pydantic schema rejects unknown `classifier:` keys |
-| T-F2 | Train smoke (`@pytest.mark.slow`, CPU, 2 epochs, MLflow disabled): every `TRACKED_METRICS` name is present and not all-NaN in `metrics_history.csv`; `best.ckpt` reloads via `check_model_class` + `load_checkpoint_strict`; `epoch_summary.jsonl` has one line per epoch |
-| T-F3 | Callback order: `GuidEpochMetricsCallback` is first, and `val/guid_logloss` of epoch e is in the CSV row of epoch e (not e+1) |
-| T-F4 | MLflow nesting with `FakeMLflowLogger`/`FakeMLflowExperiment` (`train/test_utils.py:86-108`): unit configs carry `mlflow.parentRunId`, `fold`, `seed`, `kind`; `log_model` is false; the parent is fail-closed when the client raises |
-| T-F5 | Per-unit teardown: after 2 units in one process, no `atexit` upload is still registered and no model tensors remain on the device |
-| T-V1 | Verify gate: a synthetic `summary.json` hits each criterion (PASS/FAIL/INCONCLUSIVE); a missing registry figure → FAIL |
-| T-E5 | Subgroup membership known answers on the fixture (every family of §11.6.1; empty `acidosis_x_bg` documented, not computed); healthy-only groups report spec, unhealthy-only report sens |
-| T-E6 | ROC vertical average and pooled ROC on synthetic folds; R2/R3 populations (available vs −∞ padding) |
-| T-E7 | Fail-soft: an analysis that raises → `n_failed = 1`, other analyses complete, exit code 1, traceback in `summary.json` |
-| T-X1 | **Smoke, end-to-end** (`smoke.yaml`, CPU, < 3 min): all stages including `verify`; planted-signal GUID AUROC > 0.9; shuffled control < 0.65; linear probe runs; `summary.md` produced; **every figure in `FIGURE_REGISTRY` produced**; verify exits 0 |
-| T-X2 | Same smoke with `source.kind: hdf5` (ST/PH) |
-| T-X3 | Resume: re-running `train` skips completed units; changed config digest errors |
+| ID | Test | File |
+|---|---|---|
+| T-X1 | **The one end-to-end test** (`@pytest.mark.slow`): `smoke.yaml` on the 3-fold fixture, `--stage all --devices cpu,cpu` (fold-parallel, §14.4). Every stage done with exit code 0; every unit locked; planted-signal GUID AUROC > 0.9 (model and probe); shuffled control < 0.65; every unit locked before its test rows; verify exits 0; per-fold worker logs, no result part left. Then on the finished run: T-L2 (a unit without `selection_lock.json` refuses predict) and the dead-fold record (§14.4) | `test_e2e.py` |
+| T-C2 | Task mappings and exclusions | `test_cohort.py` |
+| T-C3 | Label strategies: ω known answers; eval windows time-matched across classes | `test_cohort.py` |
+| T-C4 | Fold checks: split and patient overlap raise; pretraining exposure | `test_cohort.py` |
+| T-C5 | Covariate as-of join is causal and respects `max_age`; stage and TLO context hide the future | `test_cohort.py` |
+| T-L1 | Forbidden columns never reach a batch | `test_data.py` |
+| T-D1 | Sequence batch contract and padding; train-only fits and priors; shuffled labels stay within train | `test_data.py` |
+| T-S1 | `VaeSource` on the tiny trf_cfs checkpoint: shapes, step mask, derived keys; `load_task` keeps every checkpoint hyperparameter; every VAE family resolves its binding | `test_sources.py` |
+| T-S3 | Cache: once per unique segment, aligned, resumable, fingerprint mismatch refused | `test_sources.py` |
+| T-S4 | Scaler: train-only, recording weighting, floor | `test_sources.py` |
+| T-M1 | No NaN with padded rows or a single segment | `test_model.py` |
+| T-M2 | Causal online outputs equal an explicit prefix sweep | `test_model.py` |
+| T-M3 | CORAL biases stay ordered; P(Y > k) monotone | `test_model.py` |
+| T-LS | Loss known answers; prior offset | `test_losses.py` |
+| T-T1 | Empirical FPR cap valid and maximally sensitive | `test_thresholds.py` |
+| T-T2 | NP umbrella: k* matches brute force; simulated population FPR guarantee | `test_thresholds.py` |
+| T-T4 | Threshold bases (committed, instantaneous) known answers | `test_thresholds.py` |
+| T-E1 | Metric engine matches sklearn; calibration known answers | `test_metrics.py` |
+| T-E2 | Pooled confusion = sum of folds; shared-test dedupe | `test_metrics.py` |
+| T-E3 | Bootstrap reproducible, stratified, undefined draws counted | `test_metrics.py` |
+| T-K1 | Prior correction and temperature calibration known answers | `test_train.py` |
+| T-R1 | Trainable regimes: gradients reach the allowlist only, frozen modules stay in eval; the co-training preservation gate rejects a degraded VAE | `test_regimes.py` |
+| T-E7 | Fail-soft evaluation step; a provenance digest mismatch refuses | `test_eval_analyses.py` |
+| T-V1 | Verify gate: a good summary passes; a check that covered nothing is never a pass | `test_verify.py` |
+| T-F1 | Config: shipped configs validate; unknown keys rejected; digest ignores execution knobs; an older run-dir schema is refused | `test_config.py` |
+| T-P1 | Fold scheduler: slots busy but never oversubscribed, a failure stays in its fold, output per fold, HDF5 locking off, an interrupt terminates the running fold processes | `test_parallel.py` |
 
 ---
 
@@ -2489,6 +2509,9 @@ Full discussion is in [`RESEARCH.md`](RESEARCH.md). The references that ground d
 
 ## CHANGELOG
 
+- 2026-09-30 — Figures: every time-resolved trace is one continuous line (`report._estimate_line`: bold with filled markers where powered, faint with hollow markers where underpowered; before, underpowered bins were loose markers and a fully underpowered member had no line); S8 family pages added (block S); time pages (`_stack`, the S2/S5/X10 grid, S8) drawn at `WINDOWS_FIGURE_WIDTH` (13 in) so a 12-hour window of half-hour bins (24 points) stays readable; R13 merges bins so at most 12 windows are drawn, each GUID's latest snapshot per merged window (`report._merge_windows`). Checked on the fixture tiled to 12 h (`tmp/classifier_figure_preview/layout_12h.py`).
+- 2026-09-30 — Test suite pruned at the owner's request (532 tests, ~28 min with slow ones, to one end-to-end test plus 135 quick ones, <1 min): §15 lists what stays. Deleted: every figure/report/subgroup/time-resolved/compare/ensemble/multiclass-block/MLflow/attribution test file and the other slow runs; T-X1 is now the fold-parallel smoke and carries T-L2. Also: `report.py` writes `summary.md`/`comparison.md` as UTF-8 (the platform default made `report` fail on Windows).
+- 2026-09-30 — Fold-parallel execution (§14.4): `run.devices` / `--devices cuda:0,…` runs the per-fold part of `train` (`run.train_fold`) and `predict` (`run.predict_fold`) in one `spawn` process per fold, one device slot each (`parallel.run_folds`); the parent keeps cohort, extract, the baselines and the MLflow parent, merges each fold as its process ends (the only writer of run-level files), and runs evaluate, report and verify once. HDF5 file locking off and stdout/stderr per fold process; a dead fold process leaves its unlocked units `failed`; `train.PROCESS_LOGS` keeps a fold process off `run.log`. `run.devices` is not digested. Tests: `test_parallel.py` (scheduler), a parallel-vs-serial check (identical prediction tables, thresholds, unit states and progress lines; the dead-fold record), since folded into `test_e2e.py::test_end_to_end_fold_parallel`.
 - 2026-09-30 — Completion (everything but the real-data runs); 528 tests green (25 files, ~28 min incl. slow). **Leakage:** `context.tlo.pre_onset: clip` (new default, owner-approved) floors ψ(TLO) at 0, so a pre-onset segment carries no time until labour onset; `signed` stays as an ablation; T-L1 now randomises negative TLO and the fixture's onsets fall inside some recordings. A non-causal sequence model's segment-row class probabilities and CORAL g are NaN, and `thresholds.ovr_view` gives OvR scores only where a causal online score exists, so its OvR thresholds are GUID-level. **Built:** `auc_margin` and `pauc` (closed-form AUC-M; CVaR one-way pAUC at the primary α; class-balanced sampler and non-`none` calibration enforced); E6 attribution (hand-written Integrated Gradients, captum not being a dependency: computed in `predict` into `predictions/attribution.parquet`, `E6` shares with CIs, figure `attribution_channels`, completeness reported; off by default). **Fixes:** `patient_map` joined on `guid_norm`; `segment_head: false` skips segment-basis policies; `k_warm` drops positions from the per-position term only (`w_pos`), and `final_only` re-marks the kept last segment after a `no_valid_steps` drop (closes the P5 open item); `sample_z` leaves the KL keys on the means; `OnlineReader` gives each process its own HDF5 handles (online runs with loader workers); the preservation gate reads any logged monitor; binary T bounded to [1/100, 100]; early stopping and `best.ckpt` share one default monitor; `last_k:0` refused; `sens_target` names an unreachable β (or falls back under `allow_fallback`); T4 without `to_delivery` and S1 without subgroup families are not applicable instead of raising; the S2/X10 power guard is per class; pooled derived rates carry CIs; `run_context.checkpoint_sha256` filled; the K3 legend reads the primary seed; E2 pages honour a trim of 0; a verify check that covered nothing is INCONCLUSIVE. **Real-scale readiness** (a 1/5-scale rehearsal, 3 folds × 1040 GUIDs × ~35 segments, GTX 1660 Ti): the feature store is memory-mapped (a real cache is ~15.5 GB at the default keys and a 660-s stride); the cohort metadata pass reads columns (152 s → 11 s, identical tables); derived-rate bootstrap CIs are vectorised (116 s → 5 s); `run.report_workers` caps the report's figure processes (not digested); the fixture generator takes scale parameters. Measured: extraction 268 segments/s (hdf5) and 53 segments/s (full-size trf_cfs VAE); training GPU-bound; evaluate 250 s and report 86 s at B = 2000 at rehearsal scale. Placeholder paths fail at `--stage cohort` with a clear message. Remaining: the real-data runs (§16 tracker), the §18 open questions at their defaults, and the documented `ponytail:` shortcuts.
 - 2026-09-29 — Review fixes (a max-effort review of the package: 15 confirmed or plausible findings; the 11 below fixed, each with a regression test that fails on the old code; 488 tests green, ~25 min incl. slow). **P7/P8:** `attn_summary`'s entropy has a finite gradient at entmax's exact zeros (`xlogy`'s NaN backward poisoned every trainable regime with an attention-upstream allowlist); `sources.load_task` rebuilds the VAE task with every checkpoint hyperparameter its constructor chain takes (`task_parameters`; `compile_model` off), so co-training optimises the pretraining objective including `lambda_ms` / `lambda_deriv` / `lambda_boundary`; a cotrain unit whose every epoch fails the preservation gate is `failed` and never locked or predicted; verify criterion 8 gates the primary model only (diagnostic rows listed); `VF` pairs `model` (seeds, ens) with `frozen` on shared (fold, guid) rows only (dropped rows in `inclusion.csv`, `n_unpaired`); the seed ensemble's `folds/fold_<k>/ens[/<kind>]/calibration.json` reaches summary §6 and K4. **Earlier phases:** the instantaneous basis selects on the checkpoint's staleness window (`thresholds.snapshot_window`, shared with `metrics._points`; a `*_1h` policy was fitted on the 0.5-h bin and reported on the 1-h window, so its val FPR could exceed the cap at the checkpoint); 3-class calibration runs in log space (`calibrated_logp`), so a T at its 0.01 floor or a stored float32 zero no longer gives ±inf alarm logits, and stored `p_c<k>_cal` (neural and probe) are clipped to [1e-12, 1 − 1e-12]; the ICI/E50/E90 smooth is unpenalised (C = 1 halved an underconfident model's ICI at n = 300); `rate_ci` returns its undefined cluster-bootstrap draws and every rate CI records them in `n_boot_undefined` (§11.7); `pretrain_exposure` treats an unnamed shard list as UNKNOWN (C12 and criterion 3 INCONCLUSIVE, never PASS). **Open (not fixed):** the signed TLO context input encodes time until labour onset for pre-onset segments (a §7.1 spec question: clip at 0?); OvR thresholds of a non-causal `three_class` sequence model read future-informed `p_c<k>_cal` through the running max; `patient_map` keyed by raw GUID, not `guid_norm`; `segment_head: false` with a segment-basis policy fails after training; the lower-severity review items (T4 needs `to_delivery` in `time_axes`, empty `subgroup_families` breaks S1, `grad_segments: last_k:0`, `sens_target` with −inf positives, among others).
 - 2026-09-29 — P8 done on the 3-fold fixture; 476 tests green (24 files, ~24 min incl. slow). **Seed ensemble (§10.7):** every unit kind with more than one seed per fold (`model`; under an online regime the `frozen` baseline too) gets `seed='ens'`: the mean of the members' raw prior-corrected logits (`logit_seg`, `logit_online`, every GUID `score_*`, CORAL `ord_score`; 3-class probabilities as the softmax of the mean log-probability), then one calibration and one threshold selection (OvR on `three_class`) on the ensemble's val rows through `lock_unit`, into `folds/fold_<k>/ens[/<kind>]/`. Its `selection_lock.json` digests `calibration.json`, `thresholds.json` and the members' locks, so a retrained member makes it stale: `train` skips a valid ensemble lock and re-selects a stale one (`baselines.lock_problem`); `predict` reads it before the fold's rows are scored (L5) and lists a failed member or ensemble in `missing_units`. The ensemble is the primary model (`metrics.primary_model` prefers `('model', 'ens')`), unprefixed on the MLflow parent (seeds as `seed<s>/`), and drawn in H2 beside its seeds. **Q2:** `comparison.parquet` gains `p_delong` (fast DeLong, Sun & Xu 2014 midrank structural components, on the pooled GUID `score_final_cal` of every `delta_auroc` record, whole population and every powered subgroup cell; rows aligned on (fold, guid)) and `p_nb` (Nadeau–Bengio on the per-fold test AUROC differences, variance factor 1/k + 1/(k−1), df k−1, whole population); both in the forest legend and `comparison.md`. **Refit bootstrap** (§11.7 b, `eval.bootstrap.refit_threshold: true`, default off): per replicate, each fold's val GUIDs are resampled (outcome-stratified patient clusters), every policy is re-selected on the resampled val basis population through `thresholds.policy_threshold` (split out of `select_thresholds`), and the resampled test GUIDs are scored at the replicate thresholds; rows `subgroup='threshold_refit'` (sens/spec/FPR per fold and pooled, point = the fixed-threshold value; the per-fold threshold with its interval), drawn as T3 panel (b); T3 at B = 2000 on a synthetic 3-fold run 1.0 s → 4.2 s. **Acceptance:** T-X3 with ensembles (a retrained member re-locks its fold's ensemble only) and `compare` on two smoke runs (the ensemble vs a segment-scope run: finite `p_delong` / `p_nb`) in `tests/test_ensemble.py`. `ponytail:` DeLong treats GUIDs as independent (Obuchowski if a patient map groups them); the ensemble re-scores its members' val split (another VAE pass under online regimes); `fixed` policies and the multiclass alarm logit keep the fold's calibration in the refit bootstrap. The P8 smoke uses three folds: on folds 1–2 alone the shuffled control's pooled AUROC is 0.66 (criterion 7), a fixture artifact.

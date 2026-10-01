@@ -6,7 +6,7 @@ Almost every figure here is drawn by the shared pipeline in `teb_vae/lag_attn_rw
 
 A rule that applies to every figure here: **an empty panel is a statement, not a bug.** A panel that found no finite value draws the words `no finite values` rather than an empty frame, and that means the analysis measured nothing rather than that the plotting failed.
 
-A second rule applies to every *lag* axis this pipeline will ever draw: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$, the residual physiological delay after the model's own input delay $\delta$ is added back. There is no "original-sensor" twin: the stored UP/FHR timeline is canonical, the dataset builder's UP shift is part of the signal, and no lag axis adds it back or subtracts it.
+A second rule applies to every *lag* axis this pipeline will ever draw: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$, the residual physiological delay after the model's own input delay $\delta$ is added back.
 
 **A third rule is specific to this model, and it is the one most likely to be got wrong here.** This package draws two different attention mechanisms and their axes are not the same axis. The `attention/` and `lag_kl/` figures draw the **lag cross-attention**: $M = 4$ heads over $L = 91$ **lags**, which decides which past *source* neighbourhood informs the latent. The `encoder_attention/` figures draw the **encoder self-attention**: $H_e = 4$ heads over the within-stream **time axis**, which decides how each history state is built out of its own stream's past. A source encoder that attends 60 s back is not a model that found its coupling at 60 s.
 
@@ -341,9 +341,9 @@ All of them are defined in **Terminology** above.
 - $D_{\mathrm{base}}(\tau)$, $D_{\mathrm{full}}(\tau)$ — the two block scores resolved by horizon step instead of summed over it. Units are nats **per horizon step** here, not per anchor: this is the block score's per-$\tau$ decomposition, so the 30 values sum back to the block.
 - **gap** — their difference, the per-$\tau$ version of `pred_gap`.
 - **RMSE** — the point error of each branch at that lead time, in **bpm** where the loader's statistics are known.
-- Computed on the **single-draw** path, and the title says so.
+- Computed on the **single-draw** path.
 
-**How it is misread.** The curve is computed on the **single-draw** path, and says so in its title. The Monte Carlo marginalisation does not commute with the sum over $\tau$ — by Jensen — so a marginalised curve would not sum back to the marginalised headline. Horizon step $0$ is $4$ s ahead, not $0$: the anchor's own block is the past, not the forecast.
+**How it is misread.** The curve is computed on the **single-draw** path. The Monte Carlo marginalisation does not commute with the sum over $\tau$ — by Jensen — so a marginalised curve would not sum back to the marginalised headline. Horizon step $0$ is $4$ s ahead, not $0$: the anchor's own block is the past, not the forecast.
 
 ## `forecast/forecast_overlay.pdf`
 
@@ -360,7 +360,7 @@ All of them are defined in **Terminology** above.
 - **full** — $\mu^{\mathrm{full}}$, the UP-conditioned forecast. Where the two lines separate is literally what UP changed; `forecast_difference_sq` is that separation squared and averaged.
 - **x axis** — lead time in seconds within this one block, 4 s to 120 s.
 
-**How it is misread.** It is **one anchor of one retained recording**, drawn from a seeded stratified draw, not a representative case. Waveform retention is opt-in, so a run that did not ask for it emits no such figure at all; the absence is silence, not failure.
+**How it is misread.** It is **one anchor of one retained recording**, drawn from a seeded stratified draw, not a representative case: the first retained row, at the middle of the trained anchor range, neither printed on the page. Waveform retention is opt-in, so a run that did not ask for it emits no such figure at all; the absence is silence, not failure.
 
 ## `coupling/pred_gap_distribution.pdf`
 
@@ -375,10 +375,10 @@ All of them are defined in **Terminology** above.
 - **top histogram** — `mc_pred_gap` per recording: $D_{\mathrm{base}} - D_{\mathrm{full}}$ on the Monte Carlo marginalised scores. Positive = UP helped.
 - **dashed vertical at 0** — "no improvement".
 - **shaded band** — the 95% bootstrap interval **on the mean**, over recordings. It is not the spread of the data; a wide histogram with a narrow band is entirely ordinary.
-- **$n$ in the title** — recordings that actually scored at least one anchor.
+- **$n$** — recordings that actually scored at least one anchor, `n_recordings_scored` in `coupling_summary.csv`, which also carries the band's bounds (`ci_lo`, `ci_hi`). The page prints neither.
 - **bottom violins** — the same quantity under both estimators, `mc_pred_gap` and `pred_gap`. Their difference is the cost of the marginalisation, not a second result.
 
-**How it is misread.** Three ways. The shaded band is the interval on the **mean**, not the range of the data. The two violins are two *estimators of the same quantity*. And the unit of this figure is one recording, so a recording that scored no anchors is absent rather than at zero — the $n$ in the title is the count that was actually available.
+**How it is misread.** Three ways. The shaded band is the interval on the **mean**, not the range of the data. The two violins are two *estimators of the same quantity*. And the unit of this figure is one recording, so a recording that scored no anchors is absent rather than at zero — the $n$ in `coupling_summary.csv` is the count that was actually available.
 
 **And one that is specific to comparing two architectures.** This figure answers "did the source help *this* model", not "did this model beat the other one". Two runs' histograms are only comparable when their base branches are: `pred_gap` is a difference, and a gap read against a weaker $D_{\mathrm{base}}$ is not the same measurement as one read against a competitive one. The cross-model table in `verify --runs` is where that comparison is made, with $D_0$ carried beside the gap and a footnote on any row that has not earned the reading.
 
@@ -488,7 +488,7 @@ All of them are defined in **Terminology** above.
 **Terms on this figure.**
 
 - **bars** — `entropy_ratio` from `encoder_attention_entropy.csv`, pooled rows only. It is `entropy_nats / ceiling_attainable_nats`.
-- **dashed line at 1** — "uniform over every admitted key". It is drawn rather than left implicit because the ratio has no meaning without it and a reader would otherwise pick their own reference.
+- **dashed line at 1** — `uniform` in the legend: uniform over every admitted key. It is drawn rather than left implicit because the ratio has no meaning without it and a reader would otherwise pick their own reference.
 - **the ceiling** — $\operatorname{mean}_t \log\min(t{+}1, c)$ over that block's own scored anchors, with $c = T$ on the target stream and $c = W_U$ on the source. It is **not** $\log T$: at anchor $t$ only $\min(t+1, c)$ keys exist at all.
 - **the two panels are not on one scale of difficulty.** The source panel's ceiling is $\log 16$ at most and the target's is up to $\log 300$, so a source head and a target head at the same ratio are spread over very different numbers of keys.
 
@@ -563,7 +563,7 @@ All of them are defined in **Terminology** above.
 
 **In plain terms.** *"When the model says it is 95% sure, is it right 95% of the time?"* The decoder emits a mean **and** an error bar per sample. Every score in this pipeline is a likelihood, so if the error bars are wrong, every score is wrong too — and a model can drive its score down dishonestly by shrinking its error bars where it happens to be right. The test: for every predicted sample, ask what fraction of the predicted distribution lies below the truth. If the error bars are honest, those fractions are spread **uniformly** over $[0, 1]$ — a flat histogram and a straight diagonal. A hump in the middle means the error bars are too wide; piles at both ends mean they are too narrow.
 
-**What it shows.** Top: the probability integral transform $u = \Phi((x - \mu)/\sigma)$ of every scored raw sample, as a density, against the flat line a calibrated observation model produces. Bottom: the reliability curve — the empirical CDF of that PIT against the diagonal — with the three central-coverage levels quoted in the panel title.
+**What it shows.** Top: the probability integral transform $u = \Phi((x - \mu)/\sigma)$ of every scored raw sample, as a density, against the flat line a calibrated observation model produces. Bottom: the reliability curve — the empirical CDF of that PIT against the diagonal — with the three central-coverage levels in `calibration_coverage.csv`.
 
 **Axes.** Top: PIT value in $[0, 1]$ against density, where $1.0$ is the calibrated value whatever the bin count. Bottom: nominal against observed cumulative probability.
 
@@ -572,7 +572,7 @@ All of them are defined in **Terminology** above.
 - **PIT** — $u = \Phi((x - \mu)/\sigma)$ per scored raw sample: the truth's percentile inside its own predicted distribution.
 - **flat line at 1.0** (top) — the density a perfectly calibrated model produces, whatever the bin count.
 - **diagonal** (bottom) — the reliability target: observed cumulative probability equals nominal.
-- **coverage figures in the title** — the fraction of truth that fell inside $\pm 1\sigma$, $\pm 2\sigma$, $\pm 3\sigma$. The targets are $0.6827$, $0.9545$, $0.9973$ — **not** $0.95$, which is $\pm 1.96\sigma$.
+- **coverage figures** (`calibration_coverage.csv`, not on the page) — the fraction of truth that fell inside $\pm 1\sigma$, $\pm 2\sigma$, $\pm 3\sigma$. The targets are $0.6827$, $0.9545$, $0.9973$ — **not** $0.95$, which is $\pm 1.96\sigma$.
 - **$\cup$ shape** = variance too **small** (too much truth in the tails). **$\cap$ shape** = variance too large. This is the direction most often inverted on sight.
 
 **How it is misread.** The shape is the diagnosis and the direction is easy to invert. The nominal coverages quoted are $\operatorname{erf}(k/\sqrt{2})$; a reader checking against $0.95$ will find a correctly calibrated model half a point off. This census is pooled over raw samples rather than averaged per recording, so it weights a recording by how much of it was scored — the per-recording figures are in `calibration_per_recording.csv`. The decoder is **shared with the comparison model**, so a calibration failure here is not evidence about the encoder replacement.
@@ -621,7 +621,7 @@ All of them are defined in **Terminology** above.
 **Terms on this figure.**
 
 - **spectral gain** $g = \sqrt{S_{yy}/S_{xx}}$ — the forecast's amplitude over the truth's at that frequency. **$g < 1$ is over-smoothing**, the characteristic failure of a mean-square-trained forecaster.
-- **phase** — negative means the forecast **lags** the truth. Wrapped to $(-\pi, \pi]$, so a steep slope crosses the axis repeatedly; the unwrapped version is `group_delay_s` in `coherence_bands.csv`.
+- **phase** — negative means the forecast **lags** the truth (the axis says only `phase (rad)`). Wrapped to $(-\pi, \pi]$, so a steep slope crosses the axis repeatedly; the unwrapped version is `group_delay_s` in `coherence_bands.csv`.
 - **dotted verticals** — $0.25$ Hz and harmonics, where the decoder's per-token output head could place an artifact. See `coherence_seam.pdf`.
 
 **How it is misread.** A low gain is **not** automatically a fault. The mean-square-optimal amplitude given a coherence $\gamma$ is $g = \gamma$, not $g = 1$, so a well-trained model is *supposed* to shrink where it is uncertain. `coherence_decomposition.pdf`'s amplitude term measures distance from that optimum; this panel measures distance from the truth's own variance. The bottom panel is **descriptive**: it pools each class's recordings rather than treating them as a sample, so it carries no interval and no test.
@@ -706,7 +706,7 @@ The two levels take **different forms on purpose**. There are hundreds to thousa
 
 - **how the curves overlap** — each cohort is a **faint fill under a hairline outline in the same colour**. Follow the *outline*: it is drawn at full opacity above every cohort's fill, so a curve stays traceable across the whole axis even where two others are stacked on it. The fill only says where that cohort's mass sits; where fills overlap the tint is a blend and means nothing on its own.
 - **strip** — per recording: dot = median, thick bar = inter-quartile range, thin line = full range. Same colour as its histogram.
-- **legend** — `<cohort> (<n> seg / <n> rec)`. Both denominators, because the histogram and the strip have different ones, and the strip's is the one that matters for any claim.
+- **legend** — `<cohort>`, named once (in the first row of each column). The segment and recording counts per cohort are in `distribution_summary.csv`: the histogram and the strip have different denominators, and the strip's is the one that matters for any claim. The y label says only `density`; the strip is the row of marks above the curves.
 - **density** — each curve integrates to 1 over its own bins, so a cohort ten times larger is not a curve ten times taller. `distribution_summary.csv` carries the counts, means and quartiles for every cohort at both levels.
 - **shared bins** — one grid per panel, from the pooled values of the cohorts drawn in it.
 
@@ -738,7 +738,7 @@ The two levels take **different forms on purpose**. There are hundreds to thousa
 - **line** — the **median** over recordings; **ribbon** — the inter-quartile range over recordings. Each recording is reduced to one value per anchor first.
 - **bottom panel** — one recording's segments assembled on `t_abs = epoch + 4t`, hours before delivery, x axis inverted so delivery sits at the right.
 - **`n_contributing`** — how many segments were averaged at each absolute timestep where they overlap. **`gap_before_s`** — a break in the data; the line stops rather than interpolating.
-- The recording drawn is the **longest** one, not a representative one.
+- The recording drawn is the **longest** one, not a representative one; its GUID and subgroup are the bottom panel's title.
 
 **How it is misread.** The shape of the top panel is **structural before it is physiological**: the warm-up prefix carries no loss term, the lag support is truncated until $t \ge L - 1$, and the last $H$ anchors are never scored. On the bottom panel a **break is a break**: where a recording has a gap the line stops rather than being interpolated across, and a step at a segment join is an artifact of assembly, which is what `whole_delivery_boundaries.csv` exists to identify.
 
@@ -898,9 +898,8 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 - **grey band** — the **count-matched random-trigger null**, drawn as mean $\pm 2$ standard deviations. It exists because the reported statistic is a *minimum over a window*, which is negative on any data at all.
 - **shaded vertical span** — the response window the dip statistic is taken over.
 - The truth, base and full curves are each corrected by the **truth's** pre-onset level so they stay comparable. The difference curve is **not** corrected, because a level cancels exactly out of a difference of two forecasts.
-- The UP trace has already been advanced by 20 s upstream; adding that back would double-count a correction made once.
 
-**How it is misread.** The null is the figure. A dip is only a response if it leaves the band. The contraction times are read from the stored UP trace, which the preprocessing has already advanced by 20 s. The truth, base and full curves are corrected by the **truth's** pre-onset level; the difference curve is not corrected at all.
+**How it is misread.** The null is the figure. A dip is only a response if it leaves the band. The truth, base and full curves are corrected by the **truth's** pre-onset level; the difference curve is not corrected at all.
 
 ## `events/conditioned_coupling.pdf`
 
@@ -934,7 +933,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 - **upper violins** — `nll_oracle_block` (the bottleneck-free probe), `mc_nll_base_block` and `mc_nll_full_block`, each over the **held-out** recordings only.
 - **oracle** — an evaluation-only decoder of the same capacity reading `target_state` (the encoder's own history state) instead of $z$. Trained on half the evaluation recordings and scored on the other half, split at **recording** level.
 - **`delta_suff_nats`** $= D_{\mathrm{base}} - D_{\mathrm{oracle}}$: the bottleneck's cost.
-- **`pred_gap`** $= D_{\mathrm{base}} - D_{\mathrm{full}}$: UP's contribution. Both are annotated in the panel title with bootstrap intervals over recordings.
+- **`pred_gap`** $= D_{\mathrm{base}} - D_{\mathrm{full}}$: UP's contribution. Both, with bootstrap intervals over recordings, are in `sufficiency_summary.csv`; the page does not print them.
 - **lower panel** — the probe's own training curve, for the probe and for a **doubled-width** refit. If doubling the width still improves the held-out score, the probe was capacity-bound and `capacity_bound` says so.
 - **`convergence.converged`** — arithmetic on the held-out curve: the final quarter contributed at most a tenth of everything the score ever gained.
 - $D_{\mathrm{base}}$ here is **not** the headline `d_base_mc_nats`: it is restricted to the held-out half, so all three violins share one denominator.
@@ -953,7 +952,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 
 **In plain terms.** *"Show me one baby."* Every other figure is an aggregate. This is one 20-minute segment of one delivery with everything the model did to it stacked on a shared time axis, so the rows can be read against each other: a contraction in row 1 lines up with a bump in row 5 and a bright band in row 6. It is the figure to open when a number looks strange and you want to see what produced it.
 
-These have no fixed filename, so like the grouped variants they are documented as a family. Each page is the same seven-row diagnostic the training callback writes every validation epoch, drawn from the same builder.
+These have no fixed filename, so like the grouped variants they are documented as a family. The title names the recording and its subgroup and nothing else; the segment's epoch is in the filename and its readouts are in `per_sample.csv`. Each page is the same seven-row diagnostic the training callback writes every validation epoch, drawn from the same builder.
 
 **The seven rows, top to bottom.**
 

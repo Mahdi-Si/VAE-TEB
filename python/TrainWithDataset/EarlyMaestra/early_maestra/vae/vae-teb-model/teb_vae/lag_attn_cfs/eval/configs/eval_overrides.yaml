@@ -18,12 +18,12 @@
 general_config:
   batch_size:
     # 32, not the training 128. Under no_grad the activation retention that dominates training is
-    # gone, but the transients are not: the pass decodes four scored branches over
-    # A x H x C_keep coefficients at K Monte Carlo draws (156 x 10 x 76 at the shipped geometry),
-    # which is two ~463 KB tensors per branch per draw — about 0.9 MB per batch element — plus the (T, M, L)
-    # attention weights at (300, 4, 91). That is roughly 1.7x the raw cells' per-sample decode, and
-    # 32 still leaves the transient under 60 MB, so the sibling's value transfers rather than being
-    # halved on an argument nobody measured.
+    # gone, but the transients are not: the pass decodes four scored branches over all
+    # A dense anchors x H steps x C_keep channels at K Monte Carlo draws, which is two
+    # (A, H, C_keep) float32 tensors per branch per draw, plus the (T, M, L) attention weights with
+    # L = max_lag + 1 -- every factor read from the checkpoint's own geometry. At the geometries
+    # this cell has trained, 32 keeps that transient in the tens of MB, so the sibling's value
+    # transfers rather than being halved on an argument nobody measured.
     #
     # `test` is the key GraphDataModule actually reads for the eval loader. A batch size placed
     # under `eval_config` would be a dead key and the loader would quietly run at 128, which is
@@ -285,8 +285,8 @@ eval_config:
   # interval over which a contraction could still influence what is being predicted, which is a
   # property of the physiology rather than of an H-step forecast block. Shortening it would also make
   # the contraction-conditioned readouts non-comparable across cells for a reason that has nothing
-  # to do with the target domain. It spans 120 / (4 H) of this cell's horizons -- three at
-  # the shipped H = 10.
+  # to do with the target domain. It spans 120 / (4 H) of this cell's horizons, whatever H the
+  # checkpoint was trained at.
   event_lag_window_s: 120.0
 
   # Resamples behind every bootstrap interval, drawn over RECORDINGS. Recordings, not anchors: at

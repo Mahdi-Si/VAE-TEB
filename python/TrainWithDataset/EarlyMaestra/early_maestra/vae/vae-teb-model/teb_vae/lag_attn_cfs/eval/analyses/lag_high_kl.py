@@ -79,8 +79,9 @@ tables, the occlusion join and the contraction enrichment. The record says so in
 **The population is the recording, inside a window as well as across it**, on both clocks; the
 second clock's is the subset that carries a second-stage onset, by the shared eligibility rule.
 
-**The axis is stored-coefficient time.** Every lag-resolved artifact carries
-:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT`.
+**The axis is stored-coefficient time.** Every lag-resolved record carries
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` and every figure the one-line
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`.
 
 .. note::
 
@@ -100,6 +101,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
+from matplotlib.lines import Line2D
 
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
@@ -451,14 +453,14 @@ WINDOW_DRIFT_COMPARISON = "window_vs_class_pooled"
 #: Laid out this way a **column** reads one comparison under both metrics, and a **row** compares
 #: the two comparisons in one unit.
 DISTANCE_METRICS: Tuple[Tuple[str, str], ...] = (
-    ("wasserstein_s", "1-Wasserstein (s, stored-coefficient time)"),
-    ("jensen_shannon", "Jensen-Shannon distance (base 2)"),
+    ("wasserstein_s", "1-Wasserstein (s)"),
+    ("jensen_shannon", "Jensen-Shannon distance"),
 )
 
-#: The two comparisons across, each with the phrase its panel titles are built from.
+#: The two comparisons across, each with the title its first-row panel carries.
 DISTANCE_COMPARISONS: Tuple[Tuple[str, str], ...] = (
-    (WINDOW_DRIFT_COMPARISON, "each window against its own class pooled over the clock"),
-    (CLASS_PAIR_COMPARISON, "between classes, window by window"),
+    (WINDOW_DRIFT_COMPARISON, "Window vs own class"),
+    (CLASS_PAIR_COMPARISON, "Between classes"),
 )
 
 #: Columns of the three histogram tables, written out so a consumer can lay out its reader before
@@ -575,7 +577,7 @@ class Clock:
         binner: The shared binning function for this landmark.
         bin_column: The window index column it adds.
         center_column: The window centre column travelling with it.
-        axis_label: The x-axis label, naming the sign convention outright.
+        axis_label: The x-axis label.
         inverted: Whether the axis is drawn with the landmark at the right.
         figure: This clock's profile-and-trajectory page.
         windows_figure: This clock's tested page.
@@ -620,7 +622,7 @@ CLOCKS: Tuple[Clock, ...] = (
         binner=cohort.add_second_stage_bins,
         bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
         center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
-        axis_label="Hours from second-stage onset (negative = before onset, positive = after)",
+        axis_label="Hours from second-stage onset",
         inverted=False,
         figure="lag_high_kl_second_stage",
         windows_figure="lag_high_kl_second_stage_windows",
@@ -2707,6 +2709,53 @@ def pairwise_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
 # =================================================================================================
 # The figures
 # =================================================================================================
+#: How a profile source is named on a panel: the source key is a column-name fragment.
+SOURCE_TITLES: Dict[str, str] = {"kl": "KL", "attn": "Attention"}
+
+
+def _source_title(source_key: str) -> str:
+    """Name a profile source as a panel title, for example ``KL``."""
+    return SOURCE_TITLES.get(source_key, source_key)
+
+
+def _key_legend(ax: Any, *, classes: bool, solid: str = "", dashed: str = "") -> None:
+    """Draw a trajectory panel's legend: the classes, then what the line styles mean.
+
+    The classes carry their own colour, so the line-style entries are neutral grey: an entry
+    coloured by one class would read as that class's alone.
+
+    Args:
+        ax: Target axes, whose labelled lines are the classes.
+        classes: Whether the class entries are drawn. They are the same on every panel of a page,
+            so the caller draws them once.
+        solid: Name of the solid line, or empty when the panel title already names it.
+        dashed: Name of the dashed line, or empty when the panel has none.
+    """
+    handles, names = ax.get_legend_handles_labels() if classes else ([], [])
+    for style, name in (("-", solid), ("--", dashed)):
+        if name:
+            handles.append(Line2D([], [], color=figures.COLOR_GRAY, linestyle=style,
+                                  linewidth=figures.LINE_THIN))
+            names.append(name)
+    if handles:
+        ax.legend(handles, names, fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+
+
+#: A tested readout as a panel title, keyed by its column; a column not listed is shown as is.
+_READOUT_TITLES: Dict[str, str] = {
+    feature_column(HIGH_BAND_KEY, "kl", "centroid"): "High-band KL centroid",
+    band_column(HIGH_BAND_KEY, ANCHOR_FRAC_SUFFIX): "High-anchor share",
+    histogram_feature_column("median"): "Median lag",
+    histogram_feature_column("iqr"): "IQR",
+    histogram_feature_column("entropy"): "Entropy",
+}
+
+
+def _readout_title(column: str) -> str:
+    """Name a tested readout as a panel title, for example ``High-anchor share``."""
+    return _READOUT_TITLES.get(column, column)
+
+
 def _empty_panel(ax: Any, title: str) -> None:
     """Mark a panel that has nothing to draw, rather than leaving blank axes."""
     ax.text(
@@ -2771,10 +2820,7 @@ def build_selection_figure(
             ax.hist(
                 log_kl[member], bins=bins, density=True, histtype="step",
                 color=colours.get(group, figures.COLOR_BLUE), linewidth=figures.LINE_REGULAR,
-                label=(
-                    f"{group} (n={len(set(anchor_guids[member]))} deliveries, "
-                    f"{int(member.sum())} anchors)"
-                ),
+                label=group,
             )
         for band in ANCHOR_BANDS:
             # Only the bands cut on the KL belong on a KL histogram.
@@ -2785,28 +2831,29 @@ def build_selection_figure(
                     linewidth=figures.LINE_THIN,
                 )
                 ax.annotate(
-                    f"{band.key}: q{band.q_lo:g} = {lo:.3g} nats", (np.log10(lo), 0.0),
+                    f"{band.key}: {lo:.3g} nats", (np.log10(lo), 0.0),
                     xycoords=("data", "axes fraction"), xytext=(2, 4), textcoords="offset points",
                     fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY, rotation=90,
                     va="bottom",
                 )
-        ax.set_title("pooled per-anchor KL, by clinical class, with the band thresholds")
-        ax.set_xlabel("log10 K_t (nats per anchor)")
+        ax.set_title("Per-anchor KL")
+        ax.set_xlabel(r"$\log_{10} K_t$ (nats per anchor)")
         ax.set_ylabel("density of anchors")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "pooled per-anchor KL")
+        _empty_panel(ax, "Per-anchor KL")
 
     # --- Panel 2: the pooled restricted profiles and the hot lags -------------------------------
     ax = axes[1, 0]
     drawn = 0
     if hot.any():
-        for index in np.nonzero(hot)[0]:
+        for rank, index in enumerate(np.nonzero(hot)[0]):
             ax.axvspan(
                 float(seconds[index]) - SECONDS_PER_LAG_STEP / 2.0,
                 float(seconds[index]) + SECONDS_PER_LAG_STEP / 2.0,
                 color=figures.COLOR_LIGHT_GRAY, alpha=0.5, linewidth=0,
+                label="hot lags" if rank == 0 else "_nolegend_",
             )
     styles = {"high": (figures.COLOR_VERMILLION, "-"), "top": (figures.COLOR_ORANGE, "-"),
               "rest": (figures.COLOR_BLUE, "--")}
@@ -2819,23 +2866,17 @@ def build_selection_figure(
         ax.plot(
             seconds, np.nanmean(matrix, axis=0), color=colour, linestyle=style,
             linewidth=figures.LINE_EMPHASIS,
-            label=(
-                f"{band.key} anchors (n={len(set(np.asarray(guids, dtype=object)[with_rows]))} "
-                f"deliveries)"
-            ),
+            label=band.key,
         )
         drawn += 1
     if drawn:
-        ax.set_title(
-            "pooled KL attribution per lag, by anchor band; shaded = hot lags "
-            f"(upper {100 * (1 - HOT_LAG_QUANTILE):.0f}% of pooled attribution across lags)"
-        )
+        ax.set_title("Attribution by band")
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("nats per anchor")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "pooled KL attribution per lag, by anchor band")
+        _empty_panel(ax, "Attribution by band")
 
     # --- Panel 3: the argmax by KL decile -------------------------------------------------------
     ax = axes[2, 0]
@@ -2846,10 +2887,7 @@ def build_selection_figure(
             -0.5, field.shape[0] - 0.5,
         )
         figures.heatmap_with_colorbar(
-            figure, ax, field[::-1], title=(
-                "share of anchors whose KL attribution peaks at each lag, by KL decile "
-                "(bottom row = lowest KL)"
-            ),
+            figure, ax, field[::-1], title="Peak lag by KL decile",
             xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL, ylabel="KL decile (0 = lowest)",
             symmetric=False, colorbar_label="share of the decile's anchors", extent=extent,
             interpolation="none",
@@ -2862,7 +2900,7 @@ def build_selection_figure(
             for index in range(field.shape[0])
         ], fontsize=figures.FONT_TINY)
     else:
-        _empty_panel(ax, "argmax lag by KL decile")
+        _empty_panel(ax, "Peak lag by KL decile")
 
     # --- Panel 4: the contraction enrichment ----------------------------------------------------
     ax = axes[3, 0]
@@ -2882,16 +2920,13 @@ def build_selection_figure(
             for group in groups
         }
         figures.violin_panel(
-            ax, samples, title=(
-                "high-anchor share within the contraction window minus outside it, per recording "
-                f"(>= {MIN_ENRICHMENT_ANCHORS} anchors in each arm)"
-            ),
+            ax, samples, title="Contraction enrichment",
             ylabel="enrichment (share difference)", colors=figures.group_colors(groups),
             reference=0.0, reference_label="no enrichment",
         )
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "contraction enrichment of high-KL anchors")
+        _empty_panel(ax, "Contraction enrichment")
 
     figures.caveat_note(figure)
     return figure
@@ -2947,24 +2982,16 @@ def build_usefulness_figure(
             ax.plot(
                 x, cell["median"], marker="o", markersize=3, color=colour,
                 linewidth=figures.LINE_EMPHASIS if group == "all" else figures.LINE_REGULAR,
-                label=f"{group} (n={int(cell['n_recordings_total'].iloc[0])} deliveries)",
+                label=str(group),
             )
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
-        headline = usefulness if usefulness.get("tested") else {}
-        title = "forecast gain (D_base - D_full) by KL decile of the same anchor: median per recording"
-        if headline:
-            title += (
-                f"; high - rest = {headline['mean_difference_nats']:+.3g} nats, "
-                f"p = {headline['wilcoxon'].get('p_value', float('nan')):.2g}, "
-                f"positive in {headline['positive_fraction']:.0%} of {headline['n_pairs']} recordings"
-            )
-        ax.set_title(title)
-        ax.set_xlabel("KL decile (0 = lowest K_t)")
+        ax.set_title("Forecast gain by KL decile")
+        ax.set_xlabel("KL decile (0 = lowest)")
         ax.set_ylabel("nats per anchor")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "forecast gain by KL decile (the per-anchor table carries no gain)")
+        _empty_panel(ax, "Forecast gain by KL decile")
 
     # --- Panel 2: gain by argmax lag -------------------------------------------------------------
     ax = axes[1, 0]
@@ -2977,27 +3004,27 @@ def build_usefulness_figure(
             continue
         ax.plot(
             cell["compensated_seconds"], cell["mean_gain_nats"], color=colour, linestyle=style,
-            linewidth=figures.LINE_REGULAR, label=f"{name} anchors (n={int(cell['n_anchors'].sum())})",
+            linewidth=figures.LINE_REGULAR, label=name,
         )
         drawn += 1
     if drawn:
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
-        ax.set_title("mean forecast gain by the lag the anchor's KL attribution peaks at")
+        ax.set_title("Forecast gain by peak lag")
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("nats per anchor")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "forecast gain by argmax lag")
+        _empty_panel(ax, "Forecast gain by peak lag")
 
     # --- Panel 3: where the source looks when it helps -------------------------------------------
     ax = axes[2, 0]
     drawn = 0
     for key, label, colour, style in (
-        ("all_kl", "KL attribution, all anchors", figures.COLOR_BLACK, "-"),
-        ("gainw_attn", "attention weighted by positive forecast gain", figures.COLOR_GREEN, "-"),
-        (f"{GAIN_BAND_KEY}_kl", "KL attribution, gain band", figures.COLOR_GREEN, "--"),
-        (f"{HIGH_BAND_KEY}_kl", "KL attribution, high band", figures.COLOR_VERMILLION, "--"),
+        ("all_kl", "KL, all anchors", figures.COLOR_BLACK, "-"),
+        ("gainw_attn", "gain-weighted attn", figures.COLOR_GREEN, "-"),
+        (f"{GAIN_BAND_KEY}_kl", "KL, gain band", figures.COLOR_GREEN, "--"),
+        (f"{HIGH_BAND_KEY}_kl", "KL, high band", figures.COLOR_VERMILLION, "--"),
     ):
         matrix = profiles.get(key)
         if matrix is None or not np.isfinite(matrix).any():
@@ -3010,19 +3037,13 @@ def build_usefulness_figure(
                 linewidth=figures.LINE_REGULAR, label=label)
         drawn += 1
     if drawn:
-        title = "pooled lag profiles as shares: where the source looks, and where it looks when it helps"
-        if overlap.get("available"):
-            title += (
-                f"; {overlap['share_of_high_in_gain']:.0%} of high anchors are gain anchors "
-                f"(independence: {overlap['share_expected_if_independent']:.0%})"
-            )
-        ax.set_title(title)
+        ax.set_title("Pooled lag profiles")
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share of the profile")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(ax)
     else:
-        _empty_panel(ax, "pooled lag profiles")
+        _empty_panel(ax, "Pooled lag profiles")
 
     # --- Panel 4: observational against interventional ------------------------------------------
     ax = axes[3, 0]
@@ -3040,22 +3061,16 @@ def build_usefulness_figure(
             ax.scatter(
                 cell["attribution_share_all"], cell["occlusion_delta_nats"], s=9,
                 color=palette[index % len(palette)], alpha=0.7,
-                label=f"{name} (lags {int(cell['lag_lo'].iloc[0])}-{int(cell['lag_hi'].iloc[0])}, "
-                      f"n={len(cell)} deliveries)",
+                label=str(name),
             )
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
-        ax.set_title(
-            "per recording: share of KL attribution inside a geometry band against the forecast "
-            "cost of occluding that band"
-        )
-        ax.set_xlabel("share of the recording's KL attribution in the band")
-        ax.set_ylabel("occlusion delta (nats per anchor)")
+        ax.set_title("Attribution against occlusion")
+        ax.set_xlabel("KL attribution share in band")
+        ax.set_ylabel("occlusion delta (nats/anchor)")
         ax.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(ax)
     else:
-        _empty_panel(
-            ax, "attribution share against occlusion cost (the interventional pass did not run here)"
-        )
+        _empty_panel(ax, "Attribution against occlusion")
 
     figures.caveat_note(figure)
     return figure
@@ -3070,9 +3085,16 @@ def _draw_trajectory_panel(
     companion: Optional[str],
     ylabel: str,
     title: str,
+    solid_label: str = "",
+    companion_label: str = "",
+    legend_classes: bool = True,
 ) -> int:
     """Draw one readout's class trajectories -- median with its inter-quartile ribbon -- and,
-    dashed, a companion column's median on the same axis."""
+    dashed, a companion column's median on the same axis.
+
+    The legend holds the classes (drawn once per page, by ``legend_classes``) and what the solid
+    and dashed lines are, in neutral grey.
+    """
     selected = [
         row for row in rows
         if row["group_column"] == labels.CLASS_COLUMN and row["clock"] == clock.name
@@ -3084,7 +3106,6 @@ def _draw_trajectory_panel(
         _empty_panel(ax, title)
         return 0
     colours = figures.group_colors(groups)
-    labelled = False
     for group in groups:
         cell = sorted((row for row in primary if row["group"] == group), key=lambda r: r["bin_center_h"])
         if not cell:
@@ -3098,7 +3119,7 @@ def _draw_trajectory_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell]), marker="o", markersize=3, color=colour,
             linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
+            label=str(group),
         )
         for row in cell:
             ax.annotate(
@@ -3112,9 +3133,7 @@ def _draw_trajectory_panel(
                 np.array([row["bin_center_h"] for row in other]),
                 np.array([row["median"] for row in other]),
                 linestyle="--", color=colour, linewidth=figures.LINE_THIN,
-                label=f"{companion} (dashed)" if not labelled else "_nolegend_",
             )
-            labelled = True
     ax.set_title(title)
     ax.set_xlabel(clock.axis_label)
     ax.set_ylabel(ylabel)
@@ -3122,7 +3141,7 @@ def _draw_trajectory_panel(
         ax.invert_xaxis()
     else:
         ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0)
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    _key_legend(ax, classes=legend_classes, solid=solid_label, dashed=companion_label)
     figures.style_axes(ax)
     return len(groups)
 
@@ -3159,13 +3178,10 @@ def build_clock_figure(
         ax = axes[index, 0]
         figures.heatmap_with_colorbar(
             figure, ax, share[::-1],
-            title=(
-                f"{group}: share of the HIGH-band KL attribution by lag and window "
-                f"(n={int(n_recordings)} deliveries)"
-            ),
+            title=f"{group} (n = {int(n_recordings)})",
             ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL, symmetric=False,
             vlimits=(0.0, limit) if limit > 0.0 else None,
-            colorbar_label="share of the attribution", extent=extent, interpolation="none",
+            colorbar_label="share of high-band KL", extent=extent, interpolation="none",
         )
         if clock.inverted:
             ax.invert_xaxis()
@@ -3173,7 +3189,7 @@ def build_clock_figure(
             ax.axvline(0.0, color=figures.COLOR_LIGHT_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         ax.set_xlabel(clock.axis_label)
     if not fields:
-        _empty_panel(axes[0, 0], "share of the high-band KL attribution by lag and window")
+        _empty_panel(axes[0, 0], "High-band lag share")
 
     base = max(len(fields), 1)
     high_frac = band_column("high", ANCHOR_FRAC_SUFFIX)
@@ -3181,24 +3197,24 @@ def build_clock_figure(
     rest_centroid = feature_column("rest", "kl", "centroid")
     _draw_trajectory_panel(
         axes[base, 0], clock, rows, high_frac, companion=band_column("top", ANCHOR_FRAC_SUFFIX),
-        ylabel="share of the segment's anchors",
-        title=f"{high_frac} against the clock, by {labels.CLASS_COLUMN} (tested)",
+        ylabel="share of the segment's anchors", title="High-anchor share",
+        solid_label="high band", companion_label="top band",
     )
     _draw_trajectory_panel(
         axes[base + 1, 0], clock, rows, high_centroid, companion=rest_centroid,
-        ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
-        title=f"{high_centroid} against the clock, by {labels.CLASS_COLUMN} (tested)",
+        ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL, title="High-band KL centroid",
+        solid_label="high band", companion_label="rest band", legend_classes=False,
     )
     _draw_trajectory_panel(
         axes[base + 2, 0], clock, rows, HOT_SHARE_COLUMNS["kl"], companion=HOT_SHARE_COLUMNS["attn"],
-        ylabel="share of the attribution on the hot lags",
-        title=f"{HOT_SHARE_COLUMNS['kl']} against the clock, by {labels.CLASS_COLUMN} (untested)",
+        ylabel="attribution share on hot lags", title="Hot-lag share",
+        solid_label="KL", companion_label="attention", legend_classes=False,
     )
     high_gain = band_column(HIGH_BAND_KEY, PRED_GAP_SUFFIX)
     _draw_trajectory_panel(
         axes[base + 3, 0], clock, rows, high_gain, companion=band_column(REST_BAND_KEY, PRED_GAP_SUFFIX),
-        ylabel="forecast gain (nats per anchor)",
-        title=f"{high_gain} against the clock, by {labels.CLASS_COLUMN} (untested per window)",
+        ylabel="forecast gain (nats per anchor)", title="High-band gain",
+        solid_label="high band", companion_label="rest band", legend_classes=False,
     )
     figures.caveat_note(figure)
     return figure
@@ -3216,14 +3232,16 @@ def build_windows_figure(
     for column, record in zip(READOUTS, records):
         samples, _ = window_samples(clock, class_frame, column)
         order = [int(row["time_bin"]) for row in record.get("per_window") or []]
-        readouts.append((column, [samples.get(key, {}) for key in order], record))
+        readouts.append(
+            (_readout_title(column), [samples.get(key, {}) for key in order], record)
+        )
     figure = figures.windowed_comparison_figure(
         readouts,
         groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
         bin_width=TRAJECTORY_BIN_HOURS,
         min_body_size=shared_stats.MIN_GROUP_SIZE,
         xlabel=clock.axis_label,
-        ylabel="value (seconds for the centroid; share of anchors for the fraction)",
+        ylabel="seconds, or share of anchors",
         delivery_orientation=clock.inverted,
     )
     figures.caveat_note(figure)
@@ -3257,6 +3275,7 @@ def _draw_distribution_overlay(
     seconds: np.ndarray,
     *,
     title: str,
+    legend: bool = True,
 ) -> int:
     """Overlay one class's lag distribution per line, on the lag axis.
 
@@ -3267,10 +3286,12 @@ def _draw_distribution_overlay(
     Args:
         ax: Target axes.
         profiles: Class to its pooled distribution over the lags.
-        counts: Class to the recordings behind it, for the legend.
+        counts: Class to the recordings behind it, for the pooled reference's weights.
         groups: The classes, worst first.
         seconds: The compensated lag axis.
         title: Panel title.
+        legend: Whether to draw the legend. The keys are the same on every panel of a page, so
+            the caller draws it once.
 
     Returns:
         How many classes were drawn.
@@ -3296,14 +3317,14 @@ def _draw_distribution_overlay(
         # what survives the overlap, and the two panels beneath this one carry the contrast.
         ax.step(
             seconds, profiles[group], where="mid", color=colour,
-            linewidth=figures.LINE_EMPHASIS, zorder=2,
-            label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+            linewidth=figures.LINE_EMPHASIS, zorder=2, label=str(group),
         )
     ax.set_title(title)
     ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
     ax.set_ylabel("share of the distribution")
     ax.set_ylim(bottom=0.0)
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return len(drawn)
 
@@ -3354,6 +3375,7 @@ def _draw_distribution_difference(
     seconds: np.ndarray,
     *,
     title: str,
+    legend: bool = True,
 ) -> int:
     r"""Each class's distribution **minus the pooled one**, in percentage points of share per lag.
 
@@ -3366,10 +3388,11 @@ def _draw_distribution_difference(
     Args:
         ax: Target axes.
         profiles: Class to its pooled distribution over the lags.
-        counts: Class to the recordings behind it, for the reference weighting and the legend.
+        counts: Class to the recordings behind it, for the reference weighting.
         groups: The classes, worst first.
         seconds: The compensated lag axis.
         title: Panel title.
+        legend: Whether to draw the legend; see :func:`_draw_distribution_overlay`.
 
     Returns:
         How many classes were drawn.
@@ -3386,7 +3409,7 @@ def _draw_distribution_difference(
         difference = 100.0 * (np.asarray(profiles[group], dtype=np.float64) - reference)
         ax.step(
             seconds, difference, where="mid", color=colour, linewidth=figures.LINE_EMPHASIS,
-            zorder=3, label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+            zorder=3, label=str(group),
         )
         # A faint fill toward zero, so the sign of each excursion reads at a glance; faint, so
         # three of them overlapping still read as three outlines.
@@ -3395,8 +3418,9 @@ def _draw_distribution_difference(
         )
     ax.set_title(title)
     ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-    ax.set_ylabel("class minus pooled (percentage points of share)")
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    ax.set_ylabel("class minus pooled (% points)")
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return len(drawn)
 
@@ -3409,6 +3433,7 @@ def _draw_distribution_cdf(
     seconds: np.ndarray,
     *,
     title: str,
+    legend: bool = True,
 ) -> int:
     r"""Each class's **cumulative** distribution over the lags, with its median lag marked.
 
@@ -3425,6 +3450,7 @@ def _draw_distribution_cdf(
         groups: The classes, worst first.
         seconds: The compensated lag axis.
         title: Panel title.
+        legend: Whether to draw the legend; see :func:`_draw_distribution_overlay`.
 
     Returns:
         How many classes were drawn.
@@ -3447,7 +3473,7 @@ def _draw_distribution_cdf(
         cumulative = np.nancumsum(density)
         ax.step(
             seconds, cumulative, where="post", color=colour, linewidth=figures.LINE_EMPHASIS,
-            zorder=2, label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+            zorder=2, label=str(group),
         )
         median = float(quantile_seconds(density, seconds, (0.5,))[0])
         if np.isfinite(median):
@@ -3457,14 +3483,15 @@ def _draw_distribution_cdf(
             )
     ax.set_title(title)
     ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-    ax.set_ylabel("cumulative share of the distribution")
+    ax.set_ylabel("cumulative share")
     ax.set_ylim(0.0, 1.02)
     ax.text(
-        0.99, 0.02, "dotted drops = each class's median lag",
+        0.99, 0.02, "dotted: median lag",
         transform=ax.transAxes, ha="right", va="bottom", fontsize=figures.FONT_TINY,
         color=figures.COLOR_GRAY,
     )
-    ax.legend(fontsize=figures.FONT_LABEL, loc="lower right", bbox_to_anchor=(1.0, 0.08))
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="lower right", bbox_to_anchor=(1.0, 0.08))
     figures.style_axes(ax)
     return len(drawn)
 
@@ -3504,6 +3531,7 @@ def _draw_density_violins(
     seconds: np.ndarray,
     *,
     title: str,
+    legend: bool = True,
 ) -> int:
     r"""One violin per (window, class) cell on the clock, whose **body is the cell's lag
     distribution itself**.
@@ -3531,6 +3559,7 @@ def _draw_density_violins(
         cells: The pooled cells.
         seconds: The compensated lag axis.
         title: Panel title.
+        legend: Whether to draw the legend, which is the same on both sources' panels.
 
     Returns:
         How many cells were drawn.
@@ -3597,11 +3626,12 @@ def _draw_density_violins(
     else:
         ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0)
     ax.text(
-        0.99, 0.01, f"count above each body = recordings; faint dashed = fewer than {minimum}",
+        0.99, 0.01, f"faint: n < {minimum}",
         transform=ax.transAxes, ha="right", va="bottom", fontsize=figures.FONT_TINY,
         color=figures.COLOR_GRAY,
     )
-    ax.legend(fontsize=figures.FONT_LABEL, loc="upper left", ncol=len(groups) + 2)
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="upper left", ncol=len(groups) + 2)
     figures.style_axes(ax)
     return drawn
 
@@ -3727,9 +3757,7 @@ def _draw_ridgeline(
             float(seconds[0]) - SECONDS_PER_LAG_STEP / 2.0,
             float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0,
         )
-        ax.set_title(
-            f"{group} (n={int(cells.pooled_counts.get(group, 0))} deliveries)", color=colour
-        )
+        ax.set_title(f"{group} (n = {int(cells.pooled_counts.get(group, 0))})", color=colour)
         ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
         if column == 0:
             ax.set_yticks(baselines)
@@ -3739,7 +3767,7 @@ def _draw_ridgeline(
             )
             # Short on purpose: the clock's full sign convention is on every other panel of the
             # page, and at full length it overruns the panel above.
-            ax.set_ylabel("window centre (h); labour progresses downward")
+            ax.set_ylabel("window centre (h)")
         else:
             ax.tick_params(axis="y", labelleft=False)
         figures.style_axes(ax)
@@ -3751,8 +3779,7 @@ def _draw_ridgeline(
         head = figure.add_subplot(header)
         head.axis("off")
         head.set_title(
-            f"{title}\ngrey dashed = the class pooled over the whole clock; tick = median lag; "
-            f"right margin = recordings; dashed, unfilled = fewer than {minimum}",
+            f"{title}\ngrey: class pooled, tick: median, dashed: n < {minimum}",
             loc="left", fontsize=figures.FONT_SMALL, color=figures.COLOR_BLACK,
         )
     return len(ordered)
@@ -3767,6 +3794,7 @@ def _draw_distance_panel(
     column: str,
     ylabel: str,
     title: str,
+    legend: bool = True,
 ) -> int:
     """Draw one distance column against the clock, one line per class or per class pair.
 
@@ -3785,6 +3813,8 @@ def _draw_distance_panel(
         column: The distance column.
         ylabel: The y-axis label, naming the metric and its unit.
         title: Panel title.
+        legend: Whether to draw the legend. The rows of a column share its keys, so the caller
+            draws it on the first row.
 
     Returns:
         How many series were drawn.
@@ -3830,7 +3860,8 @@ def _draw_distance_panel(
         ax.axvline(
             0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
         )
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
     figures.style_axes(ax)
     return drawn
 
@@ -3915,51 +3946,50 @@ def build_histogram_figure(
             [figure.add_subplot(span(top + offset, column)) for column in range(len(PROFILE_SOURCES))]
             for offset in range(3)
         ]
-        for column, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
+        for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
             block = cells.get((band_key, source_key))
             axes = [created[offset][column] for offset in range(3)]
+            # The band and the source are named once, on the top row of their column.
             titles = (
-                f"{band_key} band, {source_key}: {meaning}, pooled over the whole clock",
-                f"{band_key} band, {source_key}: each class minus the pooled distribution",
-                f"{band_key} band, {source_key}: cumulative distribution, medians dropped to the axis",
+                f"{band_key.capitalize()} band, {_source_title(source_key)}",
+                "Class minus pooled",
+                "Cumulative distribution",
             )
             if block is None:
                 for ax, title in zip(axes, titles):
                     _empty_panel(ax, title)
                 continue
+            # One legend for the page: the classes and the pooled reference are the same in every
+            # panel, so it sits on the first.
+            first = index == 0 and column == 0
             _draw_distribution_overlay(
                 axes[0], block.pooled, block.pooled_counts, block.groups, seconds,
-                title=titles[0],
+                title=titles[0], legend=first,
             )
             _draw_distribution_difference(
                 axes[1], block.pooled, block.pooled_counts, block.groups, seconds,
-                title=titles[1],
+                title=titles[1], legend=False,
             )
             _draw_distribution_cdf(
                 axes[2], block.pooled, block.pooled_counts, block.groups, seconds,
-                title=titles[2],
+                title=titles[2], legend=False,
             )
 
     base = 3 * len(HISTOGRAM_BANDS)
     # The violin row across both sources first, then the ridge row, for the same lettering reason.
     for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
         block = cells.get((HIGH_BAND_KEY, source_key))
-        violin_title = (
-            f"{HIGH_BAND_KEY} band, {source_key}: lag distribution per window and class "
-            f"(body = the cell's distribution; untested)"
-        )
+        violin_title = "Lag distribution by window"
         if block is None:
             _empty_panel(figure.add_subplot(span(base, column)), violin_title)
             continue
         _draw_density_violins(
-            figure.add_subplot(span(base, column)), clock, block, seconds, title=violin_title
+            figure.add_subplot(span(base, column)), clock, block, seconds, title=violin_title,
+            legend=column == 0,
         )
     for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
         block = cells.get((HIGH_BAND_KEY, source_key))
-        ridge_title = (
-            f"{HIGH_BAND_KEY} band, {source_key}: the same cells as ridges, one column per "
-            f"class, labour running down the page (untested)"
-        )
+        ridge_title = "Distribution ridges"
         if block is None:
             _empty_panel(figure.add_subplot(span(base + 2, column)), ridge_title)
             continue
@@ -3976,10 +4006,11 @@ def build_histogram_figure(
     )
     for row, (metric, ylabel) in enumerate(DISTANCE_METRICS):
         for column, (comparison, phrase) in enumerate(DISTANCE_COMPARISONS):
+            # A column is one comparison under both metrics: it is titled on its first row only.
             _draw_distance_panel(
                 figure.add_subplot(span(last + row, column)), clock, drawn_distances,
                 comparison=comparison, column=metric, ylabel=ylabel,
-                title=f"{HIGH_BAND_KEY} band, attn: {phrase} (untested)",
+                title=phrase if row == 0 else "", legend=row == 0,
             )
     figures.caveat_note(figure)
     return figure
@@ -4017,20 +4048,17 @@ def build_subgroup_histogram_figure(
     figure, axes = figures.new_figure(
         2 * len(PROFILE_SOURCES), n_columns, height_per_row=2.8, width=13.0
     )
-    for index, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
+    for index, (source_key, _, _) in enumerate(PROFILE_SOURCES):
         by_class = densities.get((source_key, labels.CLASS_COLUMN))
         by_subgroup = densities.get((source_key, labels.SUBGROUP_COLUMN))
         for column in range(n_columns):
             class_name = classes[column] if column < len(classes) else None
             density_ax, cdf_ax = axes[2 * index, column], axes[2 * index + 1, column]
             density_title = (
-                f"{class_name}, {source_key}: subgroups against the class, whole population"
-                if class_name else f"{source_key}: {meaning}"
+                f"{class_name}, {_source_title(source_key)}"
+                if class_name else _source_title(source_key)
             )
-            cdf_title = (
-                f"{class_name}, {source_key}: cumulative, medians dropped to the axis"
-                if class_name else f"{source_key}: cumulative"
-            )
+            cdf_title = "Cumulative distribution"
             members = (
                 [group for group in by_subgroup.groups
                  if figures._class_of(group) == class_name]
@@ -4050,10 +4078,7 @@ def build_subgroup_histogram_figure(
             if reference is not None:
                 # The class the subgroups belong to, over both panels, so a subgroup is read
                 # against its own class rather than against the population.
-                label = (
-                    f"{class_name} pooled (n={int(by_class.counts.get(class_name, 0))} "
-                    f"deliveries)"
-                )
+                label = f"{class_name} pooled"
                 density_ax.step(
                     seconds, reference, where="mid", color=figures.COLOR_BLACK, linestyle="--",
                     linewidth=figures.LINE_REGULAR, label=label, zorder=4,
@@ -4070,19 +4095,27 @@ def build_subgroup_histogram_figure(
     return figure
 
 
-#: The y-axis label each tested histogram feature is drawn under, by statistic.
-_FEATURE_UNITS: Dict[str, str] = {
-    "median": "median lag (s, stored-coefficient time)",
-    "iqr": "inter-quartile lag range (s)",
-    "entropy": "entropy of the lag distribution (nats)",
+#: The name and unit each tested histogram feature is drawn under, by statistic.
+_FEATURE_UNITS: Dict[str, Tuple[str, str]] = {
+    "median": ("median lag", "s"),
+    "iqr": ("IQR of lag", "s"),
+    "entropy": ("entropy", "nats"),
 }
 
 
-def _feature_label(column: str) -> str:
-    """The unit label for one tested histogram feature column, or the column itself."""
-    for statistic, label in _FEATURE_UNITS.items():
+def _feature_label(column: str, per: str = "") -> str:
+    """The y label for one tested histogram feature column, or the column itself.
+
+    Args:
+        column: The feature column.
+        per: A denominator spelled into the unit, for example ``"h"`` for a rate; empty for none.
+
+    Returns:
+        ``<name> (<unit>)``, or ``<name> (<unit> per <per>)``.
+    """
+    for statistic, (name, unit) in _FEATURE_UNITS.items():
         if column == histogram_feature_column(statistic):
-            return label
+            return f"{name} ({unit} per {per})" if per else f"{name} ({unit})"
     return column
 
 
@@ -4112,16 +4145,16 @@ def build_histogram_features_figure(
     for column, record in zip(HISTOGRAM_READOUTS, records):
         samples, _ = window_samples(clock, features, column)
         order = [int(row["time_bin"]) for row in record.get("per_window") or []]
-        readouts.append((column, [samples.get(key, {}) for key in order], record))
+        readouts.append(
+            (_readout_title(column), [samples.get(key, {}) for key in order], record)
+        )
     figure = figures.windowed_comparison_figure(
         readouts,
         groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
         bin_width=TRAJECTORY_BIN_HOURS,
         min_body_size=shared_stats.MIN_GROUP_SIZE,
         xlabel=clock.axis_label,
-        ylabel=(
-            "value (seconds for the median lag and the inter-quartile range; nats for the entropy)"
-        ),
+        ylabel="seconds, or nats (entropy)",
         delivery_orientation=clock.inverted,
     )
     figures.caveat_note(figure)
@@ -4129,7 +4162,8 @@ def build_histogram_features_figure(
 
 
 def _draw_recording_trajectories(
-    ax: Any, clock: Clock, features: pd.DataFrame, column: str, *, title: str
+    ax: Any, clock: Clock, features: pd.DataFrame, column: str, *, title: str,
+    legend: bool = True,
 ) -> int:
     """Every recording's own trajectory of one feature, thin, with the class median heavy over it.
 
@@ -4144,6 +4178,7 @@ def _draw_recording_trajectories(
         features: :func:`clock_features`' frame.
         column: The feature column.
         title: Panel title.
+        legend: Whether to draw the legend, which is the same on every row of the page.
 
     Returns:
         How many recordings were drawn.
@@ -4175,7 +4210,7 @@ def _draw_recording_trajectories(
         ax.plot(
             np.asarray(medians.index, dtype=np.float64), np.asarray(medians, dtype=np.float64),
             color=colour, linewidth=figures.LINE_HEAVY, marker="o", markersize=3, zorder=3,
-            label=f"{group} median (n={int(block['guid'].nunique())} deliveries)",
+            label=f"{group} median",
         )
     ax.set_title(title)
     ax.set_xlabel(clock.axis_label)
@@ -4184,7 +4219,8 @@ def _draw_recording_trajectories(
         ax.invert_xaxis()
     else:
         ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0)
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    if legend:
+        ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return drawn
 
@@ -4197,7 +4233,11 @@ def _format_p(value: Any) -> str:
 def _draw_drift_violins(
     ax: Any, drift: pd.DataFrame, record: Dict[str, Any], column: str, *, title: str
 ) -> int:
-    """One violin per class of the within-recording slopes, zero marked, the tests in the title."""
+    """One violin per class of the within-recording slopes, zero marked, the omnibus $p$ in the title.
+
+    The class-against-zero tests and the surviving pairs are in ``record`` and the drift tables, not
+    on the figure.
+    """
     groups = (
         cohort.ordered_groups(sorted(set(drift["group"].astype(str))), labels.CLASS_COLUMN)
         if len(drift) else []
@@ -4206,28 +4246,11 @@ def _draw_drift_violins(
         group: np.asarray(drift.loc[drift["group"].astype(str) == group, "slope_per_h"], dtype=np.float64)
         for group in groups
     }
-    per_class = {
-        item["group"]: item for item in record.get("per_class", []) if item["metric"] == column
-    }
     omnibus = next((item for item in record.get("omnibus", []) if item["metric"] == column), {})
-    pairs = record.get("pairwise", {}).get(column, [])
-    lines = [
-        title,
-        "across classes (Kruskal-Wallis, Holm): p = " + _format_p(omnibus.get("p_holm"))
-        + "; vs zero (Wilcoxon, Holm): "
-        + ", ".join(
-            f"{group} p = {_format_p(per_class.get(group, {}).get('p_holm'))}" for group in groups
-        ),
-    ]
-    if pairs:
-        lines.append(
-            "surviving pairs: " + ", ".join(
-                f"{item['left']} vs {item['right']} delta = {float(item['cliffs_delta']):+.2f}"
-                for item in pairs
-            )
-        )
+    p_text = _format_p(omnibus.get("p_holm"))
     drawn = figures.violin_panel(
-        ax, samples, title="\n".join(lines), ylabel=f"{_feature_label(column)} per hour of labour",
+        ax, samples, title=title if p_text == "n/a" else f"{title}, p = {p_text}",
+        ylabel=_feature_label(column, per="h"),
         colors=figures.group_colors(groups), reference=0.0, reference_label="no drift",
     )
     ax.set_xticklabels(
@@ -4262,16 +4285,11 @@ def build_histogram_drift_figure(
     figure, axes = figures.new_figure(len(HISTOGRAM_READOUTS), 2, height_per_row=3.4, width=13.0)
     for row, column in enumerate(HISTOGRAM_READOUTS):
         _draw_recording_trajectories(
-            axes[row, 0], clock, features, column,
-            title=f"{column}: every recording (thin) and the class median (heavy)",
+            axes[row, 0], clock, features, column, title=_readout_title(column), legend=row == 0,
         )
         _draw_drift_violins(
             axes[row, 1], drifts.get(column, pd.DataFrame(columns=list(HISTOGRAM_DRIFT_COLUMNS))),
-            record, column,
-            title=(
-                f"{column}: within-recording slope, recordings scored in >= "
-                f"{MIN_DRIFT_WINDOWS} windows; positive = rises as delivery approaches"
-            ),
+            record, column, title="Slope per hour",
         )
     figures.caveat_note(figure)
     return figure

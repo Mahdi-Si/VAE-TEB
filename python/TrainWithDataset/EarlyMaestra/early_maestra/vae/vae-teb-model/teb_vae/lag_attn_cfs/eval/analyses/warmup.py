@@ -423,7 +423,8 @@ def build_tertile_figure(
 
     Args:
         per_guid: Per-recording means.
-        rows: The summary rows, read for the total's denominator.
+        rows: The summary rows. Unused by the drawing; kept so the builder's signature matches
+            the record it is called with.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -432,14 +433,10 @@ def build_tertile_figure(
     # attention mass, and a model with no attention over the lags has nothing to draw there.
     warmth = [name for name in WARMTH_COLUMNS if name in per_guid.columns]
     figure, axes = figures.new_figure(2 if warmth else 1)
-    total = next((row for row in rows if row.get("metric") == TOTAL_COLUMN), {})
     figures.violin_panel(
         axes[0, 0],
         {name: finite_column(per_guid, name) for name in TERTILE_COLUMNS},
-        title=(
-            f"pred_gap per recording by warm-up tertile, n = {int(total.get('n') or 0)} "
-            f"(the three sum to pred_gap)"
-        ),
+        title="Gap by warm-up tertile",
         ylabel="nats per anchor",
         reference=0.0,
         reference_label="no improvement",
@@ -448,7 +445,7 @@ def build_tertile_figure(
         figures.violin_panel(
             axes[1, 0],
             {name: finite_column(per_guid, name) for name in warmth},
-            title="attention mass on lags where the source block is warm (a small value is expected)",
+            title="Warm-lag attention",
             ylabel="fraction of attention mass",
         )
     return figure
