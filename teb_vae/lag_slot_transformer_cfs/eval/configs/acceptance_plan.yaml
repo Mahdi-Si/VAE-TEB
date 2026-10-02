@@ -28,7 +28,13 @@ declared_on: 2026-09-17
 # Revision 3: the committed delta derives its partition from the checkpoint's `max_lag` through
 # `partition_width`, so the five bands that resolves to on the 25-entry window join that window's
 # family beside the hand-declared bands of `lag25_eval_overrides.yaml`.
-revision: 3
+#
+# Revision 4: the shipped window moved to a shorter bank, so its family -- the bands
+# `partition_width` resolves to on it, plus the two fixed cross-bank bands -- is declared.
+#
+# Revision 5: the shipped arm decodes at the latent means, so the comparison that isolated the
+# variance update is replaced by one that isolates latent sampling.
+revision: 5
 
 
 protocol:
@@ -94,13 +100,13 @@ primary_comparisons:
       how the per-lag updates are combined. Both read one stored source time per proposal; the
       left sums them under a fixed scale and the right normalises a distribution over them.
 
-  - name: the_variance_update
+  - name: the_latent_sampling
     left: candidate
-    right: mean_only
+    right: sampled_latent
     column: nll_full
     isolates: >-
-      whether changing the latent's scale helps. The right-hand arm builds no scale head at all,
-      so its posterior scale is the prior's exactly.
+      whether a sampled latent helps. The left-hand arm decodes both branches at their means, so
+      its scores are exact; the right-hand arm decodes paired samples and is scored as a mixture.
 
   - name: the_source_values
     left: candidate
@@ -141,6 +147,16 @@ primary_comparisons:
 # it was scored under, never all eleven, and the correction pays for the bands that run searched.
 exploratory_band_families:
   91: [anchor, near, mid, far]
+  38:
+    - lags_000_004
+    - lags_005_009
+    - lags_010_014
+    - lags_015_019
+    - lags_020_024
+    - lags_025_029
+    - lags_030_037
+    - common_head
+    - common_tail
   25:
     - instant
     - recent

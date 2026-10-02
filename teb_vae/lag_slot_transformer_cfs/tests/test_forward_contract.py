@@ -69,6 +69,7 @@ CONTRACT_KEYS = frozenset(
         "cancellation_ratio_scale",
         "cancellation_numerator_scale",
         "cancellation_denominator_scale",
+        "proposal_ridge_per_anchor",
     }
 )
 

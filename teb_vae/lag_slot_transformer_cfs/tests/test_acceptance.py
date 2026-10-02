@@ -41,7 +41,7 @@ FIXTURE_RESAMPLES = 100
 #: result has been seen is invisible in every number it produces. A deliberate revision updates
 #: this literal and the plan's own revision counter together, and the diff is then the record that
 #: it happened.
-COMMITTED_PLAN_DIGEST = "3f20ebb0d36ade11"
+COMMITTED_PLAN_DIGEST = "d157ba06a11590c5"
 
 
 def plan_with(tmp_path: Path, **protocol: Any) -> Dict[str, Any]:
@@ -92,10 +92,10 @@ def fake_run(
     """
     leaves = {
         "candidate": {"source_stem": "pointwise", "lag_fusion": "local"},
-        "mean_only": {
+        "sampled_latent": {
             "source_stem": "pointwise",
             "lag_fusion": "local",
-            "mean_only_residual": True,
+            "latent_sampling": True,
         },
         "target_only": {"source_disabled": True},
     }[arm]
@@ -122,6 +122,13 @@ def fake_run(
     }
 
 
+#: Two bands of the shipped window's declared family: a run that records no window is read under
+#: that family, so the fixture's searched bands are named from it rather than written out.
+NEAR, FAR = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))[
+    "exploratory_band_families"
+][acceptance.shipped_lag_window()][:2]
+
+
 def straight_line(offset: float, *, n: int = 8) -> Dict[str, Dict[str, float]]:
     """A per-recording table whose gap is a known constant.
 
@@ -140,8 +147,8 @@ def straight_line(offset: float, *, n: int = 8) -> Dict[str, Dict[str, float]]:
             "kld_per_anchor": 0.5,
             "nll_silence": 100.0 + index,
             "nll_replace:zeros": 100.5 + index,
-            "nll_suppress:near": 100.0 + index - offset + 0.2 * index,
-            "nll_suppress:far": 100.0 + index - offset + 0.05,
+            f"nll_suppress:{NEAR}": 100.0 + index - offset + 0.2 * index,
+            f"nll_suppress:{FAR}": 100.0 + index - offset + 0.05,
             "nll_suppress:none": 100.0 + index - offset,
             "nll_suppress:all": 100.0 + index,
         }
@@ -229,8 +236,8 @@ def test_a_malformed_plan_is_refused_by_name(tmp_path: Path, mutate, named: str)
         ({"source_disabled": True}, "target_only"),
         ({"source_stem": "pointwise", "lag_fusion": "local"}, "candidate"),
         (
-            {"source_stem": "pointwise", "lag_fusion": "local", "mean_only_residual": True},
-            "mean_only",
+            {"source_stem": "pointwise", "lag_fusion": "local", "latent_sampling": True},
+            "sampled_latent",
         ),
         (
             {"source_stem": "pointwise", "lag_fusion": "local", "source_values_withheld": True},
@@ -299,7 +306,7 @@ def test_a_comparison_across_two_draw_counts_is_refused_as_unmatched(tmp_path: P
     arms' biases need not cancel, so this would be a difference of estimators."""
     plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1)
     left = fake_run("candidate", training_seed=1, values=straight_line(1.0))
-    right = fake_run("mean_only", training_seed=1, values=straight_line(0.5))
+    right = fake_run("sampled_latent", training_seed=1, values=straight_line(0.5))
     # Same declared draw count in the grouping, a different evaluation seed in the run: two draw
     # sets, and the pairing would carry the difference between them.
     right["eval_seed"] = 99
@@ -308,8 +315,8 @@ def test_a_comparison_across_two_draw_counts_is_refused_as_unmatched(tmp_path: P
         acceptance.arm_evidence([left, right], plan=plan), plan=plan
     )
 
-    assert block["the_variance_update"]["status"] == "UNMATCHED"
-    assert "eval_seed" in block["the_variance_update"]["detail"]
+    assert block["the_latent_sampling"]["status"] == "UNMATCHED"
+    assert "eval_seed" in block["the_latent_sampling"]["detail"]
 
 
 def test_two_arms_on_two_partitions_have_no_paired_difference(tmp_path: Path) -> None:
@@ -317,14 +324,14 @@ def test_two_arms_on_two_partitions_have_no_paired_difference(tmp_path: Path) ->
     recording, so pairing them produces nothing rather than a number built on an empty overlap."""
     plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1)
     left = fake_run("candidate", training_seed=1, values=straight_line(1.0))
-    right = fake_run("mean_only", training_seed=1, values=straight_line(0.5))
+    right = fake_run("sampled_latent", training_seed=1, values=straight_line(0.5))
     right["table"] = {f"OTHER{index}": row for index, row in enumerate(right["table"].values())}
 
     block = acceptance.primary_comparison_block(
         acceptance.arm_evidence([left, right], plan=plan), plan=plan
     )
 
-    assert block["the_variance_update"]["status"] == "NO_SHARED_RECORDINGS"
+    assert block["the_latent_sampling"]["status"] == "NO_SHARED_RECORDINGS"
 
 
 def test_the_comparison_reads_the_difference_the_tables_carry(tmp_path: Path) -> None:
@@ -334,13 +341,13 @@ def test_the_comparison_reads_the_difference_the_tables_carry(tmp_path: Path) ->
         fake_run("candidate", training_seed=seed, values=straight_line(2.0)) for seed in (1, 2, 3)
     ]
     right = [
-        fake_run("mean_only", training_seed=seed, values=straight_line(0.5)) for seed in (1, 2, 3)
+        fake_run("sampled_latent", training_seed=seed, values=straight_line(0.5)) for seed in (1, 2, 3)
     ]
 
     block = acceptance.primary_comparison_block(
         acceptance.arm_evidence(left + right, plan=plan), plan=plan
     )
-    record = block["the_variance_update"]
+    record = block["the_latent_sampling"]
 
     assert record["status"] == "READ"
     # nll_full is lower on the arm with the larger gap, so the difference is negative and the
@@ -377,11 +384,11 @@ def test_the_family_adjusted_interval_is_wider_than_the_nominal_one(tmp_path: Pa
     runs = [fake_run("candidate", training_seed=seed, values=straight_line(2.0)) for seed in (1, 2)]
 
     block = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)["candidate"]
-    near = block["bands"]["near"]
+    near = block["bands"][NEAR]
 
-    assert block["searched_bands"] == ["far", "near"]
+    assert block["searched_bands"] == sorted([NEAR, FAR])
     assert block["family_size"] == 2
-    assert block["peak_band"] == "near"
+    assert block["peak_band"] == NEAR
     assert block["family_adjusted_confidence"] > block["nominal_confidence"]
     assert near["margin_nats_family_adjusted"]["hi"] >= near["margin_nats"]["hi"]
     assert near["margin_nats_family_adjusted"]["lo"] <= near["margin_nats"]["lo"]
@@ -531,19 +538,19 @@ def test_two_windows_or_two_input_policies_do_not_pair(tmp_path: Path) -> None:
     families = plan["exploratory_band_families"]
     wide, short = max(families), min(families)
     left = fake_run("candidate", training_seed=1, searched_lag_steps=wide, values=straight_line(1.0))
-    right = fake_run("mean_only", training_seed=1, searched_lag_steps=short, values=straight_line(0.5))
+    right = fake_run("sampled_latent", training_seed=1, searched_lag_steps=short, values=straight_line(0.5))
     ablated = fake_run(
-        "mean_only", training_seed=1, searched_lag_steps=wide, values=straight_line(0.5),
+        "sampled_latent", training_seed=1, searched_lag_steps=wide, values=straight_line(0.5),
         input_policy={"zero_fhr_scattering_s0": True},
     )
     reference = fake_run("target_only", training_seed=9, values=straight_line(0.0))
 
     windows = acceptance.primary_comparison_block(
         acceptance.arm_evidence([left, right], plan=plan), plan=plan
-    )["the_variance_update"]
+    )["the_latent_sampling"]
     policies = acceptance.primary_comparison_block(
         acceptance.arm_evidence([left, ablated], plan=plan), plan=plan
-    )["the_variance_update"]
+    )["the_latent_sampling"]
 
     assert windows["status"] == "UNMATCHED" and "lag window" in windows["detail"]
     assert policies["status"] == "UNMATCHED" and "input policy" in policies["detail"]
@@ -703,10 +710,10 @@ def test_the_protocol_reads_runs_the_scoring_pass_wrote(evidence, tmp_path) -> N
     arms = record["selection"]["arms"]
     assert arms["candidate"]["n_training_seeds"] == len(ARM_SEEDS)
     assert arms["candidate"]["meets_minimum"]
-    assert arms["mean_only"]["n_training_seeds"] == 1
-    assert not arms["mean_only"]["meets_minimum"]
+    assert arms["sampled_latent"]["n_training_seeds"] == 1
+    assert not arms["sampled_latent"]["meets_minimum"]
 
-    comparison = record["selection"]["primary_comparisons"]["the_variance_update"]
+    comparison = record["selection"]["primary_comparisons"]["the_latent_sampling"]
     against = record["selection"]["per_arm"]["candidate"]["against_reference"]
     assert comparison["status"] == "BELOW_SEED_MINIMUM"
     assert comparison["difference_nats"]["n"] > 0

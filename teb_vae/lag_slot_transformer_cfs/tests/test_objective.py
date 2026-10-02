@@ -364,3 +364,33 @@ def test_a_target_at_the_wrong_anchor_set_is_refused() -> None:
             coverage_floor=model.coverage_floor,
             logvar_clamp=model.logvar_clamp,
         )
+
+
+# =================================================================================================
+# The mixture reconstruction and the density it is scored under
+# =================================================================================================
+def test_the_mixture_is_the_log_mean_likelihood_and_one_draw_is_the_single_draw_score() -> None:
+    r"""$D^{(K)} = \log K - \operatorname{logsumexp}_k(-D^{(k)})$, never above the draws' average,
+    and at $K = 1$ the objective the single-draw one bitwise. The AR(1) coefficient is part of the
+    density the block is scored under, so moving it moves the score."""
+    blocks = [torch.tensor([[1.0, 4.0]]), torch.tensor([[3.0, 4.0]])]
+    mixed = objective_module.mixture_block(blocks, "gaussian_nll")
+    expected = -torch.log(0.5 * (torch.exp(-blocks[0]) + torch.exp(-blocks[1])))
+    assert torch.allclose(mixed, expected)
+    assert bool((mixed <= torch.stack(blocks).mean(dim=0) + 1e-6).all())
+    assert objective_module.mixture_block(blocks[:1], "gaussian_nll") is blocks[0]
+
+    model = build_model()
+    _, single = score(model, seed=3)
+    _, one_draw = score(model, seed=3, mc_draws=1)
+    assert torch.equal(single["nll_full_block"], one_draw["nll_full_block"])
+    _, mixture = score(model, seed=3, mc_draws=3)
+    assert bool(torch.isfinite(mixture["total_loss"]))
+    assert not torch.equal(mixture["nll_full_block"], single["nll_full_block"])
+    with pytest.raises(ValueError, match="mc_draws"):
+        score(model, mc_draws=0)
+
+    with torch.no_grad():
+        model.target_ar_logit.fill_(0.5)
+    _, correlated = score(model, seed=3)
+    assert not torch.equal(correlated["nll_full_block"], single["nll_full_block"])

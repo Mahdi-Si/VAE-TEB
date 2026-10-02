@@ -4,6 +4,92 @@
 
 **Proposed class:** SeqVaeLagResidualTrfCfs. **Model kind:** fhr_lag_residual_cfs_v1. **Package:** teb_vae/lag_slot_transformer_cfs. **Status:** design specification; the architecture has not been implemented or trained.
 
+## Amendment 2026-10-02: the revised architecture
+
+Sections 1 to 12 below are the original specification and are kept as written. This amendment
+states what the shipped model now does differently and why; where the two disagree, this section
+and `configs/default.yaml` are authoritative. Every value is a configuration leaf and is named by
+its key rather than restated here. The literature review behind the second half of the list is
+`reports/Lag slot architecture review.md` at the repository root.
+
+**What the first trained run showed.** The mixture gain's recording interval spanned zero and
+rested on fewer than two effective draws; every lag band but the nearest was net harmful to the
+fitted model; over a third of the source divergence survived replacing the source by zeros; the
+prior scale and the short-horizon observation variance sat on their shared floor; and the phase
+block's marginal gain was negative.
+
+**The forecast density.**
+
+* *AR(1) residual along the horizon* (`forecast_ar_residual`). Each channel is scored on the
+  innovations $e_\tau = r_\tau - \phi_c r_{\tau-1}$ with a learned $\phi_c = \tanh(a_c)$ shared by
+  both branches. The map $r \mapsto e$ is unit lower-triangular, so the block score is still an
+  exact joint density. A factorised Gaussian counts one persistent error once per step it lasts.
+* *Per-channel scored horizon* (`target_phase_fast_cutoff_hz`, `target_phase_fast_horizon`). A
+  phase channel whose slow leg sits above the cutoff is scored on its leading steps only. The mask
+  is fixed before any evaluation, identical in both branches, and resolved without reference to
+  the source.
+* *A separate observation floor* (`obs_logvar_clamp`). The innovation variance of a strongly
+  correlated residual is far below its marginal variance, so the observation bound is its own key
+  and sits lower than the prior's. Where both branches sit on a binding floor the gap reduces to a
+  squared-error difference over an arbitrary constant, so `logvar_full_floor_frac` is read beside
+  every headline.
+* *Geometry* (`horizon`, `anchor_stride`, `max_lag`). The horizon holds one contraction-locked
+  deceleration whole, and the bank covers every published source-to-target delay with margin.
+
+**The source pathway.**
+
+* *Centred proposals* (`center_proposals`). Section 4.6 refused centring; the measurement above
+  reverses that decision. Each proposal is
+
+  $$r_{t,\ell} = F_\theta(h_t, E_{t,\ell}, \zeta_\ell) - F_\theta(h_t, E^{0}_{t,\ell}, \zeta_\ell),$$
+
+  with $E^{0}$ the encoding of an all-zero stream under the same availability. A source at its
+  training mean then updates nothing for any parameters, and the family of target-only terms
+  $k_\ell(h)$ of section 5.3 cancels out of every proposal. The cost is the one section 4.6 named:
+  a source observed exactly at its null carries no update. The capacity-control arm measures what
+  centring removes and therefore runs uncentred.
+* *A smooth lag axis* (`lag_basis_dim`). The lag identity is $\zeta_\ell = \sum_m B_{\ell m} w_m$
+  on a fixed cosine basis, so neighbouring lags share parameters. This is the distributed-lag
+  constraint: lagged copies of an autocorrelated source are near-collinear, and one free
+  embedding per lag lets a fit split one effect among them with opposite signs.
+* *A lag-weighted ridge on individual proposals* (`proposal_ridge`),
+  $\tfrac12 \sum_\ell \omega_\ell \lVert c_L r_{t,\ell} \rVert^2$ with $\omega_\ell$ increasing in
+  $\ell$ and of mean one. The divergence sees only the summed update; this term sees proposals
+  that cancel, and shrinks the far end of the bank hardest.
+* *Nested lag dropout* (`lag_dropout`). In training a sample's bank is truncated, with the stated
+  probability, at a uniformly drawn cutoff. Every keep-prefix of the bank is then a configuration
+  the model was trained on, so a suppression readout scores something in-distribution, and the
+  gain against the furthest kept lag is the per-lag profile that sums to the total.
+
+**The latent and the headline.**
+
+* *The shipped arm is deterministic* (`latent_sampling: false`). Both branches are decoded at
+  their means, so each branch's predictive density is the decoder's own, both block scores are
+  exact, and $G$ is a computed difference. Sampled, $G$ is the difference of two Monte Carlo
+  mixture estimates whose finite-draw bias follows each branch's own latent spread and does not
+  cancel, on a quantity the one published study of this coupling puts near a tenth of a nat. The
+  deterministic arm is mean-only by construction. Its divergence column is
+  $\tfrac12 \lVert a_t \rVert^2$: a regulariser on the bounded update and a diagnostic, not the
+  rate of a sampled code, and the section 5.5 bound is a statement about the sampled arm alone.
+* *The sampled arm trains on the mixture* (`sampled_latent.yaml`, `train_mc_draws`). Each branch
+  is scored as $\log K - \operatorname{logsumexp}_k(-D^{(k)})$, the estimator the evaluation
+  reads, in place of the single-draw bound of section 6.2 that a deterministic latent minimises.
+  Its gap is reported against its draw count.
+
+**What was considered and not adopted.** A learned gain in place of $c_L$ (the zero-initialised
+output projection already is one). Student-t innovations and a low-rank covariance head (both
+change the family's shared likelihood and every calibration readout built on a Gaussian component
+CDF; the first waits on mixture coverage re-measured under the new density). A future-conditioned
+posterior, attention as the lag readout, flow or diffusion heads, and a longer bank (each rejected
+by the review).
+
+**What still has to be measured.** None of the above has been trained. The standing checks are a
+standalone target-only model as the bound on the base branch's own error, a model retrained on
+cross-recording-paired sources as the estimator's null, a planted-profile run through the same
+pipeline, and recording-level intervals.
+
+---
+
 ## 1. Purpose and central decision
 
 The model forecasts future fetal-heart-rate (FHR) causal features from FHR history, optionally using uterine activity (UA, named UP in several dataset fields). It should learn an informative FHR latent and use UA when UA contributes predictive evidence beyond the available FHR history.

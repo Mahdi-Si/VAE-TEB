@@ -152,7 +152,7 @@ PROTOCOL_KEYS = frozenset(
 COMPARISON_KEYS = frozenset({"name", "left", "right", "column", "isolates"})
 
 #: The arm each combination of constructor leaves is. Keyed by
-#: ``(source_stem, lag_fusion, mean_only_residual, source_values_withheld, source_scalar_lift)``
+#: ``(source_stem, lag_fusion, latent_sampling, source_values_withheld, source_scalar_lift)``
 #: for a source-conditioned checkpoint; a target-only one is decided by its own leaf before this
 #: mapping is consulted, since it reports no stem and no fusion to key on.
 #:
@@ -160,7 +160,7 @@ COMPARISON_KEYS = frozenset({"name", "left", "right", "column", "isolates"})
 #: lift, say -- and is reported with its leaves rather than guessed at or dropped.
 ARM_LEAVES: Mapping[Tuple[Any, ...], str] = {
     ("pointwise", "local", False, False, False): "candidate",
-    ("pointwise", "local", True, False, False): "mean_only",
+    ("pointwise", "local", True, False, False): "sampled_latent",
     ("pointwise", "local", False, True, False): "capacity_control",
     ("pointwise", "attention", False, False, False): "pointwise_attention",
     ("conv", "attention", False, False, False): "attention_reference",
@@ -372,7 +372,7 @@ def arm_of(summary: Mapping[str, Any]) -> str:
     key = (
         arm.get("source_stem"),
         arm.get("lag_fusion"),
-        bool(arm.get("mean_only_residual")),
+        bool(arm.get("latent_sampling")),
         bool(arm.get("source_values_withheld")),
         bool(arm.get("source_scalar_lift")),
     )

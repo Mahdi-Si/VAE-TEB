@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 
 from teb_vae.lag_attn_cfs.eval.metrics import marginalise_block_scores
+from teb_vae.lag_attn_cfs.eval.metrics import forecast_innovation, forecast_likelihood_terms
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor, raw_sample_score
 
 #: Central probability levels the calibration census reports coverage at. Three rather than one:
@@ -121,6 +122,8 @@ def subset_block_scores(
     *,
     likelihood: str,
     block_split: Optional[int] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""One draw's per-anchor score, resolved by horizon step and by stored target block.
 
@@ -143,6 +146,8 @@ def subset_block_scores(
             channels $[0, \mathrm{split})$ are the first block and the rest the second. ``None``
             reports no block split at all, which is what a model with no stored-block structure
             gets rather than a split at a guessed position.
+        cell_mask: The model's $(H, C)$ scored-cell mask, or ``None`` to score every cell.
+        ar_coef: The model's $(C,)$ AR(1) residual coefficient, or ``None``.
 
     Returns:
         ``(per_horizon, per_block)``: $(B, A, H)$ and, when a split was given, $(B, A, 2)$;
@@ -153,7 +158,13 @@ def subset_block_scores(
             and its score a row of zeros that reads as a measurement.
     """
     per_sample = raw_sample_score(
-        forecast_mu, target, likelihood=likelihood, logvar=forecast_logvar
+        forecast_mu,
+        target,
+        likelihood=likelihood,
+        logvar=forecast_logvar,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
+        step_mask=mask,
     )
     masked = per_sample * mask[..., None]
     per_horizon = masked.sum(dim=3)
@@ -251,13 +262,20 @@ def matched_predictive_scores(
                 f"scored against the wrong rows."
             )
 
+    # The density's own structure, so every draw is scored as the objective scores it.
+    terms = forecast_likelihood_terms(model)
+
     draws: Dict[str, list] = {name: [] for name in branches}
     horizon_draws: Dict[str, List[torch.Tensor]] = {name: [] for name in resolve}
     block_draws: Dict[str, List[torch.Tensor]] = {name: [] for name in resolve}
     cdf_sums: Dict[str, torch.Tensor] = {}
     contributing: Optional[torch.Tensor] = None
 
-    for _ in range(int(num_samples)):
+    # A deterministic arm decodes every draw at the mean: the score is exact, the draws are one
+    # forecast, and the noise below is zero so the mixture of them is that forecast's own score.
+    sampled = bool(getattr(model, "latent_sampling", True))
+
+    for _ in range(int(num_samples) if sampled else 1):
         # Drawn once, outside the branch loop. This line is the common-random-numbers property and
         # is the whole reason the arms are scored together rather than one at a time.
         epsilon = (
@@ -265,15 +283,24 @@ def matched_predictive_scores(
             if generator is None
             else torch.empty_like(reference_mu).normal_(generator=generator)
         )
+        if not sampled:
+            epsilon = torch.zeros_like(reference_mu)
         for name, (mu, logvar) in branches.items():
             latent = mu + epsilon * torch.exp(0.5 * logvar)
             forecast_mu, forecast_logvar = model.decoder(latent, persistence=persistence)
             block, contributing = masked_raw_block_per_anchor(
-                forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+                forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar, **terms
             )
             draws[name].append(block)
             if name in calibrate:
-                component = gaussian_cdf(target, forecast_mu, forecast_logvar)
+                # The component's cumulative probability of the residual its density is about:
+                # the AR(1) innovation where the model scores one, the plain residual otherwise.
+                innovation = forecast_innovation(
+                    forecast_mu, target, terms["ar_coef"], step_mask=mask
+                )
+                component = gaussian_cdf(
+                    innovation, torch.zeros_like(innovation), forecast_logvar
+                )
                 cdf_sums[name] = (
                     component if name not in cdf_sums else cdf_sums[name] + component
                 )
@@ -285,12 +312,21 @@ def matched_predictive_scores(
                     mask,
                     likelihood=likelihood,
                     block_split=block_split,
+                    **terms,
                 )
                 horizon_draws[name].append(per_horizon)
                 if per_block is not None:
                     block_draws[name].append(per_block)
 
     assert contributing is not None  # the loops above ran at least once
+    if not sampled:
+        # One pass was the whole computation; the draw axis is filled with it so its length is
+        # the declared count and the mixture over it is that one forecast's own score.
+        repeat = int(num_samples)
+        draws = {name: blocks * repeat for name, blocks in draws.items()}
+        horizon_draws = {name: rows * repeat for name, rows in horizon_draws.items()}
+        block_draws = {name: rows * repeat for name, rows in block_draws.items()}
+        cdf_sums = {name: total * repeat for name, total in cdf_sums.items()}
     scored: Dict[str, BranchScores] = {}
     for name, blocks in draws.items():
         per_draw = torch.stack(blocks, dim=0)
@@ -358,6 +394,7 @@ def calibration_census(
     *,
     levels: Sequence[float] = DEFAULT_COVERAGE_LEVELS,
     block_split: Optional[int] = None,
+    cell_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     r"""Probability-integral transform and central coverage, from the **mixture** distribution.
 
@@ -398,6 +435,8 @@ def calibration_census(
         levels: Central probability levels to report coverage at.
         block_split: The kept-position boundary between the two stored target blocks, or
             ``None`` to resolve the horizon axis alone.
+        cell_mask: The model's $(H, C)$ scored-cell mask, or ``None``. Unscored cells leave the
+            census, so it describes the cells the block score is a sum of.
 
     Returns:
         ``{'n_coefficients', 'pit_sum', 'pit_sq_sum', 'inside': {level: count}, 'resolved':
@@ -419,6 +458,8 @@ def calibration_census(
         )
 
     weights = mask.unsqueeze(-1).expand_as(cdf).to(torch.float64)
+    if cell_mask is not None:
+        weights = weights * cell_mask.to(torch.float64)
     values = cdf.to(torch.float64)
     inside: Dict[str, float] = {}
     inside_by_horizon: Dict[str, List[float]] = {}

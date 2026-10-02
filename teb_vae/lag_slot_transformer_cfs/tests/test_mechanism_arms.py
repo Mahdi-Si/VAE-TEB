@@ -38,7 +38,7 @@ from .conftest import build_tiny_model, tiny_streams
 ARMS: Dict[str, Dict[str, Any]] = {
     "candidate": {},
     "target_only": {"source_disabled": True},
-    "capacity_control": {"source_values_withheld": True},
+    "capacity_control": {"source_values_withheld": True, "center_proposals": False},
     "mean_only": {"mean_only_residual": True},
     "pointwise_attention": {"lag_fusion": "attention"},
     "attention_reference": {"lag_fusion": "attention", "source_stem": "conv"},
@@ -128,7 +128,7 @@ def test_the_capacity_control_holds_the_candidates_budget_exactly() -> None:
     values helped" from "the bigger head helped", which is the confound it exists to remove.
     """
     candidate = build_tiny_model()
-    control = build_tiny_model(source_values_withheld=True)
+    control = build_tiny_model(source_values_withheld=True, center_proposals=False)
 
     assert pathway_parameter_counts(control) == pathway_parameter_counts(candidate)
     assert set(control.state_dict()) == set(candidate.state_dict())
@@ -143,7 +143,7 @@ def test_the_capacity_control_reads_no_source_value() -> None:
     forecasts. What has to be true is that the value never entered the graph at all, which is a
     property of what the encoder emitted.
     """
-    control = build_tiny_model(source_values_withheld=True)
+    control = build_tiny_model(source_values_withheld=True, center_proposals=False)
     _y_st, _y_ph, u_stream = tiny_streams()
     encoded, mask = control.source_encoder(control.source_gate(u_stream))
 
@@ -156,7 +156,7 @@ def test_the_capacity_control_reads_no_source_value() -> None:
 
 def test_the_capacity_control_is_not_the_target_only_arm() -> None:
     """It holds the pathway and starves it; the other removes it. Two questions, two budgets."""
-    control = build_tiny_model(source_values_withheld=True)
+    control = build_tiny_model(source_values_withheld=True, center_proposals=False)
     target_only = build_tiny_model(source_disabled=True)
 
     assert pathway_parameter_counts(control)["source"] > 0
@@ -364,7 +364,7 @@ def test_the_conv_stem_carries_the_same_per_channel_availability_as_the_pointwis
         ({"source_stem": "identity"}, "source_stem"),
         ({"lag_fusion": "softmax"}, "lag_fusion"),
         (
-            {"source_values_withheld": True, "source_stem": "conv"},
+            {"source_values_withheld": True, "center_proposals": False, "source_stem": "conv"},
             "capacity control",
         ),
         ({"source_scalar_lift": True, "source_stem": "conv"}, "per-coefficient"),
@@ -372,7 +372,13 @@ def test_the_conv_stem_carries_the_same_per_channel_availability_as_the_pointwis
         ({"lag_fusion": "attention", "lag_chunk": 2}, "renormalise"),
         # The lift of a withheld value is a learned per-channel constant on every coefficient,
         # which would still be reported as a control on capacity.
-        ({"source_scalar_lift": True, "source_values_withheld": True}, "withhold_values"),
+        (
+            {"source_scalar_lift": True, "source_values_withheld": True, "center_proposals": False},
+            "withhold_values",
+        ),
+        # Centred, a withheld source IS its null: the update is exactly zero for any parameters
+        # and the head is a block no gradient reaches.
+        ({"source_values_withheld": True}, "center_proposals"),
     ),
 )
 def test_an_undeclared_or_meaningless_arm_combination_is_refused(

@@ -65,6 +65,8 @@ from teb_vae.lag_slot_transformer_cfs.nets.model import (  # noqa: E402
 )
 from teb_vae.lag_slot_transformer_cfs.task import (  # noqa: E402
     TASK_METRIC_SUFFIXES,
+    PROPOSAL_RIDGE_KEY,
+    TRAIN_MC_DRAWS_KEY,
     VALIDATION_MC_DRAWS_KEY,
     VALIDATION_MONITOR_SUFFIXES,
     SeqVaeLagResidualTrfCfsTask,
@@ -96,6 +98,9 @@ TRANSFERABLE_PREFIXES: Tuple[str, ...] = (
     "clock_proj.",
     "horizon_core.",
     "decoder.",
+    # The AR(1) coefficient of the forecast density: one parameter for both branches, trained by
+    # the target-only arm, so it transfers with the decoder it was fitted beside.
+    "target_ar_logit",
 )
 
 #: Prefixes a transfer deliberately leaves at their constructed values, and re-zeroes afterwards.
@@ -418,6 +423,16 @@ class LagResidualTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
         super().create_model()
         self._log_lag_geometry()
         self._configure_validation_monitor()
+        # The objective's mixture draw count, onto the task's saved hyperparameters by the route
+        # the monitor's takes. The task validates it; an absent key is the single-draw objective.
+        vae_config = model_config.get("VAE_model") or {}
+        draws = vae_config.get(TRAIN_MC_DRAWS_KEY)
+        if draws is not None:
+            self.apply_config_hyperparameters({TRAIN_MC_DRAWS_KEY: int(draws)}, self.pl_model)
+            logger.info(f"reconstruction mixture: K={int(draws)} paired draws per anchor")
+        ridge = vae_config.get(PROPOSAL_RIDGE_KEY)
+        if ridge is not None:
+            self.apply_config_hyperparameters({PROPOSAL_RIDGE_KEY: float(ridge)}, self.pl_model)
 
         if warm_start is None:
             return
