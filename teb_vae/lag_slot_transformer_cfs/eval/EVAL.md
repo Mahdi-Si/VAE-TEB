@@ -394,7 +394,7 @@ was.
    measured resources at the declared batch and draw counts. Record the decision in the run log
    below. No arm is promoted on `pred_gap_weighted`, on `mean_pred_gap`, or on its own internal
    gap alone.
-4. **The two controls.** Set `base:` of `capacity_control.yaml` and `mean_only.yaml` to the
+4. **The two controls.** Set `base:` of `capacity_control.yaml` and `sampled_latent.yaml` to the
    chosen bank profile -- `lag25.yaml` if the shortened bank was competitive, `joint.yaml`
    otherwise -- repoint their warm start at `-a`, train, and score under the chosen bank's
    evaluation profile.

@@ -206,6 +206,10 @@ class _StubModel:
         """
         self.decoder = decoder
 
+    def forecast_likelihood_kwargs(self):
+        """The factorised all-cells density: no scored-cell mask and no AR coefficient."""
+        return {"cell_mask": None, "ar_coef": None}
+
 
 def _scoring_fixture(*, batch=2, anchors=3, horizon=2, channels=2, d_z=4):
     """Build a stub model, a target and a mask at a small declared geometry.

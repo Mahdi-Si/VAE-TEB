@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -168,7 +169,10 @@ def test_the_predictive_monitor_reaches_the_history_on_the_validation_stage(fitt
         assert values.notna().all(), column
         assert f"train/{suffix}" not in history.columns
     gap = history["val/pred_nll_base_mc"] - history["val/pred_nll_full_mc"]
-    assert (gap - history["val/pred_gap_mc"]).abs().max() < 1e-4
+    # The columns are single precision, so the bound is a few of their own spacings at the block
+    # score's magnitude -- which grows with the scored block -- rather than a fixed number of nats.
+    magnitude = np.float32(history["val/pred_nll_full_mc"].abs().max())
+    assert (gap - history["val/pred_gap_mc"]).abs().max() <= 4.0 * float(np.spacing(magnitude))
 
 
 def test_no_column_names_a_tensor_this_architecture_lacks(fitted) -> None:

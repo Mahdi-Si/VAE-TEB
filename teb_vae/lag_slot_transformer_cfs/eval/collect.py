@@ -97,6 +97,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     calibration_report,
     calibration_sums,
     expected_anchors_per_sample,
+    forecast_likelihood_terms,
     horizon_block_sums,
     horizon_residual_sums,
     latent_health,
@@ -854,6 +855,7 @@ def objective_parity_scores(
     """
     channel_weight = getattr(model, "target_channel_weight", None)
     horizon_weight = getattr(model, "horizon_weight", None)
+    terms = forecast_likelihood_terms(model)
     full, _ = masked_raw_block_per_anchor(
         outputs["mu_full"],
         target,
@@ -862,6 +864,7 @@ def objective_parity_scores(
         logvar=outputs["logvar_full"],
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        **terms,
     )
     base, _ = masked_raw_block_per_anchor(
         outputs["mu_base"],
@@ -871,6 +874,7 @@ def objective_parity_scores(
         logvar=outputs["logvar_base"],
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        **terms,
     )
     return full, base
 
@@ -904,10 +908,11 @@ def mean_decoded_scores(
         ``{name: (B, A) per-anchor block score}``.
     """
     scores: Dict[str, torch.Tensor] = {}
+    terms = forecast_likelihood_terms(model)
     for name, (mu, _logvar) in branches.items():
         forecast_mu, forecast_logvar = model.decoder(mu, persistence=persistence)
         block, _contributing = masked_raw_block_per_anchor(
-            forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+            forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar, **terms
         )
         scores[name] = block
     return scores
@@ -1089,6 +1094,7 @@ def score_batch(
             name: calibration_census(
                 scored[name].cdf_sum, mask, levels=DEFAULT_COVERAGE_LEVELS,
                 block_split=block_split,
+                cell_mask=forecast_likelihood_terms(model)["cell_mask"],
             )
             for name in CALIBRATED_BRANCHES
             if scored[name].cdf_sum is not None
@@ -1193,11 +1199,16 @@ def shared_readout(
 
     # The training-path scores: the forward's own decoded forecasts under the one shared draw,
     # exactly as the objective sees them.
+    # Under the model's own density -- its scored cells and its AR(1) coefficient -- as every
+    # density readout below is, so each is a log-density of the density the model trained under.
+    terms = forecast_likelihood_terms(model)
     training_full, _ = masked_raw_block_per_anchor(
-        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"]
+        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"],
+        **terms,
     )
     training_base, _ = masked_raw_block_per_anchor(
-        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"]
+        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"],
+        **terms,
     )
     # The mean-decoded pair, and the two pairing controls where they ran.
     shared_branches = {
@@ -1293,7 +1304,7 @@ def shared_readout(
     baseline_logvar = torch.full((), BASELINE_LOGVAR, dtype=target.dtype, device=device)
     for name, baseline_mu in baselines.items():
         baseline_block, _ = masked_raw_block_per_anchor(
-            baseline_mu, target, mask, likelihood=likelihood, logvar=baseline_logvar
+            baseline_mu, target, mask, likelihood=likelihood, logvar=baseline_logvar, **terms
         )
         columns[f"nll_{name}_block"] = _per_sample_mean(baseline_block, contributing)
 
@@ -1303,7 +1314,7 @@ def shared_readout(
         "base": outputs["mu_base"], "full": outputs["mu_full"], **baselines
     }
     for name, point_mu in point_forecasts.items():
-        sums = masked_raw_error_sums(point_mu, target, mask)
+        sums = masked_raw_error_sums(point_mu, target, mask, cell_mask=terms["cell_mask"])
         scored_count = sums["n_coefficients"].to(torch.float64).clamp_min(1.0)
         columns[f"sq_error_{name}"] = sums["sum_sq"].to(torch.float64) / scored_count
         if name in ("base", "full"):
@@ -1320,10 +1331,10 @@ def shared_readout(
     # and the three warm-up tertile gaps -- so all of them are partial sums of the training-path
     # ``pred_gap`` they are read beside.
     base_by_channel = branch_channel_scores(
-        outputs["mu_base"], outputs["logvar_base"], target, mask, likelihood=likelihood
+        outputs["mu_base"], outputs["logvar_base"], target, mask, likelihood=likelihood, **terms
     )
     full_by_channel = branch_channel_scores(
-        outputs["mu_full"], outputs["logvar_full"], target, mask, likelihood=likelihood
+        outputs["mu_full"], outputs["logvar_full"], target, mask, likelihood=likelihood, **terms
     )
     gap_by_anchor_channel = base_by_channel - full_by_channel  # (B, A, C_keep)
     gap_per_channel = _per_sample_vector_mean(gap_by_anchor_channel, contributing)
@@ -1349,6 +1360,10 @@ def shared_readout(
     lo, hi = float(model.logvar_clamp[0]), float(model.logvar_clamp[1])
     floor_threshold = lo + LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
     ceil_threshold = hi - LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+    # The decoder's own bound, which the observation columns are read against.
+    obs_lo, obs_hi = (float(bound) for bound in model.obs_logvar_clamp)
+    obs_floor_threshold = obs_lo + LOGVAR_FLOOR_MARGIN_FRAC * (obs_hi - obs_lo)
+    obs_ceil_threshold = obs_hi - LOGVAR_FLOOR_MARGIN_FRAC * (obs_hi - obs_lo)
     columns["mean_logvar_prior"] = _per_sample_mean(logvar_prior.mean(dim=-1), contributing)
     columns["mean_logvar_post"] = _per_sample_mean(logvar_post.mean(dim=-1), contributing)
     columns["logvar_prior_floor_frac"] = _per_sample_mean(
@@ -1356,10 +1371,10 @@ def shared_readout(
     )
     columns["mean_logvar_full"] = _per_sample_element_mean(outputs["logvar_full"], mask)
     columns["logvar_full_floor_frac"] = _per_sample_element_mean(
-        (outputs["logvar_full"] <= floor_threshold).to(dtype), mask
+        (outputs["logvar_full"] <= obs_floor_threshold).to(dtype), mask
     )
     columns["logvar_full_ceil_frac"] = _per_sample_element_mean(
-        (outputs["logvar_full"] >= ceil_threshold).to(dtype), mask
+        (outputs["logvar_full"] >= obs_ceil_threshold).to(dtype), mask
     )
     # The saturation fractions in both framings: a flat mean over every element, and the same
     # over the scored anchors. The residual is the bounded update against its own bound, in
@@ -1419,7 +1434,7 @@ def shared_readout(
     calibration = (
         calibration_sums(
             outputs["mu_full"], outputs["logvar_full"], target, mask,
-            logvar_clamp=model.logvar_clamp,
+            logvar_clamp=model.obs_logvar_clamp, **terms,
         )
         if likelihood == "gaussian_nll"
         else {}
@@ -1461,9 +1476,9 @@ def shared_readout(
                 ("full", (outputs["mu_full"], outputs["logvar_full"])),
             )
             for statistic, value in {
-                **horizon_residual_sums(branch_mu, branch_logvar, target, mask),
+                **horizon_residual_sums(branch_mu, branch_logvar, target, mask, **terms),
                 **horizon_block_sums(
-                    branch_mu, branch_logvar, target, mask, likelihood=likelihood
+                    branch_mu, branch_logvar, target, mask, likelihood=likelihood, **terms
                 ),
             }.items()
         },
@@ -1787,6 +1802,8 @@ def arm_record(model: Any) -> Dict[str, Any]:
         "source_stem": None if source_disabled else str(getattr(model, "source_stem", "pointwise")),
         "lag_fusion": None if source_disabled else fusion,
         "mean_only_residual": bool(getattr(model, "mean_only_residual", False)),
+        "latent_sampling": bool(getattr(model, "latent_sampling", True)),
+        "center_proposals": bool(getattr(model, "center_proposals", False)),
         "source_scalar_lift": bool(getattr(model, "source_scalar_lift", False)),
         "source_values_withheld": bool(getattr(model, "source_values_withheld", False)),
         "lag_summation_scale": float(getattr(model, "lag_scale", 1.0)),
@@ -2306,7 +2323,7 @@ def family_results(
         sq_error_per_channel_base=list(overall_vectors.get("sq_error_per_channel_base", [])),
         sq_error_per_channel_full=list(overall_vectors.get("sq_error_per_channel_full", [])),
     )
-    clamp = model.logvar_clamp
+    clamp = model.obs_logvar_clamp
     calibration = calibration_report(
         {name: value.detach().cpu() for name, value in calibration_totals.items()},
         logvar_clamp=clamp,
@@ -2796,6 +2813,7 @@ def bounds_record(model: Any) -> Dict[str, Any]:
     lo, hi = float(model.logvar_clamp[0]), float(model.logvar_clamp[1])
     return {
         "logvar_clamp": [lo, hi],
+        "obs_logvar_clamp": [float(bound) for bound in model.obs_logvar_clamp],
         "logvar_margin_frac": float(LOGVAR_FLOOR_MARGIN_FRAC),
         "logvar_margin": float(LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)),
         "mu_scale": float(model.mu_scale),

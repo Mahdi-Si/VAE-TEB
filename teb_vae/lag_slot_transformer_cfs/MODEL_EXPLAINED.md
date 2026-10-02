@@ -1,5 +1,7 @@
 # The FHR-anchored lag-residual Transformer: from signals to forecasts
 
+> **Revised 2026-10-02.** This explanation describes the model as first implemented. The shipped model has since changed its forecast density, its source pathway and its headline estimator; the amendment at the top of [DESIGN.md](DESIGN.md) states each change and is authoritative wherever the two disagree. Geometry and arm tables below are the earlier ones.
+
 This is a standalone explanation of the model implemented in `teb_vae/lag_slot_transformer_cfs`, its dataset, mathematics, training, and evaluation. It describes the working-tree implementation inspected on **2026-09-10**, at repository commit `63d0623`, together with the supplied configurations. Numerical examples use the production configuration unless explicitly marked otherwise.
 
 The implemented class is **`SeqVaeLagResidualTrfCfs`**, with model kind `fhr_lag_residual_cfs_v1`. Despite the directory name, the current model does **not** create a stochastic latent slot for each lag. That was an earlier proposal preserved in `DESIGN_V1_SUPERSEDED.md`. The current model has one latent space, a target-only Gaussian over that space, and a source-conditioned Gaussian obtained by changing the first Gaussian's parameters. “Lag slots” now refer to deterministic, separately indexed source proposals before they are summed.

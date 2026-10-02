@@ -89,12 +89,20 @@ TASK_METRIC_SUFFIXES: Tuple[str, ...] = (
     "cancellation_ratio_mean",
     "cancellation_ratio_scale",
     "lag_available_frac",
+    "proposal_ridge_rate",
 )
 
 #: The hyperparameter that switches the predictive validation monitor on: the draw count $K$, or
 #: ``None`` for the legacy validation surface. Named once, because the driver reads the same key
 #: off the configuration and hands it to the task by this name.
 VALIDATION_MC_DRAWS_KEY = "validation_mc_draws"
+
+#: The hyperparameter naming how many paired latent draws the objective's reconstruction is a
+#: mixture over, on every stage. One is the single-draw conditional score.
+TRAIN_MC_DRAWS_KEY = "train_mc_draws"
+
+#: The hyperparameter weighting the lag-weighted ridge over individual proposals.
+PROPOSAL_RIDGE_KEY = "proposal_ridge"
 
 #: The monitor's three columns, produced on the dense stages alone and only when the draw count is
 #: set. Kept apart from :data:`TASK_METRIC_SUFFIXES` for both reasons: a training batch never
@@ -176,6 +184,8 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
         base_model: Any,
         *,
         validation_mc_draws: Optional[int] = None,
+        train_mc_draws: int = 1,
+        proposal_ridge: float = 0.0,
         **kwargs: Any,
     ) -> None:
         r"""Initialize the task.
@@ -187,12 +197,21 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
                 hyperparameter so a resumed run monitors what it monitored before it stopped; the
                 driver applies the configured value after construction, by the route the seed
                 takes.
+            train_mc_draws: The draw count $K$ of the objective's reconstruction mixture, on
+                every stage, so ``val/total_loss`` is the quantity ``train/total_loss`` is.
+                Applied by the driver the same way.
+            proposal_ridge: Weight on the lag-weighted ridge over individual proposals.
             **kwargs: Every other keyword, forwarded to the inherited constructor unchanged.
 
         Raises:
-            ValueError: If the draw count is set and is not a positive integer.
+            ValueError: If either draw count is set and is not a positive integer.
         """
         super().__init__(base_model, **kwargs)
+        if isinstance(train_mc_draws, bool) or int(train_mc_draws) < 1:
+            raise ValueError(
+                f"{TRAIN_MC_DRAWS_KEY}={train_mc_draws!r} must be a positive integer; a mixture "
+                f"over no draws is not a score."
+            )
         if validation_mc_draws is not None and (
             isinstance(validation_mc_draws, bool) or int(validation_mc_draws) < 1
         ):
@@ -201,7 +220,7 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
                 f"or null; the monitor is a mixture over that many draws and a mixture over "
                 f"none is not a score."
             )
-        self.save_hyperparameters(VALIDATION_MC_DRAWS_KEY)
+        self.save_hyperparameters(VALIDATION_MC_DRAWS_KEY, TRAIN_MC_DRAWS_KEY, PROPOSAL_RIDGE_KEY)
         # The clip counters. Device tensors rather than Python numbers so the exceedance
         # indicator never forces a host synchronisation on the training step; reset at every
         # training epoch start and read at its last batch.
@@ -253,6 +272,9 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
             scored_weight=model.scored_weight,
             channel_weight=getattr(model, "target_channel_weight", None),
             horizon_weight=getattr(model, "horizon_weight", None),
+            # Bound, not called: the AR(1) coefficient is a parameter and the page must score
+            # under its value at the epoch it is drawn.
+            likelihood_terms=model.forecast_likelihood_kwargs,
         )
 
     def _mu_gap_rms(
@@ -388,6 +410,8 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
                 lambda_base=float(self.hparams.get("lambda_base", 1.0)),
                 likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
                 free_bits=float(self.hparams.get("free_bits", 0.0)),
+                mc_draws=int(self.hparams.get(TRAIN_MC_DRAWS_KEY) or 1),
+                proposal_ridge=float(self.hparams.get(PROPOSAL_RIDGE_KEY) or 0.0),
             )["metrics"]
         finally:
             self._stage = DENSE_STAGES[0]
@@ -487,6 +511,12 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
                 key = f"cancellation_ratio_{channel}"
                 if key in forward_outputs:
                     readouts[key] = masked_mean(forward_outputs[key])
+            # The ridge's own rate, in nats per anchor beside the divergence it is read against;
+            # absent on an arm that produces no per-lag proposals.
+            if "proposal_ridge_per_anchor" in forward_outputs:
+                readouts["proposal_ridge_rate"] = masked_mean(
+                    0.5 * forward_outputs["proposal_ridge_per_anchor"]
+                )
         return readouts
 
     # ------------------------------------------------------------------

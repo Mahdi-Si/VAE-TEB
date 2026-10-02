@@ -261,6 +261,7 @@ class LagResidualCore(nn.Module):
         encoder_d_ff: int,
         target_attention_blocks: int,
         logvar_clamp: Tuple[float, float],
+        obs_logvar_clamp: Optional[Tuple[float, float]],
         mu_scale: float,
         coverage_floor: float,
         persistence_residual: bool,
@@ -268,8 +269,12 @@ class LagResidualCore(nn.Module):
         residual_mu_scale: float,
         residual_logsigma_scale: float,
         lag_embed_dim: int,
+        lag_basis_dim: Optional[int],
+        lag_dropout: float,
+        latent_sampling: bool,
         proposal_hidden: Optional[int],
         mean_only_residual: bool,
+        center_proposals: bool,
         source_scalar_lift: bool,
         source_disabled: bool,
         source_values_withheld: bool,
@@ -319,9 +324,14 @@ class LagResidualCore(nn.Module):
                 the latent, which this architecture does not partition.
             encoder_d_ff: Feed-forward width inside the target encoder.
             target_attention_blocks: Causal Transformer blocks in the target encoder.
-            logvar_clamp: The prior's log-variance bound, and the decoder's observation
-                log-variance bound. The **full** log-variance is not bounded by it: it is the
-                prior's plus a bounded residual, so its range is wider by twice the scale bound.
+            logvar_clamp: The prior's log-variance bound. The **full** log-variance is not bounded
+                by it: it is the prior's plus a bounded residual, so its range is wider by twice
+                the scale bound.
+            obs_logvar_clamp: The decoder's observation log-variance bound, or ``None`` to share
+                ``logvar_clamp``. Separate because the two bound different distributions: a
+                near-step coefficient under the persistence shortcut, and an AR(1) innovation
+                still more so, has a variance far below anything a latent scale needs, and one
+                shared floor pins the short-horizon forecasts too wide.
             mu_scale: Bound on the prior mean.
             coverage_floor: Minimum valid fraction of an anchor's forecast window.
             persistence_residual: Whether the decoder's mean carries a weighted copy of the
@@ -331,9 +341,35 @@ class LagResidualCore(nn.Module):
             residual_mu_scale: $a_{\max}$, the mean bound **in prior standard deviations**.
             residual_logsigma_scale: $b_{\max}$, the bound on the log-standard-deviation residual.
             lag_embed_dim: Width of the lag embedding.
+            lag_basis_dim: Smooth cosine basis functions the lag identity is expanded on, or
+                ``None`` for one free embedding per lag. Read by the local proposal head; inert
+                under attention fusion, whose per-lag key bias is its own.
+            lag_dropout: Probability, per training sample, that the lag bank is truncated at a
+                uniformly drawn cutoff -- every lag beyond it suppressed through the selector.
+                Nested, so the model is trained on every keep-prefix of its bank and a
+                suppression readout scores a configuration it has seen rather than one it must
+                extrapolate to. Training mode only, and only where the caller passes no selector.
+            latent_sampling: Whether the two branches are decoded at paired **samples** of their
+                distributions. ``False`` decodes both at their means: the predictive density of
+                each branch is then the decoder's own, its block score is exact, and the gap
+                between them is a computed difference rather than a Monte Carlo estimate whose
+                bias differs by branch. The scale half of the update has nothing to act on there,
+                so the deterministic arm must be mean-only.
             proposal_hidden: Body width of the proposal head, or ``None`` for ``d_model``.
             mean_only_residual: Build no scale-proposal parameters, so the full distribution
                 differs from the prior in its mean alone.
+            center_proposals: Subtract from every proposal the same head's response to that
+                lag's **null** source vector -- the encoding of an all-zero stream, availability
+                kept --
+
+                $$r_{t,\ell} = F_\theta(h_t, E_{t,\ell}, \zeta_\ell)
+                             - F_\theta(h_t, E^{0}_{t,\ell}, \zeta_\ell),$$
+
+                so a source at its training mean updates nothing, exactly, for any parameters.
+                What the head can compute from the target state, the lag identity and the
+                availability schedule alone is target-only information the prior already owns;
+                uncentred, it is paid for as source divergence and can hide in per-lag terms that
+                cancel in the sum. Inert on the target-only arm, which has no head to centre.
             source_disabled: Build **no** source pathway at all -- no pointwise encoder, no lag
                 embeddings, no proposal head. The full distribution is then the prior, the
                 divergence is exactly zero, and the model is a target-only forecaster on the same
@@ -437,6 +473,23 @@ class LagResidualCore(nn.Module):
                 f"bias already provides -- a different arm answering a different question, under "
                 f"a name that says otherwise."
             )
+        if not 0.0 <= float(lag_dropout) < 1.0:
+            raise ValueError(f"lag_dropout is a probability in [0, 1), got {lag_dropout}")
+        if not bool(latent_sampling) and not bool(mean_only_residual) and not bool(source_disabled):
+            raise ValueError(
+                "latent_sampling=False decodes both branches at their means, where the scale "
+                "half of the update acts on nothing: it would be a parameter block reached by "
+                "the divergence penalty alone and trained to zero. Set mean_only_residual: true "
+                "on the deterministic arm."
+            )
+        if bool(center_proposals) and bool(source_values_withheld):
+            raise ValueError(
+                "center_proposals and source_values_withheld cannot both be set: with the values "
+                "withheld every source vector IS its null, so the centred update is exactly zero "
+                "for any parameters and the head would be a parameter block no gradient reaches. "
+                "The capacity control measures what centring removes; set center_proposals: false "
+                "on that arm."
+            )
         if str(lag_fusion) == "attention" and lag_scale is not None:
             raise ValueError(
                 f"lag_scale={lag_scale} was given under attention fusion, which performs no "
@@ -474,6 +527,11 @@ class LagResidualCore(nn.Module):
         self.n_lags = int(max_lag) + 1
         self.mu_scale = float(mu_scale)
         self.logvar_clamp = (float(logvar_clamp[0]), float(logvar_clamp[1]))
+        self.obs_logvar_clamp = (
+            self.logvar_clamp
+            if obs_logvar_clamp is None
+            else (float(obs_logvar_clamp[0]), float(obs_logvar_clamp[1]))
+        )
         self.coverage_floor = float(coverage_floor)
         self.persistence_residual = bool(persistence_residual)
         self.residual_mu_scale = float(residual_mu_scale)
@@ -482,6 +540,10 @@ class LagResidualCore(nn.Module):
         self.source_scalar_lift = bool(source_scalar_lift)
         self.source_disabled = bool(source_disabled)
         self.source_values_withheld = bool(source_values_withheld)
+        self.center_proposals = bool(center_proposals) and not self.source_disabled
+        self.latent_sampling = bool(latent_sampling)
+        self.lag_dropout = float(lag_dropout)
+        self.lag_basis_dim = None if lag_basis_dim is None else int(lag_basis_dim)
         self.source_stem = str(source_stem)
         self.lag_fusion = str(lag_fusion)
         self.lag_attention_heads = int(lag_attention_heads)
@@ -517,6 +579,15 @@ class LagResidualCore(nn.Module):
                 horizon_decay_weight(self.horizon_weight_halflife_steps, self.horizon),
                 persistent=False,
             )
+
+        # The lag ridge's weights $\omega_\ell = 2(\ell + 1)/(L + 1)$: increasing with lag and of
+        # mean one, so the ridge shrinks the far end of the bank hardest and an over-long bank
+        # costs little. Non-persistent, a function of the lag count alone.
+        self.register_buffer(
+            "lag_ridge_weight",
+            2.0 * torch.arange(1, self.n_lags + 1, dtype=torch.float32) / float(self.n_lags + 1),
+            persistent=False,
+        )
 
         # The metadata clock. Built once because it is a function of stored position and the
         # sequence length alone -- no source value and no recording-dependent quantity reaches it.
@@ -624,6 +695,7 @@ class LagResidualCore(nn.Module):
                     lag_embed_dim=int(lag_embed_dim),
                     hidden=proposal_hidden,
                     mean_only=self.mean_only_residual,
+                    lag_basis_dim=self.lag_basis_dim,
                 )
 
         # One shared decoder, invoked twice per forward and receiving no source-derived tensor.
@@ -646,7 +718,7 @@ class LagResidualCore(nn.Module):
             out_channels=self.decoder_out_channels,
             d_hidden=int(decoder_hidden),
             dropout=0.0,
-            logvar_clamp=self.logvar_clamp,
+            logvar_clamp=self.obs_logvar_clamp,
             persistence_residual=self.persistence_residual,
         )
 
@@ -860,6 +932,10 @@ class LagResidualCore(nn.Module):
         Returns:
             ``(z_prior, z_full)``, both $(B, A, d_z)$.
         """
+        if not self.latent_sampling:
+            # The deterministic arm: each branch is decoded at its mean, so its predictive density
+            # is the decoder's own and the two block scores are exact.
+            return mu_prior, mu_full
         epsilon = torch.randn_like(mu_prior)
         z_prior = mu_prior + epsilon * torch.exp(0.5 * logvar_prior)
         z_full = mu_full + epsilon * torch.exp(0.5 * logvar_full)
@@ -983,10 +1059,10 @@ class LagResidualCore(nn.Module):
         bitwise-at-initialisation property is preserved. Initialisation only, for a freshly trained
         model: applying it to transferred weights would discard what they carry.
         """
-        lo, hi = self.logvar_clamp
+        lo, hi = self.obs_logvar_clamp
         if not lo < 0.0 < hi:
             raise ValueError(
-                f"output-head calibration needs 0 inside logvar_clamp, got ({lo}, {hi})"
+                f"output-head calibration needs 0 inside obs_logvar_clamp, got ({lo}, {hi})"
             )
         self.decoder.mean_head.weight.data.mul_(0.02)
         self.decoder.logvar_head.bias.data.fill_(math.log((0.0 - lo) / (hi - 0.0)))

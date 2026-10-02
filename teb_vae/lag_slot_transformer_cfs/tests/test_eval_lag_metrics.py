@@ -30,7 +30,6 @@ TAIL_DIAGNOSTIC_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag91_tail_diagnostic.ya
 #: and the committed delta are read on.
 SHORT_PROFILE_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag25_eval_overrides.yaml"
 SHORT_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "lag25.yaml"
-WIDE_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "default.yaml"
 
 #: The wide window's hand-declared partition, carried today by the tail diagnostic profile.
 WIDE_PARTITION = ("anchor", "near", "mid", "far")
@@ -47,7 +46,9 @@ SHIPPED_PROFILES = {
         SHORT_TRAINING_CONFIG,
         ("instant", "recent", "intermediate", "tail"),
     ),
-    "tail_diagnostic": (TAIL_DIAGNOSTIC_PATH, WIDE_TRAINING_CONFIG, WIDE_PARTITION),
+    # No shipped training configuration searches the old wide window any more, so this profile
+    # is read on the window its own bands end on.
+    "tail_diagnostic": (TAIL_DIAGNOSTIC_PATH, None, WIDE_PARTITION),
 }
 
 
@@ -76,7 +77,11 @@ def shipped_profile(request):
         ``(bands, max_lag, partition names)``.
     """
     path, training, partition = SHIPPED_PROFILES[request.param]
-    max_lag = _max_lag_of(training)
+    max_lag = (
+        max(int(high) for _low, high in _bands_of(path).values())
+        if training is None
+        else _max_lag_of(training)
+    )
     bands = _resolved_bands_of(path, max_lag)
     if partition is None:
         partition = tuple(name for name in bands if name.startswith("lags_"))

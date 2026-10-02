@@ -54,3 +54,6 @@ model_config:
     # learned per-channel constant, and alongside the convolution stem, over which a value-free
     # stream is a constant the stem's own bias already provides.
     source_values_withheld: true
+    # Centring subtracts exactly what this arm measures, and would make its update identically
+    # zero; the constructor refuses the pair.
+    center_proposals: false

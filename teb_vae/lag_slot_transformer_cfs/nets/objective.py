@@ -35,7 +35,8 @@ block's magnitude alone, so what each states is a distribution over its own axis
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import math
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -86,6 +87,33 @@ def _all_reduce_sum(values: torch.Tensor) -> torch.Tensor:
     return reduced
 
 
+def mixture_block(blocks: Sequence[torch.Tensor], likelihood: str) -> torch.Tensor:
+    r"""Reduce per-draw block scores to the score of their equal-weight mixture.
+
+    $$D^{(K)} = \log K - \operatorname{logsumexp}_{k}\bigl(-D^{(k)}\bigr),$$
+
+    the negative log of the average likelihood, which is what the predictive evaluation scores.
+    The average of the per-draw scores is an upper bound on it by Jensen's inequality, and
+    training on that bound charges every draw for explaining the future alone -- which a
+    deterministic latent minimises. Under ``'mse'`` there is no likelihood to average and the
+    draws are averaged directly.
+
+    Args:
+        blocks: Per-anchor block scores $(B, A)$, one per draw. A single draw is returned as it
+            stands, so a one-draw objective is bitwise the single-draw one.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+
+    Returns:
+        The mixture score $(B, A)$.
+    """
+    if len(blocks) == 1:
+        return blocks[0]
+    stacked = torch.stack(list(blocks), dim=0)
+    if likelihood == "mse":
+        return stacked.mean(dim=0)
+    return math.log(len(blocks)) - torch.logsumexp(-stacked, dim=0)
+
+
 def compute_residual_objective(
     forward_outputs: Dict[str, torch.Tensor],
     target: torch.Tensor,
@@ -95,8 +123,13 @@ def compute_residual_objective(
     block_width: int,
     coverage_floor: float,
     logvar_clamp: Tuple[float, float],
+    obs_logvar_clamp: Optional[Tuple[float, float]] = None,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
+    extra_draws: Sequence[Mapping[str, torch.Tensor]] = (),
+    proposal_ridge: float = 0.0,
     beta: float = 1.0,
     beta_prior: float = 0.0,
     lambda_full: float = 1.0,
@@ -124,10 +157,21 @@ def compute_residual_objective(
         block_width: What the target's last axis counts. Used only by the log-variance
             diagnostics, so a wrong value changes no gradient and rescales exactly those numbers.
         coverage_floor: Minimum valid fraction of an anchor's forecast window.
-        logvar_clamp: The bound the log-variance diagnostics are read against.
+        logvar_clamp: The prior's bound, which the prior-floor diagnostic is read against.
+        obs_logvar_clamp: The decoder's bound, which the observation floor and ceiling
+            diagnostics are read against; ``None`` shares ``logvar_clamp``.
         channel_weight: Per-channel weight on the block's last axis, or ``None`` for the uniform
             objective.
         horizon_weight: Per-step weight on the horizon axis, or ``None``.
+        cell_mask: The $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None`` to score every cell.
+        ar_coef: The $(C_{\mathrm{keep}},)$ AR(1) coefficient of the residual along the horizon,
+            or ``None`` for the factorised score.
+        extra_draws: Further paired draws of both forecasts, each a mapping carrying the four
+            forecast keys. With any, each reconstruction term is the :func:`mixture_block` of the
+            forward's draw and these. The log-variance diagnostics read the forward's draw.
+        proposal_ridge: Weight on $\tfrac12$ the forward's ``proposal_ridge_per_anchor``, the
+            lag-weighted sum of squared per-lag proposal norms. Zero, or a forward that emits no
+            such key (an arm with no per-lag proposals), adds nothing.
         beta: Weight on the divergence.
         beta_prior: Weight on the prior scale rate.
         lambda_full: Weight on the full-forecast reconstruction.
@@ -168,29 +212,40 @@ def compute_residual_objective(
     # second axis to reconcile.
     support = contributing_anchors(mask)  # (B, A)
 
-    full_block, _ = masked_raw_block_per_anchor(
-        forward_outputs["mu_full"],
-        target,
-        mask,
-        likelihood=likelihood,
-        logvar=forward_outputs["logvar_full"],
-        channel_weight=channel_weight,
-        horizon_weight=horizon_weight,
-    )
-    base_block, _ = masked_raw_block_per_anchor(
-        forward_outputs["mu_base"],
-        target,
-        mask,
-        likelihood=likelihood,
-        logvar=forward_outputs["logvar_base"],
-        channel_weight=channel_weight,
-        horizon_weight=horizon_weight,
-    )
+    def branch_block(branch: str) -> torch.Tensor:
+        """One branch's per-anchor score: the mixture over the forward's draw and any further."""
+        return mixture_block(
+            [
+                masked_raw_block_per_anchor(
+                    draw[f"mu_{branch}"],
+                    target,
+                    mask,
+                    likelihood=likelihood,
+                    logvar=draw[f"logvar_{branch}"],
+                    channel_weight=channel_weight,
+                    horizon_weight=horizon_weight,
+                    cell_mask=cell_mask,
+                    ar_coef=ar_coef,
+                )[0]
+                for draw in (forward_outputs, *extra_draws)
+            ],
+            likelihood,
+        )
+
+    full_block = branch_block("full")
+    base_block = branch_block("base")
 
     kld_dim = forward_outputs["kld_per_anchor_dim"]
     kld_train_dim = kld_dim.clamp(min=float(free_bits)) if free_bits > 0.0 else kld_dim
     kl_train_anchor = kld_train_dim.sum(dim=-1) * support
     kl_raw_anchor = kld_dim.sum(dim=-1) * support
+
+    ridge_per_anchor = forward_outputs.get("proposal_ridge_per_anchor")
+    ridge_anchor = (
+        kl_raw_anchor * 0.0
+        if ridge_per_anchor is None or float(proposal_ridge) == 0.0
+        else 0.5 * ridge_per_anchor * support
+    )
 
     logvar_prior = forward_outputs["logvar_prior"]
     prior_rate_anchor = (
@@ -227,6 +282,7 @@ def compute_residual_objective(
             + base_block.sum()
             + kl_train_anchor.sum()
             + prior_rate_anchor.sum()
+            + ridge_anchor.sum()
         ) * 0.0
         return {
             "metrics": _empty_metrics(zero, beta, beta_prior, device, dtype),
@@ -250,6 +306,7 @@ def compute_residual_objective(
         + lambda_base * nll_base_block
         + beta * kl_train
         + beta_prior * prior_rate
+        + float(proposal_ridge) * ridge_anchor.sum() * scale
     )
 
     metrics = _reported_metrics(
@@ -260,6 +317,7 @@ def compute_residual_objective(
         support=support,
         block_width=block_width,
         logvar_clamp=logvar_clamp,
+        obs_logvar_clamp=logvar_clamp if obs_logvar_clamp is None else obs_logvar_clamp,
         kld_dim=kld_dim,
         beta=beta,
         beta_prior=beta_prior,
@@ -309,6 +367,7 @@ def _reported_metrics(
     support: torch.Tensor,
     block_width: int,
     logvar_clamp: Tuple[float, float],
+    obs_logvar_clamp: Tuple[float, float],
     kld_dim: torch.Tensor,
     beta: float,
     beta_prior: float,
@@ -330,7 +389,8 @@ def _reported_metrics(
         mask: The forecast mask $(B, A, H)$.
         support: The contributing-anchor indicator $(B, A)$.
         block_width: What the block's last axis counts.
-        logvar_clamp: The bound the log-variance diagnostics are read against.
+        logvar_clamp: The prior's bound, for the prior-floor diagnostic.
+        obs_logvar_clamp: The decoder's bound, for the observation floor and ceiling diagnostics.
         kld_dim: The per-coordinate divergence $(B, A, d_z)$.
         beta: The divergence weight, echoed.
         beta_prior: The prior-rate weight, echoed.
@@ -355,6 +415,8 @@ def _reported_metrics(
 
         lo, hi = logvar_clamp
         bound_margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+        obs_lo, obs_hi = obs_logvar_clamp
+        obs_margin = LOGVAR_FLOOR_MARGIN_FRAC * (obs_hi - obs_lo)
         elem_mask = mask[..., None]
         elem_denom = (elem_mask.sum() * float(block_width)).clamp_min(1.0)
         logvar_full = forward_outputs["logvar_full"]
@@ -395,7 +457,14 @@ def _reported_metrics(
             # it stays comparable with the block column whatever the mask density.
             "nll_full_sample": nll_full / block_elements,
             "nll_base_sample": nll_base / block_elements,
-            "pred_gap": nll_base - nll_full,
+            # Differenced in the reduction's own double precision: the two block means grow with
+            # the scored block and their gap does not, so a single-precision difference of the
+            # rounded means loses the gap's trailing digits.
+            "pred_gap": torch.tensor(
+                float(totals[index["nll_base"]] - totals[index["nll_full"]]) / global_n,
+                device=device,
+                dtype=dtype,
+            ),
             "source_conditioned_kl_train": global_mean("kl_train"),
             "source_conditioned_kl_raw": global_mean("kl_raw"),
             "prior_rate": global_mean("prior_rate"),
@@ -418,10 +487,10 @@ def _reported_metrics(
                 forward_outputs["logvar_base"] * elem_mask
             ).sum() / elem_denom,
             "logvar_full_floor_frac": (
-                (logvar_full <= lo + bound_margin).to(dtype) * elem_mask
+                (logvar_full <= obs_lo + obs_margin).to(dtype) * elem_mask
             ).sum() / elem_denom,
             "logvar_full_ceil_frac": (
-                (logvar_full >= hi - bound_margin).to(dtype) * elem_mask
+                (logvar_full >= obs_hi - obs_margin).to(dtype) * elem_mask
             ).sum() / elem_denom,
             "mean_logvar_prior": mean_logvar_prior,
             "mean_logvar_post": mean_logvar_post,
@@ -467,4 +536,5 @@ __all__ = [
     "LIKELIHOOD_CHOICES",
     "REDUCED_TERMS",
     "compute_residual_objective",
+    "mixture_block",
 ]

@@ -181,8 +181,9 @@ def test_a_replacement_leaves_the_clock_and_the_availability_announcement_untouc
 def test_a_replacement_moves_the_full_branch_with_the_selectors_still_enabled(matched) -> None:
     """That is what makes it a different question from suppression: the head still runs.
 
-    A valid standardized zero is an observation rather than an absence, so this arm's full branch
-    is not required to equal the prior -- and no code path here forces it to.
+    Uncentred, a valid standardized zero is an observation the head may react to. Centred -- the
+    shipped arm -- a stream of zeros is every lag's null vector, so the update is exactly zero and
+    the full branch IS the prior, with the selectors still enabled.
     """
     model, streams, outputs = matched
     y_st, y_ph, u_stream = streams
@@ -192,7 +193,10 @@ def test_a_replacement_moves_the_full_branch_with_the_selectors_still_enabled(ma
         replaced = model(y_st, y_ph, substituted, anchor_phase=0, anchor_stride=1)
 
     assert float((replaced["mu_post"] - outputs["mu_post"]).abs().max()) > 0.0
-    assert float((replaced["mu_post"] - replaced["mu_prior"]).abs().max()) > 0.0
+    if model.center_proposals:
+        assert torch.equal(replaced["mu_post"], replaced["mu_prior"])
+    else:
+        assert float((replaced["mu_post"] - replaced["mu_prior"]).abs().max()) > 0.0
 
 
 def test_the_constant_arm_removes_temporal_variation_and_keeps_the_level(matched) -> None:
