@@ -160,25 +160,31 @@ def test_suppressing_one_band_is_local_to_that_band() -> None:
 # =================================================================================================
 # A real zero is an observation
 # =================================================================================================
-def test_an_observed_standardized_zero_is_not_treated_as_absence() -> None:
-    """Absence and a real zero are different events, and only one of them silences a lag.
+def test_a_source_at_its_null_updates_nothing_only_when_proposals_are_centred() -> None:
+    """A stream of exact zeros is observed -- mask one wherever the channel has warmed up -- and
+    is every lag's null vector.
 
-    A source stream of exact zeros carries mask one wherever the channel has warmed up, so its
-    coefficients are observations that happen to sit at the mean. The model must be free to react
-    to them: nothing here centres the proposal on its response to a zero input, and nothing equates
-    a zero value with a missing one.
+    Centred, the update there is exactly zero for any parameters: whatever the head computes from
+    the target state, the lag identity and the availability bits alone is target-only information
+    and never reaches the latent. Uncentred, the same head reacts to it, which is the leak the
+    centring removes. Either way an observed value off the null moves the update.
     """
-    model = build_model(trained=True)
     y_st, y_ph, u_stream = tiny_streams()
     zeros = torch.zeros_like(u_stream)
 
-    observed = run(model, streams=(y_st, y_ph, zeros), return_proposals=True)
+    centred = build_model(trained=True)
+    at_null = run(centred, streams=(y_st, y_ph, zeros), return_proposals=True)
+    assert bool(at_null["lag_valid"].any())
+    assert torch.all(at_null["mean_proposals"] == 0.0)
+    assert torch.equal(at_null["mu_post"], at_null["mu_prior"])
+    assert float(at_null["kld_per_anchor"].abs().max()) == 0.0
+    off_null = run(centred, streams=(y_st, y_ph, u_stream))
+    assert not torch.all(off_null["update_mean"] == 0.0)
 
-    # The mask says the coefficients are present.
-    assert bool(observed["lag_valid"].any())
-    # And the model does react, rather than falling back on the prior.
-    assert not torch.all(observed["update_mean"] == 0.0)
-    assert not torch.allclose(observed["mu_post"], observed["mu_prior"])
+    uncentred = build_model(trained=True, center_proposals=False)
+    reacted = run(uncentred, streams=(y_st, y_ph, zeros))
+    assert not torch.all(reacted["update_mean"] == 0.0)
+    assert not torch.allclose(reacted["mu_post"], reacted["mu_prior"])
 
     # Which is exactly what distinguishes it from absence, measured side by side.
     absent = run(
@@ -340,3 +346,63 @@ def test_the_source_pathway_leaves_the_zero_start_after_a_few_steps() -> None:
     model.eval()
     outputs = run(model)
     assert float(outputs["kld_per_anchor"].sum()) > 0.0
+
+
+# =================================================================================================
+# The exact arm, the lag axis and the nested truncation
+# =================================================================================================
+def test_the_deterministic_arm_decodes_at_the_means_and_refuses_what_it_cannot_use() -> None:
+    """Decoded at the means both forecasts are functions of the inputs alone, so two seeds agree
+    bitwise, a mixture over further draws is refused, and so is a scale half that would act on
+    nothing."""
+    model = build_model(trained=True, latent_sampling=False, mean_only_residual=True)
+    first, second = run(model, seed=0), run(model, seed=1)
+
+    assert torch.equal(first["z_prior"], first["mu_prior"])
+    assert torch.equal(first["z_post"], first["mu_post"])
+    assert torch.equal(first["mu_full"], second["mu_full"])
+    target = torch.cat(tiny_streams()[:2], dim=-1)
+    weight = torch.ones(TINY_BATCH, TINY_SEQ_LEN)
+    with pytest.raises(ValueError, match="mc_draws"):
+        model.compute_loss(first, target, weight=weight, mc_draws=2)
+    with pytest.raises(ValueError, match="mean_only_residual"):
+        build_tiny_model(latent_sampling=False)
+
+
+def test_the_lag_basis_ties_neighbouring_lags_and_the_ridge_reads_every_proposal() -> None:
+    """Under a lag basis the head holds one embedding row per basis function, and the ridge the
+    forward emits is the lag-weighted sum of squared scaled proposal norms -- which, unlike the
+    divergence, is positive for proposals that cancel in the sum."""
+    basis_dim = 3
+    model = build_model(trained=True, lag_basis_dim=basis_dim)
+    head = model.proposal_head
+    assert head.lag_embedding.weight.shape[0] == basis_dim
+    assert head.lag_basis.shape == (TINY_N_LAGS, basis_dim)
+
+    outputs = run(model, return_proposals=True)
+    squared = outputs["mean_proposals"].pow(2).sum(dim=-1) + outputs["scale_proposals"].pow(2).sum(dim=-1)
+    expected = (model.lag_scale**2) * (squared * model.lag_ridge_weight).sum(dim=-1)
+    assert torch.allclose(outputs["proposal_ridge_per_anchor"], expected, rtol=1e-5, atol=1e-7)
+    assert float(model.lag_ridge_weight.mean()) == pytest.approx(1.0)
+    assert bool((model.lag_ridge_weight.diff() > 0).all())
+
+    target = torch.cat(tiny_streams()[:2], dim=-1)
+    weight = torch.ones(TINY_BATCH, TINY_SEQ_LEN)
+    plain = model.compute_loss(outputs, target, weight=weight)["metrics"]["total_loss"]
+    ridged = model.compute_loss(outputs, target, weight=weight, proposal_ridge=2.0)["metrics"]["total_loss"]
+    assert float(ridged - plain) == pytest.approx(float(expected.mean()), rel=1e-4)
+
+
+def test_lag_dropout_truncates_the_bank_at_a_nested_cutoff_in_training_alone() -> None:
+    """Every suppressed lag lies beyond every kept one, per sample, and evaluation keeps them all."""
+    # Chunked on both axes: the drawn selector is per sample and must reach every chunk.
+    model = build_model(trained=True, lag_dropout=0.99, anchor_chunk=2, lag_chunk=2)
+    evaluated = run(model, return_proposals=True)
+    model.train()
+    trained = run(model, return_proposals=True)
+
+    kept = trained["mean_proposals"].abs().sum(dim=(1, 3)) > 0.0  # (B, L)
+    assert bool((kept[:, 1:] <= kept[:, :-1]).all())
+    assert not bool(kept.all())
+    live = evaluated["lag_valid"].any(dim=1)
+    assert bool(((evaluated["mean_proposals"].abs().sum(dim=(1, 3)) > 0.0) == live).all())

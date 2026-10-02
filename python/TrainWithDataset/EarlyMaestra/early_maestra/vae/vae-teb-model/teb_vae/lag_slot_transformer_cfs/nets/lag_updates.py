@@ -47,6 +47,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -130,6 +132,7 @@ class LagProposalHead(nn.Module):
         lag_embed_dim: int = 8,
         hidden: Optional[int] = None,
         mean_only: bool = False,
+        lag_basis_dim: Optional[int] = None,
     ) -> None:
         r"""Initialize the proposal head.
 
@@ -149,9 +152,19 @@ class LagProposalHead(nn.Module):
                 point: a scale head that exists but is never read is a starved parameter block
                 under a distributed run and a claim in the manifest that the model updates a
                 variance it does not.
+            lag_basis_dim: $M$, the number of smooth basis functions the lag identity is expanded
+                on, or ``None`` for one free embedding per lag. Given, the embedding of lag
+                $\ell$ is
+
+                $$\zeta_\ell = \sum_{m=0}^{M-1} \cos\!\Bigl(\frac{\pi m (\ell + \tfrac12)}{L}\Bigr)\, w_m,$$
+
+                so neighbouring lags share parameters and the head's response is smooth along the
+                lag axis. That is the distributed-lag constraint: lagged copies of an
+                autocorrelated source are near-collinear, and one free parameter block per lag
+                lets the fit split one effect among them with opposite signs.
 
         Raises:
-            ValueError: If any width is not positive.
+            ValueError: If any width is not positive, or if the basis is wider than the lag axis.
         """
         super().__init__()
         for name, value in (
@@ -181,8 +194,24 @@ class LagProposalHead(nn.Module):
         # constructor draw survives the family's generic initialisation pass, which walks Linear,
         # Conv1d, LSTM and LayerNorm and leaves an Embedding alone -- so unlike the output
         # projection below, this needs no re-initialisation hook.
-        self.lag_embedding = nn.Embedding(self.n_lags, self.lag_embed_dim)
+        #
+        # Under a lag basis the table holds one row per BASIS FUNCTION rather than per lag, and a
+        # lag's embedding is its row of the fixed cosine basis times this table.
+        if lag_basis_dim is not None and not 1 <= int(lag_basis_dim) <= self.n_lags:
+            raise ValueError(
+                f"lag_basis_dim must lie in [1, n_lags={self.n_lags}], got {lag_basis_dim}"
+            )
+        self.lag_basis_dim = None if lag_basis_dim is None else int(lag_basis_dim)
+        rows = self.n_lags if self.lag_basis_dim is None else self.lag_basis_dim
+        self.lag_embedding = nn.Embedding(rows, self.lag_embed_dim)
         nn.init.normal_(self.lag_embedding.weight, mean=0.0, std=LAG_EMBED_STD)
+        if self.lag_basis_dim is not None:
+            # Non-persistent, like every geometry-shaped tensor here: a function of the two counts.
+            lag = torch.arange(self.n_lags, dtype=torch.float32)[:, None] + 0.5
+            order = torch.arange(self.lag_basis_dim, dtype=torch.float32)[None, :]
+            self.register_buffer(
+                "lag_basis", torch.cos(math.pi * order * lag / self.n_lags), persistent=False
+            )
 
         self.input_dim = self.d_model + self.source_dim + self.lag_embed_dim
         self.input_proj = nn.Linear(self.input_dim, self.hidden)
@@ -213,6 +242,7 @@ class LagProposalHead(nn.Module):
         lag_valid: Optional[torch.Tensor] = None,
         selector: Optional[torch.Tensor] = None,
         lag_index: Optional[torch.Tensor] = None,
+        null_window: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""Produce one proposal pair per anchor and lag.
 
@@ -234,6 +264,18 @@ class LagProposalHead(nn.Module):
                 rather than a slice of a full evaluation: a chunked call must identify slot
                 $\ell$ as $\ell$, not as its position within the chunk, or every chunk but the
                 first would read another slot's embedding.
+            null_window: The same gather over the encoding of an all-zero source stream, shaped
+                like ``source_window``, or ``None`` for the uncentred head. Given, each proposal
+                is **centred** against the body's response to its lag's null vector,
+
+                $$r_{t,\ell} = F_\theta(h_t, E_{t,\ell}, \zeta_\ell)
+                             - F_\theta(h_t, E^{0}_{t,\ell}, \zeta_\ell),$$
+
+                so a source vector equal to its null proposes exactly nothing for any parameters,
+                and nothing the body computes from the target state, the lag identity and the
+                availability bits alone survives into the update. Done inside this module, in one
+                call, so the module's output is the proposal the sum reads and a layer attribution
+                on it has one unit per lag.
 
         Returns:
             ``(mean_proposal, scale_proposal)``, each $(B, A, L, d_z)$, with the second ``None`` on
@@ -300,17 +342,29 @@ class LagProposalHead(nn.Module):
         weight_state, weight_source, weight_embed = self.input_proj.weight.split(
             [self.d_model, self.source_dim, self.lag_embed_dim], dim=1
         )
-        embedded = self.lag_embedding(lags)  # (L, E)
+        embedded = (
+            self.lag_embedding(lags)
+            if self.lag_basis_dim is None
+            else self.lag_basis[lags] @ self.lag_embedding.weight
+        )  # (L, E)
 
-        projected = (
+        # Everything the first layer reads that is not a source coefficient: the target state, the
+        # lag identity and the bias. Shared by the proposal and its null, so centring costs the
+        # body a second pass and the input projection nothing.
+        context = (
             F.linear(target_state, weight_state).unsqueeze(2)
-            + F.linear(flat_source, weight_source)
             + F.linear(embedded, weight_embed)[None, None, :, :]
             + self.input_proj.bias
         )
-        activated = F.gelu(projected)
-        activated = F.gelu(self.hidden_proj(activated))
-        raw = self.output_proj(activated)  # (B, A, L, d_z) or (B, A, L, 2 d_z)
+
+        def body(flat: torch.Tensor) -> torch.Tensor:
+            """The head's response to one flattened window, $(B, A, L, \\cdot)$."""
+            activated = F.gelu(context + F.linear(flat, weight_source))
+            return self.output_proj(F.gelu(self.hidden_proj(activated)))
+
+        raw = body(flat_source)  # (B, A, L, d_z) or (B, A, L, 2 d_z)
+        if null_window is not None:
+            raw = raw - body(null_window.reshape(flat_source.shape))
 
         gate = None
         if lag_valid is not None:

@@ -52,7 +52,10 @@ general_config:
   epochs: 5000
   accumulate_grad_batches: 1
 
-  # Reduce if a training step does not fit. MEASURED at the production geometry: one training step
+  # Reduce if a training step does not fit. The numbers below were measured at this cell's FIRST
+  # geometry -- a shorter horizon, a longer lag bank and a one-draw objective -- and have NOT been
+  # re-measured; the mixture objective multiplies the decoder's share by `train_mc_draws`.
+  # MEASURED at that geometry: one training step
   # peaks at about 8145 MiB per device here, and it scales very nearly linearly -- 4094 MiB at 64,
   # 2059 MiB at 32. `anchor_chunk` / `lag_chunk` below do NOT help a training step, which is a
   # measurement rather than an expectation, so this is the setting to reach for first.
@@ -96,6 +99,33 @@ model_config:
     lambda_full: 1.0
     lambda_base: 1.0
 
+    # Whether the two branches are decoded at paired SAMPLES of their latent distributions, or at
+    # their MEANS. False -- shipped -- makes each branch's predictive density the decoder's own:
+    # both block scores are exact and their gap is a computed difference. Sampled, the gap is a
+    # Monte Carlo estimate of two mixture scores whose finite-draw bias follows each branch's own
+    # latent spread and therefore does not cancel between them -- on a quantity the literature
+    # puts near a tenth of a nat. The deterministic arm must be mean-only (the scale half of the
+    # update would act on nothing), and its divergence column is then half the squared update in
+    # prior-scale units: a regulariser and a diagnostic, not a rate of a sampled code.
+    # `sampled_latent.yaml` is the comparator.
+    latent_sampling: false
+
+    # Paired latent draws K the reconstruction is a mixture over, on a SAMPLED arm: each branch is
+    # scored as log K - logsumexp_k(-D_k), the negative log of the average likelihood. One draw is
+    # the single-draw conditional score, an upper bound on it by Jensen that a deterministic
+    # latent minimises. The published operating range of this objective is sixteen draws and up;
+    # the encoders run once and the shared decoder is paid per draw. Must be one on the
+    # deterministic arm, where every draw is the same forecast.
+    train_mc_draws: 1
+
+    # Weight on the lag-weighted ridge over INDIVIDUAL proposals, half the sum over lags of
+    # omega_l * |c_L r_l|^2 with omega increasing in the lag and of mean one. The divergence
+    # penalises the summed update alone and cannot see proposals that cancel; lagged copies of an
+    # autocorrelated source are near-collinear, which is exactly where such splits appear. The
+    # increasing weight shrinks the far end of the bank hardest, so an over-long bank costs
+    # little. Logged as `proposal_ridge_rate`, in nats per anchor. PROPOSED starting value.
+    proposal_ridge: 0.25
+
     # The predictive validation monitor. Null leaves validation as it always was -- the one-draw
     # weighted objective, which is what the checkpoint and early-stopping monitors below read. A
     # positive integer K additionally scores every dense validation batch as the UNWEIGHTED
@@ -114,8 +144,13 @@ model_config:
     d_model: 128
     d_z: 64
 
-    # Ten stored steps of future, on the stored clock.
-    horizon: 10
+    # H stored steps of future, on the stored clock. Long enough to hold a contraction-locked
+    # deceleration whole: measured on raw traces, the FHR nadir trails the contraction peak by
+    # more than the short horizon this cell first shipped with could see. Three keys follow it and
+    # are stated beside it: `anchor_stride` (S = H / 2), `horizon_weight_halflife_steps` (H) and
+    # the two block-scaled guards under `advanced_config`. `horizon_depth` must keep the horizon
+    # core's receptive field at H + 1 or more.
+    horizon: 30
 
     # Raw samples per stored step. Carried for the trimmed-grid geometry every mask is built
     # against; this target domain scores coefficients rather than raw samples.
@@ -130,15 +165,25 @@ model_config:
     use_up_st: true
 
     dropout: 0.1
+
+    # The PRIOR's log-variance bound, and the OBSERVATION bound beside it. Two keys because they
+    # bound different distributions: under the persistence shortcut a near-step coefficient -- and
+    # an AR(1) innovation still more so -- has a variance far below anything a latent scale needs,
+    # and on one shared floor the short-horizon forecasts sat pinned too wide. Null on the second
+    # shares the first. PROPOSED starting value.
     logvar_clamp: [-5.0, 3.0]
+    obs_logvar_clamp: [-8.0, 3.0]
     mu_scale: 5.0
     coverage_floor: 0.9
 
     # ---------------------------------------------------------------------------------------
     # The source pathway
     # ---------------------------------------------------------------------------------------
-    # Candidate lags 0..90, so L = 91.
-    max_lag: 90
+    # Candidate lags 0..max_lag, so L = max_lag + 1 stored steps of source history. Short on
+    # purpose: on the long bank this cell first shipped with, removing every band but the nearest
+    # IMPROVED the fitted model's predictive score, and the measured source effect sits within a
+    # few tens of seconds of a contraction peak.
+    max_lag: 37
 
     # The mean bound, IN PRIOR STANDARD DEVIATIONS. Not the sibling's raw-latent-unit bound, which
     # is why that key is refused rather than reused: the same number would mean a different model.
@@ -159,6 +204,18 @@ model_config:
 
     lag_embed_dim: 8
 
+    # The lag identity is expanded on this many smooth cosine basis functions, so neighbouring
+    # lags share parameters and the head's response is smooth along the lag axis: the
+    # distributed-lag constraint, for the reason the ridge above exists. Null is one free
+    # embedding per lag. Must not exceed the lag count; inert under attention fusion. PROPOSED.
+    lag_basis_dim: 8
+
+    # Per-sample probability, in training, of truncating the lag bank at a uniformly drawn cutoff
+    # (every later lag suppressed). Nested, so every keep-prefix of the bank is a configuration
+    # the model was trained on, and a band-suppression readout scores something it has seen
+    # rather than something it must extrapolate to. PROPOSED starting value.
+    lag_dropout: 0.25
+
     # Body width of the shared proposal head. Null uses d_model, which is the shape the
     # architecture is specified at.
     proposal_hidden: null
@@ -171,22 +228,32 @@ model_config:
     # quietly being one arm while its configuration describes another, and what makes a strict load
     # across two arms refuse instead of silently reshaping.
     #
-    # All off here, so this file is the recommended joint candidate. Each comparator arm ships as
+    # This file is the recommended joint candidate. Each comparator arm ships as
     # its own file, a delta on this one, and each changes ONE of the leaves below so that a
     # difference between two of them is attributable to that leaf:
     #
     #   target_only.yaml          source_disabled          the whole source pathway
     #   capacity_control.yaml     source_values_withheld   the source VALUES, capacity held
-    #   mean_only.yaml            mean_only_residual       the variance half of the update
+    #   sampled_latent.yaml       latent_sampling          the sampled latent and its mixture
     #   pointwise_attention.yaml  lag_fusion               the fusion, representation held
     #   attention_reference.yaml  source_stem              the temporal convolution, fusion held
     #
     # Read as a chain: attention_reference -> pointwise_attention isolates the convolution stem,
     # pointwise_attention -> this file isolates the fusion, and this file -> the remaining three
-    # isolates the variance update, the source values and the pathway.
+    # isolates the sampled latent, the source values and the pathway.
     # ---------------------------------------------------------------------------------------
-    mean_only_residual: false
+    # TRUE, because the shipped arm is deterministic: decoded at the means, a scale update acts
+    # on nothing. A sampled arm may set it false to let the source reshape the latent's scale.
+    mean_only_residual: true
     source_scalar_lift: false
+
+    # Each proposal is centred against the same head's response to that lag's NULL source vector
+    # (an all-zero stream, availability kept), so a source at its training mean updates nothing for
+    # any parameters. Uncentred, the head can emit an update from the target state and the lag
+    # identity alone: target-only information, paid for as source divergence, and free to hide in
+    # per-lag terms that cancel in the sum. FALSE is the uncentred comparator, and the capacity
+    # control must set it false -- centred, that arm's update is exactly zero.
+    center_proposals: true
 
     # TRUE builds no source pathway at all -- no pointwise encoder, no lag embeddings, no proposal
     # head -- giving the target-only forecaster this candidate is warm-started from and measured
@@ -228,7 +295,7 @@ model_config:
 
     # Peak-memory settings. Null evaluates every anchor and every lag in one pass.
     #
-    # MEASURED at the production geometry, 2026-09-09, on one 12 GiB device, ungated at the declared
+    # MEASURED at this cell's first geometry, 2026-09-09, on one 12 GiB device, ungated at the declared
     # widths (an upper bound on the gated model). The finding is that these two bound the peak of an
     # EVALUATION step and do essentially nothing for a TRAINING step:
     #
@@ -285,8 +352,8 @@ model_config:
     # Anchors and the scored block
     # ---------------------------------------------------------------------------------------
     # Training tiles at this stride with a per-segment phase keyed on the recording, the segment
-    # start, the epoch and the seed. Validation and test decode the dense range.
-    anchor_stride: 5
+    # start, the epoch and the seed. Validation and test decode the dense range. S = H / 2.
+    anchor_stride: 15
 
     lag_floor: 0
 
@@ -304,7 +371,25 @@ model_config:
     # alone. The far steps are the majority of the block and are the ones a fast channel cannot
     # forecast at all, so a uniform score pays the model to widen its variance everywhere rather
     # than predict the level anywhere.
-    horizon_weight_halflife_steps: 5.0
+    horizon_weight_halflife_steps: 30.0
+
+    # ---------------------------------------------------------------------------------------
+    # The forecast DENSITY. Unlike the two weightings above these change the likelihood itself,
+    # so the evaluation applies them too and every nat it reports is a log-density of THIS density.
+    # ---------------------------------------------------------------------------------------
+    # AR(1) residual along the horizon: each channel's residual is scored on its innovation
+    # r_tau - phi_c * r_{tau-1}, with a learnable phi_c = tanh(a_c) seeded at zero, shared by both
+    # branches. Forecast residuals are strongly serially correlated across horizon steps, and a
+    # factorised Gaussian counts one persistent error once per step it persists.
+    forecast_ar_residual: true
+
+    # Per-channel scored horizon, resolved from the shards' phase-leg frequencies: a phase channel
+    # whose slow leg sits above the cutoff is scored over its first `target_phase_fast_horizon`
+    # steps only, every other channel over all H. Those channels are a zero-mean random sign after
+    # a few steps, so scoring them charges the objective for noise nothing can predict. A pair:
+    # both set or both null (null scores every cell).
+    target_phase_fast_cutoff_hz: 0.03
+    target_phase_fast_horizon: 5
 
     # ---------------------------------------------------------------------------------------
     # The shared decoder
@@ -418,7 +503,7 @@ advanced_config:
     # against the sibling's gradient distribution over a block of the same width; this
     # architecture's has not been observed. Re-measure the pre-clip gradient-norm distribution and
     # the skipped-batch rate on a training-only pilot before treating either number as tuned.
-    gradient_clip_val: 3500.0
+    gradient_clip_val: 10500.0
     gradient_clip_algorithm: "norm"
 
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
@@ -452,7 +537,7 @@ advanced_config:
 
     # INHERITED, like the clip above. The Gaussian negative log likelihood is not bounded below by
     # zero, which a spike detector configured on an assumption of non-negativity gets wrong.
-    additive_margin: 2.2e+3
+    additive_margin: 6.6e+3
 
     max_consecutive_skips: 25
 

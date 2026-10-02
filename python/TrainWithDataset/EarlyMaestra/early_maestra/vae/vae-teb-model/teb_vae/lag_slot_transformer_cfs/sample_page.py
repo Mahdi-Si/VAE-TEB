@@ -277,6 +277,7 @@ def _weighted_window_scores(
     scored_weight: Callable[[torch.Tensor], torch.Tensor],
     channel_weight: Optional[torch.Tensor],
     horizon_weight: Optional[torch.Tensor],
+    likelihood_terms: Optional[Callable[[], Dict[str, Optional[torch.Tensor]]]] = None,
 ) -> Optional[Dict[str, np.ndarray]]:
     r"""Each drawn window's block score, reduced exactly as the objective reduces it.
 
@@ -300,6 +301,9 @@ def _weighted_window_scores(
         scored_weight: The model's pooled validity, ``(B, T) -> (B, T)``.
         channel_weight: Per-channel weight on the block's last axis, or ``None``.
         horizon_weight: Per-step weight on the horizon axis, or ``None``.
+        likelihood_terms: The model's ``forecast_likelihood_kwargs``, bound: the scored-cell
+            mask and the AR(1) coefficient the objective scores under. ``None`` is the
+            factorised all-cells score.
 
     Returns:
         ``{'base': (W,), 'full': (W,)}`` over the drawn windows, or ``None`` when the batch
@@ -321,6 +325,7 @@ def _weighted_window_scores(
             anchor_valid=rows.outs["anchor_valid"],
         )
         target = forecast_target(rows.target, rows.outs["anchor_index"])
+        terms = {} if likelihood_terms is None else likelihood_terms()
         scores: Dict[str, np.ndarray] = {}
         for branch in ("base", "full"):
             block, _contributing = masked_raw_block_per_anchor(
@@ -331,6 +336,7 @@ def _weighted_window_scores(
                 logvar=rows.outs[f"logvar_{branch}"],
                 channel_weight=channel_weight,
                 horizon_weight=horizon_weight,
+                **terms,
             )
             scores[branch] = to_numpy(block[index])[positions].astype(float)
     return scores
@@ -451,6 +457,7 @@ def residual_forecast_rows(
     scored_weight: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    likelihood_terms: Optional[Callable[[], Dict[str, Optional[torch.Tensor]]]] = None,
 ) -> None:
     r"""Draw this page's forecast rows, over the anchors the forward decoded.
 
@@ -482,6 +489,7 @@ def residual_forecast_rows(
         scored_weight: The model's own pooled validity. ``None`` behaves as above.
         channel_weight: The objective's per-channel weight, or ``None``.
         horizon_weight: The objective's per-horizon-step weight, or ``None``.
+        likelihood_terms: The model's bound ``forecast_likelihood_kwargs``, or ``None``.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -660,6 +668,7 @@ def residual_forecast_rows(
             scored_weight=scored_weight,
             channel_weight=channel_weight,
             horizon_weight=horizon_weight,
+            likelihood_terms=likelihood_terms,
         )
     )
     _draw_weighted_gap_row(

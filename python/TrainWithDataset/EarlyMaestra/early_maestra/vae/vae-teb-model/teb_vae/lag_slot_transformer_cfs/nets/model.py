@@ -126,6 +126,7 @@ class SeqVaeLagResidualTrfCfs(
         encoder_d_ff: int = 512,
         target_attention_blocks: int = 6,
         logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
+        obs_logvar_clamp: Optional[Tuple[float, float]] = None,
         mu_scale: float = 5.0,
         coverage_floor: float = 0.9,
         persistence_residual: bool = True,
@@ -133,8 +134,12 @@ class SeqVaeLagResidualTrfCfs(
         residual_mu_scale: float = 3.0,
         residual_logsigma_scale: float = 1.0,
         lag_embed_dim: int = 8,
+        lag_basis_dim: Optional[int] = None,
+        lag_dropout: float = 0.0,
+        latent_sampling: bool = True,
         proposal_hidden: Optional[int] = None,
         mean_only_residual: bool = False,
+        center_proposals: bool = True,
         source_scalar_lift: bool = False,
         source_disabled: bool = False,
         source_values_withheld: bool = False,
@@ -156,6 +161,8 @@ class SeqVaeLagResidualTrfCfs(
         target_weight_ph: float = 1.0,
         target_novelty_frac: Optional[Sequence[float]] = None,
         target_forecast_shift: Optional[Sequence[int]] = None,
+        target_scored_horizon: Optional[Sequence[int]] = None,
+        forecast_ar_residual: bool = True,
         init_weights: bool = True,
         zero_fhr_scattering_s0: bool = False,
         zero_up_scattering_s0: bool = False,
@@ -210,7 +217,9 @@ class SeqVaeLagResidualTrfCfs(
             encoder_num_heads: Attention heads inside the target encoder.
             encoder_d_ff: Feed-forward width inside the target encoder.
             target_attention_blocks: Causal Transformer blocks in the target encoder.
-            logvar_clamp: The prior's log-variance bound and the observation log-variance bound.
+            logvar_clamp: The prior's log-variance bound.
+            obs_logvar_clamp: The observation log-variance bound, or ``None`` to share
+                ``logvar_clamp``.
             mu_scale: Bound on the prior mean.
             coverage_floor: Minimum valid fraction of an anchor's forecast window.
             persistence_residual: Whether the decoder mean carries the anchor's own target vector.
@@ -220,8 +229,18 @@ class SeqVaeLagResidualTrfCfs(
                 keyword is refused rather than reused.
             residual_logsigma_scale: $b_{\max}$, the bound on the log-standard-deviation residual.
             lag_embed_dim: Width of the lag embedding.
+            lag_basis_dim: Smooth cosine basis functions the lag identity is expanded on, so
+                neighbouring lags share parameters; ``None`` is one free embedding per lag.
+            lag_dropout: Per-sample probability, in training, of truncating the lag bank at a
+                uniformly drawn cutoff, so every keep-prefix of the bank is in-distribution.
+            latent_sampling: Decode both branches at paired samples (``True``) or at their means
+                (``False``), where both block scores are exact. The deterministic arm must be
+                mean-only.
             proposal_hidden: Body width of the proposal head, or ``None`` for ``d_model``.
             mean_only_residual: Build no scale-proposal parameters at all.
+            center_proposals: Subtract each proposal's response to its lag's null source vector,
+                so a source at its training mean updates nothing for any parameters. Refused with
+                ``source_values_withheld``, whose arm it would make exactly the target-only one.
             source_scalar_lift: Widen each source coefficient's own representation.
             source_disabled: Build no source pathway at all, giving the target-only arm. The full
                 distribution is then the prior, the divergence is exactly zero, and the two decoded
@@ -260,6 +279,13 @@ class SeqVaeLagResidualTrfCfs(
             target_weight_ph: The same for the second.
             target_novelty_frac: Per-declared-channel novelty share, a readout only.
             target_forecast_shift: The forecast clock's signed re-indexing of the scored element.
+            target_scored_horizon: $H_c$ per declared target channel -- how many leading horizon
+                steps of channel $c$ are scored -- or ``None`` to score every cell. Resolved from
+                the shards by the trainer; part of the forecast density, so the evaluation
+                applies it too.
+            forecast_ar_residual: Score each channel's horizon on the innovations of an AR(1)
+                residual with a learnable $\phi_c = \tanh(a_c)$, seeded at zero so a fresh model
+                is bitwise the factorised score. One $\phi$ for both branches.
             init_weights: Run the generic initialisation pass and the repairs that follow it.
             zero_fhr_scattering_s0: Zero the target stream's order-zero scattering coefficient
                 $S_0$ -- the first channel of the first stored target block -- at the model's
@@ -333,6 +359,10 @@ class SeqVaeLagResidualTrfCfs(
             target_weight_st=target_weight_st, target_weight_ph=target_weight_ph
         )
         self._set_target_novelty(target_novelty_frac=target_novelty_frac)
+        self._set_likelihood_structure(
+            target_scored_horizon=target_scored_horizon,
+            forecast_ar_residual=forecast_ar_residual,
+        )
 
         # The alignment shifts reach the base under ITS names, which is the one place in this
         # family where the channel delay does any work. They arrive under names of their own
@@ -347,6 +377,8 @@ class SeqVaeLagResidualTrfCfs(
         # resolves the gate the channel weights are positional over.
         self._validate_causal_geometry()
         self._register_channel_weights()
+        # After the decoder exists, whose width the AR coefficient and the cell mask share.
+        self._register_likelihood_structure()
 
         # The input ablation switches, after the base so the masks can be registered as buffers.
         # Non-persistent, like every geometry-shaped tensor here: their widths follow the declared
@@ -470,6 +502,8 @@ class SeqVaeLagResidualTrfCfs(
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
+        mc_draws: int = 1,
+        proposal_ridge: float = 0.0,
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
@@ -499,6 +533,15 @@ class SeqVaeLagResidualTrfCfs(
             lambda_base: Weight on the base-forecast reconstruction.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
             free_bits: Per-coordinate floor on the divergence entering the loss.
+            mc_draws: Paired latent draws $K$ per anchor the reconstruction is a mixture over.
+                The forward's own draw is the first; the remaining $K - 1$ are drawn and decoded
+                here from the same two parameter sets, one shared $\epsilon$ per draw. One is
+                the single-draw conditional score, bitwise. Refused above one on the
+                deterministic arm, where every draw is the same forecast.
+            proposal_ridge: Weight on the lag-weighted ridge over individual proposals,
+                $\tfrac12 \sum_\ell \omega_\ell \lVert c_L r_{t,\ell} \rVert^2$. The divergence
+                penalises the summed update alone and cannot see proposals that cancel; this term
+                does, and shrinks far lags hardest.
             lambda_ms: Accepted and refused above zero; see below.
             lambda_deriv: The same.
             lambda_boundary: The same.
@@ -507,7 +550,8 @@ class SeqVaeLagResidualTrfCfs(
             ``{'metrics': ..., 'likelihood': ...}``.
 
         Raises:
-            ValueError: If any shape-term weight is nonzero. The three terms read a forecast
+            ValueError: If ``mc_draws`` is not positive, or if any shape-term weight is nonzero.
+                The three terms read a forecast
                 block's last axis as a trajectory -- pooled neighbourhoods, first differences, a
                 boundary sample identified with the previous anchor's -- and here that axis counts
                 channels, which have no order and no continuity with anything. They are accepted as
@@ -525,10 +569,39 @@ class SeqVaeLagResidualTrfCfs(
                     f"the forecast block's last axis as a trajectory, and here it counts channels. "
                     f"Set it to 0.0, which is what every configuration of this target domain ships."
                 )
+        if int(mc_draws) < 1:
+            raise ValueError(f"mc_draws must be >= 1, got {mc_draws}")
+        if int(mc_draws) > 1 and not self.latent_sampling:
+            raise ValueError(
+                f"mc_draws={mc_draws} was given on the deterministic arm, where both branches "
+                f"are decoded at their means and every draw is the same forecast. Set "
+                f"train_mc_draws: 1, or latent_sampling: true."
+            )
         scored = self.scored_weight(weight)
         target = self._build_forecast_target(
             target_features, forward_outputs["anchor_index"]
         )
+        # The further draws of the mixture. Latent parameters are the forward's, so the encoders
+        # run once; only the shared decoder is paid per draw, with the forward's own persistence.
+        persistence = forward_outputs.get("persistence")
+        extra_draws = []
+        for _ in range(int(mc_draws) - 1):
+            z_prior, z_post = self.reparameterize_shared(
+                forward_outputs["mu_prior"],
+                forward_outputs["logvar_prior"],
+                forward_outputs["mu_post"],
+                forward_outputs["logvar_post"],
+            )
+            mu_base, logvar_base = self.decoder(z_prior, persistence=persistence)
+            mu_full, logvar_full = self.decoder(z_post, persistence=persistence)
+            extra_draws.append(
+                {
+                    "mu_base": mu_base,
+                    "logvar_base": logvar_base,
+                    "mu_full": mu_full,
+                    "logvar_full": logvar_full,
+                }
+            )
         return compute_residual_objective(
             forward_outputs,
             target,
@@ -539,6 +612,12 @@ class SeqVaeLagResidualTrfCfs(
             block_width=self.decoder_out_channels,
             coverage_floor=self.coverage_floor,
             logvar_clamp=self.logvar_clamp,
+            obs_logvar_clamp=self.obs_logvar_clamp,
+            extra_draws=extra_draws,
+            proposal_ridge=proposal_ridge,
+            # The density's own structure -- scored cells and the AR(1) coefficient -- which the
+            # evaluation applies too, unlike the two weights below.
+            **self.forecast_likelihood_kwargs(),
             # ``getattr`` rather than an attribute read: both are buffers where they exist and
             # absent otherwise, and ``None`` means the score skips the multiplication rather than
             # multiplying by ones.
@@ -719,7 +798,23 @@ class SeqVaeLagResidualTrfCfs(
         if self.source_disabled:
             proposals = self._absent_proposals(anchor_conditioning)
         else:
+            if self.training and self.lag_dropout > 0.0 and selector is None:
+                selector = self._nested_lag_dropout(anchor_conditioning)
+            if selector is not None:
+                # To the full anchor-by-lag shape once, here: the chunked passes below slice both
+                # axes, and a broadcastable size-one axis would slice to nothing past its first
+                # chunk.
+                selector = selector.expand(
+                    anchor_conditioning.shape[0], anchor_conditioning.shape[1], self.n_lags
+                )
             encoded, channel_mask = self.source_encoder(source)
+            # The null encoding every proposal is centred against: the same encoder over an
+            # all-zero stream, so the availability announcement is kept and only the values go.
+            encoded_null = (
+                self.source_encoder(torch.zeros_like(source))[0]
+                if self.center_proposals
+                else None
+            )
             accumulate = (
                 self._attend_proposals
                 if self.lag_fusion == "attention"
@@ -729,6 +824,7 @@ class SeqVaeLagResidualTrfCfs(
                 anchor_index=anchor_index,
                 anchor_conditioning=anchor_conditioning,
                 encoded=encoded,
+                encoded_null=encoded_null,
                 channel_mask=channel_mask,
                 selector=selector,
                 return_proposals=return_proposals,
@@ -793,6 +889,9 @@ class SeqVaeLagResidualTrfCfs(
             outputs[f"cancellation_ratio_{channel}"] = ratio
             outputs[f"cancellation_numerator_{channel}"] = numerator
             outputs[f"cancellation_denominator_{channel}"] = denominator
+        if proposals.get("ridge") is not None:
+            # In the scaled update's own units, so it is commensurable with the divergence.
+            outputs["proposal_ridge_per_anchor"] = (self.lag_scale**2) * proposals["ridge"]
 
         if persistence is not None:
             outputs["persistence"] = persistence
@@ -815,6 +914,58 @@ class SeqVaeLagResidualTrfCfs(
     # ------------------------------------------------------------------
     # The two proposal passes
     # ------------------------------------------------------------------
+    def _nested_lag_dropout(self, anchor_conditioning: torch.Tensor) -> torch.Tensor:
+        r"""A training-time selector that truncates some samples' lag bank at a random cutoff.
+
+        With probability ``lag_dropout`` a sample keeps lags $0, \ldots, k$ for a cutoff $k$ drawn
+        uniformly over the bank, and every later lag is suppressed; otherwise it keeps them all.
+        Nested rather than independent per lag, because the readout it serves is nested: the
+        gain against the furthest kept lag is the one per-lag profile that sums to the total
+        under an autocorrelated source.
+
+        Args:
+            anchor_conditioning: $h_t$ at the decoded anchors, read for batch size and device.
+
+        Returns:
+            The selector $(B, 1, L)$, one where a lag is kept.
+        """
+        batch, device = anchor_conditioning.shape[0], anchor_conditioning.device
+        cutoff = torch.randint(0, self.n_lags, (batch,), device=device)
+        truncated = torch.rand(batch, device=device) < self.lag_dropout
+        cutoff = torch.where(truncated, cutoff, torch.full_like(cutoff, self.n_lags - 1))
+        lags = torch.arange(self.n_lags, device=device)
+        return (lags[None, :] <= cutoff[:, None]).to(anchor_conditioning.dtype)[:, None, :]
+
+    def _propose(
+        self,
+        state: torch.Tensor,
+        window: torch.Tensor,
+        null_window: Optional[torch.Tensor],
+        **gates: Any,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        r"""The attention comparator's update, centred against the null source when one is given.
+
+        $$r = F_\theta(h, E, \cdot) - F_\theta(h, E^{0}, \cdot),$$
+
+        both under the same gates, so a window equal to its null updates nothing for any
+        parameters. Two calls, because a normalised aggregation has no per-lag output to centre;
+        the local head centres each proposal itself, in one call.
+
+        Args:
+            state: $h_t$ at the chunk's anchors $(B, A, d_h)$.
+            window: The gathered source window.
+            null_window: The same gather over the null encoding, or ``None`` on an uncentred arm.
+            **gates: ``lag_valid``, ``selector`` and, under lag chunking, ``lag_index``.
+
+        Returns:
+            ``(mean, scale)`` as the fusion returns them, the second ``None`` on the mean-only arm.
+        """
+        mean, scale = self.proposal_head(state, window, **gates)
+        if null_window is None:
+            return mean, scale
+        null_mean, null_scale = self.proposal_head(state, null_window, **gates)
+        return mean - null_mean, None if scale is None else scale - null_scale
+
     def _absent_proposals(self, anchor_conditioning: torch.Tensor) -> Dict[str, Any]:
         r"""What the accumulation returns when there is no source pathway to accumulate.
 
@@ -857,6 +1008,7 @@ class SeqVaeLagResidualTrfCfs(
         anchor_index: torch.Tensor,
         anchor_conditioning: torch.Tensor,
         encoded: torch.Tensor,
+        encoded_null: Optional[torch.Tensor],
         channel_mask: torch.Tensor,
         selector: Optional[torch.Tensor],
         return_proposals: bool,
@@ -881,6 +1033,8 @@ class SeqVaeLagResidualTrfCfs(
             anchor_index: The decoded anchors $(B, A)$.
             anchor_conditioning: $h_t$ at those anchors $(B, A, d_h)$.
             encoded: The pointwise source encoding $(B, T, C_U, W)$.
+            encoded_null: The same encoder's output over an all-zero stream, or ``None`` on an
+                uncentred arm. Every proposal has its response to this subtracted.
             channel_mask: Its availability $(B, T, C_U)$.
             selector: $s_{t,\ell}$ broadcastable to $(B, A, L)$, or ``None``.
             return_proposals: Retain the per-lag arrays and the gathered channel mask.
@@ -907,6 +1061,8 @@ class SeqVaeLagResidualTrfCfs(
             if self.mean_only_residual
             else torch.zeros(batch, n_anchors, device=device, dtype=dtype)
         )
+        # The lag-weighted sum of squared proposal norms, in the graph: the ridge's own input.
+        ridge = torch.zeros(batch, n_anchors, device=device, dtype=dtype)
         lag_valid = torch.zeros(
             batch, n_anchors, self.n_lags, device=device, dtype=torch.bool
         )
@@ -935,6 +1091,18 @@ class SeqVaeLagResidualTrfCfs(
                     lag_floor=self.lag_floor,
                     lag_offset=lag_start,
                 )
+                null_window = (
+                    None
+                    if encoded_null is None
+                    else self.source_encoder.gather(
+                        encoded_null,
+                        channel_mask,
+                        anchors,
+                        n_lags=lag_stop - lag_start,
+                        lag_floor=self.lag_floor,
+                        lag_offset=lag_start,
+                    )[0]
+                )
                 valid = lag_validity(window_mask)
                 lag_valid[:, start:stop, lag_start:lag_stop] = valid
 
@@ -946,12 +1114,18 @@ class SeqVaeLagResidualTrfCfs(
                 mean_chunk, scale_chunk = self.proposal_head(
                     state,
                     window,
+                    null_window=null_window,
                     lag_valid=valid,
                     selector=chunk_selector,
                     lag_index=torch.arange(lag_start, lag_stop, device=device),
                 )
 
                 mean_total[:, start:stop] = mean_total[:, start:stop] + mean_chunk.sum(dim=2)
+                omega = self.lag_ridge_weight[lag_start:lag_stop].to(dtype)
+                squared = mean_chunk.pow(2).sum(dim=-1)
+                if scale_chunk is not None:
+                    squared = squared + scale_chunk.pow(2).sum(dim=-1)
+                ridge[:, start:stop] = ridge[:, start:stop] + (squared * omega).sum(dim=2)
                 with torch.no_grad():
                     mean_norm_sum[:, start:stop] += mean_chunk.norm(dim=-1).sum(dim=2)
                 if scale_chunk is not None and scale_total is not None:
@@ -983,6 +1157,7 @@ class SeqVaeLagResidualTrfCfs(
             "mean_proposals": None,
             "scale_proposals": None,
             "channel_mask": None,
+            "ridge": ridge,
         }
         if return_proposals:
             result["mean_proposals"] = _reassemble(mean_kept)
@@ -998,6 +1173,7 @@ class SeqVaeLagResidualTrfCfs(
         anchor_index: torch.Tensor,
         anchor_conditioning: torch.Tensor,
         encoded: torch.Tensor,
+        encoded_null: Optional[torch.Tensor],
         channel_mask: torch.Tensor,
         selector: Optional[torch.Tensor],
         return_proposals: bool,
@@ -1024,6 +1200,8 @@ class SeqVaeLagResidualTrfCfs(
             anchor_index: The decoded anchors $(B, A)$.
             anchor_conditioning: $h_t$ at those anchors $(B, A, d_h)$.
             encoded: The source encoding over the stored grid, in whatever shape its encoder emits.
+            encoded_null: The same encoder's output over an all-zero stream, or ``None`` on an
+                uncentred arm. The fusion's response to it is subtracted from the update.
             channel_mask: Its per-channel availability $(B, T, C_U)$.
             selector: $s_{t,\ell}$ broadcastable to $(B, A, L)$, or ``None``.
             return_proposals: Retain the gathered channel mask, which the exposure readout needs.
@@ -1059,12 +1237,24 @@ class SeqVaeLagResidualTrfCfs(
                 n_lags=self.n_lags,
                 lag_floor=self.lag_floor,
             )
+            null_window = (
+                None
+                if encoded_null is None
+                else self.source_encoder.gather(
+                    encoded_null,
+                    channel_mask,
+                    anchors,
+                    n_lags=self.n_lags,
+                    lag_floor=self.lag_floor,
+                )[0]
+            )
             valid = lag_validity(window_mask)
             lag_valid[:, start:stop] = valid
 
-            mean_chunk, scale_chunk = self.proposal_head(
+            mean_chunk, scale_chunk = self._propose(
                 state,
                 window,
+                null_window,
                 lag_valid=valid,
                 selector=None if selector is None else selector[:, start:stop],
             )

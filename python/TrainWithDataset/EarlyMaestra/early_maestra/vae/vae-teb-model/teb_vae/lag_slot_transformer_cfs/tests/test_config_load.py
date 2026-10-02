@@ -46,6 +46,14 @@ NON_CONSTRUCTOR_KEYS: Set[str] = {
     # The predictive validation monitor's draw count: a task hyperparameter the driver applies
     # after construction, by the route the seed takes, and never a constructor argument.
     "validation_mc_draws",
+    # The reconstruction mixture's draw count, applied to the task the same way.
+    "train_mc_draws",
+    # The weight on the lag-weighted proposal ridge: an objective weight, applied the same way.
+    "proposal_ridge",
+    # The per-channel scored horizon's rule, resolved from the shards into
+    # ``target_scored_horizon`` by the trainer.
+    "target_phase_fast_cutoff_hz",
+    "target_phase_fast_horizon",
     # The causal representation, resolved into the four channel tuples and the novelty vector.
     "causal_reach_budget_s",
     "causal_warmup_budget_steps",
@@ -67,6 +75,8 @@ UNSET_BY_DESIGN: Set[str] = {
     "source_align_delays",
     "target_novelty_frac",
     "target_forecast_shift",
+    # Resolved from the scored-horizon rule and the shards' phase-leg frequencies.
+    "target_scored_horizon",
     # Weight initialisation is not a configuration decision.
     "init_weights",
 } | set(REFUSED_KEYWORDS)
@@ -222,7 +232,11 @@ def test_the_short_bank_profile_builds_the_window_it_declares_and_nothing_else_m
 
     model = build_from_config("lag25.yaml").eval()
     assert model.n_lags == expected_lags
-    assert model.proposal_head.lag_embedding.weight.shape[0] == expected_lags
+    # One embedding row per lag-basis function where the lag identity is expanded on a basis,
+    # and one per lag otherwise.
+    assert model.proposal_head.lag_embedding.weight.shape[0] == (
+        block["lag_basis_dim"] or expected_lags
+    )
     assert model.lag_scale == pytest.approx(expected_lags ** -0.5)
     assert model.build_lag_mask(model.sequence_length).shape[1] == expected_lags
 

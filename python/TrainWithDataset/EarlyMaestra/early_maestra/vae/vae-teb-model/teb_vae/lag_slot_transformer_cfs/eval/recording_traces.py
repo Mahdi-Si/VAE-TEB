@@ -52,6 +52,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     batch_guids,
     model_inputs,
 )
+from teb_vae.lag_attn_cfs.eval.metrics import forecast_likelihood_terms
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors
 
@@ -205,11 +206,14 @@ def gather_segment_traces(
     anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
     mask, coverage, _kl_support = anchor_support(model, weight, outputs)
     contributing = contributing_anchors(mask) > 0.0
+    terms = forecast_likelihood_terms(model)
     nll_full, _ = masked_raw_block_per_anchor(
-        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"]
+        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"],
+        **terms,
     )
     nll_base, _ = masked_raw_block_per_anchor(
-        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"]
+        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"],
+        **terms,
     )
     # The proposal norm exists on the explicit-sum fusion with a source pathway only; elsewhere
     # the lag family is absent from the trace rather than zero-filled.
