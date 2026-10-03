@@ -1,0 +1,16 @@
+# Arm (plan B.9): Does the level leave the latent?
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_persistence
+
+model_config:
+  VAE_model:
+    persistence_residual: true
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_patch_persistence
+      tags:
+        variant: lag_attn_trf_patch_persistence

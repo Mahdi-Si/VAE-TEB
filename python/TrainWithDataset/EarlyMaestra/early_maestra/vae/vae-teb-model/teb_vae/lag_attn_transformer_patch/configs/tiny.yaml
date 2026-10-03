@@ -1,0 +1,46 @@
+# Local smoke: one epoch, one device, the committed 4-sample shard. Widths shrink; the shipped
+# geometry (T 300, R 16, H 30, F 30, S 15) and trim_minutes stay.
+#
+#   python -m teb_vae.lag_attn_transformer_patch.trainer \
+#       --config teb_vae/lag_attn_transformer_patch/configs/tiny.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_tiny
+  cuda_devices: [0]
+  epochs: 1
+  plot_frequency: 1
+  lr_warmup_steps: 4     # short enough to complete inside a smoke fit
+  batch_size: {train: 2, test: 2}
+  folders_config: {out_dir_base: output/teb_vae_trf_patch_tiny}
+
+model_config:
+  VAE_model:
+    d_model: 32          # = num_heads * d_head
+    d_z: 8               # divisible by num_heads (head-structured posterior)
+    d_head: 8
+    max_lag: 8
+    encoder_d_ff: 64
+    target_attention_blocks: 2
+    source_attention_blocks: 2
+    source_attention_window: 8
+    decoder_hidden: 32
+    horizon_attention_blocks: 1
+    dropout: 0.0
+    likelihood: mse      # starves the log-variance heads: exercises the DDP-strategy fallback
+    # From summary_stats.py on tiny_shard.hdf5.
+    target_summary_loc: [0.0, 0.3183]
+    target_summary_scale: [0.2553, 0.2187]
+    variability_eps: 0.0251
+
+dataset_config:
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for 4 samples
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # a smoke run is not a result
