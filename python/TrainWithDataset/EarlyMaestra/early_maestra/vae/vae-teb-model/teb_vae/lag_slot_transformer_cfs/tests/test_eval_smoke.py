@@ -107,7 +107,8 @@ def test_the_artifact_layout_is_the_familys_own(slot_collected_run) -> None:
         f"the skip path rather than the pipeline"
     )
     # This cell's own three readout analyses, each with its table and its figures.
-    extension = slot_collected_run["summary"]["eval_config"]["figure_format"]
+    # A null format is the family's default, which the two globs below already name.
+    extension = slot_collected_run["summary"]["eval_config"]["figure_format"] or "pdf"
     assert (results_dir / arms.ANALYSIS_DIRNAME / arms.PER_RECORDING_FILENAME).is_file()
     assert (results_dir / arms.ANALYSIS_DIRNAME / f"{arms.HEADLINE_FIGURE}.{extension}").is_file()
     assert (results_dir / lag_suppression.ANALYSIS_DIRNAME / lag_suppression.LAG_PROFILE_FILENAME).is_file()

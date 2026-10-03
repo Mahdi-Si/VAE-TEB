@@ -51,7 +51,12 @@ SCORED_ARMS: Dict[str, Dict[str, Any]] = {
         "model_config.VAE_model.lag_chunk": None,
         "model_config.VAE_model.source_stem": "conv",
     },
-    "capacity_control": {"model_config.VAE_model.source_values_withheld": True},
+    # Uncentred, as the shipped arm file is: centred, a withheld source is its own null and the
+    # constructor refuses the pair.
+    "capacity_control": {
+        "model_config.VAE_model.source_values_withheld": True,
+        "model_config.VAE_model.center_proposals": False,
+    },
 }
 
 

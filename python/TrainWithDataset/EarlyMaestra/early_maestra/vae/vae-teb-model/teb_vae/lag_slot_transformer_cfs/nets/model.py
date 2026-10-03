@@ -936,36 +936,6 @@ class SeqVaeLagResidualTrfCfs(
         lags = torch.arange(self.n_lags, device=device)
         return (lags[None, :] <= cutoff[:, None]).to(anchor_conditioning.dtype)[:, None, :]
 
-    def _propose(
-        self,
-        state: torch.Tensor,
-        window: torch.Tensor,
-        null_window: Optional[torch.Tensor],
-        **gates: Any,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        r"""The attention comparator's update, centred against the null source when one is given.
-
-        $$r = F_\theta(h, E, \cdot) - F_\theta(h, E^{0}, \cdot),$$
-
-        both under the same gates, so a window equal to its null updates nothing for any
-        parameters. Two calls, because a normalised aggregation has no per-lag output to centre;
-        the local head centres each proposal itself, in one call.
-
-        Args:
-            state: $h_t$ at the chunk's anchors $(B, A, d_h)$.
-            window: The gathered source window.
-            null_window: The same gather over the null encoding, or ``None`` on an uncentred arm.
-            **gates: ``lag_valid``, ``selector`` and, under lag chunking, ``lag_index``.
-
-        Returns:
-            ``(mean, scale)`` as the fusion returns them, the second ``None`` on the mean-only arm.
-        """
-        mean, scale = self.proposal_head(state, window, **gates)
-        if null_window is None:
-            return mean, scale
-        null_mean, null_scale = self.proposal_head(state, null_window, **gates)
-        return mean - null_mean, None if scale is None else scale - null_scale
-
     def _absent_proposals(self, anchor_conditioning: torch.Tensor) -> Dict[str, Any]:
         r"""What the accumulation returns when there is no source pathway to accumulate.
 
@@ -1251,10 +1221,10 @@ class SeqVaeLagResidualTrfCfs(
             valid = lag_validity(window_mask)
             lag_valid[:, start:stop] = valid
 
-            mean_chunk, scale_chunk = self._propose(
+            mean_chunk, scale_chunk = self.proposal_head(
                 state,
                 window,
-                null_window,
+                null_window=null_window,
                 lag_valid=valid,
                 selector=None if selector is None else selector[:, start:stop],
             )

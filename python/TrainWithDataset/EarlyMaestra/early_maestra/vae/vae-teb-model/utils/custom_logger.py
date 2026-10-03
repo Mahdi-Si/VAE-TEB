@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
+from tqdm import tqdm
 
 # Rank env vars in Lightning's own precedence order (``_get_rank`` in
 # ``lightning/fabric/utilities/rank_zero.py``). ``RANK`` is set by torchrun/SLURM;
@@ -240,7 +241,12 @@ def setup_logging(
     if log_to_console and (resolved_rank == 0 or not console_rank_zero_only):
         handlers.append(
             dict(
-                sink=sys.stderr,
+                # Through tqdm rather than straight to the stream: a line written while a
+                # progress bar is drawn lands inside the bar and pushes it onto a new line;
+                # ``tqdm.write`` clears the bar, prints the line above it and redraws. With no
+                # bar open it is a plain write. The stream is resolved per message, so a
+                # redirected or captured stderr is honoured.
+                sink=lambda message: tqdm.write(str(message), file=sys.stderr, end=""),
                 level=console_level,
                 format=_CONSOLE_FORMAT,
                 colorize=True,
