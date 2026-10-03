@@ -389,33 +389,53 @@ Phase 6  P6-01                                  (needs Phase 5)
 
 | ID | Title | Depends on | Status |
 |---|---|---|---|
-| P0-01 | Map the co-mixin contract | — | todo |
-| P1-01 | `patchify` and `patch_summaries` | P0-01 | todo |
-| P1-02 | `PatchEmbedding` | P0-01 | todo |
-| P1-03 | Target statistics script | P0-01 | todo |
-| P1-04 | Package skeleton | P0-01 | todo |
-| P2-01 | `PatchStreamInputs` mixin | P1-01, P1-02 | todo |
-| P2-02 | `PatchSummaryTarget` mixin | P1-01 | todo |
-| P2-03 | Model constructor | P2-01, P2-02 | todo |
-| P3-01 | Task | P2-03 | todo |
-| P3-02 | Trainer and configs | P2-03, P1-03 | todo |
-| P4-01 | Tests: patching | Phase 3 | todo |
-| P4-02 | Tests: causality | Phase 3 | todo |
-| P4-03 | Tests: invariants and purity | Phase 3 | todo |
-| P4-04 | Tests: objective and target | Phase 3 | todo |
-| P4-05 | Tests: DDP reachability and strategy | Phase 3 | todo |
-| P4-06 | Tests: config load and arms | Phase 3 | todo |
-| P4-07 | Tests: task and controls | Phase 3 | todo |
-| P4-08 | Tests: train smoke | Phase 3 | todo |
-| P5-01 | Planted-delay check | Phase 4 | todo |
-| P5-02 | Classifier compatibility | Phase 4 | todo |
-| P5-03 | Parameter and cost record | Phase 4 | todo |
-| P6-01 | `DESIGN.md` and `RESULTS.md` | Phase 5 | todo |
+| P0-01 | Map the co-mixin contract | — | done |
+| P1-01 | `patchify` and `patch_summaries` | P0-01 | done |
+| P1-02 | `PatchEmbedding` | P0-01 | done |
+| P1-03 | Target statistics script | P0-01 | done |
+| P1-04 | Package skeleton | P0-01 | done |
+| P2-01 | `PatchStreamInputs` mixin | P1-01, P1-02 | done |
+| P2-02 | `PatchSummaryTarget` mixin | P1-01 | done |
+| P2-03 | Model constructor | P2-01, P2-02 | done |
+| P3-01 | Task | P2-03 | done |
+| P3-02 | Trainer and configs | P2-03, P1-03 | done |
+| P4-01 | Tests: patching | Phase 3 | done |
+| P4-02 | Tests: causality | Phase 3 | done |
+| P4-03 | Tests: invariants and purity | Phase 3 | done |
+| P4-04 | Tests: objective and target | Phase 3 | done |
+| P4-05 | Tests: DDP reachability and strategy | Phase 3 | done |
+| P4-06 | Tests: config load and arms | Phase 3 | done |
+| P4-07 | Tests: task and controls | Phase 3 | done |
+| P4-08 | Tests: train smoke | Phase 3 | done |
+| P5-01 | Planted-delay check | Phase 4 | done |
+| P5-02 | Classifier compatibility | Phase 4 | done (no classifier source change; new test `teb_vae/classifier/tests/test_patch_source.py`) |
+| P5-03 | Parameter and cost record | Phase 4 | done |
+| P6-01 | `DESIGN.md` and `RESULTS.md` | Phase 5 | done |
 
 ## C.3 Conflicts found during implementation
 
 Write each conflict as: the task ID, the plan statement, what the code does, and the decision you
 need from the user. Leave this section empty when there is none.
+
+Found by P0-01 (detail: `notes/CONTRACT.md` §10). Each was resolved by the orchestrator with the
+smallest change that keeps the plan's intent; the user may overrule any of them.
+
+| # | Plan statement | What the code does | Decision taken |
+|---|---|---|---|
+| C1 | B.3: `featurize` gives `(value, mask, delta)` | It returns one stacked `(B, 3, L)` tensor | Unpack with `.unbind(1)` |
+| C2 | B.5 lists four jobs of `PatchSummaryTarget` | The base raises in `_check_persistence_target` when `persistence_residual=True` | `PatchSummaryTarget` overrides it as a no-op, as CFT does |
+| C3 | P0-01 places some hooks in `causal_feature_target.py` | They are in `causal_inputs.py`; CWI reads fewer hooks than listed | Use `CONTRACT.md` §1 as the hook list |
+| C4 | B.5: forward keywords with the `locals()` pattern | `FORWARDED_EXCLUSIONS` lacks the four new keys, so the base raises `TypeError` | Extend the exclusion tuple locally |
+| C5 | B.6: `horizon_weight=None` | The kept `horizon_weight_halflife_steps` keyword would register a buffer that the loss then ignores | Pass `getattr(self, "horizon_weight", None)`; it is `None` at the shipped `null` |
+| C6 | B.7: bind four CFS members onto a `SeqVaeLagAttnTrfRwsTask` subclass | The `_stage` class default is needed by `VaeSource` | Subclass `SeqVaeLagAttnTrfCrwsTask`, which already has the binds, `seed`, `_stage` and `compute_loss_and_metrics`. Override only `_build_forward_inputs` and `_added_metrics` |
+| C7 | B.8 does not mention the seed | `LagAttnTrfRwsTrainer` never gives the task `general_config.seed`, so the anchor phase keys on 0 | Override `create_model` to apply the seed, as CRWS does |
+| C8 | B.8: import the e2e guards and adapt their key lists | `_check_no_inert_model_keys` reads a module global and takes no key list | Write one short refusal. Import the two raw e2e guards and the CRWS `_check_phase_key_fields`, `_check_raw_target_fields` and `_check_boundary_term_is_off` as they are |
+| C9 | B.5 removes `use_up_st` | The base default is then `True`, which has no effect | Pass `use_up_st=False` to the base |
+| C10 | B.8 does not mention tracked metrics or the startup message | `anchors_per_sample` and `kld_source_null` never reach `metrics_history.csv`; the inherited startup line is false for patches | Extend `TRACKED_METRICS` as CRWS does; override `causal_standing_message` with one true sentence |
+| C11 | P5-02: name each changed classifier file | The classifier has no package registry | No classifier source change is expected; add one test |
+| C12 | B.9: `target_summary_*` from P1-03 | The production shards are not on this machine. The tiny fixture is synthetic: level scale 0.26 and variability loc 0.32, about 14 bpm RMS beat-to-beat, far from real FHR | `default.yaml` ships the identity values `[0, 0]`, `[1, 1]` and `0.01`, marked PROVISIONAL. `tiny.yaml` carries the tiny-fixture values. The user must run `summary_stats.py` on the production shards before the first production run |
+| C13 | The B.9 table lists the removed CFS keys | It omits `target_phase_fast_cutoff_hz` and `target_phase_fast_horizon`, which set the CFS feature target's scored horizon and which the patch constructor does not take | They are dropped from `default.yaml`, and the trainer pre-flight refuses `target_phase_fast_*`, `target_delays` and `source_delays` by name |
+| C14 | B.9: `planted.yaml` = `max_lag: 60` plus the planted shard | With S = 15, `source_dropout` 0.2 and AR on, the source path stays closed on the instrument. The CFS instrument uses S = 1, no source dropout and AR off | User's decision: `planted.yaml` also carries those three CFS instrument leaves, so the two cells' readings are comparable |
 
 ## C.4 Task details
 
