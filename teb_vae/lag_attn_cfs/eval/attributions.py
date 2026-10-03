@@ -143,6 +143,17 @@ DEFAULT_SEGMENTS = 24
 #: cover its early, middle and late phases rather than one draw of them.
 ANCHORS_PER_SEGMENT = 4
 
+#: The informative-anchor rule (``attribution_pass.informative_anchors``). An anchor qualifies when
+#: its $K_t$ is in the upper $30\%$ of the KL pooled over every scored anchor of every class -- the
+#: ``high`` band of the ``lag_high_kl`` analysis, restated here because an analysis may not import
+#: another -- and when its signal is clean: the forecast coverage and the mean validity over the
+#: searched lag window both reach :data:`CLEAN_COVERAGE`.
+HIGH_KL_QUANTILE = 0.7
+CLEAN_COVERAGE = 0.95
+
+#: Example pages per class: the highest-KL clean anchors, one per recording.
+EXAMPLES_PER_CLASS = 3
+
 #: Recordings followed through every one of their segments **per class**, for the trace figure. One,
 #: because each is a few hundred attributions; the one chosen is the class's most **complete**
 #: recording over the window the run reads its clocks over -- the fewest missing segments -- so
@@ -281,6 +292,15 @@ METHOD_RECORD: Dict[str, Dict[str, str]] = {
         "status": "shipped",
         "note": "model-agnostic; grouped by lag band of the source relative to the anchor, so it is "
                 "the occlusion analysis's intervention read on this analysis's readouts and anchors",
+    },
+    "GradCAM": {
+        "status": "shipped (cohort pass, lag-attentive cells)",
+        "note": "computed in gradcam.py rather than through captum's LayerGradCam, which pools "
+                "gradients over every axis after the second and so assumes channel-first maps, "
+                "while these layers are time-major (B, T, D); three views: the input of the target "
+                "encoder's last attention block, the source K/V stream, and the lag-attention "
+                "weights scored as gradient-weighted attention; one forward and one backward per "
+                "readout, no baseline and no completeness",
     },
     "InputXGradient": {
         "status": "evaluated, not shipped",
@@ -734,6 +754,62 @@ def spread_columns(contributing: np.ndarray, per_segment: int = ANCHORS_PER_SEGM
         picks = np.unique(np.round(np.linspace(0, positions.size - 1, take)).astype(np.int64))
         chosen.append(positions[picks].astype(np.int64))
     return chosen
+
+
+def informative_columns(
+    anchor_index: np.ndarray,
+    contributing: np.ndarray,
+    candidates: Sequence[int],
+    weight: np.ndarray,
+    *,
+    n_lags: int,
+    per_segment: int = ANCHORS_PER_SEGMENT,
+    spacing: int = 1,
+) -> Tuple[np.ndarray, int]:
+    r"""Choose one sample's highest-KL anchors whose source history is clean.
+
+    The candidates come from the collection pass, already high-KL and with a clean forecast
+    window, in descending $K_t$ (:func:`~.attribution_pass.informative_anchors`). This function
+    adds the history check the per-anchor table cannot make: the mean validity
+    ``weight`` over the searched lag window $[t_a - L + 1, t_a]$ must reach
+    :data:`CLEAN_COVERAGE`. Anchors that pass come first, in $K_t$ order; anchors that fail follow,
+    so a segment is never left empty. Chosen anchors are at least ``spacing`` steps apart, so two
+    of them never share most of their forecast block.
+
+    Args:
+        anchor_index: The sample's anchor axis as stored steps, $(A,)$.
+        contributing: The sample's scored indicator, $(A,)$.
+        candidates: Candidate anchor steps, highest $K_t$ first.
+        weight: The sample's decimated validity signal, $(T,)$.
+        n_lags: $L$, the searched lag window.
+        per_segment: How many anchors to choose, as an upper bound.
+        spacing: The smallest distance between two chosen anchors, in stored steps.
+
+    Returns:
+        ``(columns, n_unclean)``: the chosen anchor-axis positions in $K_t$ order, and how many of
+        them failed the history check.
+    """
+    position = {int(step): column for column, step in enumerate(anchor_index) if contributing[column]}
+    ranked = []
+    for order, step in enumerate(int(s) for s in candidates):
+        column = position.get(step)
+        if column is None:
+            continue
+        window = np.asarray(weight[max(0, step - int(n_lags) + 1):step + 1], dtype=np.float64)
+        clean = bool(window.size) and float(window.mean()) >= CLEAN_COVERAGE - 1e-6
+        ranked.append((not clean, order, column, step))
+    ranked.sort()
+    chosen: List[int] = []
+    steps: List[int] = []
+    unclean = 0
+    for failed, _order, column, step in ranked:
+        if len(chosen) == int(per_segment):
+            break
+        if all(abs(step - other) >= int(spacing) for other in steps):
+            chosen.append(column)
+            steps.append(step)
+            unclean += int(failed)
+    return np.asarray(chosen, dtype=np.int64), unclean
 
 
 def _host(tensor: torch.Tensor) -> np.ndarray:
@@ -1281,7 +1357,10 @@ def layer_attribution(
         head = model.posterior_head
         layer = list(head.fusion) if getattr(head, "head_structured", False) else None
     else:
-        layer = getattr(model, "proposal_head", None)
+        head = getattr(model, "proposal_head", None)
+        # The head's own single-tensor output where it declares one: on a mean-only arm the head
+        # returns ``(mean, None)``, and a layer hook cannot clone a tuple carrying ``None``.
+        layer = getattr(head, "attribution_layer", head)
     if n_rows == 0 or layer is None:
         return {"per_unit": np.zeros((0, 0)), "total": np.zeros(0)}
     exact = baselines_for(baseline, inputs)

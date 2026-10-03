@@ -27,7 +27,7 @@ import pandas as pd
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.eval import attribution_pass
+from teb_vae.lag_attn_cfs.eval import attribution_pass, class_contrast
 from teb_vae.lag_attn_cfs.eval import attributions as core
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
@@ -616,6 +616,111 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         assert np.abs(handle["map_target"][null]).max() == 0.0
     grouped = result["grouped_frames"][0]
     assert (tmp_path / grouped["path"]).is_file()
+    # The cohort pass draws past the main cap (every stub recording here) and compares the classes
+    # on integrated gradients and on Grad-CAM, one recording per unit.
+    contrast = result["class_contrast"]
+    assert contrast["n_recordings_by_class"] == {"healthy": 3, "acidosis": 2, "hie": 2}
+    assert contrast["plan"]["gradcam_target_layer"] == "target_encoder input"
+    for name in contrast["files"]:
+        assert (directory / name).is_file(), name
+    for stem in (class_contrast.CLASS_FIGURE, class_contrast.CLASS_MAP_FIGURE, class_contrast.GRADCAM_FIGURE):
+        assert (directory / f"{stem}.pdf").is_file()
+    stats = pd.read_csv(directory / class_contrast.STATS_FILENAME)
+    assert set(stats["family"]) == {*(f"ig:{r}" for r in class_contrast.COHORT_READOUTS),
+                                    *(f"gradcam:{r}" for r in class_contrast.GRADCAM_READOUTS)}
+    cams = pd.read_csv(directory / class_contrast.GRADCAM_ROWS_FILENAME)
+    assert set(cams["readout"]) == set(class_contrast.GRADCAM_READOUTS) and cams["guid"].nunique() == 7
+    assert plt.get_fignums() == []
+
+
+def test_informative_columns_put_clean_history_first_in_kl_order_and_keep_their_distance() -> None:
+    anchor_index = np.arange(10, 30)
+    contributing = np.ones(20, dtype=bool)
+    weight = np.ones(40)
+    weight[18] = 0.0                     # a gap inside the 4-step lag window of anchors 18..21
+    # Highest K_t first: 20 (unclean), 25, 24 (too close to 25), 12, 15.
+    chosen, unclean = core.informative_columns(
+        anchor_index, contributing, [20, 25, 24, 12, 15], weight, n_lags=4, per_segment=3, spacing=3,
+    )
+    assert list(anchor_index[chosen]) == [25, 12, 15] and unclean == 0
+    chosen, unclean = core.informative_columns(
+        anchor_index, contributing, [20, 25, 24, 12, 15], weight, n_lags=4, per_segment=5, spacing=3,
+    )
+    assert list(anchor_index[chosen]) == [25, 12, 15, 20] and unclean == 1
+
+
+def _fixed_collate_factory(dataset: _StubDataset):
+    """A collate whose samples do not depend on the batch they land in, as a real dataset's do."""
+    def _collate(items: List[int]):
+        parts = [make_stub_batch(batch=1, seed=int(index)) for index in items]
+        batch = parts[0]
+        for name, value in vars(batch).items():
+            if torch.is_tensor(value):
+                setattr(batch, name, torch.cat([getattr(part, name) for part in parts], dim=0))
+        batch.guid = [dataset.guids[index] for index in items]
+        batch.epoch = torch.tensor([dataset.epochs[index] for index in items])
+        return batch
+    return _collate
+
+
+def _per_anchor(module, loader, dataset, classes) -> pd.DataFrame:
+    """The collection pass's per-anchor table, rebuilt from the real forward of every stub segment."""
+    rows = []
+    model = module.orig_model
+    for index in range(len(dataset)):
+        batch = loader.collate_fn([index])
+        y_st, y_ph, u_stream, _target, weight = model_inputs(module, batch)
+        with torch.no_grad():
+            outputs = model(y_st, y_ph, u_stream, anchor_phase=DENSE_ANCHOR_GEOMETRY[0], anchor_stride=DENSE_ANCHOR_GEOMETRY[1])
+        scored = core.contributing_columns(model, weight, outputs)[0]
+        for column in np.flatnonzero(scored):
+            step = int(outputs["anchor_index"][0, column])
+            rows.append({"guid": dataset.guids[index], "epoch": dataset.epochs[index], "anchor": step,
+                         labels.CLASS_COLUMN: classes[index], "coverage": 1.0,
+                         "kld_per_t": float(outputs["kld_per_t"][0, step])})
+    return pd.DataFrame(rows)
+
+
+def test_the_informative_rule_attributes_high_kl_anchors_and_pages_the_top_ones_per_class(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(core, "IG_STEPS", 8)
+    guids, epochs, classes = _stub_population()
+    dataset = _StubDataset(guids, epochs)
+    loader = types.SimpleNamespace(dataset=dataset, collate_fn=_fixed_collate_factory(dataset), batch_size=2)
+    per_sample = pd.DataFrame(
+        {"guid": guids, "epoch": epochs, labels.CLASS_COLUMN: classes,
+         labels.SUBGROUP_COLUMN: [f"{name}_cs" for name in classes]}
+    )
+    module = _module()
+    per_anchor = _per_anchor(module, loader, dataset, classes)
+    context = AnalysisContext(
+        collection=types.SimpleNamespace(per_sample=per_sample, per_anchor=per_anchor, record={}, retained={}, results={}),
+        config={}, task=module, loader=loader,
+    )
+    plt.close("all")
+
+    result = analysis.run_attribution_analysis(
+        context, eval_config={"seed": 0, "caps": {core.CAP_NAME: 6, class_contrast.COHORT_CAP_NAME: 6},
+                              "occlusion_bands": TINY_BANDS},
+        output_dir=tmp_path,
+    )
+
+    selection = result["plan"]["anchor_selection"]
+    assert selection["rule"] == "high_kl_clean" and result["class_contrast"]["plan"]["anchor_rule"] == "high_kl_clean"
+    directory = tmp_path / core.ANALYSIS_DIRNAME
+    rows = pd.read_csv(directory / core.ROWS_FILENAME)
+    kld = rows[(rows["readout"] == core.READOUT_KLD) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)]
+    # Every attributed anchor is a candidate: its K_t reaches the pooled threshold ...
+    assert (kld["value_input"] >= selection["kl_threshold_nats"] - 1e-4).all()
+    # ... and the anchors of one segment are at least one horizon apart.
+    for _, steps in kld.groupby("guid")["anchor"]:
+        gaps = np.diff(np.sort(steps.to_numpy()))
+        assert (gaps >= int(module.orig_model.horizon)).all()
+    # The example pages are the highest-KL selected segments of each class, ranked from zero.
+    examples = pd.read_csv(directory / attribution_pass.EXAMPLE_MANIFEST_FILENAME)
+    assert examples.groupby(labels.CLASS_COLUMN).size().max() <= core.EXAMPLES_PER_CLASS
+    assert examples["guid"].is_unique and len(examples) > len(set(examples[labels.CLASS_COLUMN]))
+    for _, row in examples.iterrows():
+        assert (directory / row["figure_file"]).is_file()
     assert plt.get_fignums() == []
 
 

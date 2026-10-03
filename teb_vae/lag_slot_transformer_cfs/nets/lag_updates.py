@@ -219,6 +219,10 @@ class LagProposalHead(nn.Module):
         self.output_proj = nn.Linear(
             self.hidden, self.d_z if self.mean_only else 2 * self.d_z
         )
+        # The head's output as ONE tensor, before it is split into its two channels. A layer
+        # attribution hooks this module rather than the head: the head returns ``(mean, None)`` on
+        # a mean-only arm, and a hook cannot clone a tuple that carries ``None``.
+        self.attribution_layer = nn.Identity()
         self.zero_output()
 
     def zero_output(self) -> None:
@@ -374,6 +378,7 @@ class LagProposalHead(nn.Module):
             gate = selector_term if gate is None else gate * selector_term
         if gate is not None:
             raw = raw * gate.unsqueeze(-1)
+        raw = self.attribution_layer(raw)
 
         if self.mean_only:
             return raw, None

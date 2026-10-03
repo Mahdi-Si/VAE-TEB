@@ -10,6 +10,8 @@
       "attribution_blocks.pdf",
       "attribution_channels.pdf",
       "attribution_checks.pdf",
+      "attribution_class_maps.pdf",
+      "attribution_classes.pdf",
       "attribution_horizon.pdf",
       "attribution_lag_channel.pdf",
       "attribution_lag_profile.pdf",
@@ -17,7 +19,8 @@
       "attribution_maps.pdf",
       "attribution_null.pdf",
       "attribution_time_profile.pdf",
-      "attribution_time_to_delivery.pdf"
+      "attribution_time_to_delivery.pdf",
+      "gradcam_classes.pdf"
     ],
     "calibration": [
       "logvar_distribution.pdf",

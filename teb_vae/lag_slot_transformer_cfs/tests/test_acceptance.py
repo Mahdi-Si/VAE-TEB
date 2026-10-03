@@ -671,8 +671,12 @@ def evidence(tmp_path_factory):
     for seed in ARM_SEEDS:
         checkpoint = fit_arm(fits, f"c{seed}", {"general_config.seed": seed})
         score_arm(runs, f"c{seed}", checkpoint)
-    mean_only = fit_arm(fits, "mo", {"model_config.VAE_model.mean_only_residual": True})
-    score_arm(runs, "mo", mean_only)
+    sampled = fit_arm(
+        fits,
+        "sl",
+        {"model_config.VAE_model.latent_sampling": True, "model_config.VAE_model.train_mc_draws": 2},
+    )
+    score_arm(runs, "sl", sampled)
 
     target_only = fit_arm(
         fits, "ref", {"model_config.VAE_model.source_disabled": True, "general_config.seed": 99}
@@ -736,6 +740,20 @@ def test_the_entry_point_writes_a_record_and_reports_its_verdicts(evidence, tmp_
     declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
     declaration["protocol"]["primary_draws"] = FIXTURE_DRAWS
     declaration["protocol"]["bootstrap_resamples"] = FIXTURE_RESAMPLES
+    # The fixture fits search their own short window, which the committed plan declares no family
+    # for. Its family is declared here from what the runs record, as an operator declares a
+    # window's bands before scoring it.
+    fixture_run = acceptance.discover_runs(str(runs_root))[0]
+    prefix = acceptance.SUPPRESSION_COLUMN_PREFIX
+    declaration["exploratory_band_families"][int(fixture_run["searched_lag_steps"])] = sorted(
+        {
+            name[len(prefix):]
+            for row in fixture_run["table"].values()
+            for name in row
+            if name.startswith(prefix)
+        }
+        - {"none", "all"}
+    )
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(yaml.safe_dump(declaration, sort_keys=False), encoding="utf-8")
     output = tmp_path / "acceptance.json"

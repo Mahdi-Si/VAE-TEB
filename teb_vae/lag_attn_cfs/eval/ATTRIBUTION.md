@@ -2,7 +2,7 @@
 
 This guide explains how the `attribution` analysis relates a model output to the input coefficients that influenced it. It covers the lag-attention forecasters, including the conv-LSTM and transformer variants, and the lag-slot transformer in `lag_slot_transformer_cfs`. The latter is also called the **lag-residual model** because it combines per-lag proposals into a bounded latent update.
 
-Start with sections 1–4 to understand the method and read its results. Sections 5–7 explain the saved files, selection, and cost. Sections 8–10 provide implementation details and recorded fixture findings. Section 11 lists what to check on a trained model.
+Start with sections 1–4 to understand the method and read its results. Sections 5–7 explain the saved files, selection, and cost. Sections 8–10 provide implementation details and recorded fixture findings. Section 11 lists what to check on a trained model. Section 13 explains how the classes are compared over many recordings, and the Grad-CAM views that the comparison adds.
 
 [EVAL.md](EVAL.md) explains the overall evaluation workflow, and [FIGURE_GUIDE.md](FIGURE_GUIDE.md) explains the individual plots. The lag-residual model runs the same attribution implementation as its own registered `attribution` analysis under the shared runner; see [its evaluation guide](../../lag_slot_transformer_cfs/eval/EVAL.md).
 
@@ -20,6 +20,7 @@ Start with sections 1–4 to understand the method and read its results. Section
 - [10. Recorded fixture findings](#10-recorded-fixture-findings)
 - [11. What to record from a production run](#11-what-to-record-from-a-production-run)
 - [12. Interpretation limits](#12-interpretation-limits)
+- [13. Class comparison and Grad-CAM](#13-class-comparison-and-grad-cam)
 
 ## 1. What attribution tells you
 
@@ -94,8 +95,9 @@ The Monte Carlo predictive score `mc_pred_gap` is not attributed here. Attributi
 - Layer attribution for every main readout under `source_null`, split by attention head or lag slot.
 - Source-band ablation for every main readout under `source_null`.
 - Target-only readouts on one segment per run to verify that source attribution is zero.
-- One **example anchor per class**, attributed for `kld`, `pred_gap`, `nll_full`, `mse_full`, `mse_gap`, `nll_horizon` at both steps and `lag_band` on every configured band under both baselines, with the full maps, the input streams, the raw FHR and UP of its segment, the latent at the anchor and every readout's layer split kept for the map pages. The example anchor is one of the main rows, so its maps are the main calls' own rows at that anchor, kept as they are made; only the variants no main call takes are integrated again for it.
+- Up to `EXAMPLES_PER_CLASS` $=3$ **example anchors per class**, the highest-KL clean anchors of the class (section 7), attributed for `kld`, `pred_gap`, `nll_full`, `mse_full`, `mse_gap`, `nll_horizon` at both steps and `lag_band` on every configured band under both baselines, with the full maps, the input streams, the raw FHR and UP of its segment, the latent at the anchor and every readout's layer split kept for the map pages. The example anchor is one of the main rows, so its maps are the main calls' own rows at that anchor, kept as they are made; only the variants no main call takes are integrated again for it.
 - The per-recording **trace** readouts, `kld` and `pred_gap`, at a few anchors of every segment of one recording per class under `source_null`.
+- A separate **cohort pass** for the class comparison (section 13): a larger class-balanced draw, with `kld` and `pred_gap` under `source_null` and Grad-CAM of every main readout.
 
 The lag bands are the validated `eval_config.occlusion_bands`. Besides explicit inclusive `[lo, hi]` pairs, that block may carry the reserved entry `partition_width`, an integer width that `config_schema.partition_lag_window` expands against the model's own lag window into contiguous bands named `lags_<lo>_<hi>`, the last absorbing the remainder, listed before the explicit bands. The runner validates the block before any analysis runs and hands the validated copy to this pass, so width-form bands arrive already expanded and the pass sees only pairs.
 
@@ -268,6 +270,12 @@ Every lag axis represents stored-coefficient time. It is not a physiological del
 | `attribution_traces.csv` | Manifest of traced recordings: identity, class, subgroup, segment and anchor counts, span, coverage, and array/figure paths. |
 | `attribution_trace_anchors.csv` | Every traced anchor of every traced recording in one table: identity, time axis, and each trace readout's scalars and lag statistics, as the trace figures draw them. |
 | `traces/<class>/<guid>_<subgroup>_attribution_trace.npz` | Shared trace arrays for one recording, including `attribution_lag_map` and `model_lag_map`. |
+| `attribution_cohort_rows.csv`, `attribution_cohort_vectors.npz` | The cohort pass's integrated-gradient rows and row-aligned vectors, in the same layout as `attribution_rows.csv` and `attribution_vectors.npz`. |
+| `gradcam_rows.csv`, `gradcam_vectors.npz` | One row per cohort anchor and Grad-CAM readout: the readout value and, per view, the unnormalised `<view>_total` and the `<view>_centroid_s`. The arrays hold the normalised profiles `target` $(N,T)$, `source` $(N,L)$ and `attention` $(N,L)$. |
+| `attribution_class_recordings.csv` | One row per cohort recording: its class and every tested metric (section 13). |
+| `attribution_class_stats.csv` | One row per metric: per-class `n`, mean and bootstrap interval, the Kruskal–Wallis statistic, `p_value`, `p_holm` within the family, and `significant`. |
+| `attribution_class_pairwise.csv` | One row per metric and class pair: the two means, `mean_diff` with its bootstrap interval, the Mann–Whitney `p_value`, `p_holm_pairs`, `cliffs_delta`, `magnitude` and the metric's `omnibus_p_holm`. |
+| `attribution_class_lag_channel.npz` | Per class, the mean signed and unsigned lag-by-channel maps of the cohort readouts, keyed `<readout>__<baseline>__<stream>__<class>__mean[_abs]`. |
 
 ### Per-anchor column reference
 
@@ -307,6 +315,9 @@ The lag-band table records `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_
 | `attribution_time_to_delivery.pdf` | The source attribution total and the lag centroid of every attributed anchor against hours before delivery, by class. |
 | `attribution_blocks.pdf` | Per readout, the unsigned share and the signed sum of the attribution in each of the four input blocks. |
 | `attribution_horizon.pdf` | The per-step score at the first and the last horizon step: stream totals, and the source and target attribution by offset per step. |
+| `attribution_classes.pdf` | Per cohort readout: the class-mean source attribution by lag with bootstrap bands, every class pair's difference with its band, and the per-recording source total by class with the Holm-adjusted Kruskal–Wallis $p$. |
+| `attribution_class_maps.pdf` | Per cohort readout: the class-mean unsigned source attribution by lag and channel, and the difference map of every class pair. |
+| `gradcam_classes.pdf` | Per main readout and Grad-CAM view: the class-mean profile and every class pair's difference, with bootstrap bands. |
 | `traces/<class>/<guid>_<subgroup>_attribution_trace.pdf` | The raw FHR and UP of every segment on the top rows, then the attribution lag maps of the divergence and of the forecast gap through one recording beside the model lag map, with each readout's agreement, totals and values on the hours-before-delivery axis. Every panel shares its colour scale or $y$ range across the traced recordings. |
 
 The [figure guide](FIGURE_GUIDE.md#attributionattribution_mapspdf) provides panel-by-panel interpretation. Every figure but the checks page prints `ATTRIBUTION_NOTE`, the one-line form of `ATTRIBUTION_CAVEAT`; the long caveat, the group-delay caveat and the model-specific lag qualification travel in the record (`caveat`, `lag_qualification`). Every map blanks the cells the model never read (a channel's cold steps, and the steps after the anchor on an attribution map) and draws attributions on a symmetric-log colour scale spanning `LOG_DECADES` below the scale's largest magnitude; line and bar panels of attributions are on symmetric-log axes for the same reason.
@@ -317,7 +328,7 @@ The [figure guide](FIGURE_GUIDE.md#attributionattribution_mapspdf) provides pane
 
 The block is `results.attribution` in `summary.json` for both model types, since both run it as a registered analysis under the shared runner.
 
-It contains `n_samples` (segments), `composition`, `plan`, `selection`, `trace_selection`, `cost`, `checks`, `summary`, `lag_bands`, `blocks`, `joined`, `methods`, `lag_qualification`, `caveat`, `traces`, `examples`, `failures`, and `files`. The `plan` records the cap, seed, anchors per segment, integration steps, entry fraction, baselines, main readouts, horizon steps, example readouts, lag readout and lag bands, `lag_definition`, `source_channel_shift_steps_max`, layer, `delay_steps`, the anchor geometry the anchors are chosen on, `attributed_forward` (one anchor per row, decoded at the latent means, no $\epsilon$ drawn), and the trace settings. `joined` records which supporting files were found. Attentive evaluators also include `grouped_frames`; the lag-residual block adds its channel-map record and an ablated-input check.
+It contains `n_samples` (segments), `composition`, `plan`, `selection`, `trace_selection`, `cost`, `checks`, `class_contrast` (section 13), `summary`, `lag_bands`, `blocks`, `joined`, `methods`, `lag_qualification`, `caveat`, `traces`, `examples`, `failures`, and `files`. The `plan` records the cap, seed, anchors per segment, integration steps, entry fraction, baselines, main readouts, horizon steps, example readouts, lag readout and lag bands, `lag_definition`, `source_channel_shift_steps_max`, layer, `delay_steps`, the anchor geometry the anchors are chosen on, `attributed_forward` (one anchor per row, decoded at the latent means, no $\epsilon$ drawn), and the trace settings. `joined` records which supporting files were found. Attentive evaluators also include `grouped_frames`; the lag-residual block adds its channel-map record and an ablated-input check.
 
 The lag-residual tests check that this block avoids names its acceptance gate reserves for unsupported attention distributions or per-lag KL allocations.
 
@@ -325,13 +336,22 @@ The lag-residual tests check that this block avoids names its acceptance gate re
 
 ### Main attribution selection
 
-The main pass uses a seeded selection balanced across clinical classes, subject to available recordings and the total cap. It selects one segment per recording: the middle segment in `epoch` order. A recording needs at least one segment to be eligible. Using one segment per recording prevents recordings with many segments from dominating the summaries.
+The pass attributes the anchors where the source moved the belief and the signal is clean. A typical anchor carries a small $K_t$ that is mostly the availability clock, and its attribution map is hard to read. The rule (`attribution_pass.informative_anchors`) uses the collection pass's `per_anchor.parquet`:
 
-The pass attributes up to `ANCHORS_PER_SEGMENT` anchors spread across each selected segment's scored anchors. The current value is $4$.
+1. Pool $K_t$ over every scored anchor of every class, and take its `HIGH_KL_QUANTILE` $=0.7$ quantile as one threshold in nats. This is the `high` band of the `lag_high_kl` analysis. Because one number cuts every class, no class chooses its own anchors.
+2. Keep the anchors at or above the threshold whose forecast `coverage` reaches `CLEAN_COVERAGE` $=0.95$. These are the candidates.
+3. Draw recordings that hold a candidate, class-balanced and seeded, one segment per recording. Each recording gives the segment with the most candidates; ties go to the larger top $K_t$.
+4. In that segment, keep up to `ANCHORS_PER_SEGMENT` $=4$ candidates, highest $K_t$ first, at least one horizon $H$ apart. A candidate whose mean validity over the searched lag window $[t_a-L+1,t_a]$ is below `CLEAN_COVERAGE` is used only when too few clean ones remain; `plan.anchor_selection.n_unclean_anchors` counts these.
+5. The `EXAMPLES_PER_CLASS` $=3$ selected segments of each class with the largest top $K_t$ give the example pages, each at its highest-KL anchor. The overview `attribution_maps.pdf` shows the first of each class.
+
+The population figures and tables therefore describe the **average behaviour at high-KL, clean anchors**, not at a typical anchor. `plan.anchor_selection` records the threshold in nats, the candidate count and the recordings with candidates. Using one segment per recording still prevents recordings with many segments from dominating the summaries.
+
+Without a per-anchor table (an offline re-run, or the lag-residual cell, whose pass does not pass one), the pass falls back to the earlier rule: the middle segment of each recording, `ANCHORS_PER_SEGMENT` anchors spread evenly over its scored anchors, and one example per class. `plan.anchor_selection.rule` says which rule ran.
 
 | Setting or constant | Current value and meaning |
 | --- | --- |
 | `eval_config.caps.attribution_segments` | Segment cap, currently $24$ in the committed overrides. Omitting it uses the analysis default, rather than every segment. |
+| `eval_config.caps.attribution_cohort_segments` | Segment cap of the cohort pass (section 13), currently $150$ in the committed overrides, which is $50$ recordings per class. `DEFAULT_COHORT_SEGMENTS` is also $150$. |
 | `DEFAULT_SEGMENTS` | $24$: fallback for the main selection cap. |
 | `ANCHORS_PER_SEGMENT` | $4$: anchors spread over each segment's scored support. |
 | `IG_STEPS` | $64$: integration steps. |
@@ -513,3 +533,63 @@ Use `results.attribution` for attentive models or `attribution` for the lag-resi
 - **Frequency-band attribution is not frequency-band skill.** It sums over declared input channels, including dropped channels at zero. `spectral_skill` measures predictive performance on retained target channels.
 - **Example maps show individual anchors.** A striking map is one selected example. Use the recording-level summaries to understand whether its pattern is common in the evaluated selection.
 - **Completeness is relative to the entry point.** A row above tolerance does not accurately account for its claimed integrated output difference. Inspect the per-row residuals and summary counts before interpreting its attribution.
+
+## 13. Class comparison and Grad-CAM
+
+The example pages show one anchor per class. One anchor cannot tell a class pattern from a recording pattern, so the class comparison has its own, larger draw. `class_contrast.py` reads that draw, and `gradcam.py` supplies a second, cheaper attribution method.
+
+### 13.1 The cohort pass
+
+`attribution_pass.run_cohort` draws segments with the same rule as the main pass: one middle segment per recording, class-balanced and seeded. Its cap is `caps.attribution_cohort_segments`, $150$ by default. Each segment gets only what the comparison reads:
+
+- integrated gradients of `kld` and `pred_gap` (`COHORT_READOUTS`) under `source_null`, at `ANCHORS_PER_SEGMENT` anchors;
+- Grad-CAM of the four main readouts at the same anchors.
+
+It uses the same high-KL clean anchors as the main pass (section 7). The cohort pass has no layer split, ablation, lag-band readout, horizon readout, `all_zero` path or example page. A cohort segment therefore costs about a fifth of a main-pass segment. On the epoch-944 transformer checkpoint ($L=91$, conv-stem K/V) and an RTX 4080 laptop GPU, one 64-step IG call took about $0.5$ s per row. A cohort segment thus costs about $4$ s, and $150$ segments take about $10$ minutes. One Grad-CAM call took about $1$ s per $128$ rows. The block's `class_contrast.cost` records the measured rate of each run.
+
+### 13.2 Grad-CAM
+
+For a layer with time-major activations $A\in\mathbb R^{T\times D}$ and a readout $f$ at anchor $t_a$, Grad-CAM gives each feature channel one weight and keeps the positive part of the weighted sum:
+
+$$
+w_d=\frac{1}{|\mathcal R|}\sum_{t\in\mathcal R}\frac{\partial f}{\partial A_{t,d}},\qquad
+\mathrm{CAM}_t=\mathrm{ReLU}\Bigl(\sum_d w_d\,A_{t,d}\Bigr).
+$$
+
+$\mathcal R$ is the set of steps with a nonzero gradient. On these causal models that set never passes the anchor. Each map is re-indexed by offset $\ell=t_a-t$ and divided by its sum, so a class mean shows *where* the readout looked. The unnormalised sum is kept as `<view>_total`.
+
+| View | Layer | Why this layer |
+| --- | --- | --- |
+| `target` | Input of `target_encoder.attention_blocks[-1]`; the encoder input on the conv-LSTM cell | The prior and posterior heads are per-step, so the readout at $t_a$ reads the encoder's *output* only at $t_a$, and a map there is a spike at lag $0$. The last attention block's input is the deepest target layer whose earlier steps the readout still reads. |
+| `source` | The forward's `source_state`, the K/V stream of the lag attention | The lag attention reads this stream at every lag. |
+| `attention` | Output of `lag_attn.attn_dropout`, flipped into lag order | $\mathrm{CAM}_\ell=\frac1M\sum_m\mathrm{ReLU}(\alpha^{(m)}_{t_a,\ell}\,\partial f/\partial\alpha^{(m)}_{t_a,\ell})$, which is gradient-weighted attention. The forward's `attn_weights` is a flipped *copy* of these weights that no readout depends on, so it carries no gradient. |
+
+The ReLU keeps only evidence that raises $f$. A peak therefore means more divergence for `kld`, more advantage of the full branch for `pred_gap`, and a worse score for `nll_full` and `mse_full`. Grad-CAM needs one forward and one backward per readout. It has no baseline and no completeness property, so read it beside the integrated gradients. Captum's `LayerGradCam` is not used, because it pools gradients over every axis after the second and so assumes channel-first maps.
+
+The tests in `lag_attn_transformer_cfs/tests/test_eval_class_attribution.py` check three exact facts on the tiny transformer. Every view sums to one. A target-only readout (`nll_base`) gives zero source and attention evidence. For a `lag_band` readout, the attention view equals the forward's own head-mean attention, restricted to the band and renormalised; this fixes both the hook and the lag order.
+
+### 13.3 How the classes are compared
+
+Every comparison uses the same four steps:
+
+1. Average the anchors of each recording, so that one recording is one unit.
+2. Per class, take the mean over recordings with a $95\%$ percentile bootstrap band over recordings (`BOOTSTRAP_RESAMPLES` $=1000$).
+3. Per class pair, take the difference of means, more severe minus less severe, with a band that resamples each class independently.
+4. Test each per-recording scalar across classes with Kruskal–Wallis, Holm-adjusted within one family. Then test every pair with Mann–Whitney $U$ and Cliff's $\delta$, Holm-adjusted over the metric's pairs.
+
+A family is one method and one readout, for example `ig:kld` or `gradcam:pred_gap`. The tested metrics are:
+
+| Family | Metrics per recording |
+| --- | --- |
+| `ig:<readout>` | `source_total` (signed), `source_abs_total`, `lag_centroid_s` (centroid of the unsigned lag profile), and `lagband_<band>` for every configured band |
+| `gradcam:<readout>` | `<view>_centroid_s` and `<view>_total` for each of the three views |
+
+A positive Cliff's $\delta$ means the more severe class runs higher. The statistics come from the shared `teb_vae.lag_attn.eval.stats` module, so they mean the same as in every other class table of the pipeline.
+
+### 13.4 Reading the comparison
+
+- **Read the difference panels first.** A band that excludes zero marks offsets where two classes differ. A band that straddles zero says the cohort cannot separate them there.
+- **Bands and tests are over recordings.** The cohort draws one segment per recording, so the sample size is the recording count in each legend.
+- **The classes are out of distribution.** The checkpoint trained on healthy recordings only. A class difference describes how the fitted model responds to ACIDOSIS and HIE input, not a physiological mechanism.
+- **The difference maps carry no per-cell test.** Treat an isolated cell as noise, and treat a coherent band of channels or lags as a pattern to check in the tables.
+- **Grad-CAM shares compare location, not size.** Compare sizes with `<view>_total` in the stats table.

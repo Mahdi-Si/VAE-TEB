@@ -16,7 +16,8 @@ import yaml
 import os
 
 from lightning.pytorch import Trainer, seed_everything
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, TQDMProgressBar
+from lightning.pytorch.callbacks.progress.tqdm_progress import Tqdm
 from lightning.pytorch.loggers import Logger as LightningLogger
 from lightning.pytorch.loggers import MLFlowLogger
 from lightning.pytorch.profilers import SimpleProfiler
@@ -46,8 +47,53 @@ _KNOWN_TRAINER_KEYS = {
     "precision", "gradient_clip_val", "gradient_clip_algorithm",
     "sync_batchnorm", "deterministic", "benchmark", "compile",
     "log_every_n_steps", "num_sanity_val_steps", "use_distributed_sampler",
-    "profiler",
+    "profiler", "progress_bar_refresh_rate",
 }
+
+
+class CompactProgressBar(TQDMProgressBar):
+    """A training bar that stays on one line.
+
+    Three things make the stock bar scroll instead of redrawing. Its postfix carries every
+    progress-bar metric twice (``..._step`` and ``..._epoch``) under full ``stage/name`` keys,
+    which is wider than most terminals and wraps; it opens a second bar underneath for
+    validation, which a terminal without cursor movement prints as new lines; and it redraws
+    on every batch, each redraw reading the metrics back from the device. This bar shows each
+    metric once under its short name, reports validation on the same line, and redraws every
+    ``refresh_rate`` batches.
+    """
+
+    def get_metrics(self, trainer, pl_module):
+        """The progress-bar metrics, once each and under short names.
+
+        Args:
+            trainer: The running trainer.
+            pl_module: The module being fitted.
+
+        Returns:
+            ``{name: value}`` without the version number and without the epoch aggregates; the
+            running step value is the one shown, with its ``train/`` prefix and ``_step``
+            suffix removed. Validation values keep their ``val/`` prefix.
+        """
+        items = super().get_metrics(trainer, pl_module)
+        items.pop("v_num", None)
+        return {
+            name.removeprefix("train/").removesuffix("_step"): value
+            for name, value in items.items()
+            if not name.endswith("_epoch")
+        }
+
+    def init_validation_tqdm(self):
+        """No second bar during a fit: the training bar's description says it is validating."""
+        if self._train_progress_bar is None:
+            return super().init_validation_tqdm()
+        return Tqdm(disable=True)
+
+    def on_validation_start(self, trainer, pl_module) -> None:
+        """Mark the training bar as validating; the next epoch's start restores its name."""
+        super().on_validation_start(trainer, pl_module)
+        if self._train_progress_bar is not None and not trainer.sanity_checking:
+            self._train_progress_bar.set_description(f"Epoch {trainer.current_epoch} [validating]")
 
 # Blocks the framework recognises under ``advanced_config``. ``tracking`` and
 # ``spike_breaker`` are reserved for wiring the framework does not yet own; ``memory``
@@ -462,6 +508,22 @@ class GraphModelBase(ABC):
                 log_model=bool(self._mlflow_settings.get('log_model', False)),
             ))
 
+        # The progress bar. tqdm redraws with a carriage return, which a TTY collapses into one
+        # updating line but a redirected stream (nohup, SLURM, CI) expands into thousands of
+        # near-identical lines that bury the real log. Gated on *stdout* because that is the
+        # stream the bar writes to; stderr can be a TTY while stdout is a pipe. A refresh rate
+        # of zero turns the bar off on a terminal too. The default follows the logging cadence:
+        # every redraw reads the bar's metrics back from the device, so a per-batch redraw is a
+        # per-batch synchronisation.
+        refresh_rate = int(
+            trainer_cfg.get(
+                'progress_bar_refresh_rate', trainer_cfg.get('log_every_n_steps', 1)
+            )
+        )
+        show_progress = sys.stdout.isatty() and refresh_rate > 0
+        if show_progress:
+            callback_list.append(CompactProgressBar(refresh_rate=refresh_rate))
+
         num_devices = len(self.cuda_devices)
         # SyncBatchNorm's forward needs an initialized process group, so it is only safe
         # when more than one device is actually in play — never the config value alone.
@@ -488,13 +550,7 @@ class GraphModelBase(ABC):
             'num_sanity_val_steps': int(trainer_cfg.get('num_sanity_val_steps', 0)),
             'use_distributed_sampler': bool(trainer_cfg.get('use_distributed_sampler', True)),
             'sync_batchnorm': sync_batchnorm,
-            # tqdm redraws with a carriage return, which a TTY collapses into one
-            # updating line but a redirected stream (nohup, SLURM, CI) expands into
-            # thousands of near-identical lines that bury the real log. Gated on
-            # *stdout* because that is the stream TQDMProgressBar writes to
-            # (``file=sys.stdout`` in tqdm_progress.py); stderr can be a TTY while
-            # stdout is a pipe, so testing the wrong one silently keeps the bar on.
-            'enable_progress_bar': sys.stdout.isatty(),
+            'enable_progress_bar': show_progress,
             'logger': self.lightning_loggers if self.lightning_loggers else True,
         }
 

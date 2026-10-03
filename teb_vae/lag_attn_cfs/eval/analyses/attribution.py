@@ -98,6 +98,7 @@ def run_attribution_analysis(
         occlusion=attribution_pass.read_occlusion_summary(results_dir),
         spectral=attribution_pass.read_spectral_bands(results_dir),
         delay_steps=delay_steps,
+        per_anchor=getattr(collection, "per_anchor", None),
     )
     block["grouped_frames"] = [
         grouped_frame_entry(
