@@ -1,0 +1,35 @@
+# Planted-delay instrument, not an arm (P5-01): the shard couples raw UP to raw FHR at 45 steps
+# (180 s), so the lag readout has a ground truth. max_lag 60 puts the informative band [15, 44]
+# inside the search; tiny.yaml's 8 would not. Its stats file is trim_minutes 1.0, as the loader is.
+base: tiny.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_planted
+  epochs: 40
+  lr: 0.001
+  plot_frequency: 100
+  folders_config: {out_dir_base: output/teb_vae_trf_patch_planted}
+
+model_config:
+  VAE_model:
+    max_lag: 60
+    likelihood: gaussian_nll   # the production objective shapes the KL this check reads
+    # The CFS instrument's leaves (lag_attn_transformer_cfs/configs/planted.yaml), so the two
+    # cells' planted readings are comparable: dense training anchors, no source dropout, no AR.
+    anchor_stride: 1
+    source_dropout: null
+    forecast_ar_residual: false
+    # From summary_stats.py on the planted shard (tiny.yaml's values are the other shard's).
+    target_summary_loc: [0.0, -1.5129]
+    target_summary_scale: [0.8397, 0.2227]
+    variability_eps: 0.0282
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 5
+
+dataset_config:
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_planted.hdf5

@@ -1,0 +1,188 @@
+# Patch-token cell, shipped config. It is lag_attn_transformer_cfs/configs/default.yaml with the
+# IMPLEMENTATION_PLAN.md B.9 delta applied and nothing else, so the two cells differ in the
+# representation alone: one 4 s raw patch (16 samples) per token instead of ST/PH coefficients, and
+# the next 30 per-patch summaries (level, variability) as the forecast target.
+#
+# PROVISIONAL: the loss-scale constants (gradient_clip_val, additive_margin) and the target summary
+# constants (target_summary_*, variability_eps). See the comments at each.
+#
+#   python -m teb_vae.lag_attn_transformer_patch.trainer \
+#       --config teb_vae/lag_attn_transformer_patch/configs/default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_baseline
+  seed: 42
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  lr: 0.0003
+  lr_milestone: [400, 800]
+  lr_warmup_steps: 2000
+  plot_frequency: 5
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 128
+    test: 128
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_patch
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 50
+    free_bits: 0.0
+    beta_prior: 0.1
+    likelihood: gaussian_nll
+    lambda_full: 1.0
+    lambda_base: 1.0
+    lambda_ms: 0.0
+    lambda_deriv: 0.0
+    lambda_boundary: 0.0     # must stay 0: anchors are tiled S apart (preflight refuses otherwise)
+
+    # Geometry. sequence_length and raw_per_step must be stated: the raw-length guard skips without them.
+    d_model: 128
+    d_z: 64
+    horizon: 30
+    raw_per_step: 16
+    warmup_period: 30        # covers the encoder stem's 21-token reach (CFS: 134, the ST/PH filter support)
+    sequence_length: 300
+    anchor_stride: 15
+    lag_floor: 0
+
+    dropout: 0.1
+    source_dropout: 0.2
+    decoder_hidden: 256
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    delta_logvar_scale: 2.0
+    coverage_floor: 0.9
+    base_decode: mean
+    posterior_logvar_mode: independent
+    encoder_conv_kernels: [5, 9]
+    encoder_conv_dilations: [1, 2]
+    encoder_num_heads: 4
+    encoder_d_ff: 512
+    target_attention_blocks: 6
+    source_attention_blocks: 3
+    source_attention_window: 16
+
+    # Objective (plan A.5).
+    horizon_weight_halflife_steps: null   # a weighted score is not a log-density
+    forecast_ar_residual: true            # AR(1) innovations along the horizon
+    persistence_residual: false           # keep the FHR level in the latent
+    prior_availability_input: false       # patches have no warm-up availability staircase
+
+    # Target summaries.
+    # PROVISIONAL (C12): run summary_stats.py on the production training shards before the first
+    # production run and replace these identity placeholders.
+    target_summary_loc: [0.0, 0.0]
+    target_summary_scale: [1.0, 1.0]
+    variability_eps: 0.01
+    source_validity: finite
+
+    max_lag: 37
+    num_heads: 4
+    d_head: 32
+    use_entmax: true
+    attention_grad_checkpoint: false
+    lag_kv_source: adapter   # unchanged from CFS; here the adapter is the UP patch embedding
+    lag_bias_init: alibi_decay
+    alibi_slope_scale: 0.0
+    query_uses_logvar: false
+    horizon_depth: 4
+    horizon_kernel: 3
+    horizon_film: true
+    horizon_attention_blocks: 2
+    horizon_embed_std: 0.8
+    head_init_calibration: true
+    a_head_gain: 2.0
+  core_model_checkpoint: null
+
+dataset_config:
+  # The CFS shard paths: any existing build works, since only fhr, up and weight are read.
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_no_cs.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/stats.hdf5
+  dataloader_config:
+    num_workers: 8
+    prefetch_factor: 4
+    normalize_fields: [fhr, up]
+    dataset_kwargs:
+      pin_memory: false
+      load_fields: [fhr, up, weight, guid, epoch]
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: -48000
+      epoch_max: null
+      label: null
+      cache_size: 0
+      trim_minutes: 1.0      # must match the stats file's
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    # PROVISIONAL: scaled by 60/2280 from CFS; re-derive per lag_attn_transformer_e2e/DESIGN.md §12.
+    gradient_clip_val: 280.0
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+    compile: false
+    log_every_n_steps: 25
+    num_sanity_val_steps: 0
+    use_distributed_sampler: true
+    profiler: simple
+  logging:
+    console_level: INFO
+    file_level: INFO
+    json_log: true
+    console_diagnose: false
+    rotation: "100 MB"
+    retention: "14 days"
+  spike_breaker:
+    enabled: true
+    multiplier: 5.0
+    ema_decay: 0.02
+    warmup_batches: 100
+    comparison_metric: main_loss
+    ema_floor: 1.0e+9
+    # PROVISIONAL: scaled by 60/2280 from CFS; re-derive per lag_attn_transformer_e2e/DESIGN.md §12.
+    additive_margin: 175.0
+    max_consecutive_skips: 25
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-attn-trf-patch
+      run_name: lag_attn_trf_patch_baseline
+      artifact_location: null
+      log_model: true
+      log_checkpoints: false
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn_trf_patch_baseline
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val/total_loss"
+      patience: 50
+      min_delta: 0.0001
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+      secondary_monitor: "val/nll_full_block"
+    lag_attn_rws_plotting:
+      enabled: false         # v1 ships no forecast page
+      num_examples: 2
+      file_format: "pdf"
