@@ -29,6 +29,13 @@ of a real run and land in the block beside the fixture-proved ones.
 beside the raw FHR and UP of its segment. Its maps are the main calls' own rows at that anchor,
 kept as they are made; only the variants no main call takes are integrated again for it.
 
+**The class comparison has its own, larger draw** (:func:`run_cohort`). One example per class
+cannot separate a class from a recording, and a main-pass segment is too costly to scale up. The
+cohort pass draws ``caps.attribution_cohort_segments`` segments by the same rule, integrates only
+the divergence and the forecast gap under the source-null baseline, adds Grad-CAM
+(:mod:`~teb_vae.lag_attn_cfs.eval.gradcam`), and hands the result to
+:mod:`~teb_vae.lag_attn_cfs.eval.class_contrast` for class means, class differences and tests.
+
 **Every written table names its rows**: ``guid``, subgroup, class, ``epoch`` and ``anchor`` on
 every per-row and per-anchor file (the row-aligned arrays carry them under a ``row_`` prefix), and
 the ``unit`` of the readout, which is also the unit of its attributions.
@@ -46,7 +53,7 @@ import torch
 from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval import attributions as core
-from teb_vae.lag_attn_cfs.eval import cohort, frames, traces
+from teb_vae.lag_attn_cfs.eval import class_contrast, cohort, frames, gradcam, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
@@ -135,25 +142,78 @@ def recording_table(segments: pd.DataFrame, index_map: Mapping[Tuple[str, Option
     return frame
 
 
+def informative_anchors(
+    per_anchor: Optional[pd.DataFrame],
+    *,
+    quantile: float = core.HIGH_KL_QUANTILE,
+    coverage: float = core.CLEAN_COVERAGE,
+) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+    r"""The anchors worth explaining: high $K_t$ and a clean forecast window.
+
+    The threshold is one number in nats, the ``quantile`` of $K_t$ pooled over every scored anchor
+    of every class, so that no class chooses its own anchors and a class contrast stays honest.
+
+    Args:
+        per_anchor: The collection pass's per-anchor table, with ``guid``, ``epoch``, ``anchor``,
+            ``kld_per_t`` and ``coverage``; ``None`` or incomplete falls back to evenly spread
+            anchors.
+        quantile: The pooled $K_t$ quantile an anchor must reach.
+        coverage: The forecast coverage an anchor must reach.
+
+    Returns:
+        ``(candidates, record)``: ``guid``, ``epoch``, ``anchor`` and ``kld_per_t`` of every
+        qualifying anchor, highest $K_t$ first, or ``None``; and the rule with its threshold and
+        counts.
+    """
+    needed = {"guid", "epoch", "anchor", "kld_per_t", "coverage"}
+    if per_anchor is None or per_anchor.empty or not needed <= set(per_anchor.columns):
+        return None, {"rule": "spread", "reason": "no per-anchor table with kld_per_t and coverage"}
+    kl = per_anchor["kld_per_t"].to_numpy(dtype=np.float64)
+    threshold = float(np.nanquantile(kl, float(quantile)))
+    keep = (kl >= threshold) & (per_anchor["coverage"].to_numpy(dtype=np.float64) >= float(coverage))
+    candidates = per_anchor.loc[keep, ["guid", "epoch", "anchor", "kld_per_t"]].copy()
+    candidates["guid"] = candidates["guid"].astype(str)
+    candidates = candidates.sort_values("kld_per_t", ascending=False).reset_index(drop=True)
+    return candidates, {
+        "rule": "high_kl_clean", "kl_quantile": float(quantile), "kl_threshold_nats": threshold,
+        "coverage_min": float(coverage), "history_validity_min": float(coverage),
+        "n_scored_anchors": int(len(per_anchor)), "n_candidate_anchors": int(len(candidates)),
+        "n_recordings_with_candidates": int(candidates["guid"].nunique()),
+    }
+
+
 def select_segments(
     segments: pd.DataFrame,
     index_map: Mapping[Tuple[str, Optional[int]], int],
     *,
     cap: int,
     seed: int,
+    candidates: Optional[pd.DataFrame] = None,
+    examples_per_class: int = 0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Draw the segments to attribute: one per recording, class-balanced, seeded, capped.
+
+    Without ``candidates`` each drawn recording gives its middle segment. With them only recordings
+    that hold a candidate are drawn, and each gives the segment with the most candidates (ties:
+    the larger top $K_t$). The row then carries ``anchors``, that segment's candidate steps highest
+    $K_t$ first, and ``top_kld``. The ``examples_per_class`` rows of each class with the largest
+    ``top_kld`` get an ``example_rank`` $0, 1, \\ldots$ for the example pages.
 
     Args:
         segments: From :func:`labelled_segments`.
         index_map: The dataset listing.
         cap: The segment cap.
         seed: The draw's seed.
+        candidates: From :func:`informative_anchors`, or ``None``.
+        examples_per_class: Example pages per class; used with ``candidates`` only.
 
     Returns:
         ``(rows, accounting)``: the chosen rows with ``dataset_index``, ascending in that index,
         and the draw's accounting with the cap recorded.
     """
+    if candidates is not None:
+        candidates = candidates.assign(stamp=[epoch_stamp(e) for e in candidates["epoch"]])
+        segments = segments[segments["guid"].astype(str).isin(set(candidates["guid"]))]
     recordings = recording_table(segments, index_map)
     classes = [name for name in recordings[labels.CLASS_COLUMN].dropna().unique()] if len(recordings) else []
     per_class = int(math.ceil(int(cap) / max(len(classes), 1)))
@@ -169,7 +229,19 @@ def select_segments(
         own = segments[segments["guid"].astype(str) == guid].sort_values("epoch")
         if own.empty:
             continue
-        middle = own.iloc[len(own) // 2]
+        extra: Dict[str, Any] = {}
+        if candidates is None:
+            middle = own.iloc[len(own) // 2]
+        else:
+            mine = candidates[candidates["guid"] == guid]
+            ranked = mine.groupby("stamp")["kld_per_t"].agg(["size", "max"]).sort_values(["size", "max"], ascending=False)
+            stamps = [epoch_stamp(e) for e in own["epoch"]]
+            best = next((s for s in ranked.index if s in stamps), None)
+            if best is None:
+                continue
+            middle = own.iloc[stamps.index(best)]
+            steps = mine[mine["stamp"] == best]
+            extra = {"anchors": steps["anchor"].astype(int).tolist(), "top_kld": float(steps["kld_per_t"].max())}
         index = index_map.get((guid, epoch_stamp(middle["epoch"])))
         if index is None:
             continue
@@ -178,11 +250,16 @@ def select_segments(
                 "guid": guid, "epoch": float(middle["epoch"]),
                 labels.CLASS_COLUMN: choice[labels.CLASS_COLUMN],
                 labels.SUBGROUP_COLUMN: choice[labels.SUBGROUP_COLUMN],
-                "dataset_index": int(index),
+                "dataset_index": int(index), **extra,
             }
         )
     columns = ["guid", "epoch", *labels.GROUP_COLUMNS, "dataset_index"]
+    if candidates is not None:
+        columns += ["anchors", "top_kld"]
     rows = pd.DataFrame(picked, columns=columns)
+    if candidates is not None and examples_per_class > 0 and len(rows):
+        rank = rows.groupby(labels.CLASS_COLUMN)["top_kld"].rank(method="first", ascending=False) - 1
+        rows["example_rank"] = rank.where(rank < int(examples_per_class))
     accounting["n_segments_selected"] = int(len(rows))
     return rows.sort_values("dataset_index").reset_index(drop=True), accounting
 
@@ -350,6 +427,11 @@ class BatchWork:
             ``count`` $(L, C)$ of the finite cells, for the population lag-by-channel maps.
             Accumulated rather than kept per row because a row's map is $L \\times C$ and the
             figure wants only the mean.
+        lag_channel_by_class: The same running sums per clinical class, keyed
+            ``(readout, baseline, stream, class)``, for the class-mean maps.
+        gradcam_rows: One record per Grad-CAM row (anchor and readout): identity, readout value
+            and the unnormalised total of each view.
+        gradcam_vectors: Row-aligned normalised Grad-CAM profiles, one list per view.
         n_scattering: Width of the target scattering block, read off the first batch.
         forward_equivalents: How many single-row forward-and-backward passes the batch cost.
     """
@@ -359,21 +441,30 @@ class BatchWork:
         self.rows: List[Dict[str, Any]] = []
         self.vectors: Dict[str, List[np.ndarray]] = {}
         self.examples: Dict[str, Dict[str, Any]] = {}
-        self.lag_channel: Dict[Tuple[str, str, str], Dict[str, np.ndarray]] = {}
+        self.lag_channel: Dict[Tuple[str, ...], Dict[str, np.ndarray]] = {}
+        self.lag_channel_by_class: Dict[Tuple[str, ...], Dict[str, np.ndarray]] = {}
+        self.gradcam_rows: List[Dict[str, Any]] = []
+        self.gradcam_vectors: Dict[str, List[np.ndarray]] = {}
         self.n_scattering: Optional[int] = None
         self.forward_equivalents = 0
+        # Anchors the informative rule kept although their lag-window history failed the check.
+        self.n_unclean_anchors = 0
 
-    def accumulate_lag_channel(self, key: Tuple[str, str, str], aligned: np.ndarray) -> None:
-        """Add one call's $(N, L, C)$ offset-aligned maps to the running sums under ``key``."""
+    def accumulate_lag_channel(
+        self, key: Tuple[str, ...], aligned: np.ndarray, store: Optional[Dict[Tuple[str, ...], Dict[str, np.ndarray]]] = None
+    ) -> None:
+        """Add one call's $(N, L, C)$ offset-aligned maps to the running sums under ``key``, in
+        ``store`` (the pooled sums by default)."""
+        store = self.lag_channel if store is None else store
         field = np.asarray(aligned, dtype=np.float64)
         finite = np.isfinite(field)
-        entry = self.lag_channel.get(key)
+        entry = store.get(key)
         if entry is None:
             entry = {
                 "sum": np.zeros(field.shape[1:]), "abs_sum": np.zeros(field.shape[1:]),
                 "count": np.zeros(field.shape[1:]),
             }
-            self.lag_channel[key] = entry
+            store[key] = entry
         entry["sum"] += np.where(finite, field, 0.0).sum(axis=0)
         entry["abs_sum"] += np.where(finite, np.abs(field), 0.0).sum(axis=0)
         entry["count"] += finite.sum(axis=0)
@@ -546,6 +637,7 @@ def attribute_batch(
     keep_maps_for: Optional[Dict[str, Any]] = None,
     work: Optional[BatchWork] = None,
     raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
+    gradcam_readouts: Sequence[str] = (),
 ) -> BatchWork:
     """Run every attribution of one batch and reduce each row to its record and vectors.
 
@@ -574,6 +666,8 @@ def attribute_batch(
         work: The accumulator to extend, or ``None`` for a fresh one.
         raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, for the
             example's raw signals in physical units; ``None`` keeps loader units, labelled so.
+        gradcam_readouts: The readouts to take Grad-CAM of at the same anchors
+            (:mod:`~teb_vae.lag_attn_cfs.eval.gradcam`); lag-attentive cells only.
 
     Returns:
         The accumulator.
@@ -589,9 +683,23 @@ def attribute_batch(
     with torch.no_grad():
         outputs = model(y_st, y_ph, u_stream, **kwargs)
     contributing = core.contributing_columns(model, weight, outputs)
-    columns_per_sample = core.spread_columns(contributing, anchors_per_segment)
-    identity = _identity(batch, rows)
     work = work if work is not None else BatchWork()
+    informative = "anchors" in rows.columns
+    if informative:
+        # The segment's high-KL clean candidates, highest K_t first; see informative_columns.
+        anchor_axis, validity = outputs["anchor_index"].detach().cpu().numpy(), weight.detach().cpu().numpy()
+        lag_window = int(getattr(getattr(model, "lag_attn", None), "L", 0) or int(model.max_lag) + 1)
+        columns_per_sample = []
+        for element, steps_wanted in enumerate(rows["anchors"]):
+            chosen, unclean = core.informative_columns(
+                anchor_axis[element], contributing[element], steps_wanted, validity[element],
+                n_lags=lag_window, per_segment=anchors_per_segment, spacing=int(model.horizon),
+            )
+            columns_per_sample.append(chosen)
+            work.n_unclean_anchors += unclean
+    else:
+        columns_per_sample = core.spread_columns(contributing, anchors_per_segment)
+    identity = _identity(batch, rows)
     if work.n_scattering is None:
         work.n_scattering = int(y_st.shape[-1])
     rows_inputs, rows_extra, columns, sample = core.expand_rows(inputs, extra, columns_per_sample)
@@ -625,14 +733,16 @@ def attribute_batch(
         kld_rows = kld_dim.detach().cpu().numpy()[sample, columns.cpu().numpy()]
     top_coordinate = torch.as_tensor(np.argmax(kld_rows, axis=1), dtype=torch.long, device=columns.device)
 
+    # The example anchor of a sample: its highest-KL chosen anchor under the informative rule, the
+    # middle of its spread anchors otherwise.
     example_rows: Dict[str, int] = {}
     for element in range(len(identity)) if keep_maps_for is not None else ():
-        key = str(identity[element][labels.CLASS_COLUMN])
-        if key not in keep_maps_for or keep_maps_for[key] is not None or key in example_rows:
+        key = example_key(rows.iloc[element])
+        if key is None or key not in keep_maps_for or keep_maps_for[key] is not None or key in example_rows:
             continue
         of_sample = np.flatnonzero(sample == element)
         if of_sample.size:
-            example_rows[key] = int(of_sample[of_sample.size // 2])
+            example_rows[key] = int(of_sample[0] if informative else of_sample[of_sample.size // 2])
     wanted = {
         (readout, baseline, tag)
         for readout, tag, _band, _step in core.example_variants(lag_bands, horizons) for baseline in core.BASELINES
@@ -700,6 +810,19 @@ def attribute_batch(
             if ablation is not None:
                 for name, values in ablation.items():
                     record[f"ablation_{name}"] = float(values[offset])
+    # Grad-CAM at the same anchors: one forward and one backward per readout.
+    for readout in (gradcam_readouts if cell.dense_latent else ()):
+        wrapper = core.AnchorReadout(model, cell, readout=readout, likelihood=likelihood).eval()
+        cams = gradcam.gradcam(wrapper, rows_inputs, rows_extra, columns)
+        work.forward_equivalents += 2 * n_rows
+        for offset in range(n_rows):
+            work.gradcam_rows.append({
+                **identity[int(sample[offset])], "anchor": int(steps[offset]), "readout": readout,
+                "value": float(cams["value"][offset]),
+                **{f"{view}_total": float(cams[f"{view}_total"][offset]) for view in gradcam.VIEWS},
+            })
+            for view in gradcam.VIEWS:
+                work.gradcam_vectors.setdefault(view, []).append(cams[view][offset].astype(np.float32))
     if not example_rows:
         return work
     # The example anchors, their full maps kept for the map figures, beside the raw signals of
@@ -728,9 +851,26 @@ def attribute_batch(
             raw=holders[element].raw, raw_units=holders[element].raw_units,
         )
         work.forward_equivalents += cost
+        example["example_rank"] = int(rows.iloc[element].get("example_rank", 0) or 0)
+        example["kld_rank_note"] = (
+            "highest-KL clean anchor of the class" if informative else "middle spread anchor of the first segment of the class"
+        )
         keep_maps_for[key] = example
         work.examples[key] = example
     return work
+
+
+def example_key(row: pd.Series) -> Optional[str]:
+    """The example-page key of a selected segment, or ``None`` when it gives no example page.
+
+    Under the informative rule a segment is an example when it carries an ``example_rank``, and the
+    key is ``<class>:<rank>``. Without it the key is the class, so the first segment of each class
+    gives the one example.
+    """
+    if "example_rank" not in row.index:
+        return str(row.get(labels.CLASS_COLUMN))
+    rank = row["example_rank"]
+    return None if rank is None or not np.isfinite(float(rank)) else f"{row[labels.CLASS_COLUMN]}:{int(rank)}"
 
 
 def _reduce_rows(
@@ -767,10 +907,15 @@ def _reduce_rows(
     fit = core.agreement(lags, model_profile)
     # The population lag-by-channel maps, for the main readouts under both baselines.
     if result.readout in core.MAIN_READOUTS and n_rows:
+        row_class = np.asarray([str(identity[int(s)][labels.CLASS_COLUMN]) for s in sample])
         for stream, maps in ((core.STREAM_TARGET, result.target), (core.STREAM_SOURCE, result.source)):
-            work.accumulate_lag_channel(
-                (result.readout, result.baseline, stream), core.offset_channel_map(maps, result.anchor, n_lags)
-            )
+            aligned = core.offset_channel_map(maps, result.anchor, n_lags)
+            work.accumulate_lag_channel((result.readout, result.baseline, stream), aligned)
+            for name in np.unique(row_class):
+                work.accumulate_lag_channel(
+                    (result.readout, result.baseline, stream, name), aligned[row_class == name],
+                    store=work.lag_channel_by_class,
+                )
     lag_groups = core.lag_band_groups(lag_bands, n_lags) if lag_bands else {}
     lag_band_values = core.band_sums(lags, lag_groups) if lag_groups else {}
     band_values = {
@@ -860,6 +1005,8 @@ def run_segments(
     n_steps: int,
     anchors_per_segment: int,
     raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
+    examples: bool = True,
+    **options: Any,
 ) -> Tuple[BatchWork, int]:
     """Re-read the selected segments in dataset order and attribute every one.
 
@@ -873,6 +1020,9 @@ def run_segments(
         n_steps: Integration steps.
         anchors_per_segment: Anchors per segment.
         raw_scales: The raw signals' physical scales, for the example pages.
+        examples: Whether to keep one example anchor per class for the map pages.
+        **options: Passed to :func:`attribute_batch`: the readouts, the baselines, the ``with_*``
+            switches and ``gradcam_readouts``.
 
     Returns:
         ``(work, n_batches)``.
@@ -880,7 +1030,10 @@ def run_segments(
     work = BatchWork()
     if selected.empty:
         return work, 0
-    classes = {str(name): None for name in selected[labels.CLASS_COLUMN].dropna().unique()}
+    classes = (
+        {key: None for key in (example_key(row) for _, row in selected.iterrows()) if key is not None}
+        if examples else None
+    )
     batch_size = max(1, int(getattr(loader, "batch_size", None) or 1))
     segments = subset_loader(loader, list(selected["dataset_index"]), batch_size=batch_size)
     position = 0
@@ -895,7 +1048,7 @@ def run_segments(
         attribute_batch(
             task, moved, batch_rows, cell, lag_bands=lag_bands, channel_groups=channel_groups,
             n_steps=n_steps, anchors_per_segment=anchors_per_segment, keep_maps_for=classes, work=work,
-            raw_scales=raw_scales,
+            raw_scales=raw_scales, **options,
         )
         n_batches += 1
     return work, n_batches
@@ -1280,17 +1433,22 @@ def trace_recording(
     return gathered
 
 
-def lag_channel_summary(work: BatchWork) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+def lag_channel_summary(
+    work: BatchWork, store: Optional[Mapping[Tuple[str, ...], Mapping[str, np.ndarray]]] = None
+) -> Dict[Tuple[str, ...], Dict[str, Any]]:
     """Reduce the running lag-by-channel sums to means, ``NaN`` where no row reached a cell.
 
     Args:
         work: The accumulator.
+        store: Which running sums to reduce: ``work.lag_channel`` by default, or
+            ``work.lag_channel_by_class``.
 
     Returns:
-        ``{(readout, baseline, stream): {'mean': (L, C), 'mean_abs': (L, C), 'n_rows': int}}``.
+        ``{key: {'mean': (L, C), 'mean_abs': (L, C), 'n_rows': int}}`` with the store's keys:
+        ``(readout, baseline, stream)``, and the class appended for the per-class store.
     """
-    summary: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for key, entry in work.lag_channel.items():
+    summary: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    for key, entry in (work.lag_channel if store is None else store).items():
         count = np.asarray(entry["count"], dtype=np.float64)
         with np.errstate(invalid="ignore", divide="ignore"):
             mean = np.where(count > 0.0, entry["sum"] / count, np.nan)
@@ -1308,6 +1466,123 @@ def lag_channel_arrays(summary: Mapping[Tuple[str, str, str], Mapping[str, Any]]
         arrays[f"{stem}__mean_abs"] = np.asarray(entry["mean_abs"], dtype=np.float32)
         arrays[f"{stem}__n_rows"] = np.asarray(int(entry["n_rows"]), dtype=np.int64)
     return arrays
+
+
+def gradcam_frame(work: BatchWork, lag_seconds: np.ndarray) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
+    """The Grad-CAM rows with each view's centroid, and their row-aligned profiles.
+
+    Args:
+        work: The accumulator.
+        lag_seconds: The lag axis of the ``source`` and ``attention`` views.
+
+    Returns:
+        ``(rows, vectors)``: one row per anchor and readout with ``<view>_total`` and
+        ``<view>_centroid_s``, and ``{view: (N, W)}``.
+    """
+    rows = pd.DataFrame(work.gradcam_rows)
+    vectors = {view: np.stack(work.gradcam_vectors[view]) for view in gradcam.VIEWS if work.gradcam_vectors.get(view)}
+    for view, matrix in vectors.items():
+        axis = gradcam.offset_seconds(matrix.shape[1]) if view == "target" else np.asarray(lag_seconds)[:matrix.shape[1]]
+        rows[f"{view}_centroid_s"] = gradcam.centroid(matrix.astype(np.float64), axis)
+    return rows, vectors
+
+
+def run_cohort(
+    task: Any,
+    loader: Any,
+    labelled: pd.DataFrame,
+    index_map: Mapping[Tuple[str, Optional[int]], int],
+    cell: core.CellBinding,
+    *,
+    cap: int,
+    seed: int,
+    directory: Path,
+    lag_seconds: np.ndarray,
+    lag_bands: Mapping[str, Tuple[int, int]],
+    channel_groups: Mapping[str, Mapping[str, np.ndarray]],
+    n_steps: int,
+    caveat: str,
+    candidates: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """The cohort pass: a larger class-balanced draw, attributed lightly, for the class comparison.
+
+    The same selection rule as the main pass (one middle segment per recording, class-balanced,
+    seeded) at its own cap. Per segment it runs only what the class comparison reads: the
+    integrated gradients of :data:`~.class_contrast.COHORT_READOUTS` under ``source_null`` and the
+    Grad-CAM of :data:`~.class_contrast.GRADCAM_READOUTS`, with no layer split, ablation, lag-band
+    readout, horizon readout or example pages. That is about a fifth of a main-pass segment's cost.
+
+    Args:
+        task: The loaded task.
+        loader: The evaluation dataloader.
+        labelled: The labelled segments.
+        index_map: The dataset listing.
+        cell: The cell binding.
+        cap: The cohort segment cap.
+        seed: The draw and bootstrap seed.
+        directory: The attribution directory.
+        lag_seconds: The lag axis.
+        lag_bands: The configured lag bands.
+        channel_groups: From the channel map.
+        n_steps: Integration steps.
+        caveat: The one-line figure note.
+        candidates: The high-KL clean anchors from :func:`informative_anchors`, or ``None`` for
+            evenly spread anchors.
+
+    Returns:
+        The ``class_contrast`` block: the plan, the selection, the cost, the class counts, the
+        significant metrics and the files.
+    """
+    selected, accounting = select_segments(labelled, index_map, cap=cap, seed=seed, candidates=candidates)
+    gradcam_readouts = class_contrast.GRADCAM_READOUTS if cell.dense_latent else ()
+    started = time.perf_counter()
+    work, _ = run_segments(
+        task, loader, selected, cell, lag_bands=lag_bands, channel_groups=channel_groups, n_steps=n_steps,
+        anchors_per_segment=core.ANCHORS_PER_SEGMENT, examples=False,
+        readouts=class_contrast.COHORT_READOUTS, baselines=(core.BASELINE_SOURCE_NULL,),
+        with_layer=False, with_ablation=False, with_lag_readout=False, with_top_coordinate=False, with_horizon=False,
+        gradcam_readouts=gradcam_readouts,
+    )
+    elapsed = time.perf_counter() - started
+    rows, vectors = rows_frame(work), stack_vectors(work)
+    rows.to_csv(directory / class_contrast.COHORT_ROWS_FILENAME, index=False)
+    np.savez_compressed(
+        directory / class_contrast.COHORT_VECTORS_FILENAME, lag_seconds=np.asarray(lag_seconds, dtype=np.float64),
+        **row_identity(rows), **vectors,
+    )
+    files = [class_contrast.COHORT_ROWS_FILENAME, class_contrast.COHORT_VECTORS_FILENAME]
+    cam_rows, cam_vectors = gradcam_frame(work, lag_seconds)
+    if len(cam_rows):
+        cam_rows.to_csv(directory / class_contrast.GRADCAM_ROWS_FILENAME, index=False)
+        np.savez_compressed(
+            directory / class_contrast.GRADCAM_VECTORS_FILENAME, lag_seconds=np.asarray(lag_seconds, dtype=np.float64),
+            **row_identity(cam_rows), **cam_vectors,
+        )
+        files += [class_contrast.GRADCAM_ROWS_FILENAME, class_contrast.GRADCAM_VECTORS_FILENAME]
+    block = class_contrast.run_class_contrast(
+        rows, vectors, cam_rows, cam_vectors, lag_channel_summary(work, work.lag_channel_by_class),
+        directory=directory, lag_seconds=lag_seconds, lag_bands=lag_bands, seed=seed, caveat=caveat,
+    )
+    block["files"] = files + block["files"]
+    block["plan"] = {
+        "cap": int(cap), "seed": int(seed), "anchors_per_segment": core.ANCHORS_PER_SEGMENT, "ig_steps": int(n_steps),
+        "ig_readouts": list(class_contrast.COHORT_READOUTS), "ig_baselines": [core.BASELINE_SOURCE_NULL],
+        "gradcam_readouts": list(gradcam_readouts), "gradcam_views": list(gradcam.VIEWS) if gradcam_readouts else [],
+        "gradcam_target_layer": gradcam.target_layer(task.orig_model)[1] if gradcam_readouts else None,
+        "anchor_rule": "high_kl_clean" if candidates is not None else "spread",
+        "n_unclean_anchors": int(work.n_unclean_anchors),
+    }
+    block["selection"] = accounting
+    block["cost"] = core.cost_record(
+        elapsed_s=elapsed, n_segments=int(len(selected)), n_rows=int(len(rows)),
+        n_forward_equivalents=int(work.forward_equivalents), device=getattr(task, "device", None),
+    )
+    logger.info(
+        f"{core.ANALYSIS_DIRNAME}: cohort pass attributed {len(selected)} segment(s) at {len(rows)} row(s) "
+        f"in {elapsed:.1f} s; {len(block['significant_metrics'])} of {block['n_metrics_tested']} class "
+        f"metric(s) differ after Holm"
+    )
+    return block
 
 
 def example_arrays(examples: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarray]:
@@ -1558,6 +1833,7 @@ def run_pass(
     occlusion: Optional[pd.DataFrame],
     spectral: Optional[pd.DataFrame],
     delay_steps: int,
+    per_anchor: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """Select, attribute, reduce, write, and describe.
 
@@ -1577,6 +1853,10 @@ def run_pass(
         occlusion: The occlusion summary, or ``None``.
         spectral: The band-resolved skill table, or ``None``.
         delay_steps: The stored-step delay the lag axis carries, recorded in the plan.
+        per_anchor: The collection pass's per-anchor table. With it, both passes attribute the
+            high-KL clean anchors (:func:`informative_anchors`) and the example pages show the
+            :data:`~.attributions.EXAMPLES_PER_CLASS` highest-KL ones per class; without it, they
+            fall back to evenly spread anchors and one example per class.
 
     Returns:
         The block: counts, plan, selection, cost, checks, the method record, the trace manifest,
@@ -1623,7 +1903,10 @@ def run_pass(
         "trace_completeness_window_hours": eval_config.get("max_hours_before_delivery"),
     }
     labelled = labelled_segments(segments)
-    selected, accounting = select_segments(labelled, index_map, cap=cap, seed=seed)
+    candidates, plan["anchor_selection"] = informative_anchors(per_anchor)
+    selected, accounting = select_segments(
+        labelled, index_map, cap=cap, seed=seed, candidates=candidates, examples_per_class=core.EXAMPLES_PER_CLASS,
+    )
     channel_groups = core.channel_groups_from_map(channel_map)
     raw_scales = traces.raw_signal_scales(None, loader)
 
@@ -1642,8 +1925,12 @@ def run_pass(
         directory / core.VECTORS_FILENAME, lag_seconds=np.asarray(lag_seconds, dtype=np.float64),
         **row_identity(rows), **vectors,
     )
-    # The example anchors in class order, worst first, as every cohort figure orders them.
-    examples = [work.examples[name] for name in labels.ordered_groups(list(work.examples), labels.CLASS_COLUMN)]
+    plan["anchor_selection"]["n_unclean_anchors"] = int(work.n_unclean_anchors)
+    # The example anchors in class order, worst first, as every cohort figure orders them, then by
+    # rank within a class; the overview shows the first of each class.
+    order = labels.ordered_groups(sorted({str(e[labels.CLASS_COLUMN]) for e in work.examples.values()}), labels.CLASS_COLUMN)
+    examples = sorted(work.examples.values(), key=lambda e: (order.index(str(e[labels.CLASS_COLUMN])), e.get("example_rank", 0)))
+    overview = [e for e in examples if e.get("example_rank", 0) == 0]
     if examples:
         np.savez_compressed(directory / core.MAPS_FILENAME, **example_arrays(examples))
     lag_channel = lag_channel_summary(work)
@@ -1677,7 +1964,7 @@ def run_pass(
     if lag_channel:
         files.append(core.LAG_CHANNEL_FILENAME)
     figure_paths = [
-        figures.render_figure(core.build_map_figure(examples, lag_seconds=lag_seconds, cell=cell, caveat=note), directory / core.MAP_FIGURE),
+        figures.render_figure(core.build_map_figure(overview, lag_seconds=lag_seconds, cell=cell, caveat=note), directory / core.MAP_FIGURE),
         figures.render_figure(
             core.build_lag_profile_figure(
                 rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, cell=cell, caveat=note,
@@ -1732,6 +2019,16 @@ def run_pass(
         directory / EXAMPLE_MANIFEST_FILENAME, index=False
     )
     files.append(EXAMPLE_MANIFEST_FILENAME)
+
+    # The class comparison reads its own, larger draw: one example anchor per class says nothing
+    # about a class, and the main pass is too costly per segment to scale up.
+    contrast = run_cohort(
+        task, loader, labelled, index_map, cell,
+        cap=int(caps.get(class_contrast.COHORT_CAP_NAME) or class_contrast.DEFAULT_COHORT_SEGMENTS),
+        seed=seed, directory=directory, lag_seconds=lag_seconds, lag_bands=lag_bands,
+        channel_groups=channel_groups, n_steps=n_steps, caveat=note, candidates=candidates,
+    )
+    files.extend(contrast["files"])
 
     window_hours = eval_config.get("max_hours_before_delivery")
     chosen, trace_accounting = select_trace_recordings(
@@ -1795,6 +2092,7 @@ def run_pass(
             "trace_n_anchors": int(len(trace_anchors)),
         },
         "checks": checks,
+        "class_contrast": contrast,
         "summary": summary.to_dict(orient="records"),
         "lag_bands": lag_band_table.to_dict(orient="records"),
         "blocks": blocks.to_dict(orient="records"),
@@ -1834,7 +2132,7 @@ __all__ = [
     "lag_bands_frame", "layer_frame", "null_frame", "read_channel_map", "read_occlusion_summary",
     "read_spectral_bands", "recording_completeness", "recording_rows", "recording_table",
     "recordings_frame", "rows_frame",
-    "run_pass", "run_segments", "run_traces", "select_segments", "select_trace_recordings",
+    "example_key", "gradcam_frame", "informative_anchors", "run_cohort", "run_pass", "run_segments", "run_traces", "select_segments", "select_trace_recordings",
     "stack_vectors", "summary_frame", "target_only_check", "trace_recording", "write_example_pages",
     "ROW_IDENTITY_COLUMNS", "TRACE_ANCHORS_FILENAME", "example_map", "row_identity", "source_channel_shifts",
 ]

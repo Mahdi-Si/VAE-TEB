@@ -247,6 +247,12 @@ eval_config:
   #                  baseline, and the analysis's cost block records what it took so the number is
   #                  set from a measurement. Absent means the analysis's own default, not every
   #                  segment.
+  #   attribution_cohort_segments
+  #             150  SEGMENTS the attribution CLASS COMPARISON draws (50 recordings per class),
+  #                  one per recording, by the same rule. Each gets only the source-null
+  #                  integrated gradients of `kld` and `pred_gap` plus Grad-CAM, about a fifth of
+  #                  an `attribution_segments` segment: roughly 4 s per segment on one RTX 4080
+  #                  laptop GPU for the shipped transformer, so about 10 min here.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -258,6 +264,7 @@ eval_config:
     pages_per_class: 10
     traces_per_class: 10
     attribution_segments: 24
+    attribution_cohort_segments: 150
     # NOT a retention cap: it bounds how many segments the input-level occlusion readout
     # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
     # and it scores one anchor per segment, so the honest denominator is segments rather than

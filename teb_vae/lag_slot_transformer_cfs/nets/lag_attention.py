@@ -155,6 +155,10 @@ class LagAttentionFusion(nn.Module):
         self.output_proj = nn.Linear(
             self.d_model, self.d_z if self.mean_only else 2 * self.d_z
         )
+        # The head's output as ONE tensor, before it is split into its two channels. A layer
+        # attribution hooks this module rather than the head: the head returns ``(mean, None)`` on
+        # a mean-only arm, and a hook cannot clone a tuple that carries ``None``.
+        self.attribution_layer = nn.Identity()
         self.zero_output()
 
     def zero_output(self) -> None:
@@ -178,6 +182,7 @@ class LagAttentionFusion(nn.Module):
         lag_valid: Optional[torch.Tensor] = None,
         selector: Optional[torch.Tensor] = None,
         lag_index: Optional[torch.Tensor] = None,
+        null_window: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""Attend over one anchor set's lag window and emit the raw update.
 
@@ -193,6 +198,10 @@ class LagAttentionFusion(nn.Module):
                 normalised aggregation that leaves the other weights where they were.
             lag_index: Which lag slots this call covers, as a ``long`` tensor. ``None`` covers
                 every slot in order.
+
+            null_window: The same gather over the encoding of an all-zero source stream, or
+                ``None`` for the uncentred fusion. Given, the fusion's response to it is
+                subtracted, so a window equal to its null updates nothing for any parameters.
 
         Returns:
             ``(raw_mean_update, raw_scale_update)``, each $(B, A, d_z)$, the second ``None`` on the
@@ -254,32 +263,44 @@ class LagAttentionFusion(nn.Module):
         query = self.q_proj(self.q_norm(target_state)).view(
             batch, n_anchors, self.num_heads, self.d_head
         )
-        normed = self.kv_norm(flat_source)
-        keys = self.k_proj(normed).view(
-            batch, n_anchors, n_lags, self.num_heads, self.d_head
-        )
-        values = self.v_proj(normed).view(
-            batch, n_anchors, n_lags, self.num_heads, self.d_head
+        admissible = self._admissible(
+            lag_valid, selector, batch, n_anchors, n_lags, target_state.device
         )
 
-        # Content score plus the per-lag identity bias, both against the same query.
-        scores = torch.einsum("bamd,balmd->balm", query, keys)
-        scores = scores + torch.einsum("bamd,lmd->balm", query, self.lag_bias[lags])
-        scores = scores * self.scale
+        def fuse(flat: torch.Tensor) -> torch.Tensor:
+            """The fusion's update for one flattened window, under the call's own gates."""
+            normed = self.kv_norm(flat)
+            keys = self.k_proj(normed).view(
+                batch, n_anchors, n_lags, self.num_heads, self.d_head
+            )
+            values = self.v_proj(normed).view(
+                batch, n_anchors, n_lags, self.num_heads, self.d_head
+            )
 
-        admissible = self._admissible(lag_valid, selector, batch, n_anchors, n_lags, scores.device)
-        scores = scores.masked_fill(~admissible[..., None], float("-inf"))
-        weights = F.softmax(scores, dim=2)
-        # An anchor with no admissible lag scores all minus infinity, which normalises to NaN. Zero
-        # is the right reading -- no lag was attended because none could be -- and the gate below
-        # is what makes the resulting update exactly zero rather than the projection's response to
-        # an all-zero summary, which is a learned constant.
-        weights = torch.nan_to_num(weights, nan=0.0)
+            # Content score plus the per-lag identity bias, both against the same query.
+            scores = torch.einsum("bamd,balmd->balm", query, keys)
+            scores = scores + torch.einsum("bamd,lmd->balm", query, self.lag_bias[lags])
+            scores = scores * self.scale
 
-        attended = torch.einsum("balm,balmd->bamd", weights, values)
-        summary = self.o_proj(attended.reshape(batch, n_anchors, self.d_model))
-        raw = self.output_proj(summary)
+            scores = scores.masked_fill(~admissible[..., None], float("-inf"))
+            weights = F.softmax(scores, dim=2)
+            # An anchor with no admissible lag scores all minus infinity, which normalises to NaN.
+            # Zero is the right reading -- no lag was attended because none could be -- and the
+            # gate below is what makes the resulting update exactly zero rather than the
+            # projection's response to an all-zero summary, which is a learned constant.
+            weights = torch.nan_to_num(weights, nan=0.0)
+
+            attended = torch.einsum("balm,balmd->bamd", weights, values)
+            summary = self.o_proj(attended.reshape(batch, n_anchors, self.d_model))
+            return self.output_proj(summary)
+
+        raw = fuse(flat_source)
+        if null_window is not None:
+            # Centred against the fusion's response to the null source, in this one call, so the
+            # module's output is the update the model reads.
+            raw = raw - fuse(null_window.reshape(flat_source.shape))
         raw = raw * admissible.any(dim=2, keepdim=True).to(raw.dtype)
+        raw = self.attribution_layer(raw)
 
         if self.mean_only:
             return raw, None
