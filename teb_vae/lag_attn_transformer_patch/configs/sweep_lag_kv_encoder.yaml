@@ -1,0 +1,16 @@
+# Arm (plan B.9): Does lag locality matter?
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_lag_kv_encoder
+
+model_config:
+  VAE_model:
+    lag_kv_source: encoder
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_patch_lag_kv_encoder
+      tags:
+        variant: lag_attn_trf_patch_lag_kv_encoder

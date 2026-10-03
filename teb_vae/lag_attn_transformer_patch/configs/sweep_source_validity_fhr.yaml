@@ -1,0 +1,16 @@
+# Arm (plan B.9): Does the UP mask choice matter?
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_source_validity_fhr
+
+model_config:
+  VAE_model:
+    source_validity: fhr_weight
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_patch_source_validity_fhr
+      tags:
+        variant: lag_attn_trf_patch_source_validity_fhr

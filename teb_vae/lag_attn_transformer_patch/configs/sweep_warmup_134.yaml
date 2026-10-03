@@ -1,0 +1,16 @@
+# Arm (plan B.9): Is any gain from the representation, or from 76% more anchors?
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_patch_warmup_134
+
+model_config:
+  VAE_model:
+    warmup_period: 134
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_patch_warmup_134
+      tags:
+        variant: lag_attn_trf_patch_warmup_134
