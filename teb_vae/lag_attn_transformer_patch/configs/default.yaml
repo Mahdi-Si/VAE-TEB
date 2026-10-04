@@ -3,6 +3,13 @@
 # representation alone: one 4 s raw patch (16 samples) per token instead of ST/PH coefficients, and
 # the next 30 per-patch summaries (level, variability) as the forecast target.
 #
+# Revised 2026-10-04 after the first production run (112 epochs, run 2026-10-03--[21-22]): the
+# source path had closed (kld_source_null = 71 % of a 0.16-nat KL, kld_shuffled > matched,
+# pred_gap 0.2 nats per block) and the level forecast relaxed to the mean inside every window.
+# Four leaves changed: forecast_ar_residual off, lag_kv_source encoder, source_dropout null,
+# free_bits 0.02 with a 100-epoch beta ramp; plus a schedule that decays. The planted-delay
+# instrument (RESULTS.md) had opened the source path with the same leaves.
+#
 # PROVISIONAL: the loss-scale constants (gradient_clip_val, additive_margin) and the target summary
 # constants (target_summary_*, variability_eps). See the comments at each.
 #
@@ -14,12 +21,12 @@ general_config:
   seed: 42
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]
   lr: 0.0003
-  lr_milestone: [400, 800]
+  lr_milestone: [80, 110]  # epochs; x0.1 each. The first run plateaued at epoch ~60 on a flat LR.
   lr_warmup_steps: 2000
   plot_frequency: 5
   epochs: 5000
   accumulate_grad_batches: 1
-  batch_size:
+  batch_size:               # effective 128 x 7 = 896 segments per step (first run: 5,600)
     train: 128
     test: 128
   folders_config:
@@ -31,8 +38,8 @@ model_config:
       kind: linear_warmup
       start: 0.0
       end: 1.0
-      warmup_epochs: 50
-    free_bits: 0.0
+      warmup_epochs: 100     # the first run's KL had collapsed by epoch 18 of a 50-epoch ramp
+    free_bits: 0.02          # per dim per step: 64 x 0.02 = 1.28 nats per anchor the posterior may use for free
     beta_prior: 0.1
     likelihood: gaussian_nll
     lambda_full: 1.0
@@ -52,7 +59,7 @@ model_config:
     lag_floor: 0
 
     dropout: 0.1
-    source_dropout: 0.2
+    source_dropout: null     # null: pathway dropout follows `dropout`, posterior fusion dropout is 0
     decoder_hidden: 256
     logvar_clamp: [-5.0, 3.0]
     mu_scale: 5.0
@@ -71,13 +78,15 @@ model_config:
 
     # Objective (plan A.5).
     horizon_weight_halflife_steps: null   # a weighted score is not a log-density
-    forecast_ar_residual: true            # AR(1) innovations along the horizon
+    forecast_ar_residual: false           # factorised NLL. AR(1) learned phi = 0.87 and scored only the first step
     persistence_residual: false           # keep the FHR level in the latent
     prior_availability_input: false       # patches have no warm-up availability staircase
 
     # Target summaries.
-    # PROVISIONAL (C12): run summary_stats.py on the production training shards before the first
-    # production run and replace these identity placeholders.
+    # PROVISIONAL (C12): still the identity placeholders. The first run trained on them. Before
+    # the next run, on the server:
+    #   python teb_vae/lag_attn_transformer_patch/summary_stats.py --config teb_vae/lag_attn_transformer_patch/configs/default.yaml
+    # and paste the printed three leaves here.
     target_summary_loc: [0.0, 0.0]
     target_summary_scale: [1.0, 1.0]
     variability_eps: 0.01
@@ -88,7 +97,7 @@ model_config:
     d_head: 32
     use_entmax: true
     attention_grad_checkpoint: false
-    lag_kv_source: adapter   # unchanged from CFS; here the adapter is the UP patch embedding
+    lag_kv_source: encoder   # keys/values summarise a 16-token (64 s) window; the adapter is one 4 s patch
     lag_bias_init: alibi_decay
     alibi_slope_scale: 0.0
     query_uses_logvar: false

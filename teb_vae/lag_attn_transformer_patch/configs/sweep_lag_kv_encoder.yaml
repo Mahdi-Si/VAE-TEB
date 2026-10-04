@@ -1,16 +1,18 @@
 # Arm (plan B.9): Does lag locality matter?
+# Since 2026-10-04 the default reads the windowed source encoder, so this arm is the point-wise
+# adapter: the K/V the first production run used, under which the source path closed.
 base: default.yaml
 
 general_config:
-  tag: lag_attn_trf_patch_lag_kv_encoder
+  tag: lag_attn_trf_patch_lag_kv_adapter
 
 model_config:
   VAE_model:
-    lag_kv_source: encoder
+    lag_kv_source: adapter
 
 advanced_config:
   tracking:
     mlflow:
-      run_name: lag_attn_trf_patch_lag_kv_encoder
+      run_name: lag_attn_trf_patch_lag_kv_adapter
       tags:
-        variant: lag_attn_trf_patch_lag_kv_encoder
+        variant: lag_attn_trf_patch_lag_kv_adapter
