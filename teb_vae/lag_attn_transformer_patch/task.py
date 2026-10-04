@@ -4,16 +4,17 @@ r"""The training task for the patch-input cell.
   C6), which already carries the run seed, the class-default ``_stage`` that ``VaeSource`` relies on
   when it calls ``_build_forward_inputs`` outside a step, the stage-setting
   ``compute_loss_and_metrics``, the bound anchor-phase members and the step-granular LR ramp. Only
-  the two members that name the input layout are written here.
+  the two members that name the input layout and the four page seams are written here.
 * **Source-null.** The forward tuple is ``(y_patch, u_patch, phase, stride)``, so the source stream
   is ``inputs[1]``; the CFS ``_added_metrics`` reads ``inputs[2]``, which is the phase here.
-* **No forecast page.** The inherited plotting seams (``forecast_rows``, ``input_stream_panels``,
-  ``input_budget_figure``) draw raw or feature rows and are read only by the plotting callback,
-  which this package's configs disable.
+* **Diagnostic page.** The inherited page seams draw raw-sample (CRWS) or ST/PH (CFS) rows. The
+  four seams here hand the plotting callback the evaluation's patch page
+  (``eval/analyses/samples.py``), so a training page and an evaluation page are one figure.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from functools import partial
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 
@@ -54,6 +55,44 @@ class SeqVaeLagAttnTrfPatchTask(SeqVaeLagAttnTrfCrwsTask):
                 self.orig_model, forward_outputs, inputs[1], weight
             )
         }
+
+
+    # ------------------------------------------------------------------
+    # The diagnostic page's seams, read by ``lag_attn_rws.plotting.LagAttnRwsPlotCallback``
+    # ------------------------------------------------------------------
+    # The page module is imported on access: it pulls matplotlib and the shared eval, and only an
+    # enabled plotting callback reads these.
+    @property
+    def forecast_rows(self) -> Callable[[Any], None]:
+        """The patch page's UP, level-forecast, variability and patch-input rows."""
+        from teb_vae.lag_attn_transformer_patch.eval.analyses.samples import training_forecast_rows
+
+        return partial(training_forecast_rows, model=self.orig_model)
+
+    @property
+    def forecast_extra_rows(self) -> Tuple[Tuple[str, float], ...]:
+        """The rows :attr:`forecast_rows` draws beyond the two the layout always reserves."""
+        from teb_vae.lag_attn_transformer_patch.eval.analyses.samples import EXTRA_ROWS
+
+        return EXTRA_ROWS
+
+    @property
+    def input_stream_panels(self) -> Callable[..., Tuple[Any, ...]]:
+        """No shared input rows: :attr:`forecast_rows` draws the two patch streams itself."""
+        return _no_input_panels
+
+    def input_budget_figure(self, directory: Any, *, file_format: str = "pdf") -> None:
+        """No run-level budget figure: a patch token has no per-channel warm-up to budget.
+
+        Returns:
+            ``None``, which the callback reads as "nothing written".
+        """
+        return None
+
+
+def _no_input_panels(*_args: Any, **_kwargs: Any) -> Tuple[Any, ...]:
+    """An empty panel builder (the shared input rows would describe ST/PH channels)."""
+    return ()
 
 
 __all__ = ["SeqVaeLagAttnTrfPatchTask"]
