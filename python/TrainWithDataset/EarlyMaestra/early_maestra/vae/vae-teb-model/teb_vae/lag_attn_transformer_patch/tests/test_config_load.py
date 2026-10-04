@@ -71,7 +71,6 @@ CFS_DELTA = {
     "dataset_config.dataloader_config.normalize_fields": ["fhr", "up"],
     "advanced_config.trainer.gradient_clip_val": 280.0,
     "advanced_config.spike_breaker.additive_margin": 175.0,
-    "advanced_config.callbacks.lag_attn_rws_plotting.enabled": False,
     **{
         f"{_VAE}.{key}": _ABSENT
         for key in (

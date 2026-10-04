@@ -183,6 +183,6 @@ advanced_config:
       mode: "min"
       secondary_monitor: "val/nll_full_block"
     lag_attn_rws_plotting:
-      enabled: false         # v1 ships no forecast page
+      enabled: true          # the patch page (eval/analyses/samples.py), every plot_frequency epochs
       num_examples: 2
       file_format: "pdf"
