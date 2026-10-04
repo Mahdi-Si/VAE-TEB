@@ -302,7 +302,9 @@ def batch_size_of(batch: Any) -> int:
     Returns:
         The batch size, or ``0`` when the field is absent.
     """
-    value = batch.get("fhr_st") if isinstance(batch, dict) else getattr(batch, "fhr_st", None)
+    get = batch.get if isinstance(batch, dict) else (lambda name: getattr(batch, name, None))
+    # ``fhr_st`` on the feature cells; a raw-signal model's batch carries ``fhr`` instead.
+    value = next((v for v in (get("fhr_st"), get("fhr")) if v is not None), None)
     return 0 if value is None else int(value.shape[0])
 
 
@@ -2144,8 +2146,8 @@ def target_block_membership(model: Any, device: torch.device, dtype: torch.dtype
     Returns:
         A $(C_{\mathrm{keep}},)$ tensor.
     """
-    keep_index = (
-        torch.arange(model.c_y, device=device)
+    keep_index = (  # ungated: every decoded channel (== c_y on the feature cells)
+        torch.arange(model.decoder_out_channels, device=device)
         if model.target_gate is None
         else model.target_gate.keep_index.to(device)
     )
@@ -2538,10 +2540,14 @@ def evaluate_batch(
     # The warm-up tertiles, cutting the channel axis by filter speed rather than by stored block --
     # which the block split cannot, since both blocks span nearly the same rebased range. The
     # assignment is the model's own resolved partition, not a second ranking of the same vector.
-    tertile = model.warm_tertile_id.to(target.device)
+    # A model with no warm-up partition (raw patches) gets NaN tertile columns, not a fabricated split.
+    tertile = getattr(model, "warm_tertile_id", None)
     tertile_names = ("lo", "mid", "hi")
     for group, name in enumerate(tertile_names):
-        selector = (tertile == group).to(gap_per_channel.dtype)
+        if tertile is None:
+            columns[f"pred_gap_warm_{name}"] = torch.full_like(gap_per_channel[:, 0], float("nan"))
+            continue
+        selector = (tertile.to(target.device) == group).to(gap_per_channel.dtype)
         columns[f"pred_gap_warm_{name}"] = (gap_per_channel * selector).sum(dim=1)
 
     # The two geometry guards. ``anchors_per_sample`` is counted off ``anchor_valid`` rather than
@@ -2721,7 +2727,10 @@ def evaluate_batch(
     # The three tertile gaps per anchor, so the per-anchor table recombines into the per-sample
     # columns of the same name -- which is what ``report_seam.RECOMBINED_COLUMNS`` checks.
     for group, name in enumerate(tertile_names):
-        selector = (tertile == group).to(gap_by_anchor_channel.dtype)
+        if tertile is None:
+            per_anchor[f"pred_gap_warm_{name}"] = torch.full_like(gap_by_anchor_channel[..., 0], float("nan"))
+            continue
+        selector = (tertile.to(target.device) == group).to(gap_by_anchor_channel.dtype)
         per_anchor[f"pred_gap_warm_{name}"] = (gap_by_anchor_channel * selector).sum(dim=2)
     for name in ("base", "full"):
         per_anchor[f"mc_nll_{name}_block"] = scores[name]

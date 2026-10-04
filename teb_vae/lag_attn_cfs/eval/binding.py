@@ -121,6 +121,21 @@ class ModelBinding:
             under an attention name would be. So such a model supplies the pass that produces the
             shared tables from its own forward, under the shared column names where the quantity
             is the same one and under no name at all where it is not.
+
+    The remaining fields default to this cell's behaviour; a model whose target or input domain
+    differs (the raw-patch cell) sets them instead of forking a module:
+
+        replaced_analyses: Shared analysis names whose implementation this model replaces **in
+            place** (same name, same position). Unlike a colliding extra this is explicit, and a
+            name not in the shared registry raises.
+        target_fields: Loader fields that must be loaded and normalized for the target;
+            ``None`` is ``preflight.TARGET_FIELDS``.
+        shard_guard: ``(config, model) -> None`` raising ``EvalPreconditionUnmet`` when the shards do
+            not fit the model; ``None`` is ``preflight.check_declared_widths``.
+        required_batch_fields: Fields the loader probe requires on the first batch; ``None`` is
+            ``probe.REQUIRED_BATCH_FIELDS``.
+        causality_text: Replacements for the causality record's wording-only keys
+            (``statement``, ``lag_axis``, ``group_delay_seconds``); any other key raises.
     """
 
     model_cls: type
@@ -133,6 +148,11 @@ class ModelBinding:
     headline_scalars: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     excluded_analyses: Tuple[str, ...] = ()
     collect: Optional[Callable[..., Any]] = None
+    replaced_analyses: Mapping[str, Any] = field(default_factory=dict)
+    target_fields: Optional[Tuple[str, ...]] = None
+    shard_guard: Optional[Callable[[Any, Any], None]] = None
+    required_batch_fields: Optional[Tuple[str, ...]] = None
+    causality_text: Mapping[str, Any] = field(default_factory=dict)
 
 
 # =================================================================================================
