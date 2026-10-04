@@ -1,0 +1,81 @@
+# The patch cell's evaluation override delta, merged OVER a checkpoint's own resolved_config.yaml
+# (no `base:` key: `load_eval_overrides` refuses one). It is the transformer-CFS delta
+# (teb_vae/lag_attn_transformer_cfs/eval/configs/eval_overrides.yaml) with four declared changes:
+#   1. load_fields: the raw signals the patch model reads plus the clinical fields; the four ST/PH
+#      blocks are not loaded (nothing reads them; the probe's required list drops them too).
+#   2. clock_margin_min_nats: null -- 0.15 was set from the CFS availability-clock spread; a patch
+#      model has no availability clock (the null arm is "flat UP"), so the verdict stays
+#      INCONCLUSIVE until a patch run measures its own spread.
+#   3. caps for the new analyses (`<analysis>_*`; each E1 owner states its production cost).
+#   4. occlusion_bands are the transformer-CFS bands, already inside max_lag 37 (lags 0..37).
+# The holdout shards and statistics are the CFS causal k-fold split: only fhr, up and weight are
+# model inputs, and the same shards keep a patch run comparable with a CFS one on population.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn_transformer_patch.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt
+
+general_config:
+  batch_size:
+    test: 32
+
+dataset_config:
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/stats.hdf5
+  dataloader_config:
+    dataset_kwargs:
+      load_fields: [fhr, up, weight, guid, epoch, target, cs_label, bg_label, time_from_labor_onset, second_stage_onset]
+      cache_size: 0
+
+eval_config:
+  seed: 42
+  num_mc_samples: 8
+  max_samples: null
+  caps:
+    # Shared (the transformer-CFS values).
+    waveforms: 512                      # E1-F: 330 KB/segment at C = 2 (~170 MB); per-channel calibration, STV, channel_skill horizon
+    attention: 64
+    pages: 24
+    pages_per_class: 10
+    traces_per_class: 10
+    attribution_segments: 24
+    attribution_cohort_segments: 150
+    occlusion: 512
+    time_shift: 512
+    # New analyses (EVAL_PLAN.md §2). Provisional sizes from the maps; each owner may retune.
+    raw_attribution_segments: 24        # x 4 anchors x 10 IG calls (3 readouts x {raw/patch, key/value} + 4 heads), 128 steps: ~3.6 s/anchor, ~6 min (1660 Ti)
+    raw_attribution_ig_steps: 128
+    fhr_drivers_segments: 24            # x 4 anchors x 8 IG-equivalents (7 variants, src_effect is 2 forwards), 128 steps: ~4.6 s/anchor, ~7.5 min (1660 Ti)
+    fhr_drivers_ig_steps: 128
+    impulse_response_segments: 128      # x 2 backgrounds x (1 + 5 injections) = 1536 segment-forwards, ~1 min (1660 Ti)
+    impulse_response_injections: 5
+    raw_shift_segments: 256             # x 51 arms = 13056 segment-forwards, ~6 min (1660 Ti, 28 ms each)
+    delay_map_segments: 512
+    delay_map_anchors: 16               # x (1 + L = 39) single-lag arms per row (~0.8 ms/row-arm on a GTX 1660 Ti: ~5 min)
+    event_locked_segments: 256
+    decelerations_segments: 256
+    event_locked_ig_events: 64        # x 6 offsets x 2 readouts: ~768 rows (~20 min on one GPU at 512 steps)
+    event_locked_ig_steps: 512        # planted: at 128, 140/396 rows over the 1e-2 completeness tolerance; at 512, 5 rows (max 0.136)
+    decelerations_pair_window_s: 120  # contraction peak -> deepest nadir pairing window
+    latent_descriptors_segments: 512    # 1 dense forward/segment + ridge: ~1 min on a GTX 1660 Ti
+    signal_loss_segments: 1024          # observational census, 1 dense forward/segment: ~30 s
+    signal_loss_inject_segments: 64     # x 4 anchors x 13 forwards (12 gap edits + clean): ~1.5 min
+  prior_shuffle_min_nats: 1.0
+  min_active_dims: 2
+  event_lag_window_s: 120.0
+  bootstrap_resamples: 2000
+  clock_margin_min_nats: null
+  occlusion_bands:
+    anchor: [0, 4]
+    near: [5, 14]
+    mid: [15, 24]
+    far: [25, 37]
+  figure_format: null
+  max_hours_before_delivery: null
