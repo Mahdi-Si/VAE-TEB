@@ -27,6 +27,7 @@ SeqVaeLagAttnTrfPatch -> PatchStreamInputs -> CausalWarmupInputs -> PatchSummary
 | `summary_stats.py` | Prints `target_summary_loc`, `target_summary_scale` and `variability_eps` for a config's training shards |
 | `lag_recovery_check.py` | The planted-delay instrument (P5-01) |
 | `notes/CONTRACT.md` | The co-mixin contract map (P0-01) that the mixins were built against |
+| `eval/` | The evaluation: the shared CFS pipeline bound through `eval/binding.py`, plus fourteen ported or raw-signal analyses (`eval/EVAL.md`) |
 
 **Token layout.** `patchify` returns `(B, T, 33)` = `[value (16), delta (16), m_t − 1]`.
 `m_t` is the minimum of the per-sample mask over the patch. A fully valid stream has 0 in the last
@@ -100,9 +101,10 @@ The shards in `default.yaml` are the CFS paths. Any build works, because only `f
 > CRWS seams (`forecast_rows`, `input_stream_panels`) draw `(B, A, H, R)` raw rows and would
 > misdraw a `(B, A, H, 2)` forecast. Add a summary-row page when one is wanted.
 
-> lean-limit: no evaluation package. `teb_vae/lag_attn_cfs/eval` is feature-domain specific. Every
-> number this cell reports comes from one run's `metrics_history.csv`, plus `lag_recovery_check.py`
-> on the fixture, so no reported difference carries an uncertainty.
+> lean-limit: the evaluation is a binding, not a fork. `eval/` runs the shared CFS pipeline
+> (`teb_vae/lag_attn_cfs/eval`) on this model and adds the raw-signal analyses. Its own limits (the
+> shared figures' lag-axis label, the rarely trained `missing` token, climatology under the identity
+> summary constants) are listed in `eval/EVAL.md`.
 
 > lean-limit: the UP validity rule is `finite`. Only non-finite UP samples are invalid; `weight`
 > describes FHR. A disconnected UP transducer that writes zeros or a flat run reads as valid UP.
@@ -116,7 +118,7 @@ The shards in `default.yaml` are the CFS paths. Any build works, because only `f
 
 > lean-limit: the occlusion control (`controls.occluded_forward_outputs`) zeroes source rows, which
 > this representation reads as "valid and flat", not as `missing`. Its only caller is the CFS
-> evaluation, which this package does not use.
+> evaluation; the patch eval's `occlusion` edits raw UP itself and calls it with `occlusion=None`.
 
 > lean-limit: the committed fixture shards have no FHR gap and no non-finite UP sample, so a fit on
 > them never trains `missing`. The train smoke test plants a gap in a temporary copy of the shard.
@@ -143,6 +145,12 @@ python -m teb_vae.lag_attn_transformer_patch.trainer \
 
 # The planted-delay instrument (about 35 s at 40 epochs on one GPU).
 PYTHONPATH=. python teb_vae/lag_attn_transformer_patch/lag_recovery_check.py
+
+# Evaluation (eval/EVAL.md): a production checkpoint, then the planted instrument's (about 9 min).
+python -m teb_vae.lag_attn_transformer_patch.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt
+python -m teb_vae.lag_attn_transformer_patch.eval.run \
+    --checkpoint output/teb_vae_trf_patch_planted/<run>/model_checkpoints/<name>.ckpt \
+    --overrides teb_vae/lag_attn_transformer_patch/eval/configs/planted_overrides.yaml
 
 # Tests.
 .venv/bin/python -m pytest teb_vae/lag_attn_transformer_patch/tests -q -m "not slow"

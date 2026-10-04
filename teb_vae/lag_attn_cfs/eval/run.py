@@ -326,9 +326,15 @@ def merged_analysis_functions(binding: ModelBinding) -> Dict[str, Any]:
         if name in ANALYSIS_FUNCTIONS
     }
     registry = {**leading, **binding.extra_analyses, **trailing}
+    # Explicit in-place replacements of shared implementations (same name, same position).
+    unreplaceable = sorted(set(binding.replaced_analyses) - set(ANALYSIS_FUNCTIONS))
+    if unreplaceable:
+        raise ValueError(f"binding replaces analyses the shared registry lacks: {unreplaceable}")
+    registry.update({k: v for k, v in binding.replaced_analyses.items() if k in registry})
 
     excluded = tuple(binding.excluded_analyses)
-    unknown = sorted(set(excluded) - set(registry))
+    # An unskippable step may be excluded too; ``unskippable_for`` drops it from the run.
+    unknown = sorted(set(excluded) - set(registry) - set(UNSKIPPABLE_ANALYSES))
     if unknown:
         raise ValueError(
             f"binding for {binding.model_cls.__name__} excludes analyses that are not in the "
@@ -337,6 +343,12 @@ def merged_analysis_functions(binding: ModelBinding) -> Dict[str, Any]:
             f"binding, and the summary it writes, both say it was removed."
         )
     return {name: function for name, function in registry.items() if name not in excluded}
+
+
+def unskippable_for(binding: ModelBinding) -> Dict[str, Any]:
+    """The always-run steps, less any the binding excludes (``band_partition`` has no meaning
+    for a model with no stored filter-bank channels)."""
+    return {k: v for k, v in UNSKIPPABLE_ANALYSES.items() if k not in binding.excluded_analyses}
 
 
 #: Offsets applied to ``eval_config.seed`` for the four explicit generators. All non-zero and
@@ -1480,7 +1492,7 @@ def main(
             collection=collection, config=config, task=task, loader=loader
         )
         run_analyses(
-            report, list(UNSKIPPABLE_ANALYSES), UNSKIPPABLE_ANALYSES,
+            report, list(unskippable_for(binding)), unskippable_for(binding),
             context=context, eval_config=eval_config, output_dir=results_dir,
             probe=probe_record,
         )
@@ -1523,7 +1535,7 @@ def main(
         artifacts = finalise(
             report,
             output_dir=results_dir,
-            analyses=list(UNSKIPPABLE_ANALYSES) + selected,
+            analyses=list(unskippable_for(binding)) + selected,
             eval_config=eval_config,
             started_at=started_at,
             per_sample=collection.per_sample,
@@ -1580,7 +1592,7 @@ def main(
                 "sources": dict(argument_sources or {}),
             },
             "analyses_selected": selected,
-            "analyses_unskippable": list(UNSKIPPABLE_ANALYSES),
+            "analyses_unskippable": list(unskippable_for(binding)),
             # What the shared pass wrote down, minus the readouts it also carries: the row
             # counts, the honest denominator behind every column, what was excluded for scoring
             # no anchors, what was retained under which cap, the streamed accumulators, and the
@@ -1771,6 +1783,7 @@ def load_or_collect_tables(
         probe_module.run_probe,
         loader,
         configured_files=(config.get("dataset_config") or {}).get("vae_test_datasets"),
+        required_fields=binding.required_batch_fields or probe_module.REQUIRED_BATCH_FIELDS,
         max_batches=max_batches,
         output_dir=results_dir,
     )
