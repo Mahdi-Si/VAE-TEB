@@ -315,6 +315,42 @@ def patch_forecast_rows(
         ax.set_xlim(0.0, float(rows.t_max))
 
 
+def training_forecast_rows(rows: ForecastRowInputs, *, model: Any) -> None:
+    r"""The training callback's entry to :func:`patch_forecast_rows`: the same page, mid-fit.
+
+    The callback (``lag_attn_rws.plotting.LagAttnRwsPlotCallback``) hands two things in other forms
+    than the evaluation does, and this function converts both before it draws:
+
+    * ``rows.target`` is the training task's ``_build_raw_target``, the raw loader-z FHR $(B, L)$.
+      It becomes the standardized summaries $(B, T, 2)$ through ``model.summary_target``, the one
+      definition the loss also scores against.
+    * There is no loader, so the bpm scales come from ``rows.normalization_stats`` (the validation
+      dataset's own statistics). The pre-flight requires ``fhr`` and ``up`` in
+      ``normalize_fields``, so both statistics apply.
+
+    Args:
+        rows: The shared layout's row inputs, as the training callback builds them.
+        model: The training net (``summary_target``, ``raw_per_step``, ``source_validity``, the
+            summary constants and the AR(1) coefficient).
+    """
+    target = rows.target
+    if target.dim() == 2:  # raw (B, L), not yet summaries
+        target = model.summary_target(target, _field(rows.batch, "weight"))
+    stats = rows.normalization_stats or {}
+    scales = {
+        name: (float(np.asarray(stats[name]["mean"]).reshape(-1)[0]),
+               float(np.asarray(stats[name]["std"]).reshape(-1)[0]))
+        for name in ("fhr", "up")
+        if name in stats
+    }
+    units = SummaryUnits._build(
+        scales, model.target_summary_loc, model.target_summary_scale, model.variability_eps
+    )
+    ar_coef = forecast_likelihood_terms(model)["ar_coef"]
+    phi = None if ar_coef is None else ar_coef.detach().cpu().double().numpy()
+    patch_forecast_rows(dataclasses.replace(rows, target=target), model=model, units=units, phi=phi)
+
+
 # =============================================================================
 # The input-stream seam
 # =============================================================================

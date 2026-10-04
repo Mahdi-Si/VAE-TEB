@@ -97,9 +97,10 @@ The shards in `default.yaml` are the CFS paths. Any build works, because only `f
 
 ## 4. Deliberate limitations
 
-> lean-limit: no forecast page. The plotting callback is disabled in every config. The inherited
-> CRWS seams (`forecast_rows`, `input_stream_panels`) draw `(B, A, H, R)` raw rows and would
-> misdraw a `(B, A, H, 2)` forecast. Add a summary-row page when one is wanted.
+> lean-limit: the run-level input-budget figure is not drawn. A patch token has no per-channel
+> warm-up, so the task's `input_budget_figure` returns `None`. The per-epoch diagnostic page is drawn:
+> the task's page seams hand the plotting callback the evaluation's patch page
+> (`eval/analyses/samples.py`), so the training page and the evaluation page are one figure.
 
 > lean-limit: the evaluation is a binding, not a fork. `eval/` runs the shared CFS pipeline
 > (`teb_vae/lag_attn_cfs/eval`) on this model and adds the raw-signal analyses. Its own limits (the

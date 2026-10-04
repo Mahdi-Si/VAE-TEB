@@ -359,7 +359,9 @@ class LagAttnRwsPlotCallback(Callback):
                 )
             else:
                 path = writer(self.output_dir, file_format=self.file_format)
-            log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
+            # A task seam returns None when its model has no budget to draw (the patch model).
+            if path is not None:
+                log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
         except Exception as exc:  # noqa: BLE001 - a figure is never worth failing a fit for
             plt.close("all")
             logger.warning(f"LagAttnRwsPlotCallback: input-budget figure skipped: {exc}")
