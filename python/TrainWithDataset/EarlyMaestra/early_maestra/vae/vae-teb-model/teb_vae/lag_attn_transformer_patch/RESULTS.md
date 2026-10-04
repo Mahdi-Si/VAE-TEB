@@ -20,8 +20,11 @@ below them.
   - the permutation gap (`kld_shuffled` against the matched KL).
 - Both cells must use the same shard folds and the same stats file.
 
-**A difference counts only if it exceeds the classifier's own fold-to-fold spread.** There is no
-evaluation package and no confidence interval on any `metrics_history.csv` scalar (DESIGN.md §4).
+**A difference counts only if it exceeds the classifier's own fold-to-fold spread.** For a
+quantity the eval package reports with a bootstrap interval over recordings (`eval/EVAL.md`), it
+also counts only if that interval excludes zero. No `metrics_history.csv` scalar carries an
+interval. (This sentence was updated on 2026-10-03, when the eval package was added and before
+any production number existed.)
 
 | Comparison | Quantity | Reading fixed in advance |
 |---|---|---|
@@ -69,6 +72,51 @@ In the third run every head peaks inside the band: lags 29, 27, 34 and 42, with 
 - The pass/fail reading is the user's (plan P5-01). One open choice: should the interventional
   occlusion readout be ported? In this representation a zeroed source row reads as valid-and-flat
   UP, which is the "no contraction" intervention.
+
+## Eval instrument reading on the planted shard
+
+**An instrument reading at tiny widths on the committed 8-segment planted shard, not a result.** The
+val set is the training set, and every interval is over 8 recordings. Read on 2026-10-03: the
+shipped `planted.yaml` checkpoint at 40 epochs (`lag-attn-trf-patch-epoch=39.ckpt`) through
+`eval/run.py` with `eval/configs/planted_overrides.yaml` on one GTX 1660 Ti, 8 min 39 s wall. All 35
+steps ok; `time_shift` and `cross_subgroup` recorded skips (one segment per recording, one cohort).
+The plant is δ = 45 tokens = 180 s; the informative lags are [15, 44]. Every value below is from
+that run's `summary.json` and the analysis CSVs. Intervals are 95% percentile bootstraps over recordings.
+
+| Analysis | Readout | Planted reading |
+|---|---|---|
+| shared lag readouts | KL and attention argmax lag | 27 (inside [15, 44]) |
+| shared controls | `kld_source_null` / matched KL; `pred_gap_mc_nats` | 0.192 / 0.035 nats = 5.4; +0.0014 (s.e. 0.0008) |
+| `delay_map` | Argmax of the interventional delay curve | **d = 45 tokens = 180 s**: 1.41e-4 nats per cell [0.90e-4, 2.0e-4]; d = 44 and 46 at 1.40e-4 and 1.26e-4; 0.0042 nats per anchor summed over the 30-cell diagonal |
+| `occlusion` (1 anchor per segment) | `baseline` arm, band deltas | planted [15, 44]: +0.0008 [−0.015, 0.018]; peak band `near`: +0.0068 [−0.005, 0.019]. No band resolved |
+| `impulse_response` | Level kernel, `rest` background | Peak −0.13 bpm at d = 28 s; −0.043 bpm at 180 s (`segment` background: −0.020 bpm at 144 s). The data's contraction-triggered FHR dip is −12.9 bpm at 177 s, so the kernel is ≈ 1% of it at its peak and 0.3% at 180 s. Causality check 0 |
+| `raw_shift` | Centroid slope on whole-patch shifts (1 = tracks content) | Head-mean attention 0.0066 (R² 0.05); single heads −0.034 to 0.060; KL-map centroid 0.035 (R² 0.44). Sub-patch: −0.033 |
+| `raw_attribution` (4 segments × 4 anchors) | Token-binned \|IG\| of raw UP | `pred_gap` and Δlevel peak at **lag 29**, the model's own lag-map argmax on those rows; planted-band share 0.57 and 0.53 (flat 0.49). `kld` peaks at lag 52, band share 0.48, `lag_corr` 0.26. Value channel 0.88–0.89 of \|IG\|. Completeness ≤ 0.006 |
+| `event_locked` (43 contractions) | Tracking index (1 = none) | Heads 0 and 2: **1.61** [1.46, 1.75] and **1.58** [1.41, 1.87]. Heads 1 and 3: 0.0004 and 0.22. Head mean 0.82; KL map 1.04 [0.95, 1.18] |
+| `decelerations` (38 paired) | Measured vs implied delay | Measured median 170 s (pooled); triggered-FHR minimum at 177 s. Implied (attention) median 182 s, median \|error\| 15 s, but Spearman **ρ = −0.26** (per-recording mean −0.33). Enrichment on the causal contraction 0.91 [0.83, 0.98] against a permuted-delay control of 1.05 |
+| `channel_skill` | Level forecast | RMSE 6.3 bpm against persistence 10.5 bpm; beats persistence at every lead. Full against base, MSE skill −0.022 [−0.025, −0.018] |
+| `signal_loss` | FHR gap of 120 s ending at the anchor (shard has 0% `missing` tokens) | ΔKL **+0.41** nats, Δ`logvar_prior` +0.60, level forecast moves 5.6 bpm, its log-variance +0.07. The same gap ending 60 or 180 s earlier: \|ΔKL\| ≤ 0.0007 |
+| `fhr_drivers` | Lags holding 90% / 50% of \|IG\| | Base level, 90%: 444 s. `src_effect` (the KL the UP adds), 50%: 5.9 s |
+
+**What the instrument says about where the lags come from.** These are readings of one tiny model,
+not findings.
+- **The attention sits at fixed lags and does not track UP content.** Shifting UP by whole patches
+  moves the head-mean attention centroid by 0.7% of the shift, and no head by more than 6%. On the
+  paired events the attention is not enriched on the causal contraction (0.91, below its permuted
+  control), and the implied delay anti-correlates with the measured one. Heads 0 and 2 do show a
+  diagonal on the contraction-locked map (≈ 1.6); under the shift intervention they move by 3% and
+  6% of the shift.
+- **The observational lag readouts cannot name the delay.** They sit inside the informative band
+  (KL argmax 27, IG peak 29), but the KL is not UP-specific (a flat UP elicits 5.4× the matched KL,
+  and the clock-excess profile is degenerate), and the KL-IG profile correlates only 0.26 with the
+  model's own lag map. A lag in [15, 44] is consistent with the plant without locating it.
+- **An interventional readout finds the plant.** Single-lag occlusion over 16 anchors per segment,
+  read along the diagonals d = ℓ + 1 + τ, peaks at exactly d = 45 (180 s), its neighbours next. Band
+  occlusion at one anchor per segment does not resolve it.
+- **The forecast barely uses the plant at 40 epochs.** The delay-map peak is 1.4e-4 nats per cell,
+  the impulse response is about 1% of the data's contraction-triggered dip and peaks at 28 s rather
+  than 180 s, `pred_gap_mc` is +0.0014 nats per anchor, and the full level forecast is 2% worse than
+  the base in MSE. The model reacts far more to missing FHR at the anchor than to UP at any lag.
 
 ## Parameter and cost record (P5-03)
 

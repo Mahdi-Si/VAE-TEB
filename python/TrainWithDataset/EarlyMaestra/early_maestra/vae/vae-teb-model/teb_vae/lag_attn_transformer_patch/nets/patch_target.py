@@ -52,6 +52,24 @@ class PatchSummaryTarget:
         patches = patchify(fhr_raw, weight, raw_per_step=self.raw_per_step, validity="fhr_weight")
         return self._standardized_summaries(patches)
 
+    def _build_forecast_target(self, summaries: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        """The scored block: anchor ``a``'s target at step ``τ`` is token ``a + 1 + τ``.
+
+        The one gather both :meth:`compute_loss` and the shared evaluation (``metrics``, ``oracle``,
+        ``attributions``) score against, so the eval's ``nll_*`` is the training loss's.
+
+        Args:
+            summaries: Standardized summaries on the token grid ``(B, T, 2)``.
+            anchors: Decoded anchors ``(B, A)``.
+
+        Returns:
+            ``(B, A, H, 2)``.
+        """
+        taus = torch.arange(1, self.horizon + 1, device=summaries.device)
+        steps = anchors.to(summaries.device).long()[:, :, None] + taus  # (B, A, H)
+        rows = torch.arange(summaries.shape[0], device=summaries.device)[:, None, None]
+        return summaries[rows, steps]
+
     def _anchor_target_values(self, target: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
         """Persistence input: the anchor's own patch summaries, ``(B, A, 2)``.
 
@@ -90,9 +108,7 @@ class PatchSummaryTarget:
         anchors = forward_outputs.get("anchor_index")
         if anchors is None:  # a dense forward: every anchor below the ceiling
             anchors = torch.arange(self.anchor_ceiling, device=summaries.device).expand(batch, -1)
-        taus = torch.arange(1, self.horizon + 1, device=summaries.device)
-        steps = anchors.to(summaries.device).long()[:, :, None] + taus  # (B, A, H)
-        target = summaries[torch.arange(batch, device=summaries.device)[:, None, None], steps]
+        target = self._build_forecast_target(summaries, anchors)
 
         result = compute_raw_objective(
             forward_outputs,

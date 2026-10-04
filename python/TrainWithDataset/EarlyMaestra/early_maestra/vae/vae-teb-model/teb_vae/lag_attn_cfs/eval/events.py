@@ -12,14 +12,10 @@ loader's z-scored UP and to a raw one. That is a property of the detector rather
 convenience: UP has no clinically absolute scale here, and a fixed threshold would mean different
 things on two recordings.
 
-**The deceleration detector is not ported, and its absence is a scope decision rather than an
-omission.** It scores a bpm waveform, and there is no bpm anywhere in this package: defining "a
-deceleration in coefficient space" is a new construction rather than a port, so deceleration
-forecast skill and the contraction-triggered response are both out of scope for this pipeline.
-Everything reachable only from that detector goes with it -- the block-mode helpers that fixed a
-horizon step to de-duplicate per-anchor event rates, and the greedy matcher that paired a branch's
-detections against the truth's. Nothing in this package calls them, and a detector kept "in case"
-is a detector nothing tests.
+**The deceleration detector is here for raw-signal bindings only.** :func:`detect_decelerations`
+is ported from ``lag_attn_rws/eval/events.py`` (which this package may not import) for the patch
+cell, whose raw FHR maps back to bpm. Nothing in the CFS pipeline calls it: coefficients have no
+bpm. The sibling's block-mode helpers and greedy matcher are not ported.
 
 **Gaps are masked by ``weight``, never by value.** The raw traces store a missing sample as
 $0.0$ bpm, which after z-scoring is roughly $-11\sigma$: it is not a detectable sentinel, it is
@@ -80,6 +76,16 @@ ONSET_MIN_RISE_FRAC = 0.5
 #: work with and the edge rule has already removed the whole trace; it returns no events, which
 #: is why a caller reports the length rather than the empty result.
 MIN_CONTRACTION_TRACE_S = 60.0
+
+#: Deceleration detector settings (the sibling's). The prominence is the **larger** of an absolute
+#: bpm floor and a $\sigma$-relative one, unconditionally, so a z-scored input yields nothing.
+DECELERATION_SMOOTH_S = 8.0
+DECELERATION_MIN_DISTANCE_S = 15.0
+DECELERATION_PROMINENCE_BPM = 10.0
+DECELERATION_PROMINENCE_SIGMA = 0.3
+DECELERATION_EDGE_S = 30.0
+DECELERATION_WALK_S = 60.0
+MIN_DECELERATION_TRACE_S = 30.0
 
 #: The sentence a run carries beside every contraction onset it reports, so the divergence from
 #: the sibling's published stage-2 numbers is legible in the artifacts rather than only here.
@@ -418,6 +424,75 @@ def _flank(values: np.ndarray, *, peak: int, stop: int, level: float, backwards:
     return index
 
 
+# =============================================================================
+# Decelerations (raw-signal bindings only)
+# =============================================================================
+def detect_decelerations(
+    fhr_bpm: Any,
+    *,
+    fs: float = FS_RAW,
+    valid: Optional[Any] = None,
+    smooth_seconds: float = DECELERATION_SMOOTH_S,
+    min_distance_seconds: float = DECELERATION_MIN_DISTANCE_S,
+    prominence_bpm: float = DECELERATION_PROMINENCE_BPM,
+    prominence_sigma: float = DECELERATION_PROMINENCE_SIGMA,
+    edge_seconds: float = DECELERATION_EDGE_S,
+) -> Dict[str, np.ndarray]:
+    r"""Detect FHR decelerations (downward dips) on a trace **in bpm**.
+
+    Ported from ``lag_attn_rws/eval/events.py``: the smoothed trace is inverted so a nadir is a
+    peak, found at prominence $\max(\mathrm{prominence\_bpm}, \mathrm{prominence\_sigma}\cdot\sigma)$,
+    and its flanks are :func:`_event_flanks` on the inverted trace. Gaps are handled as in
+    :func:`detect_contractions`.
+
+    Args:
+        fhr_bpm: The FHR trace $(R,)$ at ``fs`` Hz, in bpm.
+        fs: Sampling rate in Hz.
+        valid: Per-raw-sample validity, from :func:`raw_validity`, or ``None``.
+        smooth_seconds: Savitzky-Golay window.
+        min_distance_seconds: Minimum spacing between nadirs.
+        prominence_bpm: Absolute prominence floor, in bpm.
+        prominence_sigma: Prominence in units of $\sigma$ of the smoothed trace.
+        edge_seconds: Drop nadirs within this many seconds of either end.
+
+    Returns:
+        ``{'onset_raw', 'nadir_raw', 'end_raw', 'depth_bpm'}``, parallel and possibly empty;
+        ``depth_bpm`` is the ``find_peaks`` prominence of the dip.
+
+    Raises:
+        ScipyRequired: If scipy is unavailable.
+    """
+    find_peaks, _ = _require_scipy()
+    signal = _to_1d(fhr_bpm)
+    n = int(signal.size)
+    empty = {**_empty("onset_raw", "nadir_raw", "end_raw"), "depth_bpm": np.empty(0)}
+    if n < int(MIN_DECELERATION_TRACE_S * fs):
+        return empty
+
+    smooth = _smooth(fill_gaps(signal, valid), window=max(int(round(smooth_seconds * fs)), 5))
+    sigma = float(np.nanstd(smooth)) or 1.0
+    inverted = -smooth
+    nadirs, properties = find_peaks(
+        inverted,
+        distance=max(int(round(min_distance_seconds * fs)), 1),
+        prominence=max(float(prominence_bpm), float(prominence_sigma) * sigma),
+    )
+    nadirs = np.asarray(nadirs, dtype=np.int64)
+    prominences = np.asarray(properties["prominences"], dtype=np.float64)
+    edge = int(round(edge_seconds * fs))
+    kept = (nadirs >= edge) & (nadirs < (n - edge))
+    nadirs, prominences = nadirs[kept], prominences[kept]
+    if nadirs.size == 0:
+        return empty
+
+    onsets, ends = _event_flanks(inverted, nadirs, prominences, walk_seconds=DECELERATION_WALK_S, fs=fs)
+    return drop_events_overlapping_gaps(
+        {"onset_raw": onsets, "nadir_raw": nadirs, "end_raw": ends, "depth_bpm": prominences},
+        valid,
+        span_keys=("onset_raw", "end_raw"),
+    )
+
+
 __all__ = [
     "CONTRACTION_EDGE_S",
     "CONTRACTION_MIN_DISTANCE_S",
@@ -425,6 +500,12 @@ __all__ = [
     "CONTRACTION_PROMINENCE_SIGMA",
     "CONTRACTION_SMOOTH_S",
     "CONTRACTION_WALK_S",
+    "DECELERATION_EDGE_S",
+    "DECELERATION_MIN_DISTANCE_S",
+    "DECELERATION_PROMINENCE_BPM",
+    "DECELERATION_PROMINENCE_SIGMA",
+    "DECELERATION_SMOOTH_S",
+    "DECELERATION_WALK_S",
     "FLANK_LEVEL_FRAC",
     "FS_RAW",
     "MIN_CONTRACTION_TRACE_S",
@@ -432,6 +513,7 @@ __all__ = [
     "ONSET_WALK_BACK_NOTE",
     "ScipyRequired",
     "detect_contractions",
+    "detect_decelerations",
     "drop_events_overlapping_gaps",
     "fill_gaps",
     "raw_validity",
