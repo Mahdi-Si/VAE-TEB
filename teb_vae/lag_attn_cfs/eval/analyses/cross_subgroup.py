@@ -634,7 +634,8 @@ def run_cross_subgroup_analysis(
         sources that were absent. A recorded skip when no metric had two testable cohorts, which
         is the ordinary outcome on the single-cohort pretraining split.
     """
-    record = analyse_metrics(output_dir)
+    # A binding whose registry differs passes its own sources on the context (``metric_sources``).
+    record = analyse_metrics(output_dir, sources=getattr(context, "metric_sources", None) or METRIC_SOURCES)
     if record["n_metrics_tested"] == 0:
         reason = (
             f"no metric had two cohorts of at least {shared_stats.MIN_GROUP_SIZE} recordings on "
