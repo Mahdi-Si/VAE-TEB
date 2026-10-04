@@ -1,0 +1,61 @@
+# The planted-delay instrument run (local, CPU-sized): the evaluation of a configs/planted.yaml
+# checkpoint on the same committed shard it trained on. The shard couples raw UP to raw FHR at 45
+# tokens = 180 s, so every lag analysis has a known answer: informative lags [15, 44] (d - H .. d - 1),
+# and an interventional delay curve peaking at d = 45 tokens. This is an instrument, not a holdout:
+# holdout = training shard, by design. Self-contained (an override delta takes no `base:`).
+#
+#   python -m teb_vae.lag_attn_transformer_patch.eval.run \
+#       --checkpoint output/teb_vae_trf_patch_planted/<run>/model_checkpoints/<name>.ckpt \
+#       --overrides teb_vae/lag_attn_transformer_patch/eval/configs/planted_overrides.yaml
+
+general_config:
+  batch_size:
+    test: 4            # 8 segments, 8 recordings: two batches, each with cross-recording partners
+
+dataset_config:
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_planted.hdf5
+  dataloader_config:
+    dataset_kwargs:
+      load_fields: [fhr, up, weight, guid, epoch, target, cs_label, bg_label, time_from_labor_onset, second_stage_onset]
+      cache_size: 0
+
+eval_config:
+  seed: 42
+  num_mc_samples: 8
+  max_samples: null
+  caps:
+    waveforms: 8
+    attention: 8
+    pages: 4
+    pages_per_class: 4
+    traces_per_class: 4
+    attribution_segments: 4
+    attribution_cohort_segments: 8
+    occlusion: 8
+    time_shift: 8
+    raw_attribution_segments: 4
+    raw_attribution_ig_steps: 128
+    fhr_drivers_segments: 4
+    impulse_response_segments: 8
+    impulse_response_injections: 5
+    raw_shift_segments: 8
+    delay_map_segments: 8
+    delay_map_anchors: 16   # 4 anchors left the plant in the noise; 16 recover d = 45
+    event_locked_segments: 8
+    event_locked_ig_steps: 512        # the tone path needs it (see eval_overrides.yaml)
+    decelerations_segments: 8
+    decelerations_pair_window_s: 240   # the plant is 180 s; production keeps the 120 s default
+    latent_descriptors_segments: 8
+    signal_loss_segments: 8
+  prior_shuffle_min_nats: 1.0
+  min_active_dims: 2
+  event_lag_window_s: 120.0
+  bootstrap_resamples: 200
+  clock_margin_min_nats: null
+  occlusion_bands:          # max_lag 60 on planted: lags 0..60
+    near: [0, 14]
+    planted: [15, 44]       # the informative band of the 45-token plant
+    far: [45, 60]
+  figure_format: null
+  max_hours_before_delivery: null

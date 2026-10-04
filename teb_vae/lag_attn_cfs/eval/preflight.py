@@ -553,7 +553,7 @@ def check_stat_path(config: Mapping[str, Any]) -> None:
         raise EvalPreconditionUnmet(str(refusal)) from refusal
 
 
-def check_target_normalized(config: Mapping[str, Any]) -> None:
+def check_target_normalized(config: Mapping[str, Any], fields: Sequence[str] = TARGET_FIELDS) -> None:
     """Refuse a config whose target blocks are not both loaded and normalized.
 
     The reused guard takes the field names as an argument precisely because which fields carry the
@@ -569,7 +569,7 @@ def check_target_normalized(config: Mapping[str, Any]) -> None:
             and the offending list.
     """
     refusal = _trainer_guard_refusal(
-        lambda checked: _check_raw_target_normalized(checked, fields=TARGET_FIELDS), config
+        lambda checked: _check_raw_target_normalized(checked, fields=tuple(fields)), config
     )
     if refusal is not None:
         raise EvalPreconditionUnmet(str(refusal)) from refusal
@@ -1416,6 +1416,8 @@ def objective_channel_weights(model: Any) -> Dict[str, Any]:
     Raises:
         AttributeError: If the model does not carry the buffer, naming the class.
     """
+    if not hasattr(model, "target_channel_weight"):  # a model with no per-channel objective weight
+        return {"applies": False}
     weights = disclosed_attribute(model, "target_channel_weight").detach().cpu().to(torch.float64)
     gate = getattr(model, "target_gate", None)
     declared = (
@@ -1728,9 +1730,10 @@ def run_preflight(
     check_trim_minutes(config)
     check_causal_transform(config)
     check_load_fields(config)
-    check_target_normalized(config)
+    target_fields = tuple(binding.target_fields or TARGET_FIELDS)
+    check_target_normalized(config, target_fields)
     check_no_reach_budget(config)
-    check_declared_widths(config, model)
+    (binding.shard_guard or check_declared_widths)(config, model)
 
     reconciliation = reconcile_with_checkpoint(
         config,
@@ -1764,22 +1767,40 @@ def run_preflight(
                 "n_shards_checked": len(_test_shards(config)),
             },
             "load_fields": {"passed": True, "required": list(REQUIRED_EVAL_LOAD_FIELDS)},
-            "target_normalized": {"passed": True, "fields": list(TARGET_FIELDS)},
+            "target_normalized": {"passed": True, "fields": list(target_fields)},
             "no_reach_budget": {"passed": True, "causal_reach_budget_s": None},
             "declared_widths": {
                 "passed": True,
-                "compared_against": "the model's own c_y / c_u, from the checkpoint's model_kwargs",
+                "compared_against": (
+                    "the model's own c_y / c_u, from the checkpoint's model_kwargs"
+                    if binding.shard_guard is None else binding.shard_guard.__name__
+                ),
                 "shards": _test_shards(config)[:1],
             },
             "config_matches_checkpoint": reconciliation,
             "warmup_budget_matches_checkpoint": warmup,
             "weights_loaded": load_check,
         },
-        "causality": causality_disclosure(config, model, binding.encoder_disclosure, warmup=warmup),
+        "causality": _with_text(
+            causality_disclosure(config, model, binding.encoder_disclosure, warmup=warmup),
+            binding.causality_text,
+        ),
         # The objective's block-weight split, from the model rather than from the config's two
         # scalars, so the phase share is the kept-width-specific number (CFS-10).
         "objective_weights": objective_channel_weights(model),
     }
+
+
+#: The causality record's wording-only keys a binding may replace (``ModelBinding.causality_text``).
+CAUSALITY_TEXT_KEYS: frozenset = frozenset({"statement", "lag_axis", "group_delay_seconds"})
+
+
+def _with_text(record: Dict[str, Any], text: Mapping[str, Any]) -> Dict[str, Any]:
+    """Replace the record's wording-only keys with a binding's own; any other key raises."""
+    unknown = sorted(set(text) - CAUSALITY_TEXT_KEYS)
+    if unknown:
+        raise ValueError(f"causality_text may replace only {sorted(CAUSALITY_TEXT_KEYS)}, got {unknown}")
+    return {**record, **dict(text)}
 
 
 def write_preflight(record: Mapping[str, Any], output_dir: Any) -> Path:
