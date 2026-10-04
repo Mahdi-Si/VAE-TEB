@@ -43,7 +43,7 @@ ARM_IDENTITY = {
 #: B.9 arms: file -> the one leaf it moves.
 ARMS = {
     "sweep_warmup_134.yaml": {f"{_VAE}.warmup_period": 134},
-    "sweep_lag_kv_encoder.yaml": {f"{_VAE}.lag_kv_source": "encoder"},
+    "sweep_lag_kv_encoder.yaml": {f"{_VAE}.lag_kv_source": "adapter"},
     "sweep_persistence.yaml": {f"{_VAE}.persistence_residual": True},
     "sweep_source_validity_fhr.yaml": {f"{_VAE}.source_validity": "fhr_weight"},
 }
@@ -61,6 +61,13 @@ CFS_DELTA = {
     f"{_VAE}.prior_availability_input": False,
     f"{_VAE}.horizon_weight_halflife_steps": None,
     f"{_VAE}.source_validity": "finite",
+    # 2026-10-04, after the first production run closed the source path (RESULTS.md).
+    f"{_VAE}.forecast_ar_residual": False,
+    f"{_VAE}.lag_kv_source": "encoder",
+    f"{_VAE}.source_dropout": None,
+    f"{_VAE}.free_bits": 0.02,
+    f"{_VAE}.beta_schedule.warmup_epochs": 100,
+    "general_config.lr_milestone": [80, 110],
     # C12: identity placeholders until summary_stats.py runs on the production shards.
     f"{_VAE}.target_summary_loc": [0.0, 0.0],
     f"{_VAE}.target_summary_scale": [1.0, 1.0],
