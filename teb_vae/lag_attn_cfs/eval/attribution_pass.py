@@ -9,12 +9,19 @@ carries. The lag-attentive cells reach it from their registered analysis, the la
 from its post-pass stage, so the two directories hold the same tables under the same names and a
 reader can lay one cell's attribution beside the other's.
 
-**The selection is per recording, one segment each.** Every summary here is over recordings, so
-one attributed segment per drawn recording keeps every recording one unit and the class balance
-exact; the recordings are drawn with the traces' own class-balanced, seeded draw, at an
-eligibility floor of one segment rather than two, and the segment is the recording's middle one
-by ``epoch``. The cap is on segments, so the per-class draw is the cap divided by the number of
-classes the split carries, rounded up, and the last class drawn stops at the cap.
+**The selection is per recording.** Every summary here is over recordings, so a recording stays
+one unit however many of its segments are attributed: its rows are averaged per segment, then per
+recording. The recordings are drawn with the traces' own class-balanced, seeded draw, spread
+round-robin over each class's subgroups, at an eligibility floor of one segment. The main pass
+takes ``caps.attribution_segments_per_recording`` segments from each, spread evenly over its
+stored timeline (one: the middle segment); the cohort pass always takes one, because its tests
+count recordings and are better served by more recordings than by more segments of the same
+ones. The cap is on segments, so each class draws ``ceil(cap / (n_classes * per_recording))``
+recordings, and the draw stops at the cap.
+
+**The anchors are each segment's own most coupled ones**: $K_t$ in the top $30\%$ of that
+segment's scored anchors, with a clean forecast window and history, at most
+:data:`~.attributions.ANCHORS_PER_SEGMENT` of them at least one horizon apart.
 
 **What is attributed per anchor.** The main readouts (:data:`~.attributions.MAIN_READOUTS`: the
 divergence, the mean-decoded forecast gap, the full block score and the full block error) under
@@ -148,38 +155,69 @@ def informative_anchors(
     quantile: float = core.HIGH_KL_QUANTILE,
     coverage: float = core.CLEAN_COVERAGE,
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    r"""The anchors worth explaining: high $K_t$ and a clean forecast window.
+    r"""The anchors worth explaining: high $K_t$ within their own segment, and a clean forecast window.
 
-    The threshold is one number in nats, the ``quantile`` of $K_t$ pooled over every scored anchor
-    of every class, so that no class chooses its own anchors and a class contrast stays honest.
+    The threshold is the ``quantile`` of $K_t$ over **each segment's** scored anchors, so every
+    segment offers its own most coupled anchors. Under a threshold pooled over the cohort, a
+    subgroup whose coupling is weak at every anchor offered none and vanished from every
+    by-subgroup figure. The cost is that a class contrast now compares each segment's relatively
+    most coupled moments, not anchors above one cohort-wide level of $K_t$; the record keeps the
+    pooled level beside the per-segment ones so a reader can see how far apart the two are.
 
     Args:
         per_anchor: The collection pass's per-anchor table, with ``guid``, ``epoch``, ``anchor``,
             ``kld_per_t`` and ``coverage``; ``None`` or incomplete falls back to evenly spread
             anchors.
-        quantile: The pooled $K_t$ quantile an anchor must reach.
+        quantile: The per-segment $K_t$ quantile an anchor must reach.
         coverage: The forecast coverage an anchor must reach.
 
     Returns:
         ``(candidates, record)``: ``guid``, ``epoch``, ``anchor`` and ``kld_per_t`` of every
-        qualifying anchor, highest $K_t$ first, or ``None``; and the rule with its threshold and
+        qualifying anchor, highest $K_t$ first, or ``None``; and the rule with its thresholds and
         counts.
     """
     needed = {"guid", "epoch", "anchor", "kld_per_t", "coverage"}
     if per_anchor is None or per_anchor.empty or not needed <= set(per_anchor.columns):
         return None, {"rule": "spread", "reason": "no per-anchor table with kld_per_t and coverage"}
     kl = per_anchor["kld_per_t"].to_numpy(dtype=np.float64)
-    threshold = float(np.nanquantile(kl, float(quantile)))
-    keep = (kl >= threshold) & (per_anchor["coverage"].to_numpy(dtype=np.float64) >= float(coverage))
+    per_segment = (
+        per_anchor.groupby(["guid", "epoch"], dropna=False)["kld_per_t"]
+        .transform(lambda values: values.quantile(float(quantile)))
+        .to_numpy(dtype=np.float64)
+    )
+    keep = (kl >= per_segment) & (per_anchor["coverage"].to_numpy(dtype=np.float64) >= float(coverage))
     candidates = per_anchor.loc[keep, ["guid", "epoch", "anchor", "kld_per_t"]].copy()
     candidates["guid"] = candidates["guid"].astype(str)
     candidates = candidates.sort_values("kld_per_t", ascending=False).reset_index(drop=True)
+    thresholds = pd.Series(per_segment).groupby(
+        [per_anchor["guid"].to_numpy(), per_anchor["epoch"].to_numpy()], dropna=False
+    ).first()
     return candidates, {
-        "rule": "high_kl_clean", "kl_quantile": float(quantile), "kl_threshold_nats": threshold,
+        "rule": "high_kl_clean_per_segment", "kl_quantile": float(quantile),
+        "kl_threshold_nats_median": float(np.nanmedian(thresholds)) if len(thresholds) else float("nan"),
+        "kl_threshold_nats_pooled": float(np.nanquantile(kl, float(quantile))),
         "coverage_min": float(coverage), "history_validity_min": float(coverage),
         "n_scored_anchors": int(len(per_anchor)), "n_candidate_anchors": int(len(candidates)),
         "n_recordings_with_candidates": int(candidates["guid"].nunique()),
     }
+
+
+def spread_positions(n_items: int, count: int) -> List[int]:
+    r"""Pick ``count`` positions spread evenly over ``n_items`` ordered items.
+
+    Position $i$ is $\lfloor (i + \tfrac12)\, n / k \rfloor$, the centre of the $i$-th of $k$ equal
+    slices, so one item is the middle one, ``n // 2``, and $k \ge n$ takes every item.
+
+    Args:
+        n_items: How many ordered items there are, $n$.
+        count: How many to pick, $k$.
+
+    Returns:
+        The distinct positions, ascending.
+    """
+    if count >= n_items:
+        return list(range(n_items))
+    return [int((index + 0.5) * n_items / count) for index in range(count)]
 
 
 def select_segments(
@@ -190,14 +228,18 @@ def select_segments(
     seed: int,
     candidates: Optional[pd.DataFrame] = None,
     examples_per_class: int = 0,
+    segments_per_recording: int = core.DEFAULT_SEGMENTS_PER_RECORDING,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Draw the segments to attribute: one per recording, class-balanced, seeded, capped.
+    """Draw the segments to attribute: class-balanced, spread over subgroups, seeded, capped.
 
-    Without ``candidates`` each drawn recording gives its middle segment. With them only recordings
-    that hold a candidate are drawn, and each gives the segment with the most candidates (ties:
-    the larger top $K_t$). The row then carries ``anchors``, that segment's candidate steps highest
-    $K_t$ first, and ``top_kld``. The ``examples_per_class`` rows of each class with the largest
-    ``top_kld`` get an ``example_rank`` $0, 1, \\ldots$ for the example pages.
+    Each class draws ``ceil(cap / (n_classes * segments_per_recording))`` recordings, round-robin
+    over its subgroups so that every subgroup a class holds is drawn before any is drawn twice.
+    Each drawn recording then gives ``segments_per_recording`` segments spread evenly over its
+    stored timeline by ``epoch`` -- its middle segment when that is one. With ``candidates`` only
+    segments holding a candidate are eligible, and each row also carries ``anchors``, that
+    segment's candidate steps highest $K_t$ first, and ``top_kld``. The best segment of each of
+    the ``examples_per_class`` recordings of a class with the largest ``top_kld`` gets an
+    ``example_rank`` $0, 1, \\ldots$ for the example pages, so no recording is paged twice.
 
     Args:
         segments: From :func:`labelled_segments`.
@@ -206,60 +248,61 @@ def select_segments(
         seed: The draw's seed.
         candidates: From :func:`informative_anchors`, or ``None``.
         examples_per_class: Example pages per class; used with ``candidates`` only.
+        segments_per_recording: Segments taken from each drawn recording, at least one.
 
     Returns:
         ``(rows, accounting)``: the chosen rows with ``dataset_index``, ascending in that index,
         and the draw's accounting with the cap recorded.
     """
+    per_recording = max(int(segments_per_recording), 1)
     if candidates is not None:
         candidates = candidates.assign(stamp=[epoch_stamp(e) for e in candidates["epoch"]])
-        segments = segments[segments["guid"].astype(str).isin(set(candidates["guid"]))]
+        held = set(zip(candidates["guid"].astype(str), candidates["stamp"]))
+        keep = [(str(g), epoch_stamp(e)) in held for g, e in zip(segments["guid"], segments["epoch"])]
+        segments = segments[np.asarray(keep, dtype=bool)] if len(segments) else segments
     recordings = recording_table(segments, index_map)
     classes = [name for name in recordings[labels.CLASS_COLUMN].dropna().unique()] if len(recordings) else []
-    per_class = int(math.ceil(int(cap) / max(len(classes), 1)))
+    per_class = int(math.ceil(int(cap) / (max(len(classes), 1) * per_recording)))
     chosen, accounting = traces.select_recordings(
-        recordings, per_class=per_class, seed=int(seed), min_segments=1
+        recordings, per_class=per_class, seed=int(seed), min_segments=1,
+        stratify_column=labels.SUBGROUP_COLUMN,
     )
     accounting["segment_cap"] = int(cap)
+    accounting["segments_per_recording"] = per_recording
     picked: List[Dict[str, Any]] = []
     for _, choice in chosen.iterrows():
-        if len(picked) >= int(cap):
-            break
         guid = str(choice["guid"])
         own = segments[segments["guid"].astype(str) == guid].sort_values("epoch")
-        if own.empty:
-            continue
-        extra: Dict[str, Any] = {}
-        if candidates is None:
-            middle = own.iloc[len(own) // 2]
-        else:
-            mine = candidates[candidates["guid"] == guid]
-            ranked = mine.groupby("stamp")["kld_per_t"].agg(["size", "max"]).sort_values(["size", "max"], ascending=False)
-            stamps = [epoch_stamp(e) for e in own["epoch"]]
-            best = next((s for s in ranked.index if s in stamps), None)
-            if best is None:
+        mine = candidates[candidates["guid"] == guid] if candidates is not None else None
+        for position in spread_positions(len(own), per_recording):
+            if len(picked) >= int(cap):
+                break
+            segment = own.iloc[position]
+            stamp = epoch_stamp(segment["epoch"])
+            index = index_map.get((guid, stamp))
+            if index is None:
                 continue
-            middle = own.iloc[stamps.index(best)]
-            steps = mine[mine["stamp"] == best]
-            extra = {"anchors": steps["anchor"].astype(int).tolist(), "top_kld": float(steps["kld_per_t"].max())}
-        index = index_map.get((guid, epoch_stamp(middle["epoch"])))
-        if index is None:
-            continue
-        picked.append(
-            {
-                "guid": guid, "epoch": float(middle["epoch"]),
-                labels.CLASS_COLUMN: choice[labels.CLASS_COLUMN],
-                labels.SUBGROUP_COLUMN: choice[labels.SUBGROUP_COLUMN],
-                "dataset_index": int(index), **extra,
-            }
-        )
+            extra: Dict[str, Any] = {}
+            if mine is not None:
+                steps = mine[mine["stamp"] == stamp]
+                extra = {"anchors": steps["anchor"].astype(int).tolist(), "top_kld": float(steps["kld_per_t"].max())}
+            picked.append(
+                {
+                    "guid": guid, "epoch": float(segment["epoch"]),
+                    labels.CLASS_COLUMN: choice[labels.CLASS_COLUMN],
+                    labels.SUBGROUP_COLUMN: choice[labels.SUBGROUP_COLUMN],
+                    "dataset_index": int(index), **extra,
+                }
+            )
     columns = ["guid", "epoch", *labels.GROUP_COLUMNS, "dataset_index"]
     if candidates is not None:
         columns += ["anchors", "top_kld"]
     rows = pd.DataFrame(picked, columns=columns)
     if candidates is not None and examples_per_class > 0 and len(rows):
-        rank = rows.groupby(labels.CLASS_COLUMN)["top_kld"].rank(method="first", ascending=False) - 1
-        rows["example_rank"] = rank.where(rank < int(examples_per_class))
+        best = rows["top_kld"] == rows.groupby("guid")["top_kld"].transform("max")
+        best &= ~rows.duplicated(subset=["guid", "top_kld"])
+        rank = rows[best].groupby(labels.CLASS_COLUMN)["top_kld"].rank(method="first", ascending=False) - 1
+        rows["example_rank"] = rank.where(rank < int(examples_per_class)).reindex(rows.index)
     accounting["n_segments_selected"] = int(len(rows))
     return rows.sort_values("dataset_index").reset_index(drop=True), accounting
 
@@ -1569,7 +1612,7 @@ def run_cohort(
         "ig_readouts": list(class_contrast.COHORT_READOUTS), "ig_baselines": [core.BASELINE_SOURCE_NULL],
         "gradcam_readouts": list(gradcam_readouts), "gradcam_views": list(gradcam.VIEWS) if gradcam_readouts else [],
         "gradcam_target_layer": gradcam.target_layer(task.orig_model)[1] if gradcam_readouts else None,
-        "anchor_rule": "high_kl_clean" if candidates is not None else "spread",
+        "anchor_rule": "high_kl_clean_per_segment" if candidates is not None else "spread",
         "n_unclean_anchors": int(work.n_unclean_anchors),
     }
     block["selection"] = accounting
@@ -1866,6 +1909,7 @@ def run_pass(
     directory.mkdir(parents=True, exist_ok=True)
     caps = dict(eval_config.get("caps") or {})
     cap = int(caps.get(core.CAP_NAME) or core.DEFAULT_SEGMENTS)
+    per_recording = int(caps.get(core.SEGMENTS_PER_RECORDING_CAP_NAME) or core.DEFAULT_SEGMENTS_PER_RECORDING)
     seed = int(eval_config.get("seed", 0)) + core.DRAW_SEED_OFFSET
     configured = dict(eval_config.get("occlusion_bands") or {})
     lag_bands = {str(name): (int(span[0]), int(span[1])) for name, span in configured.items()}
@@ -1883,7 +1927,8 @@ def run_pass(
             f"own lags and from the occlusion bands"
         )
     plan: Dict[str, Any] = {
-        "capped": True, "cap": cap, "seed": seed, "anchors_per_segment": core.ANCHORS_PER_SEGMENT,
+        "capped": True, "cap": cap, "seed": seed, "segments_per_recording": per_recording,
+        "anchors_per_segment": core.ANCHORS_PER_SEGMENT,
         "ig_steps": n_steps, "entry_fraction": core.BASELINE_ENTRY_FRACTION,
         "baselines": list(core.BASELINES), "readouts": list(core.MAIN_READOUTS),
         "horizon_steps": {name: int(step) for name, step in horizons.items()},
@@ -1906,6 +1951,7 @@ def run_pass(
     candidates, plan["anchor_selection"] = informative_anchors(per_anchor)
     selected, accounting = select_segments(
         labelled, index_map, cap=cap, seed=seed, candidates=candidates, examples_per_class=core.EXAMPLES_PER_CLASS,
+        segments_per_recording=per_recording,
     )
     channel_groups = core.channel_groups_from_map(channel_map)
     raw_scales = traces.raw_signal_scales(None, loader)
