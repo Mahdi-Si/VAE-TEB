@@ -200,9 +200,9 @@ def test_the_untrained_anchors_are_cut_from_the_maps_rather_than_shaded_over(tas
             "Latent state": (warmup_sec, tail_sec, trained),
             "Per-dimension source-conditioned KL": (warmup_sec, tail_sec, trained),
             "$\\widetilde K": (warmup_sec, tail_sec, trained),
-            # Attention is a property of the source stream and is defined at every step; only the
-            # two KL maps are identically zero in the tail by construction of the mask.
-            "Lag attention": (warmup_sec, t_max, geometry.t - geometry.warmup),
+            # The attention tensor exists at every step, but past the last anchor no step is
+            # decoded or inside the KL support, so the row is cut where the four around it are.
+            "Lag attention": (warmup_sec, tail_sec, trained),
         }
         for prefix, (left, right, columns) in expected.items():
             ax = _axes_titled(figure, prefix)

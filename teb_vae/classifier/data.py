@@ -20,8 +20,8 @@ seeded :class:`EpochBatches` batch sampler.
 
 **Forbidden inputs (L1).** ``epoch_s``, ``t_end_s`` and ``ss_rel_s`` are read, but reach tensors only as
 within-GUID differences (``t_h``, ``delta_t``, ``elapsed``) and through ``time_in_ss``, which sees the window
-length ``t_end_s - epoch_s`` and the positive part of ``ss_rel_s + window``; ``stage`` only as the straddle and
-second flags (first and unknown look alike, so ``has_ss`` does not leak from segment 0). ``hours_to_delivery``, ``cs``,
+length ``t_end_s - epoch_s`` and the positive part of ``ss_rel_s + window``; ``stage`` only as the ``in_ss`` flag
+(straddle or second; first and unknown look alike, so ``has_ss`` does not leak from segment 0). ``hours_to_delivery``, ``cs``,
 ``bg``, ``source_file``, ``n_segments`` and ``first_epoch_s`` are never read.
 
 **Memory.** The cache is memory-mapped once per process in its stored dtype (float16 by default) and shared by
@@ -50,7 +50,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from hdf5_dataset.hdf5_dataset import attribute_dict_collate
 from hdf5_dataset.length_bucket_sampler import VariableBatchBucketSampler
 from teb_vae.classifier.baselines import fold_frame
-from teb_vae.classifier.cohort import COV, COV_AGE, CONTEXT_STAGES, context_features, fold_shards, warm_positions
+from teb_vae.classifier.cohort import COV, COV_AGE, context_features, fold_shards, warm_positions
 from teb_vae.classifier.config import Classifier, CovariatesCfg
 from teb_vae.classifier.sources import Scaler, fit_scaler, open_cache
 
@@ -68,7 +68,7 @@ def CONTEXT_COLUMNS(cfg: Any) -> List[str]:  # noqa: N802 (named as in the contr
     c = getattr(cfg, "classifier", cfg)
     x = c.context
     wanted = {"tlo_psi": x.tlo.enabled, "tlo_missing": x.tlo.enabled and x.tlo.missing == "indicator",
-              **{f"stage_{s}": x.stage.enabled for s in CONTEXT_STAGES}, "time_in_ss": x.time_in_ss.enabled,
+              "in_ss": x.stage.enabled, "time_in_ss": x.time_in_ss.enabled,
               "valid_frac": x.valid_frac.enabled,
               "delta_t": x.delta_t.enabled and c.model.scope == "sequence", "elapsed": x.elapsed.enabled}
     return [name for name, on in wanted.items() if on]

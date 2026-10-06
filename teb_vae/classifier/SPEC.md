@@ -595,15 +595,15 @@ All strategies produce, per segment (segment scope) or per position (sequence sc
 
 | Strategy | Positive-GUID target / weight | Rationale |
 |---|---|---|
-| `propagate` | `y_n = y_g`, `ω_n = 1` | Weakest supervision. Kept as a baseline; the old classifier's plateau shows why it is not the default |
+| `propagate` (**default**) | `y_n = y_g`, `ω_n = 1` | The GUID outcome is the label of every epoch, with no decay. The old classifier's plateau (§5) is the known risk; `k_warm` is the lever if it recurs |
 | `horizon` | `y_n = y_g`, `ω_n = 1[Δ_n ≤ H]` (otherwise excluded from the loss) | CTG convention (last 60 min) [R: Weak labels] |
-| `horizon_decay` (**default**) | `y_n = y_g`, `ω_n = 2^{−max(0, Δ_n − H)/h}` | Temporal label smoothing (Yèche 2023); `latent_pilot` recency weights |
+| `horizon_decay` | `y_n = y_g`, `ω_n = 2^{−max(0, Δ_n − H)/h}` | Temporal label smoothing (Yèche 2023); `latent_pilot` recency weights |
 | `final_only` | only the last position / segment of each GUID is scored | offline GUID classification |
 | `mil` | no per-segment target. A bag score `s_bag = τ·log mean_n exp(s_n/τ)` (or the attention-pool output) gets `ℓ(y_g, s_bag)` | Ilse 2018; "some segment is pathological" |
 
-**Defaults:** `H = labels.horizon_h = 1.0` h, `h = labels.decay_halflife_h = 0.5` h.
+**Defaults:** `labels.strategy = propagate`, `labels.k_warm = 0`; `H = labels.horizon_h = 1.0` h and `h = labels.decay_halflife_h = 0.5` h apply to the `horizon*` strategies only.
 
-**`k_warm`** (`auto`, the default: 0 for `horizon*`, 3 for `propagate`) drops the first k positions of each GUID from the per-position loss in sequence scope. Segment scope has no positions: `auto` resolves to 0 there and an explicit k > 0 is refused. `label_weight` (ω) never carries `k_warm`: `data.GuidDataset` passes `w_pos` = ω · 1[seg_pos ≥ k_warm] to the per-position term only; the segment-local term keeps ω. `final_only`'s last segment is re-marked after a `no_valid_steps` drop (`baselines.fold_frame`).
+**`k_warm`** (default 0; `auto`: 0 for `horizon*`, 3 for `propagate`) drops the first k positions of each GUID from the per-position loss in sequence scope. Segment scope has no positions: `auto` resolves to 0 there and an explicit k > 0 is refused. `label_weight` (ω) never carries `k_warm`: `data.GuidDataset` passes `w_pos` = ω · 1[seg_pos ≥ k_warm] to the per-position term only; the segment-local term keeps ω. `final_only`'s last segment is re-marked after a `no_valid_steps` drop (`baselines.fold_frame`).
 
 **GUID-equal weighting:**
 - Per-segment losses are normalised per GUID, so each GUID contributes equally: loss_g = Σω·ℓ / Σω, then the mean over GUIDs.
@@ -645,11 +645,11 @@ GUID-level and online metrics are defined in §11.2 and §11.5, not by this key.
 |---|---|---|
 | Feature streams (§8) | yes | — |
 | `tlo_end` | yes (`context.tlo`) | `ψ(h) = sign(h)·log1p(|h|)` on hours, floored at 0 (`context.tlo.pre_onset: clip`, default): a pre-onset segment carries no time until onset, which is future information (§2.4); `signed` (ablation) keeps it. Plus a missing flag (§7.3) |
-| stage at segment end | yes (`context.stage`) | two flags {straddle, second}; **first and unknown are merged** into the all-zero "not known to be in second stage" level. A separate `unknown` flag would equal `~has_ss` from segment 0 (NaN second-stage onset is a GUID-level, label-correlated missingness, §2.4, §10.9), i.e. future information. Evaluation strata keep all four stages |
+| stage at segment end | yes (`context.stage`) | one flag `in_ss` = 1[stage ∈ {straddle, second}]: the segment is wholly or partly in second stage; **first and unknown are merged** into the zero "not known to be in second stage" level. A separate `unknown` flag would equal `~has_ss` from segment 0 (NaN second-stage onset is a GUID-level, label-correlated missingness, §2.4, §10.9), i.e. future information. Evaluation strata keep all four stages |
 | time in second stage | yes (`context.time_in_ss`) | `ψ(max(ss_rel + 1260, 0)/3600)`; 0 if not in second stage; unknown shares the stage flag |
 | Δt since previous observed segment | yes, sequence scope only (`context.delta_t`) | `log1p(Δt_h)`; 0 for the first position |
 | elapsed monitoring time | ablation only (`context.elapsed`, default off) | `log1p(h)`. **Label-correlated via asymmetric eligibility (§2.5)** |
-| `valid_frac`, fraction of masked steps | yes (`context.valid_frac`) | raw fraction. Signal loss is informative [R: failure modes] |
+| `valid_frac`, fraction of masked steps | **off** (`context.valid_frac`, default `false`) | raw fraction when enabled. Not a model input by default; it stays an exclusion criterion (`low_valid_frac`) and an evaluation stratum |
 | covariates (§7.3) | yes | value + missing flag |
 | `epoch`, `hours_to_delivery`, `t_end_s` | **never** | — |
 | negative part of `ss_rel` (time until second stage) | **never** | — |
@@ -1942,19 +1942,19 @@ classifier:
     task: adverse_vs_healthy        # §6.3
     head: binary                    # binary | multiclass | ordinal
     aux_3class_weight: 0.3          # λ3; 0 disables
-    strategy: horizon_decay         # propagate | horizon | horizon_decay | final_only | mil
-    horizon_h: 1.0
-    decay_halflife_h: 0.5
-    k_warm: auto                    # 3 for propagate, 0 otherwise (§6.5); sequence scope only
+    strategy: propagate             # propagate | horizon | horizon_decay | final_only | mil
+    horizon_h: 1.0                  # horizon* strategies and eval_window: horizon only
+    decay_halflife_h: 0.5           # horizon_decay only
+    k_warm: 0                       # auto = 3 for propagate, 0 otherwise (§6.5); sequence scope only
     eval_window: all                # all | horizon | stage:first | stage:second
 
   context:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # clip | signed (§7.1)
-    stage: {enabled: true}
+    stage: {enabled: true}          # one flag in_ss (§7.1)
     time_in_ss: {enabled: true}
     delta_t: {enabled: true}
     elapsed: {enabled: false}       # ablation only (§7.1)
-    valid_frac: {enabled: true}
+    valid_frac: {enabled: false}    # not a model input
     covariates:
       static_csv: null
       timed_csv: null

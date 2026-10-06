@@ -32,11 +32,11 @@ seven-row page unchanged. See :mod:`teb_vae.lag_attn_rws.input_budget`, which bu
 also draws the run-level companion figure: the same channels against the forecast window, which is
 where "what may this model be asked to predict" is answered.
 
-**Rows 3-7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ is excluded from
-every one of them, and the tail $[T - H, T)$ from all but the attention: those columns are not
-merely uninteresting, they carry no gradient at all -- the tail is neither decoded nor inside the
-KL support -- and while they stayed in the arrays they set the colour scale, so a warm-up transient
-compressed the whole trained region into the bottom of the colormap. They are removed from the
+**Rows 3-7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ and the tail
+$[T - H, T)$ are excluded from every one of them: those columns are not merely uninteresting, they
+carry no gradient at all -- the tail is neither decoded nor inside the KL support -- and while they
+stayed in the arrays they set the colour scale, so a warm-up transient compressed the whole trained
+region into the bottom of the colormap. They are removed from the
 *panel's copy* of the data, not shaded over it; the axes still span the full recording, so every
 row stays column-aligned with rows 1 and 2, and the empty margins are marked in grey.
 
@@ -1258,9 +1258,10 @@ def build_diagnostic_figure(
         # ---- Row: lag attention with its argmax --------------------------------
         if "lag_attn" in included:
             ax, cax = row_axes("lag_attn")
-            # The tail stays here alone among the five: attention is a property of the source
-            # stream and is defined at every step, whereas the KL panels above and below it
-            # are identically zero there by construction of the mask.
+            # Cut at the last anchor like the four rows around it. The attention tensor exists at
+            # every step, but past $T - H$ no anchor is decoded and no step is inside the KL
+            # support, so those columns are read by nothing and drawn they looked like a forecast
+            # the page failed to stop.
 
             # Resolved here rather than inside `lag_panel`, which draws the KL-by-lag row too:
             # that row is nats attributed across lags and is read against the KL panels above
@@ -1273,10 +1274,10 @@ def build_diagnostic_figure(
             )
             image = lag_panel(
                 ax, alpha_np, "Lag attention and argmax", "viridis",
-                drop_tail=False, norm=attention_norm,
+                drop_tail=True, norm=attention_norm,
             )
-            attn_trained, _ = trained_columns(alpha_np, drop_tail=False)
-            attn_time, _ = trained_columns(time_dec, drop_tail=False)
+            attn_trained, _ = trained_columns(alpha_np, drop_tail=True)
+            attn_time, _ = trained_columns(time_dec, drop_tail=True)
             ax.plot(
                 attn_time, attn_trained.argmax(axis=1),
                 color=COLOR_ORANGE, linewidth=0.7, alpha=0.85,
