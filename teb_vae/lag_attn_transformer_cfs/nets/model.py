@@ -35,14 +35,15 @@ base constructor and
 it, both shared with the conv-LSTM cell.
 
 The unit consequence, restated where a reader will look for it: under the shipped
-``configs/default.yaml`` the reconstruction is summed over
-$H \cdot C_{\mathrm{keep}} = 10 \times 76 = 760$ coefficients -- the same block the conv-LSTM causal
-cell sums, so a nat is comparable across the encoder edge -- against the raw variant's $H \cdot R$
-samples and the two-sided feature variant's $30 \times 78 = 2340$, so the nats are comparable to
-neither of those, nor across warm-up budgets within this model, since $C_{\mathrm{keep}}$ moves
-with the budget. Since 2026-09-05 the *horizon* separates this block from the two-sided cells' as
-well as $C_{\mathrm{keep}}$ does: both cfs configs forecast $10$ steps where the two-sided cells forecast $30$. The constructor default below stays the architecture parent's $30$; the horizon is
-a configuration decision and the config states it.
+``configs/default.yaml`` the forecast block is $H \cdot C_{\mathrm{keep}} = 30 \times 76 = 2280$
+cells, and the reconstruction is summed over the scored subset of them,
+$\sum_c \min(H_c, H)$, because a fast phase channel is scored over its first $H_c = 5$ steps only
+(``DESIGN.md``, amendment of 2026-09-23). That is a different sum from the raw variant's
+$H \cdot R$ samples, from the two-sided feature variant's $30 \times 78 = 2340$ and, since the
+same amendment, from the conv-LSTM causal cell's block, which keeps its own horizon and scores
+every cell. So the nats are comparable to none of those, nor across warm-up budgets within this
+model, since $C_{\mathrm{keep}}$ moves with the budget. The constructor default below stays the
+architecture parent's $30$; the horizon is a configuration decision and the config states it.
 """
 from __future__ import annotations
 
@@ -147,7 +148,7 @@ class SeqVaeLagAttnTrfCfs(
         ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry rather than a preference,
         and a run that left them at the parent's values would be describing a dataset that does not
         exist. ``horizon`` is not among them: the constructor default stays the architecture
-        parent's $30$, and the shipped ``configs/default.yaml`` sets $10$ -- a configuration
+        parent's $30$, and the shipped ``configs/default.yaml`` also sets $30$ -- a configuration
         decision rather than a property of the target domain, so it is stated in the config and
         not here.
 

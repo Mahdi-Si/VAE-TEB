@@ -198,7 +198,7 @@ Together, the checks establish whether the maps follow the model's causal input 
 
 Each attributed row corresponds to an anchor, readout, and baseline, with a band or coordinate where relevant. The two target-stream maps are combined along the target-channel axis. The resulting arrays have shapes $(N,T,c_y)$ for target attribution and $(N,T,c_u)$ for source attribution, where $N$ is the number of attributed rows.
 
-Reductions are first calculated per row, then combined within each recording, then summarised across recordings. The main selection uses one segment per recording and several anchors from that segment.
+Reductions are first calculated per row, then combined within each recording, then summarised across recordings. The main selection uses `caps.attribution_segments_per_recording` segments per recording and several anchors from each.
 
 | Reduction | Calculation and interpretation |
 | --- | --- |
@@ -338,13 +338,14 @@ The lag-residual tests check that this block avoids names its acceptance gate re
 
 The pass attributes the anchors where the source moved the belief and the signal is clean. A typical anchor carries a small $K_t$ that is mostly the availability clock, and its attribution map is hard to read. The rule (`attribution_pass.informative_anchors`) uses the collection pass's `per_anchor.parquet`:
 
-1. Pool $K_t$ over every scored anchor of every class, and take its `HIGH_KL_QUANTILE` $=0.7$ quantile as one threshold in nats. This is the `high` band of the `lag_high_kl` analysis. Because one number cuts every class, no class chooses its own anchors.
-2. Keep the anchors at or above the threshold whose forecast `coverage` reaches `CLEAN_COVERAGE` $=0.95$. These are the candidates.
-3. Draw recordings that hold a candidate, class-balanced and seeded, one segment per recording. Each recording gives the segment with the most candidates; ties go to the larger top $K_t$.
-4. In that segment, keep up to `ANCHORS_PER_SEGMENT` $=4$ candidates, highest $K_t$ first, at least one horizon $H$ apart. A candidate whose mean validity over the searched lag window $[t_a-L+1,t_a]$ is below `CLEAN_COVERAGE` is used only when too few clean ones remain; `plan.anchor_selection.n_unclean_anchors` counts these.
-5. The `EXAMPLES_PER_CLASS` $=3$ selected segments of each class with the largest top $K_t$ give the example pages, each at its highest-KL anchor. The overview `attribution_maps.pdf` shows the first of each class.
+1. In each segment, take the `HIGH_KL_QUANTILE` $=0.7$ quantile of that segment's own $K_t$ as its threshold. A per-segment threshold means every segment offers its most coupled anchors, so a subgroup with weak coupling everywhere is still attributed. A threshold pooled over the cohort gave such a subgroup no candidate at all, and it vanished from every by-subgroup figure.
+2. Keep the anchors at or above their segment's threshold whose forecast `coverage` reaches `CLEAN_COVERAGE` $=0.95$. These are the candidates.
+3. Draw recordings class-balanced and seeded, round-robin over each class's subgroups, so every subgroup of a class is drawn before any subgroup is drawn twice. Each class draws $\lceil \texttt{cap} / (n_{\mathrm{classes}} \cdot k) \rceil$ recordings, with $k$ = `caps.attribution_segments_per_recording` (main pass; the cohort pass uses $k = 1$).
+4. From each drawn recording, take $k$ segments that hold a candidate, spread evenly over the recording's timeline by `epoch`. With $k = 1$ this is the middle one.
+5. In each segment, keep up to `ANCHORS_PER_SEGMENT` $=4$ candidates, highest $K_t$ first, at least one horizon $H$ apart. A candidate whose mean validity over the searched lag window $[t_a-L+1,t_a]$ is below `CLEAN_COVERAGE` is used only when too few clean ones remain; `plan.anchor_selection.n_unclean_anchors` counts these.
+6. The `EXAMPLES_PER_CLASS` $=3$ recordings of each class with the largest top $K_t$ give the example pages, each at the highest-KL anchor of its best segment. The overview `attribution_maps.pdf` shows the first of each class.
 
-The population figures and tables therefore describe the **average behaviour at high-KL, clean anchors**, not at a typical anchor. `plan.anchor_selection` records the threshold in nats, the candidate count and the recordings with candidates. Using one segment per recording still prevents recordings with many segments from dominating the summaries.
+The population figures and tables therefore describe the **average behaviour at each segment's most coupled, clean anchors**, not at a typical anchor, and not at anchors above one cohort-wide level of $K_t$. `plan.anchor_selection` records the median per-segment threshold, the pooled level for comparison, the candidate count and the recordings with candidates. Rows are averaged per segment and then per recording, so a recording stays one unit however many segments it gives.
 
 Without a per-anchor table (an offline re-run, or the lag-residual cell, whose pass does not pass one), the pass falls back to the earlier rule: the middle segment of each recording, `ANCHORS_PER_SEGMENT` anchors spread evenly over its scored anchors, and one example per class. `plan.anchor_selection.rule` says which rule ran.
 
@@ -529,7 +530,7 @@ Use `results.attribution` for attentive models or `attribution` for the lag-resi
 - **The all-zero split depends on the path.** It describes what happens when target and source streams change together from that reference. It is not a unique division of everything the target and source contribute to the model.
 - **Lag readouts differ by architecture.** Attentive models use attention mass; the lag-residual model uses proposal norms before summation and limiting. A proposal norm is neither a lag distribution nor a KL allocation. Zero-sum changes to proposals can preserve predictions while changing lag-wise attribution.
 - **Class comparisons depend on the training population.** For the documented healthy-pretraining setup, unseen clinical groups are out of distribution. Check the run's cohort provenance before generalising a class contrast.
-- **Summaries are descriptive and use recordings as their unit.** The main draw contains one segment per recording and only a few anchors per segment. Read recording counts and selection limits; no group hypothesis tests are performed by this attribution analysis.
+- **Summaries are descriptive and use recordings as their unit.** The main draw contains a few segments per recording and only a few anchors per segment. Read recording counts and selection limits; no group hypothesis tests are performed by this attribution analysis.
 - **Frequency-band attribution is not frequency-band skill.** It sums over declared input channels, including dropped channels at zero. `spectral_skill` measures predictive performance on retained target channels.
 - **Example maps show individual anchors.** A striking map is one selected example. Use the recording-level summaries to understand whether its pattern is common in the evaluated selection.
 - **Completeness is relative to the entry point.** A row above tolerance does not accurately account for its claimed integrated output difference. Inspect the per-row residuals and summary counts before interpreting its attribution.
@@ -540,7 +541,7 @@ The example pages show one anchor per class. One anchor cannot tell a class patt
 
 ### 13.1 The cohort pass
 
-`attribution_pass.run_cohort` draws segments with the same rule as the main pass: one middle segment per recording, class-balanced and seeded. Its cap is `caps.attribution_cohort_segments`, $150$ by default. Each segment gets only what the comparison reads:
+`attribution_pass.run_cohort` draws segments with the same rule as the main pass, with one segment per recording: class-balanced, spread over subgroups, and seeded. Its cap is `caps.attribution_cohort_segments`, $150$ by default. Each segment gets only what the comparison reads:
 
 - integrated gradients of `kld` and `pred_gap` (`COHORT_READOUTS`) under `source_null`, at `ANCHORS_PER_SEGMENT` anchors;
 - Grad-CAM of the four main readouts at the same anchors.

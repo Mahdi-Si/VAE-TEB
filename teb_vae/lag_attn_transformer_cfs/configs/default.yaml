@@ -179,7 +179,7 @@ model_config:
 
     # --- Auxiliary shape terms (OFF, and lambda_boundary is REFUSED at any other value) --------
     # The three shape penalties in the shared objective -- multiscale L1, derivative Huber and
-    # boundary continuity -- are RAW-WAVEFORM concepts, and this block's last axis is 98 surviving
+    # boundary continuity -- are RAW-WAVEFORM concepts, and this block's last axis is 76 surviving
     # target channels: an unordered index with no metric, so a difference between adjacent entries
     # is a difference between two unrelated coefficients. That is every feature cell's reason and it
     # is unchanged here.
@@ -298,7 +298,8 @@ model_config:
     # The cost, accepted deliberately: base and full are no longer bitwise identical at init, since
     # the full branch still carries the posterior's noise; and the TRAINING-path pred_gap is no
     # longer a common-random-numbers contrast, so it is biased down by an amount that has nothing to
-    # do with the source. Do not compare a training-path pred_gap across this key.
+    # do with the source. Do not compare a training-path pred_gap across this key. On validation,
+    # `val/pred_gap_mean` decodes BOTH branches at their latent means and is the matched readout.
     base_decode: mean
 
     # --- How the posterior's log-variance is built -------------------------------
@@ -385,15 +386,15 @@ model_config:
     # literal would silently describe a boundary the data no longer has. Every configured shard is
     # validated, not only the first.
     #
-    # 134 keeps 98 of 102 target channels. It is where `fhr_ph` tops out, so ALL 66 phase channels
-    # survive it, and the `fhr_st` staircase has a channel at exactly 134 with the next at 162 --
+    # 134 keeps 76 of 80 target channels (98 of 102 under the legacy operator). It is where `fhr_ph`
+    # tops out, so ALL 44 phase channels survive it, and the `fhr_st` staircase has a channel at exactly 134 with the next at 162 --
     # the boundary lands on the ~0.008 Hz frequency edge both phase selections already use, rather
     # than on an arbitrary cut. The four dropped channels wait 162, 194, 233 and 278 steps.
     #
     # The SOURCE is never gated BY THIS BUDGET: its slowest channels carry the contraction envelope,
     # and dropping them to make every reachable lag warm would cost almost the whole `up_ph` block
     # against a lag search that exists to find the 20-120 s contraction-to-deceleration delay. All
-    # 51 survive it, the availability mechanism announces per step when each arrives, and the
+    # 46 survive it, the availability mechanism announces per step when each arrives, and the
     # residual is MEASURED -- `source_lag_warmth_frac_st` and `_ph`.
     #
     # The ALIGNMENT below is a different rule and does drop four of them, for a different reason:
@@ -492,7 +493,8 @@ model_config:
     #               Every element is a strict forecast for every channel -- on the stored clock the
     #               slowest kept channel draws 2.6% of its value from the horizon window and its
     #               "forecast" is near-copyable, so the latent was never forced to encode
-    #               genuinely predictive information at the slow scales. This is the default.
+    #               genuinely predictive information at the slow scales. It was the default
+    #               until 2026-09-05; the shipped value is 'stored' (the key below).
     #   'input'     s_c = -d_c: the continuation of the encoder's own aligned stream. Scored
     #               content sits up to ~350 s in the past and the source clock is ~100 s FRESHER
     #               than it, so pred_gap loses its directed reading there; kept as an arm, not a
@@ -501,8 +503,8 @@ model_config:
     #
     # WHAT 'physical' COSTS AND MOVES. The largest advance is 85 steps (the slowest kept channel,
     # round(0.875*(402.1604-13.3405)/4)), so the anchor ceiling drops from T_valid = 270 to 185:
-    # dense anchors 136 -> 51, and `anchor_stride` below moves to 5 to keep ~10 training tiles
-    # per sample. The floor does NOT move -- the scored-target half relaxes to
+    # dense anchors 136 -> 51, and that arm needs `anchor_stride: 5` to keep ~10 training tiles
+    # per sample (the shipped stored clock uses 15). The floor does NOT move -- the scored-target half relaxes to
     # max_c(W'_c - s_c) - 1 while the shifted-inputs half still binds at 134. Validity is pooled
     # conservatively over the shift span (see CausalFeatureForecastTarget.scored_weight), and the
     # novelty-tertile split keeps its stored-clock ranking (readout only; its interpretation note
@@ -594,15 +596,16 @@ model_config:
     # --- Per-block reconstruction weights ---------------------------------------
     # The relative weight of the two stored target blocks in BOTH reconstruction terms. The
     # objective was uniform over channels until now, and uniform was never neutral: at the shipped
-    # budget 66 of the 98 survivors are phase-harmonic against 32 scattering, so two-thirds of the
-    # loss went to `fhr_ph` by nothing more deliberate than there being twice as many of them.
+    # budget 44 of the 76 survivors are phase-harmonic against 32 scattering, so 58% of the loss went
+    # to `fhr_ph` by nothing more deliberate than there being more of them.
     #
-    # 1.0 / 0.1 shifts that: the resolved weights are 2.5389 on each scattering channel and 0.25389
-    # on each phase-harmonic one, so scattering carries 82.9% of the block against 32.7% before.
+    # 1.0 / 0.1 shifts that: the resolved weights are 2.0879 on each scattering channel and 0.20879
+    # on each phase-harmonic one, so scattering carries 87.9% of the block against 42.1% before.
+    # (Legacy operator, 32 + 66 = 98 survivors: 2.5389 / 0.25389, 82.9% against 32.7%.)
     #
     # RENORMALISED, which is why those numbers are not 1.0 and 0.1. The vector is scaled by
     # C_keep / sum(w), so the weighted block sums to the same magnitude the uniform one did. Without
-    # that, this pair would shrink the reconstruction 2.5x against a KL that did not move -- a 2.5x
+    # that, this pair would shrink the reconstruction 2.1x against a KL that did not move -- a 2.1x
     # rise in the effective beta wearing a channel weight's name, and `gradient_clip_val` and
     # `additive_margin` would both be out of date again. Only the DISTRIBUTION across channels
     # moves. What the pair states is therefore a RATIO: 10.0 / 1.0 configures the same objective.

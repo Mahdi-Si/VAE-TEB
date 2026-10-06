@@ -922,11 +922,11 @@ The full arrays behind every panel are in the `_full.npz` beside the figure.
 
 **Purpose.** Summarise input attribution by frequency band and source lag band, and compare it with related predictive and intervention analyses.
 
-**What it shows.** Top, one column per readout: the mean over recordings of the source-null attribution summed over each frequency band of the declared channel map, one bar group per stream, with `spectral_skill`'s per-band gap drawn on a twin axis for the target bands where that pass ran. The ticks name each band by its frequency range with the period in parentheses; the `band` column of the table keeps the key.
+**What it shows.** Top, one column per readout: the mean over recordings of the attribution summed over each frequency band of the declared channel map, one bar group per stream — the target read along the all-zero path and the source along the source-null path, the only path on which each stream moves — with `spectral_skill`'s per-band gap drawn on a twin axis for the target bands where that pass ran. The ticks name each band by its frequency range with the period in parentheses; the `band` column of the table keeps the key.
 
 Bottom: per `occlusion_bands` band of the source relative to the anchor, the integrated-gradient sum over the band, this analysis's own feature-ablation delta of the readout, and the `occlusion` pass's delta where it ran — sign-flipped on the gap readout, because that pass reports the forecast cost of removing a band and the gap moves the other way.
 
-**Axes.** Bands across; readout units up, symmetric log (nats per anchor for every main readout; the occlusion series in nats per anchor).
+**Axes.** Bands across; readout units up, symmetric log (nats per anchor for the divergence, the forecast gap and the full-branch score; squared standardised units for the full-branch squared error; the occlusion series in nats per anchor).
 
 **Interpretation.** A frequency-band sum over an input stream is over the **declared** channels of that stream, including the ones the budget dropped (their attribution is exactly zero) — the channel counts are in `attribution_bands.csv`. The ablation delta and the occlusion delta are the same intervention at different anchors and on different readouts, so they agree in sign rather than in value. Nothing here is tested.
 

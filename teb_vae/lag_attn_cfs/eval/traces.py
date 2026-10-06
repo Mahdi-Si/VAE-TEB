@@ -443,6 +443,7 @@ def select_recordings(
     per_class: int,
     seed: int,
     min_segments: int = MIN_SEGMENTS_PER_TRACE,
+    stratify_column: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     r"""Draw up to ``per_class`` eligible recordings from every clinical class, seeded.
 
@@ -458,6 +459,10 @@ def select_recordings(
         per_class: Recordings to draw from each class, as an upper bound.
         seed: The draw's seed.
         min_segments: The eligibility floor.
+        stratify_column: A column to spread each class's draw over, round-robin -- the subgroup
+            column, so a class's draw holds every one of its subgroups before any subgroup holds
+            two. ``None`` keeps the plain draw. Both consume the same permutation, so switching it
+            on reorders the draw and never changes the random stream.
 
     Returns:
         ``(chosen, accounting)``: the drawn rows in class order, and per class how many
@@ -488,7 +493,12 @@ def select_recordings(
         members = labelled[labelled[labels.CLASS_COLUMN] == name].sort_values("guid")
         eligible = members[members["n_segments"] >= int(min_segments)]
         take = min(int(per_class), len(eligible))
-        drawn = eligible.iloc[np.sort(generator.permutation(len(eligible))[:take])] if take else eligible.head(0)
+        order = generator.permutation(len(eligible))
+        if stratify_column is not None and take:
+            shuffled = eligible.iloc[order]
+            turn = shuffled.groupby(stratify_column, dropna=False, sort=False).cumcount().to_numpy()
+            order = order[np.argsort(turn, kind="stable")]
+        drawn = eligible.iloc[np.sort(order[:take])] if take else eligible.head(0)
         accounting["classes"][str(name)] = {
             "n_recordings": int(len(members)),
             "n_eligible": int(len(eligible)),

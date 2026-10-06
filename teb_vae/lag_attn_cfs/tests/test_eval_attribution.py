@@ -705,14 +705,20 @@ def test_the_informative_rule_attributes_high_kl_anchors_and_pages_the_top_ones_
     )
 
     selection = result["plan"]["anchor_selection"]
-    assert selection["rule"] == "high_kl_clean" and result["class_contrast"]["plan"]["anchor_rule"] == "high_kl_clean"
+    rule = "high_kl_clean_per_segment"
+    assert selection["rule"] == rule and result["class_contrast"]["plan"]["anchor_rule"] == rule
     directory = tmp_path / core.ANALYSIS_DIRNAME
     rows = pd.read_csv(directory / core.ROWS_FILENAME)
     kld = rows[(rows["readout"] == core.READOUT_KLD) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)]
-    # Every attributed anchor is a candidate: its K_t reaches the pooled threshold ...
-    assert (kld["value_input"] >= selection["kl_threshold_nats"] - 1e-4).all()
+    # Every attributed anchor is a candidate: its K_t reaches its own segment's threshold ...
+    level = (
+        per_anchor.groupby(["guid", "epoch"])["kld_per_t"].quantile(core.HIGH_KL_QUANTILE)
+        .rename("level").reset_index().astype({"guid": str})
+    )
+    joined = kld.astype({"guid": str}).merge(level, on=["guid", "epoch"])
+    assert len(joined) == len(kld) and (joined["value_input"] >= joined["level"] - 1e-4).all()
     # ... and the anchors of one segment are at least one horizon apart.
-    for _, steps in kld.groupby("guid")["anchor"]:
+    for _, steps in kld.groupby(["guid", "epoch"])["anchor"]:
         gaps = np.diff(np.sort(steps.to_numpy()))
         assert (gaps >= int(module.orig_model.horizon)).all()
     # The example pages are the highest-KL selected segments of each class, ranked from zero.

@@ -510,16 +510,66 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             weight: Decimated validity signal $(B, T)$.
             stage: ``'train'``, ``'val'`` or ``'test'``.
 
+        The second readout, ``pred_gap_mean``, is the forecast gap with **both** branches decoded at
+        their latent means, $D_0(\mu^p) - D_1(\mu^q)$. The objective's ``pred_gap`` decodes the base
+        branch at $\mu^p$ under ``base_decode: mean`` but the full branch at one posterior sample,
+        so it carries the posterior's sampling noise on one side only and is biased by an amount
+        unrelated to the source. This readout removes that asymmetry, scored under the same channel
+        weights, horizon weights, cell mask and AR(1) term as ``pred_gap``, so the two columns differ
+        by the decode alone. It is the in-training counterpart of the evaluation's
+        ``mean_pred_gap``, not of its Monte Carlo headline.
+
         Returns:
-            ``{'kld_source_null': ...}`` on the evaluation stages, empty on ``train``.
+            ``{'kld_source_null': ..., 'pred_gap_mean': ...}`` on the evaluation stages, empty on
+            ``train``.
         """
         if stage == "train":
             return {}
         return {
             "kld_source_null": controls.source_null_kld(
                 self.orig_model, forward_outputs, inputs[2], weight
-            )
+            ),
+            "pred_gap_mean": self._mean_decoded_pred_gap(inputs, forward_outputs, weight),
         }
+
+    @torch.no_grad()
+    def _mean_decoded_pred_gap(
+        self,
+        inputs: Tuple[Any, ...],
+        forward_outputs: Dict[str, torch.Tensor],
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Re-decode the full branch at $\mu^q$ and return the matched forecast gap.
+
+        Args:
+            inputs: The forward's positional arguments; ``inputs[0]`` and ``inputs[1]`` are the two
+                stored target blocks, whose concatenation is the scored target.
+            forward_outputs: That forward's dict.
+            weight: Decimated validity signal $(B, T)$.
+
+        Returns:
+            The scalar $D_0(\mu^p) - D_1(\mu^q)$ in nats per anchor.
+        """
+        model = self.orig_model
+        mu_post = forward_outputs["mu_post"]
+        anchors = forward_outputs["anchor_index"].to(torch.long)
+        z_mean = mu_post.gather(1, anchors[:, :, None].expand(-1, -1, mu_post.shape[-1]))
+        mu_full, logvar_full = model.decoder(z_mean, persistence=forward_outputs.get("persistence"))
+        scored = model.compute_loss(
+            {**forward_outputs, "mu_full": mu_full, "logvar_full": logvar_full},
+            torch.cat([inputs[0], inputs[1]], dim=-1),
+            weight=weight,
+            beta=0.0,
+            beta_prior=0.0,
+            lambda_full=float(self.hparams.get("lambda_full", 1.0)),
+            lambda_base=float(self.hparams.get("lambda_base", 1.0)),
+            likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
+            free_bits=0.0,
+            lambda_ms=0.0,
+            lambda_deriv=0.0,
+            lambda_boundary=0.0,
+        )["metrics"]
+        return scored["pred_gap"]
 
     # ------------------------------------------------------------------
     # Loss + metrics

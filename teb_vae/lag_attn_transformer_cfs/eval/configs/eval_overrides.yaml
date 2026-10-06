@@ -261,12 +261,19 @@ eval_config:
   #                  segments. A recording is tens of segments, so this is a few hundred
   #                  forwards per class with no Monte Carlo decode -- small beside the pass.
   #   attribution_segments
-  #              24  SEGMENTS the Captum attribution analysis attributes, one per drawn recording
-  #                  in a class-balanced draw, a few anchors each. Not a retention cap: it bounds
-  #                  a pass of tens of forward-and-backward passes per anchor, readout and
-  #                  baseline, and the analysis's cost block records what it took so the number is
-  #                  set from a measurement. Absent means the analysis's own default, not every
-  #                  segment.
+  #             144  SEGMENTS the Captum attribution analysis attributes: 12 recordings per class,
+  #                  drawn round-robin over the class's subgroups (3 per healthy subgroup, 6 per
+  #                  acidosis and HIE subgroup), times `attribution_segments_per_recording`. Up to
+  #                  4 anchors each, from the top 30% of that segment's own K_t. Not a retention
+  #                  cap: it bounds a pass of tens of forward-and-backward passes per anchor,
+  #                  readout and baseline -- about five times a cohort segment, so roughly 20 s per
+  #                  segment on the laptop GPU below and about 50 min here; the analysis's cost
+  #                  block records what it took. Absent means the analysis's own default (24).
+  #   attribution_segments_per_recording
+  #               4  segments taken from each drawn recording, spread evenly over its stored
+  #                  timeline, so a recording's summary rests on four 20-minute windows rather than
+  #                  one. Main pass only: the cohort pass below keeps one per recording. Absent
+  #                  means one, the middle segment.
   #   attribution_cohort_segments
   #             150  SEGMENTS the attribution CLASS COMPARISON draws (50 recordings per class),
   #                  one per recording, by the same rule. Each gets only the source-null
@@ -283,7 +290,8 @@ eval_config:
     pages: 24
     pages_per_class: 10
     traces_per_class: 10
-    attribution_segments: 24
+    attribution_segments: 144
+    attribution_segments_per_recording: 4
     attribution_cohort_segments: 150
     # NOT a retention cap: it bounds how many segments the input-level occlusion readout
     # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
