@@ -1321,7 +1321,9 @@ def config_digest(eval_config: Dict[str, Any]) -> str:
     """Return a digest of the resolved ``eval_config`` block.
 
     Sorted keys and a canonical separator, so the digest depends on the settings rather than on
-    the order a merge happened to produce.
+    the order a merge happened to produce. The ``attribution_*`` caps are left out: the collection
+    pass never reads them, so changing how many segments the attribution pass draws must not
+    refuse the tables an ``--only attribution`` re-run reuses.
 
     Args:
         eval_config: The validated block.
@@ -1329,7 +1331,11 @@ def config_digest(eval_config: Dict[str, Any]) -> str:
     Returns:
         The hex digest.
     """
-    canonical = json.dumps(eval_config, sort_keys=True, separators=(",", ":"), default=str)
+    caps = {
+        name: value for name, value in (eval_config.get("caps") or {}).items()
+        if not str(name).startswith("attribution_")
+    }
+    canonical = json.dumps({**eval_config, "caps": caps}, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
