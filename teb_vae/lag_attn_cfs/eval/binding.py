@@ -268,10 +268,9 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # of the model whose forward they draw, rather than on the shared registry every binding
     # inherits. A model without that forward registers its own under the same three names, so
     # two run directories are read down one layout; the shared registry holds only what reads
-    # the tables. They lead the extras so the merged run order is the one it has always been.
+    # the tables. Two of them lead the extras; ``attribution`` is registered LAST (below).
     "samples": samples_analysis.run_samples_analysis,
     "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
-    "attribution": attribution_analysis.run_attribution_analysis,
     "warmup": warmup_analysis.run_warmup_analysis,
     "source_null": source_null_analysis.run_source_null_analysis,
     # The within-recording misalignment control: the same recording's source from another time.
@@ -300,6 +299,11 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # Last of the extras: it is the only one whose input is a file another step wrote, the
     # kept-axis channel map, so it reads rather than produces.
     "spectral_skill": spectral_skill_analysis.run_spectral_skill_analysis,
+    # After every analysis whose table it joins: ``attribution_bands.pdf`` draws the occlusion
+    # deltas from ``occlusion`` and the band skill from ``spectral_skill``, read off disk, so
+    # registered before them it drew neither on a fresh run directory. Selection never reorders,
+    # so ``--only occlusion,spectral_skill,attribution`` runs in this order too.
+    "attribution": attribution_analysis.run_attribution_analysis,
 }
 
 #: What those analyses put in the headline block, which is the only block an arm table reads --
