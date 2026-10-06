@@ -144,12 +144,19 @@ DEFAULT_SEGMENTS = 24
 ANCHORS_PER_SEGMENT = 4
 
 #: The informative-anchor rule (``attribution_pass.informative_anchors``). An anchor qualifies when
-#: its $K_t$ is in the upper $30\%$ of the KL pooled over every scored anchor of every class -- the
-#: ``high`` band of the ``lag_high_kl`` analysis, restated here because an analysis may not import
-#: another -- and when its signal is clean: the forecast coverage and the mean validity over the
-#: searched lag window both reach :data:`CLEAN_COVERAGE`.
+#: its $K_t$ is in the upper $30\%$ of the KL **of its own segment**, and when its signal is clean:
+#: the forecast coverage and the mean validity over the searched lag window both reach
+#: :data:`CLEAN_COVERAGE`. The threshold is per segment rather than pooled over the cohort, so a
+#: subgroup whose coupling is weak everywhere still contributes its most coupled moments instead of
+#: no anchor at all; a pooled threshold dropped such a subgroup from every by-subgroup figure.
 HIGH_KL_QUANTILE = 0.7
 CLEAN_COVERAGE = 0.95
+
+#: Config key of the main pass's segments per drawn recording, and its default. One keeps the
+#: original draw; more spreads that many segments evenly over each recording's stored timeline, so
+#: a recording's summary rests on several 20-minute windows rather than on one.
+SEGMENTS_PER_RECORDING_CAP_NAME = "attribution_segments_per_recording"
+DEFAULT_SEGMENTS_PER_RECORDING = 1
 
 #: Example pages per class: the highest-KL clean anchors, one per recording.
 EXAMPLES_PER_CLASS = 3
@@ -3210,7 +3217,8 @@ __all__ = [
     "ANALYSIS_DIRNAME", "ANCHORS_PER_SEGMENT", "ATTENTION_CELL", "ATTRIBUTION_CAVEAT", "ATTRIBUTION_NOTE",
     "AnchorReadout", "AttributionBatch", "BANDS_FILENAME", "BAND_FIGURE", "BASELINES",
     "BASELINE_ALL_ZERO", "BASELINE_ENTRY_FRACTION", "BASELINE_SOURCE_NULL", "CAP_NAME",
-    "CellBinding", "DEFAULT_SEGMENTS", "DRAW_SEED_OFFSET", "IG_INTERNAL_BATCH_SIZE", "IG_STEPS",
+    "CellBinding", "DEFAULT_SEGMENTS", "DEFAULT_SEGMENTS_PER_RECORDING", "DRAW_SEED_OFFSET",
+    "IG_INTERNAL_BATCH_SIZE", "IG_STEPS", "SEGMENTS_PER_RECORDING_CAP_NAME",
     "LAG_BANDS_FILENAME", "LAG_PROFILE_FIGURE", "LAYER_FIGURE", "LAYER_FILENAME", "MAIN_READOUTS",
     "MAPS_FILENAME", "MAP_FIGURE", "METHOD_RECORD", "NULL_FIGURE", "NULL_FILENAME", "READOUTS",
     "READOUT_KLD", "READOUT_KLD_DIM", "READOUT_LAG_BAND", "READOUT_MU_POST_DIM",

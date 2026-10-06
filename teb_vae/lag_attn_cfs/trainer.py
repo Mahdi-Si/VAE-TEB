@@ -123,12 +123,13 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     "pred_gap_novel_hi",
 )
 
-#: The one readout that runs on validation batches only, beside the permutation control's three.
+#: The two readouts that run on validation batches only, beside the permutation control's three:
+#: the source-null KL and the forecast gap with both branches decoded at their latent means.
 #:
-#: It costs a source encode per step, and -- more importantly -- it is a *readout* that never enters
-#: the objective. Tracking a ``train/`` variant would produce a column that is NaN in every row of
-#: every run.
-_CAUSAL_VAL_ONLY_SUFFIXES: Tuple[str, ...] = ("kld_source_null",)
+#: Each costs an extra pass per step (a source encode, a decode), and -- more importantly -- each is
+#: a *readout* that never enters the objective. Tracking a ``train/`` variant would produce a column
+#: that is NaN in every row of every run.
+_CAUSAL_VAL_ONLY_SUFFIXES: Tuple[str, ...] = ("kld_source_null", "pred_gap_mean")
 
 
 class LagAttnCfsTrainer(LagAttnRwsTrainer):
