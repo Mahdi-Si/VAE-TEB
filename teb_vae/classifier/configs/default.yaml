@@ -36,19 +36,19 @@ classifier:
     task: adverse_vs_healthy        # §6.3
     head: binary                    # binary | multiclass | ordinal
     aux_3class_weight: 0.3          # λ3; 0 disables
-    strategy: horizon_decay         # propagate | horizon | horizon_decay | final_only | mil
-    horizon_h: 1.0
-    decay_halflife_h: 0.5
-    k_warm: auto                    # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
+    strategy: propagate             # propagate | horizon | horizon_decay | final_only | mil
+    horizon_h: 1.0                  # horizon* strategies and eval_window: horizon only
+    decay_halflife_h: 0.5           # horizon_decay only
+    k_warm: 0                       # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
     eval_window: all                # all | horizon | stage:first | stage:second
 
   context:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # signed: pre-onset time until onset (ablation)
-    stage: {enabled: true}
+    stage: {enabled: true}          # one flag in_ss: the segment is wholly or partly in second stage
     time_in_ss: {enabled: true}
     delta_t: {enabled: true}
     elapsed: {enabled: false}       # ablation only (§7.1)
-    valid_frac: {enabled: true}
+    valid_frac: {enabled: false}    # not a model input
     covariates:
       static_csv: null
       timed_csv: null

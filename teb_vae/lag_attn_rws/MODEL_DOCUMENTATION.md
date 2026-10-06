@@ -1770,8 +1770,8 @@ latents, with nothing saying which curve was which. Two spans are consequently b
 before the first trained anchor's own window, and the $116$ s tail that cannot be reached without
 overlapping the last tiled window.
 
-**Rows 3–7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ is cut from all
-five, and the tail $[T - H, T)$ from all but the attention. Those columns carry no gradient at all
+**Rows 3–7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ and the tail
+$[T - H, T)$ are cut from all five. Those columns carry no gradient at all
 — the tail is neither decoded nor inside the KL support — and while they stayed in the arrays they
 set the colour scale, so a warm-up transient compressed the whole trained region into the bottom of
 the colormap. This too is a drawing decision and nothing more: the tensors the forward pass returns
