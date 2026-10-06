@@ -176,11 +176,12 @@ def test_context_hides_whether_second_stage_is_reached():
     """§7.1: pre-onset segments of a GUID that later reaches second stage and of a GUID whose onset is unknown
     have the same context (an ``unknown`` flag would be ``~has_ss`` from segment 0)."""
     seg = pd.DataFrame({"tlo_end_s": 7200.0, "epoch_s": -9000.0, "t_end_s": -7740.0, "valid_frac": 0.8,
-                        "ss_rel_s": [-5000.0, np.nan]})
+                        "ss_rel_s": [-5000.0, np.nan, -600.0, 100.0]})
     seg["stage"] = cohort.stage_of(seg["ss_rel_s"], 60.0, 1260.0)
-    assert list(seg["stage"]) == ["first", "unknown"]
+    assert list(seg["stage"]) == ["first", "unknown", "straddle", "second"]
     ctx = cohort.context_features(seg)
     pd.testing.assert_series_equal(ctx.iloc[0], ctx.iloc[1], check_names=False)
+    assert list(ctx["in_ss"]) == [0.0, 0.0, 1.0, 1.0]  # one flag: wholly or partly in second stage
 
 
 def test_context_tlo_hides_time_until_onset():

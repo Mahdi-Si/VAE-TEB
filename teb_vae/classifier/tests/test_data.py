@@ -89,7 +89,7 @@ def test_allow_list_class_counts_priors_and_train_only_fits(env):
     np.testing.assert_allclose(unit.priors["main"], np.array(unit.class_counts) / len(g))
     np.testing.assert_allclose(unit.priors["aux3"], np.bincount(g["class_code"].astype(int) - 1, minlength=3) / len(g))
     assert unit.scaler.record["population"] == "train" and unit.scaler.record["n_guids"] == len(g)
-    assert (unit.n_values, unit.n_attn, unit.n_ctx) == (153, 0, 7)
+    assert (unit.n_values, unit.n_attn, unit.n_ctx) == (153, 0, 5)  # tlo_psi, tlo_missing, in_ss, time_in_ss, delta_t
     with pytest.raises(ValueError, match="L4"):
         data.train_counts(unit.frames["val"], 2)
 
