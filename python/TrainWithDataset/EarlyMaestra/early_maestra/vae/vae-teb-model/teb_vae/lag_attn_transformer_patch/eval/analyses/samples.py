@@ -1,9 +1,9 @@
 r"""``samples`` -- the raw-trace diagnostic page; port, owner E1-F (``notes/EVAL_PLAN.md`` §2).
 
 **Question.** What does the model forecast, in clinical units, against the trace a clinician
-reads? The page draws the level forecast in bpm with its ±2σ band over the raw FHR, a variability
-lane (rms-Δ bpm), and UP with the detected contractions shaded, on one shared time axis above the
-shared latent, KL and lag rows.
+reads? The page draws the raw FHR and UP on one row, the level forecast in bpm with its ±2σ band
+over the raw FHR, and a variability lane (rms-Δ bpm), on one shared time axis above the shared
+latent, KL and lag rows.
 
 **What is reused, and what is new.** The selection (a stratified draw, a class-balanced draw and
 the extremes of three headline metrics), the dense re-forward, the identity checks, the two page
@@ -13,18 +13,22 @@ analysis and run unchanged. That analysis draws through the task's three page se
 seams that draw CFS feature lanes. This module hands the shared analysis a thin view of the task
 whose three seams are the patch ones below; every other attribute delegates to the real task.
 
-**Rows** (full page, 10): ``raw`` (UP, mmHg, contractions shaded); ``forecast`` (raw FHR plus
-the tiled level forecast, bpm); ``variability`` (rms-Δ bpm per 0.25 s, log axis, with the 0.25 bpm
+**Rows** (full page, 10): ``raw`` (FHR in bpm and UP in mmHg on the CTG paper scales, gaps
+blank, as the sibling pages' ``raw_context_row`` draws them); ``forecast`` (raw FHR plus the
+tiled level forecast, bpm); ``variability`` (rms-Δ bpm per 0.25 s, log axis, with the 0.25 bpm
 monitor resolution and the ``variability_eps`` floor marked); ``input_target`` and
 ``input_source`` (the patch tokens the encoders read, missing tokens blank); then the shared
 latent, per-dimension KL, ``K_t``, lag attention and KL-by-lag rows. The compact page keeps
 ``raw``, ``forecast``, both inputs, the latent, ``K_t`` and both lag maps.
 
 **Tiling.** Anchors ``w, w + H, w + 2H, ...`` below ``T - H``, so windows abut without overlap
-(``lag_attn_rws.sample_page.raw_forecast_rows``). Each window is decoded from one latent and is
-drawn as 4 s steps, because the target is a 4 s patch summary. The band is the AR(1) marginal
-±2σ, ``v_τ = σ²_τ + φ² v_{τ-1}``, when the model scores the AR(1) innovation. ``full`` is the
-forward's own decode at one posterior draw, and ``base`` is decoded at the prior mean
+(``lag_attn_rws.sample_page.raw_forecast_rows``), plus the last decoded anchor ``T - H - 1`` for
+the remainder the abutting windows leave undrawn, first writer wins (the CFS page's
+``_tail_anchor``). The forecast therefore runs to the segment's end; the latent and KL rows stop
+at the last anchor, ``T - H``, because no anchor exists past it. Each window is decoded from one
+latent and is drawn as 4 s steps, because the target is a 4 s patch summary. The band is the AR(1)
+marginal ±2σ, ``v_τ = σ²_τ + φ² v_{τ-1}``, when the model scores the AR(1) innovation. ``full`` is
+the forward's own decode at one posterior draw, and ``base`` is decoded at the prior mean
 (``base_decode: mean``).
 """
 from __future__ import annotations
@@ -35,7 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from teb_vae.lag_attn_cfs.eval import events, traces
+from teb_vae.lag_attn_cfs.eval import traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval.analyses import samples as _shared
 from teb_vae.lag_attn_cfs.eval.metrics import forecast_likelihood_terms
@@ -75,10 +79,11 @@ VARIABILITY_LIMITS_BPM: Tuple[float, float] = (0.05, 20.0)
 #: Margin around the segment's own FHR range on the zoomed forecast row, bpm.
 FORECAST_ZOOM_MARGIN_BPM = 10.0
 
-#: Colours: the shared raw page's (base grey dashed, full vermillion).
+#: Colours: the shared raw page's (base grey dashed, full vermillion; raw FHR blue, raw UP green).
 _BASE = figures.COLOR_GRAY
 _FULL = figures.COLOR_VERMILLION
-_CONTRACTION = figures.COLOR_GREEN
+_RAW_FHR = figures.COLOR_BLUE
+_RAW_UP = figures.COLOR_GREEN
 
 
 class PatchPageTask:
@@ -108,9 +113,20 @@ def _field(batch: Any, name: str) -> Any:
 
 
 def tile_positions(anchors: np.ndarray, valid: np.ndarray, *, warmup: int, t_valid: int, horizon: int) -> List[int]:
-    """Positions on the decoded anchor axis of the abutting tiles ``w, w + H, ...`` below ``T - H``."""
+    """Positions on the decoded anchor axis of the abutting tiles ``w, w + H, ...`` below ``T - H``.
+
+    The last decoded anchor is appended when its window reaches past the abutting tiling, so the
+    drawn forecast runs to the segment's end rather than stopping a partial window short. Drawn
+    with :func:`tiled_series`, first writer wins, so the appended window contributes only the
+    steps no earlier tile covered.
+    """
     where = {int(step): position for position, step in enumerate(anchors) if bool(valid[position])}
-    return [where[step] for step in range(int(warmup), int(t_valid), int(horizon)) if step in where]
+    positions = [where[step] for step in range(int(warmup), int(t_valid), int(horizon)) if step in where]
+    if where:
+        last = max(where)
+        if positions and last + 1 + horizon > int(anchors[positions[-1]]) + 1 + horizon:
+            positions.append(where[last])
+    return positions
 
 
 def tiled_series(
@@ -118,15 +134,35 @@ def tiled_series(
 ) -> np.ndarray:
     """Lay the tiles of one ``(A, H)`` block on the token grid ``(T,)``; ``NaN`` off the tiles.
 
-    Horizon step ``τ`` of the anchor at step ``a`` is token ``a + 1 + τ``.
+    Horizon step ``τ`` of the anchor at step ``a`` is token ``a + 1 + τ``. Where two windows
+    overlap the earlier position wins, so every drawn step comes from exactly one latent.
     """
     series = np.full(int(n_steps), np.nan)
     horizon = block.shape[1]
     for position in positions:
         steps = int(anchors[position]) + 1 + np.arange(horizon)
-        keep = steps < n_steps
-        series[steps[keep]] = block[position, keep]
+        steps = steps[steps < n_steps]
+        fresh = np.isnan(series[steps])
+        series[steps[fresh]] = block[position, : steps.size][fresh]
     return series
+
+
+def window_edges(anchors: np.ndarray, positions: Sequence[int], horizon: int, n_steps: int) -> List[int]:
+    """Token indices where one drawn window ends and the next begins, plus the last window's end.
+
+    Follows :func:`tiled_series`'s first-writer rule: a window whose start an earlier tile already
+    covers begins where that tile ends.
+    """
+    edges: List[int] = []
+    end = 0
+    for position in positions:
+        start = max(int(anchors[position]) + 1, end)
+        end = min(int(anchors[position]) + 1 + int(horizon), int(n_steps))
+        if end > start:
+            edges.append(start)
+    if edges:
+        edges.append(end)
+    return edges
 
 
 def _stairs(ax: Any, series: np.ndarray, edges: np.ndarray, **kwargs: Any) -> None:
@@ -140,31 +176,11 @@ def _band(ax: Any, lo: np.ndarray, hi: np.ndarray, edges: np.ndarray, **kwargs: 
     ax.fill_between(x, np.append(lo, lo[-1]), np.append(hi, hi[-1]), step="post", linewidth=0, **kwargs)
 
 
-def contraction_spans(up: np.ndarray, valid: Optional[np.ndarray]) -> List[Tuple[float, float]]:
-    """Contraction ``(onset, end)`` in seconds from the shared detector on loader-unit UP."""
-    try:
-        found = events.detect_contractions(up, valid=valid)
-    except Exception:  # noqa: BLE001 - a page is worth drawing without its shading
-        return []
-    fs = float(events.FS_RAW)
-    return [(float(on) / fs, float(end) / fs) for on, end in zip(found["onset_raw"], found["end_raw"])]
-
-
-def _shade(ax: Any, spans: Sequence[Tuple[float, float]], *, label: bool = False) -> None:
-    """Shade the contractions on one row."""
-    for index, (onset, end) in enumerate(spans):
-        ax.axvspan(onset, end, color=_CONTRACTION, alpha=0.12, linewidth=0, zorder=0,
-                   label="contraction" if (label and index == 0) else None)
-
-
-def _window_edges(ax: Any, anchors: np.ndarray, positions: Sequence[int], horizon: int, seconds: float) -> None:
-    """Dashed rules where one tiled window ends and the next begins."""
-    if not positions:
-        return
-    edges = [(int(anchors[p]) + 1) * seconds for p in positions]
-    edges.append((int(anchors[positions[-1]]) + 1 + horizon) * seconds)
-    for edge in edges:
-        ax.axvline(edge, color=figures.COLOR_GRAY, linewidth=0.5, linestyle="--", alpha=0.7, zorder=1)
+def _window_rules(ax: Any, edges: Sequence[int], seconds: float, *, label: bool = False) -> None:
+    """Dashed rules at the window edges from :func:`window_edges`."""
+    for index, edge in enumerate(edges):
+        ax.axvline(edge * seconds, color=figures.COLOR_GRAY, linewidth=0.5, linestyle="--",
+                   alpha=0.7, zorder=1, label="window edges" if (label and index == 0) else None)
 
 
 # =============================================================================
@@ -173,7 +189,7 @@ def _window_edges(ax: Any, anchors: np.ndarray, positions: Sequence[int], horizo
 def patch_forecast_rows(
     rows: ForecastRowInputs, *, model: Any, units: SummaryUnits, phi: Optional[np.ndarray]
 ) -> None:
-    """Draw the raw UP row, the level-forecast row, the variability lane and the two input rows.
+    """Draw the raw FHR/UP row, the level-forecast row, the variability lane and the two input rows.
 
     Args:
         rows: The shared layout's row inputs; ``rows.target`` is the standardized summary target
@@ -196,28 +212,43 @@ def patch_forecast_rows(
     scales = {"fhr": (units.fhr_mean, units.fhr_std), "up": (units.up_mean, units.up_std)}
     raw_valid = traces.raw_validity_of(weight, fhr_z.size)
     fhr_bpm, fhr_unit = traces.physical_raw(fhr_z, "fhr", scales, raw_valid)
-    spans = [] if up_z is None else contraction_spans(up_z, np.isfinite(up_z))
+    time_raw = np.asarray(rows.time_raw)
 
-    # ---- raw: UP and its contractions -------------------------------------------------------
+    # ---- raw: FHR and UP, as the sibling pages' ``raw_context_row`` draws them ----------------
+    # FHR on the paper chart's bpm scale, UP in mmHg on a twin axis, gaps blank. Drawn here rather
+    # than through the shared row because that row inverts the loader's z-scoring without masking
+    # the gap sentinel, so a lost FHR sample would plunge to 0 bpm.
     ax, cax = rows.row_axes(RAW_ROW)
-    if up_z is None:
-        ax.text(0.5, 0.5, "UP not loaded", transform=ax.transAxes, ha="center", va="center")
-    else:
-        up_phys, up_unit = traces.physical_raw(up_z, "up", scales, np.isfinite(up_z))
-        traces.draw_raw_signal(ax, np.asarray(rows.time_raw), up_phys, "up", up_unit)
-    _shade(ax, spans, label=True)
-    ax.set_title(f"Raw UP, {len(spans)} contraction(s) detected (shaded)", fontsize=9, pad=6)
+    ax.plot(time_raw, fhr_bpm, color=_RAW_FHR, linewidth=figures.LINE_HAIRLINE, rasterized=True,
+            label=f"FHR ({fhr_unit})", zorder=2)
+    ax.set_ylabel(f"FHR ({fhr_unit})", fontsize=8, color=_RAW_FHR)
+    if fhr_unit == traces.RAW_SIGNAL_UNITS["fhr"]:
+        ax.set_ylim(*traces.RAW_SIGNAL_LIMITS["fhr"])
+    ax.set_title("Raw target FHR and source UP", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
-    if spans:
-        ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     figures.style_axes(ax)
     rows.finalise_time_axis(ax)
+    handles = list(ax.get_lines())
+    if up_z is not None:
+        up_phys, up_unit = traces.physical_raw(up_z, "up", scales, np.isfinite(up_z))
+        twin = ax.twinx()
+        twin.plot(time_raw, up_phys, color=_RAW_UP, linewidth=figures.LINE_HAIRLINE,
+                  rasterized=True, label=f"UP ({up_unit})", zorder=2)
+        twin.set_ylabel(f"UP ({up_unit})", fontsize=8, color=_RAW_UP)
+        twin.tick_params(axis="y", labelsize=7, colors=_RAW_UP)
+        twin.grid(False)
+        twin.set_xlim(0.0, float(rows.t_max))
+        if up_unit == traces.RAW_SIGNAL_UNITS["up"]:
+            twin.set_ylim(*traces.RAW_SIGNAL_LIMITS["up"])
+        handles += list(twin.get_lines())
+    ax.legend(handles, [h.get_label() for h in handles], loc="upper right", fontsize=7, framealpha=0.95)
     cax.set_visible(False)
 
     outs = rows.outs
     anchors = raw.host(outs["anchor_index"][i]).astype(np.int64)
     valid = raw.host(outs["anchor_valid"][i]) > 0.5
     positions = tile_positions(anchors, valid, warmup=warmup, t_valid=t_valid, horizon=horizon)
+    edges_tok = window_edges(anchors, positions, horizon, n_steps)
     target = raw.host(rows.target[i])                                       # (T, 2) standardized
     token_valid = weight >= VALID_THRESHOLD
     target = np.where(token_valid[:, None], target, np.nan)
@@ -229,17 +260,17 @@ def patch_forecast_rows(
         logvar = raw.host(outs[f"logvar_{name}"][i][..., channel])
         coef = None if phi is None else float(phi[channel])
         sigma = np.stack([raw.marginal_sigma(row, coef) for row in logvar])
-        return tuple(
+        mean, lo, hi = (
             tiled_series(block, anchors, positions, n_steps)
             for block in (mu, mu - BAND_SIGMAS * sigma, mu + BAND_SIGMAS * sigma)
         )
+        return mean, lo, hi
 
     # ---- forecast: raw FHR and the tiled level forecast, bpm -------------------------------
     if rows.wants(FORECAST_ROW):
         ax, cax = rows.row_axes(FORECAST_ROW)
-        _shade(ax, spans)
-        ax.plot(np.asarray(rows.time_raw), fhr_bpm, color=figures.COLOR_BLACK, linewidth=0.35,
-                alpha=0.55, label="raw FHR", zorder=2)
+        ax.plot(time_raw, fhr_bpm, color=figures.COLOR_BLACK, linewidth=0.35,
+                alpha=0.55, rasterized=True, label="raw FHR", zorder=2)
         level_truth = units.level_bpm(np.where(tiled, target[:, 0], np.nan))
         _stairs(ax, level_truth, edges, color=figures.COLOR_BLACK, linewidth=0.9,
                 label="true level (4 s mean)", zorder=4)
@@ -248,21 +279,21 @@ def patch_forecast_rows(
             _band(ax, lo, hi, edges, color=colour, alpha=0.18, zorder=1)
             _stairs(ax, mean, edges, color=colour, linewidth=0.9, linestyle=style,
                     label=f"{name} ({'$z^p$' if name == 'base' else '$z^q$'})", zorder=3)
-        _window_edges(ax, anchors, positions, horizon, seconds)
+        _window_rules(ax, edges_tok, seconds, label=True)
         finite = fhr_bpm[np.isfinite(fhr_bpm)]
         if fhr_unit == traces.RAW_SIGNAL_UNITS["fhr"] and finite.size:
             low, high = np.percentile(finite, [1.0, 99.0])
             ax.set_ylim(max(traces.RAW_SIGNAL_LIMITS["fhr"][0], low - FORECAST_ZOOM_MARGIN_BPM),
                         min(traces.RAW_SIGNAL_LIMITS["fhr"][1], high + FORECAST_ZOOM_MARGIN_BPM))
         ax.set_title(
-            f"Level forecast over raw FHR (bpm), tiled {horizon}-step windows, mean $\\pm$ "
-            f"{BAND_SIGMAS:.0f}$\\sigma$" + (" (AR(1) marginal)" if phi is not None else "")
-            + "; y zoomed to the segment",
+            f"Level forecast over raw FHR (bpm): {len(positions)} windows of {horizon} steps "
+            f"({horizon * seconds:.0f} s), one latent each, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$"
+            + (" (AR(1) marginal)" if phi is not None else "") + "; y zoomed to the segment",
             fontsize=9, pad=6,
         )
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_ylabel(f"FHR ({fhr_unit})", fontsize=8)
-        ax.legend(loc="upper right", fontsize=7, framealpha=0.95, ncol=4)
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.95, ncol=5)
         figures.style_axes(ax)
         rows.finalise_time_axis(ax)
         cax.set_visible(False)
@@ -271,7 +302,6 @@ def patch_forecast_rows(
     if rows.wants(VARIABILITY_ROW):
         ax, cax = rows.row_axes(VARIABILITY_ROW)
         floor = VARIABILITY_LIMITS_BPM[0]
-        _shade(ax, spans)
 
         def _bpm(series: np.ndarray) -> np.ndarray:
             return np.clip(units.variability_bpm(series), floor, None)
@@ -291,7 +321,7 @@ def patch_forecast_rows(
         if not same and eps_bpm > floor:
             ax.axhline(eps_bpm, color=figures.COLOR_PURPLE, linewidth=0.6, linestyle=":",
                        label=f"variability_eps = {eps_bpm:.2g} bpm")
-        _window_edges(ax, anchors, positions, horizon, seconds)
+        _window_rules(ax, edges_tok, seconds)
         ax.set_yscale("log")
         ax.set_ylim(*VARIABILITY_LIMITS_BPM)
         ax.set_title("Variability: rms of the within-patch first difference (bpm per 0.25 s), log scale",
@@ -420,7 +450,7 @@ def run_samples_analysis(
     )
     plan = result.setdefault("plan", {})
     plan["expected_page_rows"] = EXPECTED_PAGE_ROWS
-    plan["page"] = "patch raw-trace page (level bpm, variability lane, UP contractions)"
+    plan["page"] = "patch raw-trace page (raw FHR and UP, level bpm, variability lane)"
     plan["units"] = dataclasses.asdict(units)
     plan["band"] = f"±{BAND_SIGMAS:g}σ" + (" AR(1) marginal" if phi is not None else " per cell")
     return result

@@ -49,9 +49,10 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.data import (
 
 SPLITS = ("train", "val", "test")
 STAGES = ("first", "straddle", "second", "unknown")
-#: Stage flags of the context vector (§7.1): first and unknown are the all-zero level, since an ``unknown`` flag
-#: would equal ``~has_ss`` from segment 0 (future information).
-CONTEXT_STAGES = ("straddle", "second")
+#: Stages that set the context vector's ``in_ss`` flag (§7.1): the segment is wholly or partly in second stage.
+#: First and unknown are the zero level, since an ``unknown`` flag would equal ``~has_ss`` from segment 0
+#: (future information).
+IN_SS_STAGES = ("straddle", "second")
 SECONDS_PER_STEP = DECIMATION / RAW_SAMPLING_HZ
 META_FIELDS = ("target", "weight", "epoch", "guid", "time_from_labor_onset",
                "second_stage_onset", "cs_label", "bg_label")
@@ -544,7 +545,7 @@ def psi(x: Any) -> Any:
 
 def context_features(seg: pd.DataFrame, *, tlo_pre_onset: str = "clip") -> pd.DataFrame:
     """The §7.1 allow-listed per-segment context columns; no forbidden clock ever enters, and first and
-    unknown stage share the all-zero flags (:data:`CONTEXT_STAGES`). ``tlo_pre_onset: clip`` (``context.tlo``)
+    unknown stage share ``in_ss = 0`` (:data:`IN_SS_STAGES`). ``tlo_pre_onset: clip`` (``context.tlo``)
     floors TLO at 0: a segment ending before labour onset says nothing about how long until onset, which is
     future information like the time until second stage (§2.4); ``signed`` keeps it (ablation)."""
     tlo_h = seg["tlo_end_s"] / 3600.0
@@ -553,7 +554,7 @@ def context_features(seg: pd.DataFrame, *, tlo_pre_onset: str = "clip") -> pd.Da
     in_ss_h = np.maximum(seg["ss_rel_s"] + seg["t_end_s"] - seg["epoch_s"], 0.0) / 3600.0
     return pd.DataFrame({
         "tlo_psi": psi(tlo_h.fillna(0.0)), "tlo_missing": tlo_h.isna().astype(float),
-        **{f"stage_{s}": (seg["stage"] == s).astype(float) for s in CONTEXT_STAGES},
+        "in_ss": seg["stage"].isin(IN_SS_STAGES).astype(float),
         "time_in_ss": psi(in_ss_h.fillna(0.0)), "valid_frac": seg["valid_frac"],
     }, index=seg.index)
 

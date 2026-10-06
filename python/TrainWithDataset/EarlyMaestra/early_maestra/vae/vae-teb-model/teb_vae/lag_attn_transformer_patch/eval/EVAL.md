@@ -115,9 +115,10 @@ resample recordings.
 
 **Question.** What does the model forecast, in clinical units, against the trace a clinician reads?
 **Method.** The shared selection, re-forward and page variants, with the task's three page seams
-swapped for patch ones: abutting level-forecast tiles in bpm with the AR(1) marginal ±2σ band over
-raw FHR, a variability lane (rms-Δ bpm per 0.25 s, log axis, 0.25 bpm resolution and `eps` floor
-marked), UP with contractions shaded, the two patch input streams, then the shared latent/KL/lag rows.
+swapped for patch ones: raw FHR (bpm) and UP (mmHg) on one row, abutting level-forecast tiles in
+bpm with the AR(1) marginal ±2σ band over raw FHR (the last anchor fills the tail, so the forecast
+runs to the segment end), a variability lane (rms-Δ bpm per 0.25 s, log axis, 0.25 bpm resolution
+and `eps` floor marked), the two patch input streams, then the shared latent/KL/lag rows.
 **Outputs.** The shared `samples/` layout (`stratified/`, `by_class/`, the metric extremes,
 `sample_pages.csv`). No headline.
 **Reading.** `full` is one posterior draw; `base` is decoded at the prior mean. **Misread:** a tile
