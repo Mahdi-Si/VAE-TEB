@@ -342,6 +342,25 @@ def test_the_source_null_floor_is_the_controls_own_function_at_the_forwards_anch
     assert torch.equal(added["kld_source_null"], expected)
 
 
+def test_the_mean_decoded_gap_is_the_objectives_gap_when_the_posterior_draw_is_its_mean(
+    task, stub_batch, perturb_posterior, monkeypatch
+):
+    """With $\\epsilon = 0$ the full branch's sample is $\\mu^q$, so the matched readout and the
+    objective's ``pred_gap`` must agree: they then differ by nothing but the decode the readout
+    exists to fix. Validation-only, like the source-null floor."""
+    module = task()
+    perturb_posterior(module.orig_model)
+    module.eval()
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+
+    _, train_metrics = module.compute_loss_and_metrics(stub_batch, 0, "train")
+    _, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert "pred_gap_mean" not in train_metrics
+    assert val_metrics["pred_gap"] != 0
+    torch.testing.assert_close(val_metrics["pred_gap_mean"], val_metrics["pred_gap"])
+
+
 def test_a_readout_reusing_an_objective_metric_name_is_refused(
     task, stub_batch, monkeypatch
 ):

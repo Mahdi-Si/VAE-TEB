@@ -67,9 +67,12 @@ physical delay.
 ``teb_vae.lag_attn_transformer_cfs.eval`` supplies a ``ModelBinding``, an override delta, a runner
 and a gate, and delegates every readout, every analysis and every verdict to
 ``teb_vae.lag_attn_cfs.eval`` -- which is what makes a difference between the two cfs cells'
-summaries attributable to the encoder rather than to two implementations. A loss level is
-comparable against ``lag_attn_cfs`` and is **not** comparable against ``lag_attn_transformer_fs``,
-whose blocks are $2340$ coefficients against this cell's $2940$, both at a horizon of $30$.
+summaries attributable to the encoder rather than to two implementations. Since the final revision
+(``DESIGN.md``, amendment of 2026-09-23) a loss level is comparable against neither neighbour.
+``lag_attn_cfs`` forecasts $10$ steps and scores every cell; this cell forecasts $30$ steps over
+$30 \times 76 = 2280$ cells, scores a fast phase channel over its first $5$ steps only, and scores
+the residual under an AR(1) innovation. ``lag_attn_transformer_fs`` scores $30 \times 78 = 2340$
+two-sided coefficients. Across either edge, read signs and orderings only.
 
 lean-limit: the frequency-resolved readout is band-resolved skill and its timing half is unmeasured,
 because a stored coefficient is a modulus and the analysing filter's phase was discarded before the
@@ -77,13 +80,14 @@ value was written; replace with a phase-carrying readout when the dataset stores
 phase-preserving block, which is a dataset change rather than an evaluation one.
 
 lean-limit: the lag axis is stored-coefficient time, uncorrected for a composed group delay reaching
-$791$ s -- the same order as the $364$ s lag search itself; replace with a per-channel-pair physical
-lag built from ``causal_delay_s`` when a lag result is to be reported as a physiological delay
-rather than as a coefficient-time attribution.
+$791$ s -- larger than the $148$ s lag search itself ($\ell \le 37$ steps); replace with a
+per-channel-pair physical lag built from ``causal_delay_s`` when a lag result is to be reported as
+a physiological delay rather than as a coefficient-time attribution.
 
-lean-limit: ``eval_config.clock_margin_min_nats`` ships unset, so the availability-clock verdict
-reports INCONCLUSIVE and the gate is nine criteria rather than ten; replace with a value derived
-from the observed spread of the coupling-minus-clock difference across recordings once the first
-production run on the causal holdout split has written its ``source_null`` table. The key is the
-causal parent's and is set there once, for both cells.
+lean-limit: ``eval_config.clock_margin_min_nats`` ships at $0.15$ nats, so the availability-clock
+verdict is decided and the gate reads all ten verdicts. The value was calibrated on an earlier
+unaligned run of this cell under the legacy representation, which measured $0.160$ nats
+($[0.157, 0.164]$; ``LAG_READOUT_DIAGNOSIS.md``); replace it with a value derived from the spread
+of the coupling-minus-clock difference across recordings once a production run of the shipped
+geometry has written its ``source_null`` table.
 """
