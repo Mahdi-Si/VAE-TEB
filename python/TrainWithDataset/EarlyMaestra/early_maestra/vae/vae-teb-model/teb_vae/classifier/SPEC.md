@@ -270,7 +270,7 @@ All of these are **[FACT]** unless marked otherwise. Sources:
 | ROC points, confusion counts, rate NaN rules, stratified cluster (paired) bootstrap | `latent_pilot/evaluate.py:1256 confusion_counts`, `:1449 roc_points`, `:1691 paired_bootstrap`, `:1866 metric_intervals`, `:2028 subgroup_table` | **Import** where signatures fit; they are model-agnostic |
 | Config `base:` chains and deep merge | `teb_vae/lag_attn/config.py:85 load_config`, `:38 _deep_merge`, `:126 resolve_config_file` | **Import** |
 | Length-bucketed GUID batching | `hdf5_dataset/length_bucket_sampler.py:151 VariableBatchBucketSampler` | **Import** (seeded, `set_epoch`) |
-| Figure layer: style, rendering, colours, standard panels | `teb_vae/lag_attn_cfs/eval/figures_seam.py`: `configure_figure_style`, `render_figure`, `new_figure`, `group_colors`, `CLINICAL_CLASS_COLORS`, `SUBGROUP_COLORS`, `ribbon_plot`, `violin_panel`, `windowed_comparison_figure`, `caveat_note(text=…)` | **Import** (§11.10). **Not** `utils/style.get_class_colors`, which paints healthy blue, nor a direct `save_figure` |
+| Figure layer: style, rendering, colours, standard panels | `teb_vae/lag_attn_cfs/eval/figures_seam.py`: `CLINICAL_CLASS_COLORS`, `SUBGROUP_COLORS`, `violin_panel`, `heatmap_with_colorbar`, `windowed_comparison_figure`, the figure-format state | **Import** through `teb_vae/classifier/figstyle.py` (§11.10), which owns the classifier's style, palette and `render_figure`. **Not** `utils/style.get_class_colors`, which paints healthy blue, nor a direct `save_figure` |
 | Cohort ordering and labels | `teb_vae/lag_attn/eval/labels.py`: `ordered_groups`, `distinct_groups`, `class_name`, `subgroup_of`, `GROUP_COLUMNS` | **Import** |
 | Group statistics | `teb_vae/lag_attn/eval/stats.py`: `holm_adjust`, `kruskal_across_groups`, `pairwise_comparisons`, `wilcoxon_paired`, `windowed_group_comparisons`, `delta_magnitude`, `bootstrap_ci` (means only) | **Import** (§11.6.2, §11.14) |
 | Fail-soft reporting and manifests | `teb_vae/lag_attn/eval/report.py`: `Report` (`step`, `exit_code`, `write`), `json_safe`, `build_manifest`; `teb_vae/lag_attn_cfs/eval/report_seam.py`: `write_steps`; `teb_vae/lag_attn_cfs/eval/launch.py:29 resolve_launch_args` | **Import** (§11.14) |
@@ -1514,16 +1514,14 @@ This section carries over and extends the previous pipeline's 22-filter subgroup
 **Ordering and colours:**
 - Groups are ordered by `teb_vae/lag_attn/eval/labels.py:183 ordered_groups`, **worst cohort first** (HIE, acidosis, healthy; subgroups in reversed canonical order). The same order orients every pairwise test, so δ > 0 means the more severe cohort scores higher.
 - Class and `source_file` colours come from `teb_vae/lag_attn_cfs/eval/figures_seam.py:264 group_colors` (`CLINICAL_CLASS_COLORS`: healthy `#2E8B57`, acidosis `#E8A33D`, HIE `#C0392B`; `SUBGROUP_COLORS` tints).
-- Other families use fixed palettes defined once in `report.py`. The old CS/BG colours are kept:
+- Other families use fixed colours defined once in `report.py` (`MEMBER_COLORS`), taken from the classifier palette (`figstyle.py`):
 
   | Member | Colour |
   |---|---|
-  | cs+ | `#3498db` |
-  | cs− | `#9b59b6` |
-  | bg+ | `#f39c12` |
-  | bg− | `#16a085` |
-  | tertiles | a sequential 3-step palette |
-  | stage | first `#4c72b0`, straddle `#8172b2`, second `#c44e52`, unknown grey |
+  | cs+ / cs− | blue `#2F6DB5` / violet `#7B5EA7` |
+  | bg+ / bg− | orange `#E3812B` / teal `#2A9D8F` |
+  | tertiles T1-T3 | sequential blues `#8DB3E2`, `#3F78C2`, `#1D3F7A` |
+  | stage | first `#6C8FC7`, straddle `#7B5EA7`, second `#C8475B`, unknown grey `#A7AEB8` |
 
 - **Do not use `utils/style.get_class_colors`.** It paints healthy blue, which conflicts with the VAE figures.
 - The prediction tables carry `clinical_class` (the name) and `subgroup` (the shard basename without extension) string columns next to `class_code`, so the VAE helpers (`GROUP_COLUMNS`, `ordered_groups`, `per_recording_*`, `emit_grouped_variants`) work unchanged.
@@ -1582,12 +1580,12 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
 
 **Rendering and style:**
 - Every figure is rendered from `evaluation/tables/*.parquet` and `predictions/*.parquet` only. Never from in-memory model state.
-- Use the VAE figure seam (`teb_vae/lag_attn_cfs/eval/figures_seam.py`, which re-exports `teb_vae/lag_attn/eval/figures.py`):
-  - `configure_figure_style(fmt)`, called **once** at the start of report;
-  - `new_figure(n_rows, n_cols, height_per_row=…)`;
-  - `render_figure(fig, path_stem)`: an extension-less stem, 200 dpi, panel letters, tight layout with footnote space, and it **always closes** the figure;
-  - `legend_with_headroom`, `ribbon_plot`, `violin_panel`, `grouped_violin_figure`, `heatmap_with_colorbar`, `significance_strip`, `windowed_comparison_figure`.
-- Do not call `utils/style.save_figure` directly: it defaults to 600 dpi and adds no panel letters.
+- The classifier owns its figure style in `teb_vae/classifier/figstyle.py`; `report._seam()` returns that module. Every name it does not define falls through to the VAE figure seam (`teb_vae/lag_attn_cfs/eval/figures_seam.py`), so the shared panels (`violin_panel`, `heatmap_with_colorbar`, `windowed_comparison_figure`, …) are still the seam's. The seam is not changed.
+  - `configure_figure_style(fmt)`, called **once** at the start of report: the seam's base style, then `figstyle.RC` (sans-serif type at 7-8.5 pt, left and bottom spines in grey, a light solid grid behind the data, left-aligned semibold panel titles).
+  - `render_figure(fig, path_stem)`: an extension-less stem, 200 dpi, saved at the figure's own size, and it **always closes** the figure. Before the save, `figstyle.finish` lays the figure out with constrained layout (tight layout for a page the seam built) and draws the figure title, the figure key and the note line. No panel letters.
+- **Palette.** One series palette for models, policies and runs, in this order: blue `#2F6DB5`, orange `#E3812B`, teal `#2A9D8F`, rose `#C8475B`, violet `#7B5EA7`, brown `#8C6D46`, ochre `#C9A227`, slate `#5C6670`. Reference marks (chance line, α, zero, reference prevalence) are thin grey dashes. Confusion matrices use one sequential blue map (`clf_blues`).
+- **Layout.** Pages with one panel per model wrap into at most three columns (two for time panels). Pages with several panels per model are facet grids: one row per model, the model named in a grey strip right of the row, the column named in the top row's titles. A time-resolved page shares one x axis; its n strip is drawn once, under the instantaneous column (or under each column of a wrapped page), for the primary model.
+- Do not call `utils/style.save_figure` directly: it defaults to 600 dpi.
 - **Formats.** `eval.figure_formats` (default `[pdf]`) is looped by calling `set_figure_format` per format. PNG is available by adding `png`.
 - **Every panel tolerates empty or all-NaN input** and shows `EMPTY_NOTE`; it never raises.
 - Figure stems are module-level constants in `report.py`. The registry (`FIGURE_REGISTRY`, §11.15) lists every stem the verify gate expects for the run's configuration.
@@ -1599,9 +1597,9 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
   - a dotted zero line on the `rel_second_stage` axis (label "second-stage onset");
   - an **n strip** under the axis (GUIDs per class per bin);
   - one short **note** line under it saying what a hollow marker or a gap means (`Hollow: n < <min_bin_class_n> per class`). The exclusion counts by reason (e.g. "41 GUIDs with unknown second stage") are in `evaluation/tables/inclusion.csv` (L14) and `summary.md`, not on the figure.
-- **Figure text budget.** A figure carries a panel letter and a short noun-phrase panel title (the model as `model (seed 42)`, on the first row of a stacked page), axis labels with units, short legend keys and at most one note line. The figure title names a model or policy, or `validation` / `fold k` off the pooled test set, and is otherwise absent. Legend keys carry no `N = …` and no statistics, and are drawn once per figure when panels share them; the counts, slopes, intercepts, ECE, ICI and CIs are in the tables and `summary.md`, and the definitions of each figure (population, bands, line styles) are in this document.
+- **Figure text budget.** A figure carries one title (what it shows, then a model or policy, then `validation` / `fold k` off the pooled test set), short noun-phrase panel titles, the model as `model · seed 42` (`model · ensemble`, or the bare name of a seedless baseline), axis labels with units, one key and at most one note line. Keys shared by several panels are drawn once, under the panels; an entry that belongs to one panel only (an AUC, a mean) stays inside that panel. Legend keys carry no `N = …`; the counts, slopes, intercepts, ECE, ICI and CIs are in the tables and `summary.md`, and the definitions of each figure (population, bands, line styles) are in this document.
 - Operating points are drawn as ◦ at the validation-chosen point and ● at the realised test point, with the α line dashed.
-- The previous pipeline's line colours are kept for metric lines: sensitivity `#2ecc71` (circle), specificity `#3498db` (square), FPR `#e74c3c` (triangle). Class colours follow §11.6.2.
+- Metric lines: sensitivity blue `#2F6DB5` (circle), specificity teal `#2A9D8F` (square), FPR rose `#C8475B` (triangle). Class colours follow §11.6.2.
 
 **Cross-fold display** (`eval.fold_band`):
 - Every pooled curve shows:

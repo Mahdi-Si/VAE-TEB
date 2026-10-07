@@ -484,38 +484,48 @@ class ClassifierPlotCallback(Callback):
         from sklearn.calibration import calibration_curve
         from sklearn.metrics import precision_recall_curve, roc_curve
 
+        from teb_vae.classifier import figstyle as fs
+
         y, s = (gd["y"].to_numpy() > 0).astype(int), gd["score_final"].to_numpy(float)
-        fig, ax = plt.subplots(2, 3, figsize=(13, 8))
-        fpr, tpr, _ = roc_curve(y, s)
-        ax[0, 0].plot(fpr, tpr)
-        ax[0, 0].plot([0, 1], [0, 1], ":", color="grey")
-        ax[0, 0].set(title=f"ROC (AUROC {_auroc(y, s):.3f})", xlabel="FPR", ylabel="TPR")
-        prec, rec, _ = precision_recall_curve(y, s)
-        ax[0, 1].plot(rec, prec)
-        ax[0, 1].axhline(y.mean(), ls=":", color="grey")
-        ax[0, 1].set(title="PR", xlabel="recall", ylabel="precision")
-        for k, name in ((0, "negative"), (1, "positive")):
-            ax[0, 2].hist(s[y == k], bins=20, alpha=0.6, label=name)
-        ax[0, 2].axvline(thr, color="k", ls="--", label="threshold")
-        ax[0, 2].set(title="GUID score by class", xlabel="logit")
-        ax[0, 2].legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))  # outside: never over the histograms
-        frac, mean_p = calibration_curve(y, 1 / (1 + np.exp(-s)), n_bins=max(2, min(10, len(y) // 5)),
-                                         strategy="quantile")
-        ax[1, 0].plot(mean_p, frac, "o-")
-        ax[1, 0].plot([0, 1], [0, 1], ":", color="grey")
-        ax[1, 0].set(title="reliability", xlabel="predicted", ylabel="observed")
-        cm = confusion_matrix(y, (s > thr).astype(int), labels=[0, 1])
-        ax[1, 1].imshow(cm, cmap="Blues")
-        for (i, j), v in np.ndenumerate(cm):
-            ax[1, 1].text(j, i, str(v), ha="center", va="center")
-        ax[1, 1].set(title="confusion", xlabel="predicted", ylabel="true", xticks=[0, 1], yticks=[0, 1])
-        ax[1, 2].hist(seg["attn_entropy"], bins=30)
-        ax[1, 2].set(title="pooling attention entropy", xlabel="nats")
-        fig.suptitle(f"epoch {epoch}")
-        fig.tight_layout()
-        self.dir.mkdir(parents=True, exist_ok=True)
-        path = self.dir / f"epoch{epoch:04d}_diagnostics.{self.fmt}"
-        fig.savefig(path)
+        with plt.rc_context(fs.RC):
+            fig, ax = plt.subplots(2, 3, figsize=(11, 6.6), layout="constrained")
+            fpr, tpr, _ = roc_curve(y, s)
+            ax[0, 0].plot([0, 1], [0, 1], ls=(0, (2, 2)), color=fs.FAINT, lw=0.7)
+            ax[0, 0].plot(fpr, tpr, color=fs.BLUE, lw=2.0)
+            ax[0, 0].set(title=f"ROC · AUROC {_auroc(y, s):.3f}", xlabel="FPR", ylabel="sensitivity")
+            prec, rec, _ = precision_recall_curve(y, s)
+            ax[0, 1].axhline(y.mean(), ls=(0, (3, 3)), color=fs.MUTED, lw=0.7, label="prevalence")
+            ax[0, 1].plot(rec, prec, color=fs.BLUE, lw=2.0)
+            ax[0, 1].set(title="Precision-recall", xlabel="recall", ylabel="precision")
+            bins = np.histogram_bin_edges(s, bins=20)
+            for k, name, color in ((0, "negative", fs.TEAL), (1, "positive", fs.ROSE)):
+                ax[0, 2].hist(s[y == k], bins=bins, histtype="stepfilled", color=color, alpha=0.22, lw=0)
+                ax[0, 2].hist(s[y == k], bins=bins, histtype="step", color=color, lw=1.4, label=name)
+            ax[0, 2].axvline(thr, color=fs.INK, ls="--", lw=1.0, label="threshold")
+            ax[0, 2].set(title="GUID score by class", xlabel="logit", ylabel="GUIDs")
+            ax[0, 2].legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))  # outside: never over the histograms
+            frac, mean_p = calibration_curve(y, 1 / (1 + np.exp(-s)), n_bins=max(2, min(10, len(y) // 5)),
+                                             strategy="quantile")
+            ax[1, 0].plot([0, 1], [0, 1], ls=(0, (2, 2)), color=fs.FAINT, lw=0.7)
+            ax[1, 0].plot(mean_p, frac, "o-", color=fs.BLUE, lw=2.0, mec="white", mew=0.5)
+            ax[1, 0].set(title="Reliability", xlabel="predicted probability", ylabel="observed fraction")
+            cm = confusion_matrix(y, (s > thr).astype(int), labels=[0, 1])
+            fs._register_cmap()
+            ax[1, 1].imshow(cm, cmap=fs.SEQUENTIAL_CMAP)
+            for (i, j), v in np.ndenumerate(cm):
+                ax[1, 1].text(j, i, str(v), ha="center", va="center",
+                              color="white" if v > 0.55 * max(cm.max(), 1) else fs.INK)
+            ax[1, 1].set(title="Confusion", xlabel="predicted", ylabel="true", xticks=[0, 1], yticks=[0, 1])
+            ax[1, 2].hist(seg["attn_entropy"], bins=30, color=fs.BLUE, edgecolor="white", lw=0.5)
+            ax[1, 2].set(title="Pooling attention entropy", xlabel="nats", ylabel="segments")
+            for a in ax.flat:
+                if a is not ax[1, 1]:
+                    fs.style_axes(a, grid="y" if a in (ax[0, 2], ax[1, 2]) else "both")
+            fig.suptitle(f"Validation diagnostics · epoch {epoch}", x=0.01, ha="left", fontweight="bold",
+                         fontsize=fs.FONT_TITLE)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            path = self.dir / f"epoch{epoch:04d}_diagnostics.{self.fmt}"
+            fig.savefig(path, dpi=150)
         plt.close(fig)
         return path
 

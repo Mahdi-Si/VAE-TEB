@@ -47,6 +47,10 @@ def test_every_view_is_a_share_on_the_models_own_axis() -> None:
             value = wrapper(*inputs, *extra, columns, torch.zeros_like(columns))
         assert np.allclose(cams["value"], value.numpy(), atol=1e-6)
         assert cams["target"].shape == (len(columns), int(model.sequence_length))
+        # The warm-up steps are no part of the target map: every offset reaching before F is NaN.
+        reach = wrapper.anchor_steps(columns).cpu().numpy() - int(model.warmup_period)
+        offsets = np.arange(cams["target"].shape[1])
+        assert np.isnan(cams["target"][offsets[None, :] > reach[:, None]]).all()
         assert cams["source"].shape == cams["attention"].shape == (len(columns), int(model.lag_attn.L))
         for view in gradcam.VIEWS:
             sums = np.nansum(cams[view], axis=1)
