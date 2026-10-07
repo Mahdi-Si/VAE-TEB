@@ -23,6 +23,12 @@ the full branch for ``pred_gap``, and a *worse* score for ``nll_full`` and ``mse
   only at $t_a$: a map there is a spike at lag $0$ by construction. The input of the last
   attention block is the deepest target layer whose earlier steps the readout still reads. An
   encoder without attention blocks (the conv-LSTM cell) falls back to the encoder's own input.
+  **The warm-up steps** $t < F$ (``model.warmup_period``) are left out of both the channel
+  weights and the map, and read as ``NaN``. There most target channels are still masked, so the
+  encoder sees a near-constant start input that a causal attention stack can load heavily; kept
+  in, it can put the same peak at the far end of the axis in every class, set by where the
+  segment starts rather than by anything recorded. An anchor at $t_a$ therefore covers offsets
+  $0 \ldots t_a - F$ only, and an anchor at the floor covers offset $0$ alone.
 * ``source`` -- the source representation the lag attention reads as keys and values, the
   forward's ``source_state``.
 * ``attention`` -- the lag-attention weights $\alpha^{(m)}_{t_a,\ell}$ at the anchor, read where
@@ -75,17 +81,20 @@ def target_layer(model: nn.Module) -> Tuple[nn.Module, str]:
     return encoder, "target_encoder input"
 
 
-def temporal_cam(activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:
+def temporal_cam(activations: torch.Tensor, gradients: torch.Tensor, first_step: int = 0) -> torch.Tensor:
     r"""The Grad-CAM map of one time-major layer, one row per sample.
 
     Args:
         activations: $A$, $(N, T, D)$.
         gradients: $\partial f / \partial A$, $(N, T, D)$.
+        first_step: Steps before this one are excluded from $\mathcal R$, so they neither set the
+            channel weights nor receive a map value. $0$ keeps every read step.
 
     Returns:
         $\mathrm{CAM}$, $(N, T)$, zero outside each row's read steps $\mathcal R$.
     """
     read = (gradients.abs().sum(dim=-1) > 0).to(gradients.dtype)                 # (N, T)
+    read[:, : max(int(first_step), 0)] = 0.0
     weights = (gradients * read[..., None]).sum(dim=1) / read.sum(dim=1).clamp(min=1.0)[:, None]
     return torch.relu((activations * weights[:, None, :]).sum(dim=-1)) * read
 
@@ -168,17 +177,21 @@ def gradcam(
     anchors = wrapper.anchor_steps(columns)
     rows = torch.arange(n_rows, device=columns.device)
     n_lags = int(captured["attention"].shape[-1])
-    target_cam = temporal_cam(tensors[0].detach(), grads[0])
+    host = lambda tensor: tensor.detach().cpu().to(torch.float64).numpy()  # noqa: E731
+    # The warm-up steps are excluded from the target view and read as NaN, so an offset that reaches
+    # them is "not part of this anchor's map" rather than "no evidence there"; see the module text.
+    floor = int(getattr(model, "warmup_period", 0) or 0)
+    target_cam = host(temporal_cam(tensors[0].detach(), grads[0], first_step=floor))
+    target_cam[:, :floor] = np.nan
     source_cam = temporal_cam(tensors[1].detach(), grads[1])
     # Window position j is lag L - 1 - j, so a flip on the last axis puts both in lag order.
     alpha = tensors[2].detach()[rows, anchors].flip(-1)                               # (N, M, L)
     alpha_grad = grads[2][rows, anchors].flip(-1)
     attention_cam = torch.relu(alpha * alpha_grad).mean(dim=1)
     anchor_list = anchors.detach().cpu().numpy()
-    host = lambda tensor: tensor.detach().cpu().to(torch.float64).numpy()  # noqa: E731
     out: Dict[str, np.ndarray] = {"value": host(values)}
     for view, cam in (
-        ("target", core.lag_profile(host(target_cam), anchor_list, int(target_cam.shape[1]))),
+        ("target", core.lag_profile(target_cam, anchor_list, int(target_cam.shape[1]))),
         ("source", core.lag_profile(host(source_cam), anchor_list, n_lags)),
         ("attention", host(attention_cam)),
     ):

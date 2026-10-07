@@ -1022,7 +1022,7 @@ Bottom: per `occlusion_bands` band of the source relative to the anchor, the int
 
 **Purpose.** Compare where in time each class's readouts looked, through Grad-CAM, at the cost of one forward and one backward per readout.
 
-**What it shows.** One row per main readout (`kld`, `pred_gap`, `nll_full`, `mse_full`). Each of the three views has a class-mean panel and a class-difference panel, with 95% bootstrap bands over recordings. The views are: the target stream at the input of the target encoder's last attention block, on a minutes axis over the whole history; the source K/V stream on the lag axis; and the lag-attention weights at the anchor scored as gradient-weighted attention, on the same lag axis.
+**What it shows.** One row per main readout (`kld`, `pred_gap`, `nll_full`, `mse_full`). Each of the three views has a class-mean panel and a class-difference panel, with 95% bootstrap bands over recordings. The views are: the target stream at the input of the target encoder's last attention block, on a minutes axis over the history after the warm-up floor $F$ (the steps before $F$ are left out, so an anchor at $t_a$ reaches back $t_a - F$ steps and the far end of the axis averages only the later anchors); the source K/V stream on the lag axis; and the lag-attention weights at the anchor scored as gradient-weighted attention, on the same lag axis.
 
 **Axes.** Offset before the anchor (minutes) or stored-coefficient lag across; Grad-CAM share up. Each anchor's map sums to one.
 
