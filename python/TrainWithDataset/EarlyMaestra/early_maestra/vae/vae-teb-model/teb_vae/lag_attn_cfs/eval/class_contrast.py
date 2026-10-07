@@ -449,7 +449,7 @@ def build_gradcam_figure(
 
     Each Grad-CAM map is a share that sums to one over its offsets, so a class mean shows where the
     readout looked and a difference band that excludes zero marks offsets where two classes looked
-    differently. The target view is on a minutes axis over the whole history; the source and
+    differently. The target view is on a minutes axis over the history after the warm-up floor; the source and
     attention views share the lag axis of the other lag figures.
 
     Returns:
