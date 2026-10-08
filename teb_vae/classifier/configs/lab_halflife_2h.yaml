@@ -1,0 +1,7 @@
+# Label ablation (SPEC §17 item 3): horizon_decay with a 2 h half-life (baseline 0.5 h): a positive segment at 3 h
+# before delivery weighs 0.5, at 5 h 0.25.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_halflife_2h}
+  labels: {decay_halflife_h: 2.0}

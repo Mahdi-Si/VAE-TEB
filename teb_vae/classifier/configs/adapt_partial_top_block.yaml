@@ -1,0 +1,12 @@
+# Adaptation (SPEC §10.1 partial, §17 item 7): the VAE's top target-encoder attention block trains with the head at
+# backbone_lr; every other VAE module stays frozen in eval(). An online regime: the VAE runs on every batch (about 50
+# segments/s per GPU), so folds 1-3 and one seed first. The `frozen` unit per seed trains beside it (summary §4, VF).
+# Run it after the source ablations: if target_state beats mu_prior, the bottleneck is the limit and this is the lever.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_partial_top, seeds: [42], folds: [1, 2, 3]}
+  train:
+    regime: partial
+    unfreeze: [target_encoder.attention_blocks.last]   # `.last` resolves to the top block of the checkpoint (§8.2)
+    backbone_lr: 1.0e-5

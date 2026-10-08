@@ -157,7 +157,7 @@ def check_model_vs_shortcut(summary: Dict[str, Any]) -> Dict[str, Any]:
     """8: the primary model's pooled test GUID AUROC exceeds the shortcut baseline's (FAIL otherwise; point
     estimates), INCONCLUSIVE where their bootstrap CIs overlap. The primary model is evaluate's
     (:func:`~teb_vae.classifier.metrics.primary_model`: ``model``'s seed ensemble, else its first seed, else the probe);
-    every other non-baseline row (extra seeds, ``frozen``, ``noind``, ``*_covoff``) is a diagnostic, listed but never
+    every other non-baseline row (extra seeds, ``frozen``, ``noind``, ``*_covoff``, ``*_stage``) is a diagnostic, listed but never
     gated. Pooled, not the fold mean, since the CIs are the pooled ones."""
     auc = [r for r in (_dig(summary, "results", "headline") or {}).values()
            if (r.get("level"), r.get("policy_id"), r.get("metric")) == ("guid", "threshold_free", "auroc")]

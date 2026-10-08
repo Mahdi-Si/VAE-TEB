@@ -47,10 +47,12 @@ HEAD_LOSSES: Dict[str, Tuple[str, ...]] = {
 _UNDIGESTED_RUN_KEYS = ("device", "devices", "num_workers", "report_workers")
 #: Run-dir schema version, hashed into :func:`digest`, so a run dir written under an older schema is refused on
 #: resume. Bump it whenever a run-dir schema changes (cohort/prediction columns, context width, file layout).
-SCHEMA_VERSION = 5  # 3: raw covariate columns in cohort/segments.parquet, covariate_availability.parquet (P5);
+SCHEMA_VERSION = 6  # 3: raw covariate columns in cohort/segments.parquet, covariate_availability.parquet (P5);
 #                     4: 3-class prediction columns (p_c*_cal, ord_score) and thresholds.json["ovr"] (P6);
 #                     5: pooling-attention scalars (attn_late_mass, attn_centroid, seq_attn_final) in
-#                        predictions/segments.parquet (P6 block E)
+#                        predictions/segments.parquet (P6 block E);
+#                     6: the stage-offset view (`<kind>_stage` prediction rows, stage_offsets.json and
+#                        thresholds_stage.json per unit, §11.3) and the healthy_comparator family (§11.6.1)
 
 #: Regimes whose ``train.unfreeze`` allowlist trains VAE parameters (§10.1); ``frozen_online`` runs the VAE online
 #: without gradients.
@@ -193,12 +195,15 @@ class Hdf5Cfg(_Block):
 
 
 class SourceCfg(_Block):
-    kind: Literal["vae", "hdf5"]
+    kind: Literal["vae", "hdf5", "vae+hdf5"]  # vae+hdf5: the VAE keys and the ST/PH fields side by side (§8.2)
     vae: VaeCfg
     hdf5: Hdf5Cfg
     time_pool: PositiveInt
     cache_root: str
     cache_dtype: Literal["float16", "float32"]
+    # §8.5: drop the channels whose train std sits under the scale floor (near-constant inputs) instead of keeping
+    # them at the floor; per fold, recorded in scaler.json
+    drop_floor_channels: bool
 
 
 # ---- model -------------------------------------------------------------------------------------
@@ -266,6 +271,9 @@ class LossWeightsCfg(_Block):
     positions: NonNegativeFloat
     bag: NonNegativeFloat
     segment: NonNegativeFloat
+    # §10.3: the head the bag term pools: the segment-local head (when present) or the per-position head, whose
+    # running max is the committed decision (§11.2)
+    bag_head: Literal["segment", "position"]
 
 
 class OptimizerCfg(_Block):
@@ -385,6 +393,9 @@ class EvalCfg(_Block):
     error_analysis: Dict[Literal["top_k"], int]
     attribution: Dict[Literal["enabled", "n_steps"], Union[bool, int]]
     covariates_off: bool
+    # §11.3: a second decision view per neural unit, `<kind>_stage`: the calibrated logits shifted by per-stratum
+    # offsets fitted on the val negatives (in / not in second stage), every policy re-selected on val
+    stage_offsets: bool
     bootstrap: BootstrapCfg
     reference_prevalence: Optional[Prob]
     trajectory_pages: Dict[Literal["per_class", "top_errors"], int]
@@ -445,6 +456,9 @@ class Classifier(_Block):
         if self.eval.ovr_thresholds is True and lab.task != "three_class":
             raise ValueError("eval.ovr_thresholds: true needs labels.task: three_class (calibrated class "
                              "probabilities, §11.3)")
+        if self.eval.stage_offsets and lab.task == "three_class":
+            raise ValueError("eval.stage_offsets shifts the binary alarm logit only; it does not re-select the per-class "
+                             "OvR thresholds of labels.task: three_class (§11.3)")
         return self
 
     @model_validator(mode="after")
