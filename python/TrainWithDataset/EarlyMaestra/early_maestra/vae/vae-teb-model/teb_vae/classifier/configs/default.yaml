@@ -33,7 +33,14 @@ classifier:
     min_segments_per_guid: 1
 
   labels:
-    task: adverse_vs_healthy        # §6.3
+    # task (§6.3), class codes 1 healthy / 2 acidosis / 3 HIE -> target; a code left out is excluded from the task:
+    #   adverse_vs_healthy   1 -> 0, 2 -> 1, 3 -> 1   (binary; the primary task)
+    #   hie_vs_rest          1 -> 0, 2 -> 0, 3 -> 1   (binary; rare positive, NP thresholds need enough negatives)
+    #   hie_vs_healthy       1 -> 0, 3 -> 1, acidosis excluded   (binary)
+    #   acidosis_vs_healthy  1 -> 0, 2 -> 1, HIE excluded        (binary)
+    #   three_class          1 -> 0, 2 -> 1, 3 -> 2   (head multiclass | ordinal; aux_3class_weight must be 0)
+    #   cs_outcome           target = the cs flag, every class kept (treatment-paradox exploration only)
+    task: adverse_vs_healthy
     head: binary                    # binary | multiclass | ordinal
     aux_3class_weight: 0.3          # λ3; 0 disables
     strategy: propagate             # propagate | horizon | horizon_decay | final_only | mil
