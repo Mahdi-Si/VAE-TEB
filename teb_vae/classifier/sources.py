@@ -244,6 +244,18 @@ def _under(name: str, prefixes: Sequence[str]) -> bool:
     return any(name == p or name.startswith(p + ".") for p in prefixes)
 
 
+def _resolve_last(prefix: str, names: Sequence[str]) -> str:
+    """``<module>.last`` -> ``<module>.<i>`` with ``i`` the highest index of that ``nn.ModuleList`` among ``names``
+    (``target_encoder.attention_blocks.last`` is the top encoder block whatever the checkpoint's depth); any other
+    prefix is returned as is (an unmatched one still raises in :class:`VaeSource`)."""
+    if not prefix.endswith(".last"):
+        return prefix
+    base = prefix[: -len(".last")]
+    found = [n[len(base) + 1:].split(".", 1)[0] for n in names if n.startswith(base + ".")]
+    indices = [int(i) for i in found if i.isdigit()]
+    return f"{base}.{max(indices)}" if indices else prefix
+
+
 class VaeSource:
     """A VAE's per-step outputs (§8.2). Frozen (``unfreeze`` empty): ``eval()`` and no gradient throughout.
 
@@ -272,8 +284,9 @@ class VaeSource:
         if any(key.name == "kld_excess" for key in vae.keys) and not nullable:
             raise NotImplementedError(f"kld_excess needs a source-null forward (encode_source_kv over a u_stream "
                                       f"input); {type(self.model).__name__} ({vae.package}) has none")
-        self.unfreeze, self.trainable, self.sample_z = tuple(unfreeze), bool(unfreeze), sample_z
         names = [name for name, _ in self.model.named_parameters()]
+        self.unfreeze = tuple(_resolve_last(p, names) for p in unfreeze)  # `<list>.last` names the top block
+        self.trainable, self.sample_z = bool(unfreeze), sample_z
         unmatched = [p for p in self.unfreeze if not any(_under(n, [p]) for n in names)]
         if unmatched:
             raise ValueError(f"train.unfreeze prefix(es) {unmatched} match no parameter of "
@@ -598,9 +611,56 @@ class Hdf5Source:
         return _finish(torch.cat(parts, -1), mask, None, self.channels, self.pool)
 
 
+class CombinedSource:
+    """``source.kind: vae+hdf5`` (§8.2): the VAE's per-step outputs and the stored ST/PH streams side by side, in one
+    frozen cache. One dataset serves both: the checkpoint's loader contract (so the VAE reads exactly its own
+    inputs) with the HDF5 fields added to ``load_fields`` and ``normalize_fields``, and validity masks on a causal
+    build; both sources must name the same stats file (L13). Values are ``[vae || hdf5]``, the step mask is the AND
+    of both, the attention cues are the VAE's. Frozen only: the config refuses the online regimes for this kind.
+    """
+
+    trainable = False
+
+    def __init__(self, cfg: SourceCfg, probe_shard: str, *, device: str = "cpu") -> None:
+        self.vae, self.hdf5 = VaeSource(cfg, device=device), Hdf5Source(cfg, probe_shard)
+        mine, theirs = self.vae.dataset_kwargs["stats_path"], self.hdf5.dataset_kwargs["stats_path"]
+        if str(mine) != str(theirs):
+            raise ValueError(f"vae+hdf5 needs one stats file: the checkpoint's loader reads {mine}, "
+                             f"source.hdf5.stats_path is {theirs}")
+        kw = dict(self.vae.dataset_kwargs)
+        kw["load_fields"] = list(dict.fromkeys([*kw["load_fields"], *self.hdf5.required_fields]))
+        if kw.get("normalize_fields") is not None:
+            kw["normalize_fields"] = list(dict.fromkeys(
+                [*kw["normalize_fields"], *(f for f in self.hdf5.fields if f not in RAW_FIELDS)]))
+        kw["emit_validity_mask"] = self.hdf5.causal
+        self.dataset_kwargs = kw
+        self.required_fields = tuple(kw["load_fields"])
+        self.step_seconds, self.pool = self.vae.step_seconds, cfg.time_pool
+        self.fingerprint = {"kind": "vae+hdf5", "vae": self.vae.fingerprint, "hdf5": self.hdf5.fingerprint,
+                            "time_pool": cfg.time_pool}
+
+    def dataset(self, paths: Sequence[str]) -> CombinedHDF5Dataset:
+        """One unfiltered dataset over ``paths`` under the merged loader contract."""
+        return _normalised(paths, self.dataset_kwargs)
+
+    def __call__(self, batch: Any) -> StepFeatures:
+        h = self.hdf5(batch)  # first: the VAE's transfer leaves the CPU batch as it is, but keep the order explicit
+        v = self.vae(batch)
+        device, n_v = v.values.device, v.values.shape[-1]
+        mask = v.step_mask & h.step_mask.to(device)
+        values = torch.where(mask[..., None], torch.cat([v.values, h.values.to(device)], -1), 0.0)
+        attn = None if v.attn is None else torch.where(mask[..., None], v.attn, 0.0)
+        return StepFeatures(values=values, step_mask=mask, attn=attn,
+                            channels=(*v.channels[:n_v], *h.channels, *v.channels[n_v:]))
+
+
 def make_source(cfg: SourceCfg, probe_shard: str, *, device: str = "cpu") -> Any:
-    """The configured source; ``probe_shard`` (any shard of the tree) is read by Hdf5Source only."""
-    return VaeSource(cfg, device=device) if cfg.kind == "vae" else Hdf5Source(cfg, probe_shard)
+    """The configured source; ``probe_shard`` (any shard of the tree) is read by the HDF5 side only."""
+    if cfg.kind == "vae":
+        return VaeSource(cfg, device=device)
+    if cfg.kind == "hdf5":
+        return Hdf5Source(cfg, probe_shard)
+    return CombinedSource(cfg, probe_shard, device=device)
 
 
 # ---- cache (§8.4) ------------------------------------------------------------------------------
@@ -752,7 +812,8 @@ def read_rows(cache_dir: Any, rows: Sequence[int]) -> StepFeatures:
 # ---- scaler (§8.5) -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Scaler:
-    """Per-channel ``(x - center) / scale`` over the kept channels; zero-variance ones dropped."""
+    """Per-channel ``(x - center) / scale`` over the kept channels; zero-variance ones dropped, and under
+    ``drop_at_floor`` (``source.drop_floor_channels``) the near-constant ones too (§8.5)."""
 
     channels: Tuple[str, ...]
     center: np.ndarray
@@ -782,14 +843,16 @@ class Scaler:
 
 
 def fit_scaler(index: pd.DataFrame, values: Any, step_mask: Any, channels: Sequence[str], *,
-               minimum_scale: float = 1e-3, relative_floor: float = 0.1) -> Scaler:
+               minimum_scale: float = 1e-3, relative_floor: float = 0.1, drop_at_floor: bool = False) -> Scaler:
     """Fit the per-channel scaler on one fold's **train** rows (§8.5, L4).
 
     Generalises ``latent_pilot/extract.py:592 fit_scaler`` + ``_hierarchical_moments`` (not
     importable at HEAD, and keyed to one latent) to any stream: moments are means over valid steps
     within a segment, then over segments within a GUID, then over GUIDs equally. Scales are floored
     at ``max(minimum_scale, relative_floor * median positive std)``; a channel constant over every
-    valid train step is dropped with a warning and recorded.
+    valid train step is dropped with a warning and recorded. Channels whose std sits under the floor
+    (near-constant inputs) are always listed in a warning and counted (``n_at_floor``); with
+    ``drop_at_floor`` they are dropped too (``dropped_at_floor``).
 
     Args:
         index: One row per segment, aligned with ``values``; needs ``split`` (all ``train``),
@@ -797,6 +860,7 @@ def fit_scaler(index: pd.DataFrame, values: Any, step_mask: Any, channels: Seque
         values: ``(N, T', C)``, post-transform (the source applies it).
         step_mask: ``(N, T')`` bool.
         channels: The ``C`` channel names.
+        drop_at_floor: ``source.drop_floor_channels``: drop the channels under the scale floor.
 
     Raises:
         ValueError: On a non-train row, several folds, or no varying channel at all.
@@ -829,11 +893,21 @@ def fit_scaler(index: pd.DataFrame, values: Any, step_mask: Any, channels: Seque
     dropped = [name for name, k in zip(channels, keep) if not k]
     if dropped:
         logger.warning(f"scaler: dropping {len(dropped)} zero-variance channel(s): {dropped}")
+    at_floor = keep & (std < floor)
+    names_at_floor = [name for name, a in zip(channels, at_floor) if a]
+    if names_at_floor:  # near-constant inputs (the 2026-10-07 run: 60 of 64 delta_mu channels)
+        logger.warning(f"scaler: {len(names_at_floor)} channel(s) with train std under the floor {floor:.4g} "
+                       f"({'dropped' if drop_at_floor else 'kept at the floor'}): {names_at_floor}")
+    if drop_at_floor:
+        keep = keep & ~at_floor
+        if not keep.any():
+            raise ValueError("drop_floor_channels left no channel: every channel sits under the scale floor")
     fold = int(index["fold"].iloc[0]) if "fold" in index else None
     record = {"population": "train", "fold": fold,
               "hierarchy": "steps within segments, segments within GUIDs, GUIDs equally",
               "n_guids": int(len(set(guids))), "n_segments": int(used.sum()),
               "n_steps": int(count.sum()), "floor": floor,
-              "n_at_floor": int((keep & (std < floor)).sum()), "dropped": dropped}
+              "n_at_floor": int(at_floor.sum()), "dropped": dropped,
+              "dropped_at_floor": names_at_floor if drop_at_floor else []}
     return Scaler(channels=tuple(channels), center=first, scale=np.maximum(std, floor), keep=keep,
                   record=record)

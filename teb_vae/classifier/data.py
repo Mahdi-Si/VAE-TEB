@@ -316,7 +316,7 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
     train = frames["train"]
     rows = train["row"].to_numpy()
     scaler = fit_scaler(train[["fold", "split", "guid"]], _Rows(store, rows), store.step_mask[rows],
-                        store.channels)
+                        store.channels, drop_at_floor=c.source.drop_floor_channels)
     names, n = np.asarray(store.channels), store.values.shape[-1]
     counts, aux = train_counts(train, 3 if c.labels.task == "three_class" else 2)
     unit = UnitData(
