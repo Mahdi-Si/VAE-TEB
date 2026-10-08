@@ -1,0 +1,11 @@
+# Source ablation (SPEC §17 item 1): no delta_mu. In the 2026-10-07 run 60 of its 64 channels sat under the scale
+# floor (std <= 0.08 against about 2 for mu_prior); the source pathway reached the classifier through two dimensions.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_src_mu_prior}
+  source:
+    vae:
+      keys:                         # lists replace on merge: the full key set
+        - {name: mu_prior}
+        - {name: kld_per_t, transform: log1p, role: attention}

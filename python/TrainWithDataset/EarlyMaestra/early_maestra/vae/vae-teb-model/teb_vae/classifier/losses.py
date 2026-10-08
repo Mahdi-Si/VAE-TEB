@@ -15,7 +15,8 @@
     head's same term. The positions term has weight 1 here (it is the only main term).
   - sequence scope: λ_final·final + λ_pos·positions + λ_bag·bag + λ_seg·segment + λ₃·(the same four
     terms for the aux heads). ``positions``/``segment`` average over GUIDs with Σω > 0 only. The bag is
-    ``τ·log mean_n exp(s_n/τ)`` over the segment-local head (else the position head), per logit.
+    ``τ·log mean_n exp(s_n/τ)`` over the segment-local head (``loss_weights.bag_head: segment``, else the position
+    head; ``position`` pools the per-position head, whose running max the committed decision reads), per logit.
     ``strategy: mil`` turns the positions term off and the bag on (weight ``λ_bag``, or 1 if that is 0).
   - The aux 3-class head always uses plain ``ce`` (same label smoothing); ``y3 = -1`` is masked out.
   - ``parts`` holds the unweighted main terms and the λ-weighted aux composite (before λ₃).
@@ -196,11 +197,13 @@ def masked_lse(s: Tensor, mask: Tensor, tau: float) -> Tensor:
 
 
 def _sequence_terms(crit: Crit, pos: Tensor, seg: Optional[Tensor], y: Tensor, g: Tensor, mask: Tensor,
-                    w: Tensor, w_pos: Tensor, lam: Dict[str, float], tau: float) -> Dict[str, Tensor]:
+                    w: Tensor, w_pos: Tensor, lam: Dict[str, float], tau: float,
+                    bag_head: str = "segment") -> Dict[str, Tensor]:
     """The four sequence-scope terms of one head family. pos/seg (B, N, K), GUID target y (B,), GUID
     weight g (B,) (0 = unlabeled), seg_mask (B, N), raw ω (B, N) for the segment-local term and ``w_pos`` (ω with
     ``k_warm`` applied, §6.5) for the per-position term. Disabled terms are 0. Per-segment terms weigh ω / Σ_n ω, so
-    every GUID with Σω > 0 counts once (GUID-equal, §6.5)."""
+    every GUID with Σω > 0 counts once (GUID-equal, §6.5). ``bag_head`` (``loss_weights.bag_head``): the bag pools
+    the segment-local head when present (``segment``) or the per-position head (``position``, §10.3)."""
     zero = pos.new_zeros(())
     b, n = mask.shape
     has = g * mask.any(1)
@@ -211,7 +214,7 @@ def _sequence_terms(crit: Crit, pos: Tensor, seg: Optional[Tensor], y: Tensor, g
 
     yy = y[:, None].expand(b, n)
     last = (mask.sum(1) - 1).clamp(min=0)
-    bag_src = pos if seg is None else seg
+    bag_src = pos if (seg is None or bag_head == "position") else seg
     return {
         "final": crit(pos[torch.arange(b, device=pos.device), last], y, has) if lam["final"] else zero,
         "positions": crit(pos, yy, per_guid(w_pos)) if lam["positions"] else zero,
@@ -250,8 +253,9 @@ def compute_loss(out: Dict[str, Tensor], batch: Dict[str, Tensor], *, scope: str
     mask, w = batch["seg_mask"], batch["w"]
     w_pos = batch.get("w_pos", w)  # k_warm drops positions from the per-position term only (data.GuidDataset)
     main = _sequence_terms(crit, out["pos"], out.get("seg"), batch["y"], torch.ones_like(g3), mask, w, w_pos,
-                           lam, lse_tau)
-    aux = (_sequence_terms(ce3, out["aux3_pos"], out.get("aux3_seg"), y3, g3, mask, w, w_pos, lam, lse_tau)
+                           lam, lse_tau, lw.bag_head)
+    aux = (_sequence_terms(ce3, out["aux3_pos"], out.get("aux3_seg"), y3, g3, mask, w, w_pos, lam, lse_tau,
+                           lw.bag_head)
            if lam3 else {key: torch.zeros_like(value) for key, value in main.items()})
     loss_aux3 = sum(lam[key] * aux[key] for key in lam)
     total = sum(lam[key] * main[key] for key in lam) + lam3 * loss_aux3

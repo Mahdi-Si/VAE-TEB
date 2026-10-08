@@ -73,9 +73,12 @@ from teb_vae.classifier.config import (  # noqa: E402
 from teb_vae.classifier.data import (  # noqa: E402
     UnitData, build_unit, covariates_off, load_store, without_indicators,
 )
-from teb_vae.classifier.thresholds import guid_level_policies, ovr_thresholds, select_thresholds  # noqa: E402
+from teb_vae.classifier.thresholds import (  # noqa: E402
+    fit_stage_offsets, guid_level_policies, ovr_thresholds, select_thresholds,
+)
 from teb_vae.classifier.train import (  # noqa: E402
-    ATTN_COLUMNS, ATTRIBUTION_COLUMNS, attribute_split, calibrate_frames, score_split, train_unit, unit_calibration,
+    ATTN_COLUMNS, ATTRIBUTION_COLUMNS, apply_stage_offsets, attribute_split, calibrate_frames, score_split, train_unit,
+    unit_calibration,
 )
 from teb_vae.lag_attn.eval.report import json_safe  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.launch import resolve_launch_args  # noqa: E402
@@ -88,6 +91,10 @@ UNIT_LOCKED = ("model_checkpoints/best.ckpt", "scaler.json", "calibration.json",
 #: What a seed ensemble's lock digests (§10.7), besides its members' own ``selection_lock.json``: a retrained member
 #: re-locks, which changes that digest, so a stale ensemble is re-selected by the next ``train``.
 ENS_LOCKED = ("calibration.json", "thresholds.json")
+#: The §11.3 stage-offset view (``eval.stage_offsets``) per unit: the offsets fitted on the val negatives and the
+#: thresholds re-selected on the shifted val rows. Both enter the unit's lock; its prediction rows are ``<kind>_stage``.
+STAGE_FILES = ("stage_offsets.json", "thresholds_stage.json")
+STAGE_SUFFIX = "_stage"
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -225,7 +232,8 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
     A unit with no causal per-position score (non-causal, no segment head) is thresholded like the shortcut
     (:func:`~teb_vae.classifier.thresholds.guid_level_policies`); one without a segment score (``segment_head:
     false``) skips its ``segment``-basis policies (recorded ``skipped``). ``scored``: the val scores, when they do not
-    come from ``out``'s own checkpoint (a seed ensemble, :func:`lock_ensemble`)."""
+    come from ``out``'s own checkpoint (a seed ensemble, :func:`lock_ensemble`). With ``eval.stage_offsets`` and a
+    causal online score, the §11.3 stage view is selected here too: :data:`STAGE_FILES`, digested by the same lock."""
     c = cfg.classifier
     scored = score_split(out, unit, "val") if scored is None else scored
     cal = unit_calibration(c, scored[1])
@@ -248,6 +256,17 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
         thr["ovr"] = ovr_thresholds(seg, gd, policies, **kw)
     (out / "calibration.json").write_text(json.dumps(cal, indent=2))
     (out / "thresholds.json").write_text(json.dumps(thr, indent=2))  # plain json: -Infinity is legal
+    files = list(files)
+    if c.eval.stage_offsets and seg["logit_online_cal"].notna().any():  # §11.3: the `<kind>_stage` view, val-selected
+        off = fit_stage_offsets(seg)
+        s2, g2 = apply_stage_offsets(seg, gd, off, scope=c.model.scope, aggregators=c.model.segment_aggregators,
+                                     tau=c.model.lse_tau)
+        thr_stage = select_thresholds(s2, g2, policies, **kw)
+        for pid, (level, why) in skipped.items():
+            thr_stage.setdefault(level, {})[pid] = {"skipped": why}
+        (out / STAGE_FILES[0]).write_text(json.dumps(off, indent=2))
+        (out / STAGE_FILES[1]).write_text(json.dumps(thr_stage, indent=2))
+        files += list(STAGE_FILES)
     lock = write_lock(out, digest(cfg), files, fold=unit.fold, seed=seed, kind=kind, note=note)
     if mlflow_run_id:
         _log_metrics(_mlflow(cfg).get("tracking_uri"), mlflow_run_id,
@@ -291,10 +310,21 @@ def neural_predict(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], spli
     return segs, gds, thr, units, missing
 
 
+def _stage_rows(c: Classifier, out: Path, seg: pd.DataFrame, gd: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """The ``<kind>_stage`` rows (§11.3) of a unit's ``(seg, gd)``: :func:`apply_stage_offsets` under the offsets the
+    unit at ``out`` locked (:data:`STAGE_FILES`); every other column, the calibration included, is the unit's."""
+    off = json.loads((out / STAGE_FILES[0]).read_text())
+    s, g = apply_stage_offsets(seg, gd, off, scope=c.model.scope, aggregators=c.model.segment_aggregators,
+                               tau=c.model.lse_tau)
+    model_id = f"{seg['model_id'].iloc[0]}{STAGE_SUFFIX}"
+    return s.assign(model_id=model_id), g.assign(model_id=model_id)
+
+
 def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int,
                       splits: Sequence[str] = ("val", "test")
                       ) -> Tuple[list, list, Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    """:func:`neural_predict` of one fold, in the same row order: what a fold process scores (§14.4)."""
+    """:func:`neural_predict` of one fold, in the same row order: what a fold process scores (§14.4). A unit (or
+    ensemble) that locked :data:`STAGE_FILES` also yields its ``<kind>_stage`` rows under ``thresholds_stage.json``."""
     c, want, source = cfg.classifier, digest(cfg), manifest["source"]
     index, n_valid = _cache_rows(source)
     segs, gds, thr, units, missing = [], [], {}, [], []
@@ -322,6 +352,7 @@ def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], f
         passes = [(kind, unit)]
         if c.eval.covariates_off and unit.n_cov and kind != "shuffled":
             passes.append((f"{kind}_covoff", covariates_off(unit)))
+        staged = (out / STAGE_FILES[0]).is_file()
         for model_id, u in passes:
             for split in splits:
                 sc = score_split(out, u, split)
@@ -330,20 +361,37 @@ def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], f
                 s, g = unit_rows(labels[labels["split"] == split], sc, cal, model_id, seed)
                 segs.append(s)
                 gds.append(g)
+                if staged and model_id == kind:
+                    s2, g2 = _stage_rows(c, out, s, g)
+                    segs.append(s2)
+                    gds.append(g2)
             thr[f"{model_id}|{seed}|{fold}"] = json.loads((out / "thresholds.json").read_text())
             units.append({"model_id": model_id, "seed": str(seed), "fold": fold,
                           "lock_written_at": lock["locked_utc"]})
+            if staged and model_id == kind:
+                thr[f"{kind}{STAGE_SUFFIX}|{seed}|{fold}"] = json.loads((out / STAGE_FILES[1]).read_text())
+                units.append({"model_id": f"{kind}{STAGE_SUFFIX}", "seed": str(seed), "fold": fold,
+                              "lock_written_at": lock["locked_utc"]})
     for kind, lock in ens_locks.items():
         out = ens_dir(run_dir, fold, kind)
         cal = json.loads((out / "calibration.json").read_text())
+        staged = (out / STAGE_FILES[0]).is_file()
         for model_id in dict.fromkeys(m for m, _ in scored if m in (kind, f"{kind}_covoff")):
             for split in splits:
                 s, g = unit_rows(labels[labels["split"] == split], ensemble_scores(scored[model_id, split]), cal,
                                  model_id, "ens")
                 segs.append(s)
                 gds.append(g)
+                if staged and model_id == kind:
+                    s2, g2 = _stage_rows(c, out, s, g)
+                    segs.append(s2)
+                    gds.append(g2)
             thr[f"{model_id}|ens|{fold}"] = json.loads((out / "thresholds.json").read_text())
             units.append({"model_id": model_id, "seed": "ens", "fold": fold, "lock_written_at": lock["locked_utc"]})
+            if staged and model_id == kind:
+                thr[f"{kind}{STAGE_SUFFIX}|ens|{fold}"] = json.loads((out / STAGE_FILES[1]).read_text())
+                units.append({"model_id": f"{kind}{STAGE_SUFFIX}", "seed": "ens", "fold": fold,
+                              "lock_written_at": lock["locked_utc"]})
     return segs, gds, thr, units, missing
 
 
