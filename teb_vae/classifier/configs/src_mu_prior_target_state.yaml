@@ -1,0 +1,13 @@
+# Source ablation (SPEC §17 item 1): mu_prior plus the 128-d target encoder state, which sits before the collapsed
+# latent bottleneck (§2.6). If this beats mu_prior alone by a margin, the bottleneck is the limit and adaptation of the
+# posterior (adapt_*.yaml) is the next step.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_src_mu_prior_target_state}
+  source:
+    vae:
+      keys:
+        - {name: mu_prior}
+        - {name: target_state}
+        - {name: kld_per_t, transform: log1p, role: attention}

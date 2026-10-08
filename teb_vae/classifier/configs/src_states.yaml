@@ -1,0 +1,13 @@
+# Source ablation (SPEC §17 item 1): the two encoder states (target 128-d, source 128-d) instead of the latents. The
+# source state carries the UP pathway before the posterior head, which in the 2026-10-07 run moved only two latent
+# dimensions.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_src_states}
+  source:
+    vae:
+      keys:
+        - {name: target_state}
+        - {name: source_state}
+        - {name: kld_per_t, transform: log1p, role: attention}

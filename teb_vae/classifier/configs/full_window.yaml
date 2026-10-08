@@ -1,0 +1,8 @@
+# Training window ablation: train on the whole evaluation window (train_epoch_min_s = epoch_min_s, i.e. the last
+# 12.4 h) instead of the last 6 h. The 2026-10-07 run's early false alarms did not come from the untrained early
+# segments (8 % at position 0), but its train sequences were 8-31 segments against 10-66 at test.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_full_window}
+  data: {train_epoch_min_s: -44640.0}

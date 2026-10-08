@@ -1,0 +1,10 @@
+# Label ablation (SPEC §17 item 3): MIL. No per-position target; the bag τ·log mean exp(s_n/τ) over the per-position
+# head (bag_head: position, §10.3) gets the GUID label, so the loss penalises the quantity the committed alarm reads
+# (the running max of the online score, §11.2). The final and segment-local terms stay.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_mil_bag}
+  labels: {strategy: mil}
+  train:
+    loss_weights: {final: 1.0, positions: 0.0, bag: 1.0, segment: 0.3, bag_head: position}

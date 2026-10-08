@@ -1,0 +1,8 @@
+# Source ablation (SPEC §17 item 1): the ST/PH coefficients straight from the shards, no VAE (§8.3): the model-free
+# reference every VAE source is read against. source.hdf5.min_step: auto masks every step before the longest channel
+# warm-up; the extract log prints the kept steps, read it before trusting the run.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_src_st_ph}
+  source: {kind: hdf5}

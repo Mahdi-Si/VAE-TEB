@@ -55,7 +55,7 @@ from teb_vae.classifier.data import (
 from teb_vae.classifier.losses import class_weights, compute_loss, coral_log_probs, criterion, prior_offset
 from teb_vae.classifier.model import ClassifierNet, aggregate, n_params, running_aggregate
 from teb_vae.classifier.sources import OnlineFeatures, VaeSource
-from teb_vae.classifier.thresholds import fpr_threshold
+from teb_vae.classifier.thresholds import fpr_threshold, stage_stratum
 from teb_vae.lag_attn.eval.report import json_safe
 from train.callbacks import (
     HyperparameterLoggingCallback, LossPlotCallback, MetricsHistoryCsvCallback, MetricsLoggingCallback,
@@ -772,7 +772,7 @@ class ClassifierTrainer(GraphModelBase):
             "source_fingerprint_hash": self.source.get("fingerprint_hash"), "cache_dir": self.source.get("cache_dir"),
             "vae_checkpoint_sha256": fingerprint.get("checkpoint_sha256"),
             "feature_channels": self.pl_model.checkpoint_extras["feature_channels"],
-            "dropped_channels": u.scaler.record.get("dropped", []),
+            "dropped_channels": [*u.scaler.record.get("dropped", []), *u.scaler.record.get("dropped_at_floor", [])],
             "optimizer": c.train.optimizer.model_dump(mode="json"),
             "schedule": c.train.schedule.model_dump(mode="json"),
             "trainer": self.config["advanced_config"].get("trainer", {}),
@@ -1294,3 +1294,28 @@ def calibrate_frames(seg: pd.DataFrame, gd: pd.DataFrame, cal: Mapping[str, Any]
     return (seg.assign(logit_seg_cal=np.where(seg["logit_seg"].isna(), NAN, seg_cal),
                        logit_online_cal=np.where(seg["logit_online"].isna(), NAN, online)),
             gd.assign(score_final_cal=_alarm_lp(lp_gd)))
+
+
+# ---- stage offsets (§11.3: the `<kind>_stage` decision view) ------------------------------------------------------
+def apply_stage_offsets(seg: pd.DataFrame, gd: pd.DataFrame, record: Mapping[str, Any], *, scope: str,
+                        aggregators: Sequence[str], tau: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """``(seg, gd)`` under the per-stratum offsets of :func:`~teb_vae.classifier.thresholds.fit_stage_offsets`:
+    ``logit_online_cal`` and ``logit_seg_cal`` minus ``δ_{stratum(row)}`` (the row's causal in-second-stage flag),
+    and the GUID ``score_final_cal`` rebuilt from the shifted rows: the last position's online logit (sequence
+    scope), or the re-aggregated ``logit_seg_cal`` (segment scope; every ``score_<agg>_cal`` too), so the M7
+    end-point identities hold for the shifted view as for the original. NaN rows stay NaN; every other column keeps
+    the unit's values (the uncalibrated logits, the class probabilities)."""
+    delta = pd.Series(stage_stratum(seg["stage"]), index=seg.index).map(record["offsets"]).to_numpy(np.float64)
+    seg = seg.assign(logit_online_cal=seg["logit_online_cal"].to_numpy(np.float64) - delta,
+                     logit_seg_cal=seg["logit_seg_cal"].to_numpy(np.float64) - delta)
+    key = ["split", "guid"]
+    idx = pd.MultiIndex.from_frame(gd[key])
+    if scope == "segment":
+        by = seg.groupby(key, sort=False)["logit_seg_cal"]
+        seg["logit_online_cal"] = by.transform(lambda s: running_aggregate(s.to_numpy(copy=True), aggregators[0], tau))
+        per = {a: by.agg(lambda s, a=a: aggregate(s.to_numpy(copy=True), a, tau)) for a in aggregators}
+        scores = {f"score_{a}_cal": per[a].reindex(idx).to_numpy(np.float64) for a in aggregators[1:]
+                  if f"score_{a}_cal" in gd}
+        return seg, gd.assign(score_final_cal=per[aggregators[0]].reindex(idx).to_numpy(np.float64), **scores)
+    last = seg.drop_duplicates(key, keep="last").set_index(key)["logit_online_cal"]
+    return seg, gd.assign(score_final_cal=last.reindex(idx).to_numpy(np.float64))

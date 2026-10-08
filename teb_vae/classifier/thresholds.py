@@ -402,3 +402,37 @@ def ovr_view(frame: pd.DataFrame, k: int, cols: Sequence[str]) -> pd.DataFrame:
         x = np.where(frame["logit_online_cal"].isna(), np.nan, x)
     return frame.assign(y=(frame["class_code"] - 1 == k).astype(np.int64),
                         **{c: np.where(frame[c].isna(), np.nan, x) for c in cols})
+
+
+# ---- stage offsets (§11.3: the `<kind>_stage` decision view) -------------------------------------
+#: The causal second-stage strata of a segment row (the §7.1 ``in_ss`` flag: first and unknown look alike).
+IN_SS_STAGES = ("straddle", "second")
+STAGE_STRATA = ("not_in_ss", "in_ss")
+
+
+def stage_stratum(stage: Any) -> np.ndarray:
+    """``in_ss`` where ``stage`` is straddle or second, else ``not_in_ss``; the stratum a row's offset is read from."""
+    return np.where(pd.Series(np.asarray(stage)).astype(str).isin(IN_SS_STAGES).to_numpy(), "in_ss", "not_in_ss")
+
+
+def fit_stage_offsets(val_segments: pd.DataFrame) -> Dict[str, Any]:
+    """Per-stratum offsets δ_s of the calibrated online logit, fitted on the VALIDATION negatives only (L5).
+
+    δ_s = mean healthy ``logit_online_cal`` in stratum s minus the overall healthy mean, so ``s - δ_s`` has one
+    healthy centre in and out of second stage and one threshold then caps the FPR about equally in both; the
+    2026-10-07 run scored healthy second-stage segments 0.3 logits above first-stage ones, which made the single
+    threshold a second-stage detector (sensitivity 0.55 vs 0.22). A stratum without healthy rows gets 0.
+
+    Returns:
+        ``{"offsets": {stratum: δ}, "n_neg": {stratum: n}, "score": "logit_online_cal", "population": ...}``.
+    """
+    neg = val_segments[np.asarray(val_segments["y"]) == 0]
+    s = neg["logit_online_cal"].to_numpy(np.float64)
+    ok, strata = np.isfinite(s), stage_stratum(neg["stage"])
+    overall = float(s[ok].mean()) if ok.any() else 0.0
+    offsets, n = {}, {}
+    for st in STAGE_STRATA:
+        m = ok & (strata == st)
+        n[st] = int(m.sum())
+        offsets[st] = float(s[m].mean() - overall) if m.any() else 0.0
+    return {"offsets": offsets, "n_neg": n, "score": "logit_online_cal", "population": "val negatives (segments)"}

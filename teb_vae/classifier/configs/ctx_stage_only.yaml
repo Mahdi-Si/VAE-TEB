@@ -1,0 +1,8 @@
+# Context ablation (SPEC §17 item 4): stage and time in second stage only, no time from labour onset (and no TLO
+# missing flag). Against ctx_off.yaml it prices the stage inputs, against the baseline the TLO inputs.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_ctx_stage_only}
+  context:
+    tlo: {enabled: false}

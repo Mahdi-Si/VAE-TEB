@@ -287,7 +287,7 @@ def _fit(cfg: Config, run_dir: Path, fold: int, feats: Features, out: Path) -> N
     frame = frame[frame["split"] != "test"].reset_index(drop=True)  # test stays unread until the lock
     tr = frame[frame["split"] == "train"]
     scaler = fit_scaler(tr[["fold", "split", "guid"]], _CacheValues(feats.cache_dir, tr["row"]),
-                        feats.mask[tr["row"].to_numpy()], feats.channels)
+                        feats.mask[tr["row"].to_numpy()], feats.channels, drop_at_floor=c.source.drop_floor_channels)
     scaler.save(out / "scaler.json")
     online, _ = probe_features(frame, feats, scaler, c.baselines.probe_last_n)
     last = _is_last(frame)
