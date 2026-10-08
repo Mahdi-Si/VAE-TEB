@@ -1,0 +1,7 @@
+# Label ablation (SPEC §17 item 3): horizon_decay with a 1 h half-life (baseline 0.5 h): a positive segment at 3 h
+# before delivery weighs 0.25 instead of 0.03. Expected to move early sensitivity, not the final AUROC.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_halflife_1h}
+  labels: {decay_halflife_h: 1.0}

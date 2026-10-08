@@ -1,0 +1,6 @@
+# Label ablation (SPEC §17 item 3): horizon_decay with a 2 h full-weight horizon (baseline 1 h), half-life unchanged.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_horizon_2h}
+  labels: {horizon_h: 2.0}

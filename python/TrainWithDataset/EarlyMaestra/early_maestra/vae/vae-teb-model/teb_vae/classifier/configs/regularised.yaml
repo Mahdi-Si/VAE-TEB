@@ -1,0 +1,50 @@
+# The ablation baseline (SPEC §13.3, since 2026-10-07). The 10-fold runs of 2026-10-05 (propagate, lr 1e-3) and
+# 2026-10-07 (horizon_decay, lr 1e-4) both peaked by epoch 5-10 at a val GUID AUROC near 0.65 while train AUROC reached
+# 0.98, so this delta adds within-segment temporal structure, shrinks the trunk, adds noise, ensembles 3 seeds and
+# selects best.ckpt on ranking (temperature calibration fixes the scale afterwards). It also carries the 2026-10-07
+# run's labels, training window and context, so that every `base: regularised.yaml` ablation differs from it in one
+# thing. Do not also pass `optimizer.lr` or `max_epochs` overrides: they would replace the values here. The paths
+# (data.kfold_root, source.vae.checkpoint, source.hdf5.stats_path, run.out_root) still come from --set / RUN_ARGS.
+base: default.yaml
+
+classifier:
+  run:
+    name: trf_cfs_adverse_seq_reg
+    seeds: [42, 43, 44]             # seed ensemble: the `ens` unit averages the 3 seeds per fold (§10.7)
+
+  data:
+    train_epoch_min_s: -21600.0     # train on the last 6 h; val and test keep the full window (L6)
+
+  labels:
+    # Training target per position (SPEC §6.5). Alternatives, with the keys they read:
+    #   propagate      every position takes the GUID label, weight 1 (k_warm drops the first k positions)
+    #   horizon        positive-GUID positions count only within horizon_h of delivery
+    #   horizon_decay  positive-GUID weight 2^(-max(0, Δ - horizon_h) / decay_halflife_h), Δ = hours to delivery
+    #   final_only     only the last position of each GUID is scored (offline GUID classification)
+    #   mil            no per-position target: τ·log mean exp(s_n/τ) over the positions gets the GUID label
+    # The 2026-10-07 run: horizon_decay, H 1 h, half-life 0.5 h (a positive segment at 3 h weighs 0.03); the
+    # lab_*.yaml configs vary these.
+    strategy: horizon_decay
+    horizon_h: 1.0
+    decay_halflife_h: 0.5
+
+  context:
+    delta_t: {enabled: false}       # as in the 2026-10-07 run (the transformer's relative-time bias carries Δt)
+
+  model:
+    step: {temporal: causal_conv, dropout: 0.2}   # depthwise-separable causal conv, k 5, dilations 1/2/4 (§9.2)
+    token: {d: 64, dropout: 0.2}
+    sequence: {layers: 1, heads: 4, d_ff: 128, dropout: 0.2}
+    head: {hidden: 32, dropout: 0.3}
+
+  train:
+    segment_dropout: 0.3
+    optimizer: {lr: 3.0e-4, weight_decay: 5.0e-2}
+    max_epochs: 60                  # the cosine schedule spans max_epochs, so it now decays within the run
+
+  eval:
+    stage_offsets: true             # the `<kind>_stage` secondary view (§11.3): per-stage offsets, val-selected
+
+advanced_config:
+  callbacks:
+    early_stopping: {monitor: val/guid_auroc, mode: max, patience: 20}

@@ -218,7 +218,7 @@ def _row_label(ax: Any, text: str) -> None:
                 bbox={"boxstyle": "square,pad=0.45", "fc": fs.STRIP, "ec": "none"}, annotation_clip=False)
 
 
-def _facets(n_rows: int, n_cols: int, *, row_h: float = 1.55, width: Optional[float] = None,
+def _facets(n_rows: int, n_cols: int, *, row_h: float = 1.95, width: Optional[float] = None,
             strip: Tuple[int, ...] = (), sharex: Any = "all") -> tuple:
     """A faceted page: ``n_rows`` x ``n_cols`` data panels and, when ``strip`` names columns, a thin n strip row under
     those columns (hidden elsewhere, where the last data row keeps its tick labels). Returns ``(fig, grid, strips)``:
@@ -474,7 +474,7 @@ def _op_points(ax: Any, met: pd.DataFrame, c: Dict[str, Any], m: str, sd: str, f
     drawn = []
     for pid, g in pts.groupby("policy_id"):
         color = _policy_color(c, pid)
-        for split, face, edge in (("val", "white", color), ("test", color, "white")):
+        for split, face, edge in (("val", "white", color), ("test", color, figstyle.EDGE)):
             q = g[g["split"] == split].set_index("metric")["value"]
             if {"sens", "fpr"} <= set(q.index):
                 ax.plot(q["fpr"], q["sens"], "o", ms=5.5, mfc=face, mec=edge if split == "test" else color,
@@ -490,7 +490,7 @@ def _policy_key(fig: Any, c: Dict[str, Any], policies: Any) -> None:
     fs, ids = _seam(), _pids(c, policies)
     if not ids:
         return
-    dots = [Line2D([], [], marker="o", ms=5.5, ls="none", color=_policy_color(c, p), mec="white") for p in ids]
+    dots = [Line2D([], [], marker="o", ms=5.5, ls="none", color=_policy_color(c, p), mec=figstyle.EDGE) for p in ids]
     dots.append(Line2D([], [], marker="o", ms=5.5, ls="none", mfc="white", mec=fs.MUTED))
     fs.add_key(fig, dots, [*ids, "hollow: validation"])
 
@@ -559,7 +559,7 @@ def _roc_guid(T: Dict[str, Any], c: Dict[str, Any], split: str = "test", fold: O
                                     label="fold min-max")
                 ax.fill_between(v["fpr"], v["tpr"] - v["tpr_sd"], v["tpr"] + v["tpr_sd"], color=fs.ORANGE, alpha=0.15,
                                 lw=0)
-                ax.plot(v["fpr"], v["tpr"], ls="--", color=fs.ORANGE, lw=fs.LINE_REGULAR, label="fold mean ± SD")
+                ax.plot(v["fpr"], v["tpr"], color=fs.ORANGE, lw=fs.LINE_REGULAR, label="fold mean ± SD")
             b = _sel(r, variant=f"{variant}:band")
             if len(b):
                 ax.fill_between(b["fpr"], b["tpr_lo"], b["tpr_hi"], color=fs.BLUE, alpha=0.16, lw=0, label="95% band")
@@ -642,8 +642,8 @@ def _threshold_drift(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
             test = _sel(te, policy_id=pid).pivot_table(index="fold", columns="metric", values="value")
             j = _sel(t, policy_id=pid).set_index("fold")[["val_sens", "val_fpr"]].join(test, how="inner")
             if {"sens", "fpr"} <= set(j.columns):
-                row[0].plot(j["val_sens"], j["sens"], "o", ms=4.5, color=color, mec="white", mew=0.5)
-                row[1].plot(j["val_fpr"], j["fpr"], "o", ms=4.5, color=color, mec="white", mew=0.5)
+                row[0].plot(j["val_sens"], j["sens"], "o", ms=4.5, color=color, mec=figstyle.EDGE, mew=0.5)
+                row[1].plot(j["val_fpr"], j["fpr"], "o", ms=4.5, color=color, mec=figstyle.EDGE, mew=0.5)
                 seen.add(pid)
             if "fpr_overshoot" in j and "pooled" in test.index:
                 row[2].plot(np.full(len(j), i) + np.linspace(-0.15, 0.15, len(j)), j["fpr_overshoot"], "o", ms=3.5,
@@ -671,7 +671,7 @@ def _threshold_drift(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
     from matplotlib.lines import Line2D
 
     ids = _pids(c, seen)
-    fs.add_key(fig, [Line2D([], [], marker="o", ls="none", ms=5, color=_policy_color(c, p), mec="white") for p in ids]
+    fs.add_key(fig, [Line2D([], [], marker="o", ls="none", ms=5, color=_policy_color(c, p), mec=figstyle.EDGE) for p in ids]
                + [Line2D([], [], marker="D", ls="none", ms=5, color=fs.MUTED, mec=fs.INK)], [*ids, "pooled"])
     _tag(fig, "Threshold drift")
     return fig
@@ -690,7 +690,8 @@ AXIS_LABEL = {"to_delivery": "hours before delivery", "from_onset": "hours since
 ROC_KIND = {"committed_cumulative": "Committed cumulative", "committed_overall": "Committed overall",
             "snapshot": "Snapshot"}
 #: Under-power marker of the time-resolved figures: a hollow marker is a bin with fewer GUIDs of a class than needed.
-UNDER_BIN = "Hollow markers: fewer than {n} GUIDs of a class in the bin"
+UNDER_BIN = ("Hollow, coloured ring: fewer than {n} GUIDs of a class in the bin; hollow, black ring: no estimate "
+             "in the bin (the line is joined over it)")
 
 
 def _tr(T: Dict[str, Any], **eq: Any) -> pd.DataFrame:
@@ -752,12 +753,25 @@ def _xlim(axes: Any, t: pd.Series, axis: str, pol: Optional[Dict[str, Any]] = No
     ts = np.unique(t.astype(float).dropna().to_numpy())
     xs = [*ts, *([0.0] if axis == "rel_second_stage" else []),
           *([float(pol["at"])] if pol and pol.get("at", "end") != "end" and pol.get("axis", "to_delivery") == axis else [])]
-    pad = 0.6 * float(np.diff(ts).min()) if ts.size > 1 else 0.5
+    step = float(np.diff(ts).min()) if ts.size > 1 else 0.0
+    pad = 0.6 * step if step else 0.5
     lo, hi = (min(xs) - pad, max(xs) + pad) if xs else (0.0, 1.0)
     axes = list(np.ravel(axes))
     axes[0].set_xlim((hi, lo) if axis == "to_delivery" else (lo, hi))
     for ax in axes:
         ax.set_autoscalex_on(False)
+        _time_ticks(ax, hi - lo, step)
+
+
+def _time_ticks(ax: Any, span: float, step: float) -> None:
+    """A dense time grid: a major tick at the round step that gives at most 13 labels, a minor grid line at every bin
+    (``step``) when that is finer, else at half the major step."""
+    from matplotlib.ticker import MultipleLocator
+
+    major = next((m for m in (0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 12.0, 24.0) if span / m <= 13), 48.0)
+    minor = step if 0 < step < major and span / step <= 150 else major / 2
+    ax.xaxis.set_major_locator(MultipleLocator(major))
+    ax.xaxis.set_minor_locator(MultipleLocator(minor))
 
 
 def _x_time(ax: Any, axis: str) -> None:
@@ -783,29 +797,40 @@ def _rates(f: pd.DataFrame, pid: Optional[str]) -> Dict[str, pd.DataFrame]:
 
 def _estimate_line(ax: Any, t: Any, value: Any, raw: Any, under: Any, *, color: str, ls: str, lw: float, marker: str,
                    ms: float, label: Optional[str]) -> bool:
-    """One trace over the time bins, always drawn as a line, so every trace of every time-resolved figure reads alike.
+    """One trace over the time bins, drawn as one continuous solid line, so every trace of every time-resolved figure
+    reads alike and none is broken into pieces.
 
     Each bin's estimate is ``value`` where the bin is powered and the count ratio ``raw`` where it is underpowered
-    (``under``; ``value`` is NaN there). The whole estimate path is drawn thin and faint in the trace's colour and line
-    style; the powered stretch over it at full weight ``lw`` with filled markers (it carries ``label``); underpowered
-    bins as hollow markers on the path. A trace whose every bin is underpowered is therefore a faint line with hollow
-    markers, never loose points. Nothing is drawn when no bin has an estimate; returns whether it drew (and so used
-    ``label``).
+    (``under``; ``value`` is NaN there). The line runs through every bin with an estimate at full weight ``lw``; powered
+    bins carry a filled marker with a thin dark edge (:data:`figstyle.EDGE`), underpowered bins a hollow marker ringed
+    in the trace's colour. An interior bin without an estimate (a row with neither, or a grid step with no row) is
+    joined over, so the line stays whole, and marked where the line crosses it by a hollow marker with a black ring,
+    so the joined stretch never reads as data; bins before the first or after the last estimate are not drawn. The
+    line carries ``label``. ``ls`` is accepted and ignored: a trace is never dashed. Nothing is drawn when no bin has
+    an estimate; returns whether it drew (and so used ``label``).
     """
     fs = _seam()
     t, value, raw = (np.asarray(a, np.float64) for a in (t, value, raw))
     under = np.asarray(under, bool) & np.isfinite(raw)
     y = np.where(under, raw, value)
-    if not np.isfinite(y).any():
+    keep = np.isfinite(y) & np.isfinite(t)
+    if not keep.any():
         return False
-    order = np.argsort(t, kind="stable")
-    t, value, y, under = t[order], value[order], y[order], under[order]
-    ax.plot(t, y, color=color, ls=ls, lw=fs.LINE_THIN, alpha=0.5)
-    ax.plot(t, np.where(under, np.nan, value), color=color, ls=ls, lw=lw, marker=marker, ms=ms, mec="white", mew=0.5,
-            label=label, zorder=3)
+    grid = np.unique(t[np.isfinite(t)])
+    order = np.argsort(t[keep], kind="stable")
+    t, y, under = t[keep][order], y[keep][order], under[keep][order]
+    ax.plot(t, y, color=color, lw=lw, marker=marker, ms=ms, mec=fs.EDGE, mew=fs.MARKER_EDGE,
+            markevery=list(np.flatnonzero(~under)), label=label, zorder=3, solid_joinstyle="round")
     if under.any():
-        ax.plot(t[under], y[under], marker, ls="none", ms=ms + 0.8, mfc="white", mec=color, mew=fs.LINE_REGULAR,
-                zorder=3)
+        ax.plot(t[under], y[under], marker, ls="none", ms=ms + 0.6, mfc="white", mec=color, mew=0.9, zorder=4)
+    # the bins the line is joined over: rows without an estimate, and grid steps missing between two estimates
+    step = float(np.diff(grid).min()) if grid.size > 1 else 0.0
+    fill = [np.arange(a + step, b - step / 2, step) for a, b in zip(t[:-1], t[1:]) if step and b - a > 1.5 * step]
+    miss = np.unique(np.round(np.concatenate([grid, *fill]), 9))
+    miss = miss[(miss > t[0]) & (miss < t[-1]) & ~np.isin(miss, np.round(t, 9))]
+    if miss.size:
+        ax.plot(miss, np.interp(miss, t, y), marker, ls="none", ms=ms + 0.6, mfc="white", mec=fs.EDGE, mew=0.9,
+                zorder=4)
     return True
 
 
@@ -819,7 +844,7 @@ def _series(ax: Any, f: pd.DataFrame, c: Dict[str, Any], *, color: str, marker: 
         per = f[f["fold"] != "pooled"]
         for _, g in per.groupby("fold"):
             g = g.sort_values("t")
-            ax.plot(g["t"], g["value"].astype(float), color=color, lw=fs.LINE_THIN * 0.8, alpha=0.22, ls=ls)
+            ax.plot(g["t"], g["value"].astype(float), color=color, lw=fs.LINE_THIN * 0.8, alpha=0.22)
         if c["eval"]["fold_band"] == "minmax" and per["fold"].nunique() > 1:
             e = per.assign(value=per["value"].astype(float)).groupby("t")["value"].agg(["min", "max"])
             ax.fill_between(e.index.astype(float), e["min"], e["max"], color=color, alpha=0.07, lw=0)
@@ -833,10 +858,13 @@ def _series(ax: Any, f: pd.DataFrame, c: Dict[str, Any], *, color: str, marker: 
                    lw=fs.LINE_EMPHASIS * 2, marker=marker, ms=fs.MARKER_SMALL, label=label)
 
 
-def _unit_y(ax: Any, ticks: tuple = (0, 0.5, 1)) -> None:
-    """A rate axis: [0, 1] with a little room, a few ticks."""
+def _unit_y(ax: Any, ticks: tuple = (0, 0.2, 0.4, 0.6, 0.8, 1)) -> None:
+    """A rate axis: [0, 1] with a little room, a major tick every 0.2 and a minor grid line every 0.1."""
+    from matplotlib.ticker import MultipleLocator
+
     ax.set_ylim(-0.04, 1.04)
     ax.set_yticks(list(ticks))
+    ax.yaxis.set_minor_locator(MultipleLocator(0.1))
 
 
 def _rates_panel(ax: Any, f: pd.DataFrame, c: Dict[str, Any], pol: Dict[str, Any], fold: Optional[str]) -> None:
@@ -862,7 +890,7 @@ def _n_strip(ax: Any, f: pd.DataFrame, c: Dict[str, Any], unit: str = "GUIDs", l
     col = fs.CLINICAL_CLASS_COLORS
     for y, name, color, marker in (("n_pos", "adverse (n)", col["hie"], "o"), ("n_neg", "healthy (n)", col["healthy"], "s")):
         ax.plot(f["t"].astype(float), f[y].astype(float), marker=marker, ms=2.5, lw=fs.LINE_REGULAR, color=color,
-                mec="white", mew=0.3, label=name)
+                mec=figstyle.EDGE, mew=0.3, label=name)
     ax.axhline(c["eval"]["min_bin_class_n"], ls=":", color=fs.MUTED, lw=fs.LINE_HAIRLINE)
     top = float(np.nanmax(f[["n_pos", "n_neg"]].astype(float).to_numpy(), initial=1.0))
     ax.set(ylim=(0, 1.2 * top), yticks=[0, round(top)], ylabel=f"{unit}\nper bin")
@@ -964,7 +992,7 @@ def _model_panels(models: List[tuple], width: float = 11.0) -> tuple:
     """``(fig, axes per model, strips)`` of a page with one time panel per model, wrapped into two columns, an n strip
     under each column; unused cells hidden."""
     rows, cols = _wrap(len(models))
-    fig, grid, strips = _facets(rows, cols, strip=tuple(range(cols)), width=width if cols > 1 else 7.4, row_h=1.75)
+    fig, grid, strips = _facets(rows, cols, strip=tuple(range(cols)), width=width if cols > 1 else 7.4, row_h=2.15)
     for ax in grid.flat[len(models):]:
         ax.set_visible(False)
         if rows > 1:
@@ -990,7 +1018,7 @@ def _auroc_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
                 (_sel(x, denominator="bin_present", metric="auroc"), fs.BLUE, "o", "snapshot AUROC", "-"),
                 (_sel(x, denominator="available", metric="auroc"), fs.ORANGE, "s", "cumulative AUROC", "-"),
                 (_sel(x, denominator="bin_present", metric=f"pauc@{alpha:g}"), fs.VIOLET, "D",
-                 f"snapshot pAUC@{alpha:g}", "--")):
+                 f"snapshot pAUC@{alpha:g}", "-")):
             _series(a, f, c, color=color, marker=marker, label=label, fold=fold, ls=ls)
         if a.lines:
             a.axhline(0.5, ls=(0, (2, 2)), color=fs.FAINT, lw=fs.LINE_HAIRLINE)
@@ -1071,14 +1099,15 @@ def _decision_horizon(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional[st
         for pid in _pids(c, x["policy_id"]):
             color = _policy_color(c, pid)
             for ax, met in ((a, "sens"), (b, "fpr")):
-                for sp, face, ls in (("val", "white", "--"), ("test", color, "-")):
+                for sp, face in (("val", "white"), ("test", color)):
                     g = _sel(x, policy_id=pid, split=sp, metric=met).sort_values("t")
                     if sp == "test":
                         ax.fill_between(g["t"].astype(float), g["ci_lo"].astype(float), g["ci_hi"].astype(float),
                                         color=color, alpha=0.12, lw=0)
-                    ax.plot(g["t"].astype(float), g["value"].astype(float), marker="o", ms=4, mfc=face,
-                            mec=color if sp == "val" else "white", mew=0.7, color=color, ls=ls,
-                            lw=fs.LINE_REGULAR if sp == "val" else fs.LINE_EMPHASIS * 2,
+                    ax.plot(g["t"].astype(float), g["value"].astype(float), marker="o", ms=fs.MARKER_SMALL + 0.4,
+                            mfc=face, mec=color if sp == "val" else fs.EDGE,
+                            mew=0.8 if sp == "val" else fs.MARKER_EDGE, color=color,
+                            lw=fs.LINE_THIN if sp == "val" else fs.LINE_EMPHASIS * 2, alpha=0.7 if sp == "val" else 1.0,
                             label=pid if sp == "test" else None, zorder=3)
         for ax, what in ((a, "sensitivity"), (b, "FPR")):
             if not ax.lines:
@@ -1091,8 +1120,8 @@ def _decision_horizon(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional[st
             b.axhline(al, ls=(0, (3, 2)), color=fs.MUTED, lw=fs.LINE_HAIRLINE)
         key(a)
         _row_label(b, _who(m, sd))
-    fs.add_key(fig, [Line2D([], [], ls="--", marker="o", mfc="white", mec=fs.MUTED, color=fs.MUTED)],
-               ["validation (dashed)"])
+    fs.add_key(fig, [Line2D([], [], lw=fs.LINE_THIN, marker="o", mfc="white", mec=fs.MUTED, color=fs.MUTED)],
+               ["validation (thin, hollow)"])
     grid[0, 0].set_title("Sensitivity")
     grid[0, 1].set_title("FPR")
     for ax in grid[-1]:
@@ -1125,7 +1154,7 @@ def _threshold_stability(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional
         for i, pid in enumerate(pids):
             v = t.loc[t["policy_id"] == pid, "threshold"].astype(float)
             row[0].vlines(i, v.min(), v.max(), color=_policy_color(c, pid), lw=fs.LINE_HEAVY * 1.6, alpha=0.3)
-            row[0].plot(np.full(len(v), i), v, "o", ms=4, color=_policy_color(c, pid), mec="white", mew=0.5)
+            row[0].plot(np.full(len(v), i), v, "o", ms=4, color=_policy_color(c, pid), mec=figstyle.EDGE, mew=0.5)
         b = _sel(rf, model_id=m, seed=sd)
         b = b[np.isfinite(b["value"].astype(float))]
         folds = sorted(b["fold"].astype(str).unique(), key=int)
@@ -1136,7 +1165,7 @@ def _threshold_stability(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional
             dx = 0.4 * (np.array([folds.index(f) for f in g["fold"].astype(str)]) / max(len(folds) - 1, 1) - 0.5)
             row[1].vlines(i + dx, g["ci_lo"].astype(float), g["ci_hi"].astype(float), color=_policy_color(c, pid),
                           lw=fs.LINE_REGULAR * 1.4)
-            row[1].plot(i + dx, g["value"].astype(float), "o", ms=4, color=_policy_color(c, pid), mec="white", mew=0.5)
+            row[1].plot(i + dx, g["value"].astype(float), "o", ms=4, color=_policy_color(c, pid), mec=figstyle.EDGE, mew=0.5)
         for ax in row[:2]:
             if ax.lines or ax.collections:
                 ax.set_xticks(range(len(pids)), pids, rotation=30, ha="right", fontsize=fs.FONT_SMALL)
@@ -1149,13 +1178,16 @@ def _threshold_stability(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional
         for pid in _pids(c, x["policy_id"]):
             color = _policy_color(c, pid)
             for ax, met in ((row[2], "sens"), (row[3], "fpr")):
-                for sp, face, ls in (("val", "white", "--"), ("test", color, "-")):
+                for sp, face in (("val", "white"), ("test", color)):
                     g = _sel(x, policy_id=pid, split=sp, metric=met)
                     g = g.assign(j=g["subgroup_value"].astype(str).astype(int)).sort_values("j")
                     v = g["value"].astype(float)
                     err = np.clip([v - g["ci_lo"].astype(float), g["ci_hi"].astype(float) - v], 0, None) if sp == "test" else None
-                    ax.errorbar(g["j"], v, yerr=err, marker="o", ms=4, mfc=face, mec=color, color=color, ls=ls,
-                                lw=fs.LINE_REGULAR, elinewidth=fs.LINE_THIN, label=pid if sp == "test" else None)
+                    ax.errorbar(g["j"], v, yerr=err, marker="o", ms=fs.MARKER_SMALL + 0.4, mfc=face,
+                                mec=color if sp == "val" else fs.EDGE, mew=0.8 if sp == "val" else fs.MARKER_EDGE,
+                                color=color, lw=fs.LINE_THIN if sp == "val" else fs.LINE_REGULAR * 1.3,
+                                alpha=0.7 if sp == "val" else 1.0, elinewidth=fs.LINE_THIN,
+                                label=pid if sp == "test" else None)
             row[3].axhline(_policy(c, pid).get("alpha") or np.nan, ls=(0, (3, 2)), color=color, lw=fs.LINE_HAIRLINE)
         for ax, what in ((row[2], "sensitivity"), (row[3], "FPR")):
             if not ax.lines:
@@ -1166,8 +1198,8 @@ def _threshold_stability(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional
             fs.style_axes(ax)
         key(row[2])
         _row_label(row[3], _who(m, sd))
-    fs.add_key(fig, [Line2D([], [], ls="--", marker="o", mfc="white", mec=fs.MUTED, color=fs.MUTED)],
-               ["validation (dashed)"])
+    fs.add_key(fig, [Line2D([], [], lw=fs.LINE_THIN, marker="o", mfc="white", mec=fs.MUTED, color=fs.MUTED)],
+               ["validation (thin, hollow)"])
     for ax, title in zip(grid[0], ("Per-fold thresholds", "Refit interval", "Sensitivity under shift",
                                    "FPR under shift")):
         ax.set_title(title)
@@ -1661,6 +1693,68 @@ def _vs_frozen_md(R: Dict[str, Any]) -> List[str]:
             "basis population and thresholds. NB: Nadeau-Bengio over the per-fold AUROCs.", "", _md(t), ""]
 
 
+def _comparator_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
+    """§3 addendum: the pre-specified healthy comparators (family ``healthy_comparator``, §11.6.1), primary model,
+    GUID level: every adverse GUID against all healthy, against the blood-gas (BG+) healthy and against the no-gas
+    (BG-) healthy; AUROC and the primary policy's sensitivity and specificity, pooled test with CI, per-fold mean ± SD
+    and the (optimistic) validation value. Empty when the family was not evaluated."""
+    S = T.get("subgroups", pd.DataFrame())
+    s = _s_primary(_sel(S, analysis="S1", subgroup="healthy_comparator", level="guid")) if len(S) else S
+    if s.empty:
+        return []
+    pid, rows = c["eval"]["primary_policy"], []
+    s = s.assign(fold=s["fold"].astype(str), subgroup_value=s["subgroup_value"].astype(str))
+    for mem in member_order(s["subgroup_value"].unique()):
+        x = s[s["subgroup_value"] == mem]
+        n = x[(x["metric"] == "n_guids") & (x["split"] == "test") & (x["fold"] == "pooled")]
+        for metric, pol in (("auroc", None), ("sens", pid), ("spec", pid)):
+            m = x[(x["metric"] == metric) & (x["policy_id"].isna() if pol is None else (x["policy_id"] == pol))]
+            t, v = m[m["split"] == "test"], m[m["split"] == "val"]
+            per = t[t["fold"] != "pooled"]["value"].astype(float)
+            rows.append({"comparator": mem, "metric": metric if pol is None else f"{metric}@{pol}",
+                         "n+ / n- (pooled test)": f"{n['n_pos'].iloc[0]:.0f} / {n['n_neg'].iloc[0]:.0f}" if len(n) else "-",
+                         "pooled test [95% CI]": _s_cell(t[t["fold"] == "pooled"]),
+                         "fold mean ± SD": f"{_cell(per.mean())} ± {_cell(per.std())} (k={per.size})" if per.size else "-",
+                         "val (optimistic)": _s_cell(v[v["fold"] == "pooled"])})
+    return ["### Healthy comparator (pre-specified)", "",
+            "The adverse GUIDs against three healthy populations (§11.6.1 `healthy_comparator`): `all_healthy` (every "
+            "healthy GUID), `bg_healthy` (healthy GUIDs with a blood gas: a gas was drawn, so the labour raised concern) "
+            "and `no_bg_healthy` (no gas). Train and val healthy GUIDs are mostly BG+, the augmented test healthy GUIDs "
+            "mostly BG-, so the headline above depends on which population is meant; report both.", "",
+            _md(pd.DataFrame(rows)), ""]
+
+
+def _np_cost_md(R: Dict[str, Any], c: Dict[str, Any], thr: pd.DataFrame) -> List[str]:
+    """§5 addendum: what the NP umbrella primary policy costs against the empirical cap of the same α, basis and
+    point, for the primary model at GUID level (pooled test sensitivity and FPR of both), with the validation
+    negatives n₀ the order statistic was taken over: the price shrinks as n₀ grows (RESEARCH, Thresholds)."""
+    ev = c["eval"]
+    p = next((x for x in ev["thresholds"] if x["id"] == ev["primary_policy"]), None)
+    if not p or p.get("method") != "np_umbrella":
+        return []
+    q = next((x for x in ev["thresholds"] if x.get("policy") == "fpr_cap" and x.get("method") == "empirical"
+              and x.get("alpha") == p.get("alpha") and x.get("basis") == p.get("basis") and x.get("at") == p.get("at")),
+             None)
+    head = R.get("headline") or {}
+    pm = primary_model(sorted({(r["model_id"], r["seed"]) for r in head.values()}))
+    if q is None or pm is None:
+        return []
+
+    def get(pid: str, met: str) -> Optional[float]:
+        v = (head.get(f"{pm[0]}|{pm[1]}|guid|{pid}|{met}") or {}).get("test")
+        return None if v is None or not np.isfinite(float(v)) else float(v)
+
+    s_np, f_np, s_e, f_e = (get(p["id"], "sens"), get(p["id"], "fpr"), get(q["id"], "sens"), get(q["id"], "fpr"))
+    if None in (s_np, s_e, f_np, f_e):
+        return []
+    n0 = _sel(thr, model_id=pm[0], seed=pm[1], level="guid", policy_id=p["id"]) if len(thr) else thr
+    n0 = float(n0["n_neg"].mean()) if len(n0) and "n_neg" in n0 else float("nan")
+    return [f"- NP cost: `{p['id']}` (δ {p.get('delta')}) against `{q['id']}` at the same α {p['alpha']}: pooled test "
+            f"sensitivity {s_np:.3f} vs {s_e:.3f} ({100 * (s_np - s_e):+.1f} points) at FPR {f_np:.3f} vs {f_e:.3f}. "
+            f"The umbrella's order statistic was taken over n₀ ≈ {n0:.0f} validation negatives per fold; its price "
+            f"shrinks as n₀ grows (RESEARCH, Thresholds).", ""]
+
+
 def summary_md(run_dir: Path, T: Dict[str, Any], c: Dict[str, Any]) -> Path:
     """``summary.md``: the §11.11 sections 1-12, in order, each under a stable ``## <n>. `` heading (verify
     criterion 12). Sections 6, 7, 9 and 10 come from one function each (:func:`_calibration_md`,
@@ -1706,7 +1800,8 @@ def summary_md(run_dir: Path, T: Dict[str, Any], c: Dict[str, Any]) -> Path:
             "primary": head["primary"], "val (optimistic)": head["val"]})
     L += [f"## 3. Headline (primary policy `{primary}` and threshold-free)", "",
           "Validation values are optimistic (used for selection). AUROC/pAUC: the per-fold mean ± SD is primary, "
-          "pooled OOF secondary. Naive CV intervals under-cover across folds (Bates 2024).", "", _md(head), ""]
+          "pooled OOF secondary. Naive CV intervals under-cover across folds (Bates 2024).", "", _md(head), "",
+          *_comparator_md(T, c)]
 
     b1 = R.get("B1") or {}
     base = pd.DataFrame([{
@@ -1736,7 +1831,8 @@ def summary_md(run_dir: Path, T: Dict[str, Any], c: Dict[str, Any]) -> Path:
     L += ["## 5. Thresholds and FPR overshoot (test FPR - α, on each policy's basis population)", "",
           "Validation sens/FPR are the selection-time values (mean over folds). The NP guarantee holds at GUID level only; "
           "NP tolerance: the 95% binomial tolerance of the pooled test FPR above α (n_neg pooled).",
-          "", _md(thr), "", *([f"- NP overshoot check: **{npo.get('verdict')}** ({npo.get('detail')})", ""] if npo else [])]
+          "", _md(thr), "", *([f"- NP overshoot check: **{npo.get('verdict')}** ({npo.get('detail')})", ""] if npo else []),
+          *_np_cost_md(R, c, T["thr"])]
     L += [*_calibration_md(T, c), *_three_class_md(T, c), *_time_resolved_md(T, c), *_subgroups_md(T, c),
           *_highlights_md(T, c), *_limitations_md(T, c), *_tripod_md(T, c)]
     path = run_dir / SUMMARY_MD
@@ -1848,11 +1944,12 @@ def report(run_dir: Any, cfg: Any) -> int:
 # primary policy; members run worst cohort first (``metrics.member_order``) in the §11.6.2 colours (:func:`_member_style`).
 # §9 (:func:`_subgroups_md`) and the S3/S5 part of §10 of summary.md read the same rows.
 from teb_vae.classifier.metrics import (  # noqa: E402
-    BASELINES, CLASSES, EMPTY_FAMILIES, K3_FAMILIES, RESTRICTED, ROC_FAMILIES, S2_FAMILIES, SINGLE_CLASS_FAMILIES, member_order, primary_model,
-    subgroup_families,
+    BASELINES, CLASSES, EMPTY_FAMILIES, K3_FAMILIES, RESTRICTED, ROC_FAMILIES, S2_FAMILIES, SINGLE_CLASS_FAMILIES,
+    TERTILE_FAMILIES, member_order, primary_model, subgroup_families,
 )
 
 SUBGROUPS_VS_TIME = "subgroups/subgroups_vs_time_{axis}_{policy}"
+SUBGROUPS_TERTILES_VS_TIME = "subgroups/subgroups_tertiles_vs_time_{axis}_{policy}"
 SUBGROUP_FOREST = "subgroups/subgroup_forest"
 SUBGROUP_DELTA = "subgroups/subgroup_delta"
 RESTRICTED_PAIRS = "subgroups/restricted_pairs_{axis}"
@@ -1874,31 +1971,39 @@ MEMBER_COLORS = {"cs_pos": figstyle.BLUE, "cs_neg": figstyle.VIOLET, "bg_pos": f
 
 def _member_style(family: str, value: str, members: List[str]) -> tuple:
     """(colour, linestyle) of one member (§11.6.2): class and shard colours (``group_colors``; class_x_cs and restricted
-    pairs by their class), the bg colour for the healthy bg cells, :data:`MEMBER_COLORS`, else the shared line palette in
-    member order; cs- dashed inside class_x_cs and healthy_bg_x_cs."""
+    pairs by their class, the cs- member a lighter shade of its class), the bg colour for the healthy bg cells,
+    :data:`MEMBER_COLORS`, else the shared line palette in member order. The line style is always solid: members are
+    told apart by colour, metrics by marker (:data:`MEMBER_METRICS`)."""
     fs = _seam()
-    ls = "--" if family in ("class_x_cs", "healthy_bg_x_cs") and value.endswith("cs_neg") else "-"
     if family in ("class", "source_file", "class_x_cs", RESTRICTED):
         key = value if family in ("class", "source_file") else value.split("_")[0]
-        return MEMBER_COLORS.get(key) or fs.group_colors([key])[key], ls
+        color = MEMBER_COLORS.get(key) or fs.group_colors([key])[key]
+        return (fs.tint(color, 0.45) if family == "class_x_cs" and value.endswith("cs_neg") else color), "-"
     if family in ("healthy_x_bg", "healthy_bg_x_cs"):
-        return MEMBER_COLORS["bg_pos" if "_bg_pos" in value else "bg_neg"], ls
+        return MEMBER_COLORS["bg_pos" if "_bg_pos" in value else "bg_neg"], "-"
     pal = fs.LINE_PALETTE
-    return MEMBER_COLORS.get(value) or (pal[members.index(value) % len(pal)] if value in members else fs.FAINT), ls
+    return MEMBER_COLORS.get(value) or (pal[members.index(value) % len(pal)] if value in members else fs.FAINT), "-"
 
 
-def _grid(n_rows: int, n_cols: int, height: float = 1.45) -> tuple:
+def _grid(n_rows: int, n_cols: int, height: float = 1.85) -> tuple:
     """``n_rows`` x ``n_cols`` panels on one shared x axis (the time-resolved subgroup pages), at the windows width."""
     fig, grid, _ = _facets(n_rows, n_cols, row_h=height)
     return fig, grid
 
 
+#: The rates a subgroup trace can show and their markers (the same as :data:`RATES`): sensitivity where the member
+#: holds adverse GUIDs, specificity and FPR where it holds healthy ones.
+MEMBER_METRICS = {"sens": "o", "spec": "s", "fpr": "^"}
+
+
 def _member_lines(ax: Any, x: pd.DataFrame, family: str, members: List[str], *, suffix: str = "",
-                  pick: Optional[Callable[[str, str], list]] = None, named: bool = False) -> None:
-    """One line per member in ``x`` (one metric type's bin rows of ``family``): sensitivity (solid) where the member has
-    adverse GUIDs, specificity (dashed) where it has healthy ones, or ``pick(member, linestyle)`` =
-    ``[(metric, linestyle)]``; names carry ``suffix`` (X10). Underpowered points hollow at the count ratio; the first
-    line of a member is labelled with its name when ``named``."""
+                  pick: Optional[Callable[[str], tuple]] = None, metrics: tuple = ("sens", "spec", "fpr"),
+                  named: bool = False) -> None:
+    """One solid line per member and rate in ``x`` (one metric type's bin rows of ``family``): each of ``metrics`` the
+    member has (sensitivity where it has adverse GUIDs, specificity and FPR where it has healthy ones), or
+    ``pick(member)`` of them; the member's colour, the rate's marker (:data:`MEMBER_METRICS`); names carry ``suffix``
+    (X10). Underpowered points hollow at the count ratio; the first line of a member is labelled with its name when
+    ``named``."""
     fs = _seam()
     if x.empty:
         return _empty(ax)
@@ -1910,10 +2015,10 @@ def _member_lines(ax: Any, x: pd.DataFrame, family: str, members: List[str], *, 
             continue
         g = v.loc[mem].sort_index()
         n, t = cnt.loc[mem].reindex(g.index), g.index.to_numpy(np.float64)
-        color, ls = _member_style(family, mem, members)
+        color = _member_style(family, mem, members)[0]
         under = g[f"underpowered{suffix}"].eq(1.0).to_numpy() if f"underpowered{suffix}" in g else np.zeros(len(g), bool)
         label = mem if named else None
-        for met, mls in (pick(mem, ls) if pick else (("sens", ls), ("spec", "--" if ls == "-" else ":"))):
+        for met in (pick(mem) if pick else metrics):
             if f"{met}{suffix}" not in g:
                 continue
             hit, den = (f"tp{suffix}", "n_pos") if met == "sens" else (f"fp{suffix}", "n_neg")
@@ -1922,13 +2027,33 @@ def _member_lines(ax: Any, x: pd.DataFrame, family: str, members: List[str], *, 
                 with np.errstate(invalid="ignore", divide="ignore"):
                     raw = (g[hit].astype(float) / n[den]).to_numpy(np.float64)
                 raw = 1.0 - raw if met == "spec" else raw
-            if _estimate_line(ax, t, g[f"{met}{suffix}"].astype(float), raw, under, color=color, ls=mls,
-                              lw=fs.LINE_EMPHASIS * 1.7, marker="o", ms=fs.MARKER_SMALL - 0.4, label=label):
+            if _estimate_line(ax, t, g[f"{met}{suffix}"].astype(float), raw, under, color=color, ls="-",
+                              lw=fs.LINE_EMPHASIS * 1.7, marker=MEMBER_METRICS[met], ms=fs.MARKER_SMALL, label=label):
                 label = None  # a member without this metric (e.g. healthy-only: no sensitivity) labels its next line
     if not ax.lines:
         return _empty(ax)
     _unit_y(ax)
     fs.style_axes(ax)
+
+
+def _member_key(fig: Any, metrics: tuple = ("sens", "spec", "fpr")) -> None:
+    """The marker entries of a subgroup page's figure key: which rate each marker shape is."""
+    from matplotlib.lines import Line2D
+
+    fs, names = _seam(), {"sens": "sensitivity", "spec": "specificity", "fpr": "FPR"}
+    fs.add_key(fig, [Line2D([], [], color=fs.MUTED, marker=MEMBER_METRICS[m], ms=4.5, mec=fs.EDGE, mew=fs.MARKER_EDGE)
+                     for m in metrics], [names[m] for m in metrics])
+
+
+def _member_legend(ax: Any, handles: List[Any], labels: List[str], title: Optional[str] = None) -> None:
+    """The member legend right of ``ax``: one colour swatch (a line, no marker) per member."""
+    from matplotlib.lines import Line2D
+
+    fs = _seam()
+    if handles:
+        ax.legend([Line2D([], [], color=h.get_color(), lw=2.2) for h in handles], labels, loc="center left",
+                  bbox_to_anchor=(1.02, 0.5), fontsize=fs.FONT_SMALL, title=title, alignment="left",
+                  title_fontproperties={"weight": "semibold", "size": fs.FONT_SMALL})
 
 
 def _s_primary(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1945,10 +2070,11 @@ def _s_rows(T: Dict[str, Any], c: Dict[str, Any], axis: str, split: str, fold: O
 
 
 def _time_page(fig: Any, grid: Any, c: Dict[str, Any], d: pd.DataFrame, axis: str, split: str, fold: Optional[str],
-               head: str, note: str, legend_titles: Optional[List[str]] = None) -> Any:
+               head: str, note: str = "", legend_titles: Optional[List[str]] = None,
+               metrics: tuple = ("sens", "spec", "fpr")) -> Any:
     """Shared x range, basis/onset lines, column titles, axis labels, the title ``head`` (primary model and policy),
-    the one-line ``note`` (line styles, then what a hollow marker means) and, right of each row, the legend of its first
-    panel (``legend_titles`` per row) of a subgroup page."""
+    the marker key (``metrics``), the one-line note (``note``, then what a hollow marker means) and, right of each row,
+    the member legend of its first panel (``legend_titles`` per row) of a subgroup page."""
     fs = _seam()
     pol = _policy(c, c["eval"]["primary_policy"])
     _xlim(grid, d["t"], axis, pol)
@@ -1958,24 +2084,22 @@ def _time_page(fig: Any, grid: Any, c: Dict[str, Any], d: pd.DataFrame, axis: st
     for ax in grid.flat:
         _time_lines(ax, axis, pol)
     _tag(fig, head, split=split, fold=fold)
-    fs.caveat_note(fig, text=f"{note} {UNDER_BIN.format(n=c['eval']['min_subgroup_n'])}.")
+    _member_key(fig, metrics)
+    fs.caveat_note(fig, text=" ".join(filter(None, (note, f"{UNDER_BIN.format(n=c['eval']['min_subgroup_n'])}."))))
     for i, row in enumerate(grid):
-        h, lab = row[0].get_legend_handles_labels()
-        if h:
-            row[-1].legend(h, lab, loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=fs.FONT_SMALL,
-                           title=(legend_titles or [None] * len(grid))[i], title_fontproperties={"weight": "semibold",
-                                                                                                 "size": fs.FONT_SMALL},
-                           alignment="left", handlelength=2.2)
+        _member_legend(row[-1], *row[0].get_legend_handles_labels(), title=(legend_titles or [None] * len(grid))[i])
     return fig
 
 
 def _subgroups_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: str = "test",
-                       fold: Optional[str] = None) -> Any:
-    """S2: rows = subgroup families (the S2 set; val and per fold the class family, the §11.10 core set), columns = the
-    three metric types, one line per member under the primary policy on the bin grid: sensitivity (solid) where it
-    holds adverse GUIDs, specificity (dashed) where it holds healthy ones (§11.6); primary model."""
+                       fold: Optional[str] = None, tertiles: bool = False) -> Any:
+    """S2: rows = subgroup families (the clinical S2 families, or with ``tertiles`` the tertile families; val and per
+    fold the class family, the §11.10 core set), columns = the three metric types, one solid line per member and rate
+    under the primary policy on the bin grid: sensitivity (●) where it holds adverse GUIDs, specificity (■) and FPR
+    (▲) where it holds healthy ones (§11.6); primary model."""
     d = _s_rows(T, c, axis, split, fold, ovr=False)
-    fams = [f for f in (S2_FAMILIES if split == "test" and fold is None else ("class",)) if f in subgroup_families(c)]
+    pool = TERTILE_FAMILIES if tertiles else [f for f in S2_FAMILIES if f not in TERTILE_FAMILIES]
+    fams = [f for f in (pool if split == "test" and fold is None else ("class",)) if f in subgroup_families(c)]
     if d.empty or not fams:
         return _all_empty(1, 3)
     fig, grid = _grid(len(fams), 3)
@@ -1986,15 +2110,15 @@ def _subgroups_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split
             _member_lines(ax, _sel(x, metric_type=mt), fam, members, named=j == 0)
         row[0].set_ylabel(fam.replace("_", " "))
     pm = primary_model(_models(d))
-    return _time_page(fig, grid, c, d, axis, split, fold, f"Subgroups over time · {_who(*pm)} · policy "
-                      f"{c['eval']['primary_policy']}", "Solid: sensitivity, dashed: specificity.")
+    return _time_page(fig, grid, c, d, axis, split, fold, f"{'Tertile subgroups' if tertiles else 'Subgroups'} over "
+                      f"time · {_who(*pm)} · policy {c['eval']['primary_policy']}")
 
 
 def _restricted_pairs(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: str = "test",
                       fold: Optional[str] = None) -> Any:
     """S5: one row per restricted pair (the more severe class first), columns = the three metric types: the alarm rate
-    of each subtype under the primary policy (the positive subtype's sensitivity solid, the other's alarm rate dashed:
-    the FPR for healthy, whose FPR is shared by every pair); the pair's pooled AUROC is the row's legend title."""
+    of each subtype under the primary policy (the positive subtype's sensitivity ●, the healthy FPR ▲, shared by every
+    pair; an adverse second subtype its sensitivity); the pair's pooled AUROC is the row's legend title."""
     pairs = [member_order(p) for p in c["eval"].get("restricted_pairs") or []]
     d = _sel(_s_rows(T, c, axis, split, fold, ovr=False), subgroup="class")
     if d.empty or not pairs:
@@ -2005,43 +2129,47 @@ def _restricted_pairs(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split:
         x = d[d["subgroup_value"].astype(str).isin([a, b])]
         for j, (ax, mt) in enumerate(zip(row, TYPES)):
             _member_lines(ax, _sel(x, metric_type=mt), "class", [a, b], named=j == 0,
-                          pick=lambda mem, _: [("fpr" if mem == "healthy" else "sens", "-" if mem == a else "--")])
+                          pick=lambda mem: ("fpr",) if mem == "healthy" else ("sens",))
         r = _sel(auc, subgroup_value=f"{a}_vs_{b}")
         titles.append(f"AUROC {_cell(float(r['value'].iloc[0]))}" if len(r) else "")
         row[0].set_ylabel(f"{a} vs {b}\nalarm rate")
     pm = primary_model(_models(d))
     return _time_page(fig, grid, c, d, axis, split, fold, f"Restricted pairs · {_who(*pm)} · policy "
-                      f"{c['eval']['primary_policy']}", "Solid: severe-subtype sensitivity, dashed: other alarm rate.",
-                      titles)
+                      f"{c['eval']['primary_policy']}", legend_titles=titles, metrics=("sens", "fpr"))
 
 
 def _subgroup_family_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, family: str, axis: str = "to_delivery",
                              split: str = "test", fold: Optional[str] = None) -> Any:
-    """S8: one clinical family on its own wide page (the previous pipeline's per-family subgroup plots): one row per
-    metric type (instantaneous, committed cumulative, committed overall), full width on hours before delivery, one line
-    per member under the primary policy, sensitivity (solid) where the member holds adverse GUIDs and specificity
-    (dashed) where it holds healthy ones; primary model. The S2 rows of ``family``, drawn at the windows width so a
-    12-hour window of half-hour bins stays readable."""
+    """S8: one clinical family on its own page (the previous pipeline's per-family subgroup plots): rows = the three
+    metric types (instantaneous, committed cumulative, committed overall), columns = sensitivity, specificity and FPR,
+    one solid line per member under the primary policy on hours before delivery (sensitivity where the member holds
+    adverse GUIDs, specificity and FPR where it holds healthy ones); primary model. The S2 rows of ``family``."""
+    from matplotlib.lines import Line2D
+
     fs = _seam()
     d = _sel(_s_rows(T, c, axis, split, fold, ovr=False), subgroup=family)
     if d.empty:
-        return _all_empty(len(TYPES), 1)
-    fig, grid, _ = _facets(len(TYPES), 1, row_h=1.8, width=fs.WINDOWS_FIGURE_WIDTH)
+        return _all_empty(len(TYPES), 3)
+    fig, grid, _ = _facets(len(TYPES), 3, row_h=1.95, width=fs.WINDOWS_FIGURE_WIDTH)
     members = member_order(d["subgroup_value"].astype(str).unique())
-    for i, (ax, mt) in enumerate(zip(grid[:, 0], TYPES)):
-        _member_lines(ax, _sel(d, metric_type=mt), family, members, named=i == 0)
-        ax.set_ylabel(TYPE_LABEL[mt])
+    for i, mt in enumerate(TYPES):
+        for j, met in enumerate(MEMBER_METRICS):
+            _member_lines(grid[i, j], _sel(d, metric_type=mt), family, members, metrics=(met,))
+        grid[i, 0].set_ylabel("rate")
+        _row_label(grid[i, -1], TYPE_LABEL[mt].replace("\n", " "))
+    for ax, name in zip(grid[0], ("Sensitivity", "Specificity", "FPR")):
+        ax.set_title(name)
     pol = _policy(c, c["eval"]["primary_policy"])
     _xlim(grid, d["t"], axis, pol)
-    _x_time(grid[-1, 0], axis)
+    for ax in grid[-1]:
+        _x_time(ax, axis)
     for ax in grid.flat:
         _time_lines(ax, axis, pol)
+        _key(ax)  # the basis / onset lines
+    fs.add_key(fig, [Line2D([], [], color=_member_style(family, m, members)[0], lw=2.2) for m in members], members)
     pm = primary_model(_models(d))
     _tag(fig, f"{family.replace('_', ' ')} · {_who(*pm)} · policy {c['eval']['primary_policy']}", split=split, fold=fold)
-    fs.caveat_note(fig, text=f"Solid: sensitivity, dashed: specificity. {UNDER_BIN.format(n=c['eval']['min_subgroup_n'])}.")
-    h, lab = grid[0, 0].get_legend_handles_labels()
-    if h:
-        grid[0, 0].legend(h, lab, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=fs.FONT_SMALL, handlelength=2.2)
+    fs.caveat_note(fig, text=f"{UNDER_BIN.format(n=c['eval']['min_subgroup_n'])}.")
     return fig
 
 
@@ -2071,7 +2199,7 @@ def _s_forest(T: Dict[str, Any], c: Dict[str, Any], d: pd.DataFrame, cols: list,
         pos[(f, m)] = y
         spans[-1][2] = y + 0.5
     fig, axes = plt.subplots(1, len(cols), sharey=True, squeeze=False, layout="constrained",
-                             figsize=(2.1 * len(cols) + 2.4, max(2.6, 0.17 * y + 1.2)))
+                             figsize=(2.1 * len(cols) + 2.4, max(2.6, 0.115 * y + 1.2)))
     for ax, (met, pid, name) in zip(axes[0], cols):
         for k, (_, lo, hi) in enumerate(spans):
             if k % 2 == 0:
@@ -2082,7 +2210,7 @@ def _s_forest(T: Dict[str, Any], c: Dict[str, Any], d: pd.DataFrame, cols: list,
                      hollow=np.asarray(hollow(g), bool))
         x = np.where(g["hollow"], g["value_raw"].astype(float), g["value"].astype(float))
         ax.hlines(g["y"], g["ci_lo"].astype(float), g["ci_hi"].astype(float), colors=g["color"], lw=fs.LINE_REGULAR * 1.3)
-        ax.scatter(x, g["y"], s=22, edgecolors=np.where(g["hollow"], g["color"], "white"),
+        ax.scatter(x, g["y"], s=18, edgecolors=np.where(g["hollow"], g["color"], fs.EDGE),
                    facecolors=np.where(g["hollow"], "white", g["color"]), linewidths=0.9, zorder=3)
         if met in ref:
             ax.axvline(ref[met], ls=(0, (2, 2)), color=fs.MUTED, lw=fs.LINE_HAIRLINE)
@@ -2104,27 +2232,34 @@ def _s_forest(T: Dict[str, Any], c: Dict[str, Any], d: pd.DataFrame, cols: list,
 
 
 def _subgroup_forest(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
-    """S3 (with K3's slope): per member, AUROC and pAUC (mixed members), sensitivity and specificity at the primary
+    """S3 (with K3's slope): per member, AUROC and pAUC (mixed members), sensitivity, specificity and FPR at the primary
     policy (as the population reports), the calibration slope; pooled test, 95% CIs (ranking: patient-cluster bootstrap;
     rates: Wilson); hollow = underpowered."""
     ev = c["eval"]
     pid, a = ev["primary_policy"], primary_alpha(ev)
     d = _sel(T["subgroups"], analysis="S1", split="test", fold="pooled", level="guid")
     cols = [("auroc", None, "AUROC"), (f"pauc@{a:g}", None, f"pAUC@{a:g}"), ("sens", pid, f"Sensitivity ({pid})"),
-            ("spec", pid, f"Specificity ({pid})"), ("calib_slope", None, "Calibration slope")]
+            ("spec", pid, f"Specificity ({pid})"), ("fpr", pid, f"FPR ({pid})"),
+            ("calib_slope", None, "Calibration slope")]
     return _s_forest(T, c, d, cols, ref={"auroc": 0.5, f"pauc@{a:g}": 0.5, "calib_slope": 1.0},
-                     note=f"{UNDER_BIN.format(n=ev['min_subgroup_n']).replace(' in the bin', '')}.",
+                     note=f"Hollow markers: fewer than {ev['min_subgroup_n']} GUIDs of a class.",
                      hollow=lambda g: g["underpowered"].fillna(False).astype(bool))
 
 
 def _subgroup_delta(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
     """S4: per member, the difference to its complement (every other pooled test GUID) of AUROC and of sensitivity /
-    specificity at the primary policy, paired patient-cluster bootstrap 95% CIs; filled = Holm-adjusted p < 0.05 within
-    the family."""
+    specificity / FPR at the primary policy, paired patient-cluster bootstrap 95% CIs; filled = Holm-adjusted p < 0.05
+    within the family. ΔFPR is not a table row: FPR = 1 - specificity on the same GUIDs, so it is -Δspecificity with the
+    interval mirrored and the same p."""
     pid = c["eval"]["primary_policy"]
     d = _sel(T["subgroups"], analysis="S4", split="test", fold="pooled")
+    spec = d[d["metric"].astype(str) == "delta_spec"] if len(d) else d
+    if len(spec):
+        d = pd.concat([d, spec.assign(metric="delta_fpr", value=-spec["value"].astype(float),
+                                      value_raw=-spec["value_raw"].astype(float), ci_lo=-spec["ci_hi"].astype(float),
+                                      ci_hi=-spec["ci_lo"].astype(float))], ignore_index=True)
     cols = [("delta_auroc", None, "ΔAUROC vs complement"), ("delta_sens", pid, f"Δsensitivity ({pid})"),
-            ("delta_spec", pid, f"Δspecificity ({pid})")]
+            ("delta_spec", pid, f"Δspecificity ({pid})"), ("delta_fpr", pid, f"ΔFPR ({pid})")]
     return _s_forest(T, c, d, cols, ref={m: 0.0 for m, _, _ in cols},
                      note=f"Filled: Holm p < 0.05. Hollow: not significant or n < {c['eval']['min_subgroup_n']} per class.",
                      hollow=lambda g: ~(g["p_holm"].astype(float) < 0.05).to_numpy())
@@ -2172,7 +2307,7 @@ def _covariate_strata(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
             fs.style_axes(ax, grid="y")
             _key(ax)
     _tag(fig, "Covariate strata")
-    fs.caveat_note(fig, text=f"{UNDER_BIN.format(n=c['eval']['min_subgroup_n']).replace(' in the bin', '')}.")
+    fs.caveat_note(fig, text=f"Hollow markers: fewer than {c['eval']['min_subgroup_n']} GUIDs of a class.")
     return fig
 
 
@@ -2225,7 +2360,7 @@ def _calibration_subgroups(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> An
             g = x[x["subgroup_value"] == mem].sort_values("t")
             color = _member_style(fam, mem, members)[0]
             err = np.clip([g["value"] - g["ci_lo"], g["ci_hi"] - g["value"]], 0, None).astype(float)
-            ax.errorbar(g["t"], g["value"], yerr=err, color=color, marker="o", ms=4, mec="white", mew=0.5,
+            ax.errorbar(g["t"], g["value"], yerr=err, color=color, marker="o", ms=4, mec=figstyle.EDGE, mew=0.5,
                         elinewidth=fs.LINE_THIN, lw=fs.LINE_EMPHASIS * 1.6, label=mem)
         if not ax.lines:
             _empty(ax)
@@ -2261,7 +2396,7 @@ def _per_class_subgroups(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, spl
         row[0].set_ylabel(f"OvR {CLASSES[k]}\n{fam.replace('_', ' ')}")
     pm = primary_model(_models(d))
     return _time_page(fig, grid, c, d, axis, split, fold, f"Per-class subgroups · {_who(*pm)} · policy "
-                      f"{c['eval']['primary_policy']}", "Solid: sensitivity, dashed: specificity.")
+                      f"{c['eval']['primary_policy']}")
 
 
 def _s_cell(r: pd.DataFrame) -> str:
@@ -2341,6 +2476,8 @@ def _s_highlights_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 AXIS_BUILDERS[SUBGROUPS_VS_TIME] = _subgroups_vs_time
 EXPECTED_WHEN[SUBGROUPS_VS_TIME] = lambda c: bool(set(S2_FAMILIES) & set(subgroup_families(c)))
 CORE_EXTRA.append(SUBGROUPS_VS_TIME)  # val/ and fold_<k>/ draw the class family only (§11.10 core set)
+AXIS_BUILDERS[SUBGROUPS_TERTILES_VS_TIME] = partial(_subgroups_vs_time, tertiles=True)  # S2, the tertile families
+EXPECTED_WHEN[SUBGROUPS_TERTILES_VS_TIME] = lambda c: bool(set(TERTILE_FAMILIES) & set(subgroup_families(c)))
 _BUILDERS[SUBGROUP_FOREST] = _subgroup_forest
 _BUILDERS[SUBGROUP_DELTA] = _subgroup_delta
 EXPECTED_WHEN[SUBGROUP_FOREST] = EXPECTED_WHEN[SUBGROUP_DELTA] = lambda c: bool(subgroup_families(c))
@@ -2421,7 +2558,7 @@ def _rel_plot(ax: Any, r: pd.DataFrame, color: str, label: Optional[str] = None,
         ax.plot(r["pred"], r["obs"], color=color, lw=fs.LINE_THIN, alpha=0.3)
         return
     err = np.clip([r["obs"] - r["lo"], r["hi"] - r["obs"]], 0, None)
-    ax.errorbar(r["pred"], r["obs"], yerr=err, color=color, marker="o", ms=4.2, mec="white", mew=0.5,
+    ax.errorbar(r["pred"], r["obs"], yerr=err, color=color, marker="o", ms=4.2, mec=figstyle.EDGE, mew=0.5,
                 elinewidth=fs.LINE_THIN, lw=fs.LINE_EMPHASIS * 2, label=label, zorder=3)
 
 
@@ -2477,7 +2614,7 @@ def _calibration_guid(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "tes
         if not np.allclose(p, p0):
             r0 = _reliability(y, p0)
             # filled: hollow markers mean an underpowered bin in every time-resolved figure
-            ax.plot(r0["pred"], r0["obs"], "o--", ms=3.5, color=fs.ORANGE, mec="white", mew=0.4, lw=fs.LINE_REGULAR,
+            ax.plot(r0["pred"], r0["obs"], "o-", ms=3.5, color=fs.ORANGE, mec=figstyle.EDGE, mew=0.4, lw=fs.LINE_REGULAR,
                     label="uncalibrated")
         _rel_frame(ax, _who(m, sd), "observed fraction adverse" if i % cols == 0 else None, key)
         ax.set_aspect("auto")
@@ -2528,9 +2665,9 @@ def _calibration_per_class(T: Dict[str, Any], c: Dict[str, Any], *, split: str =
 
 
 def _unit_calibration(T: Dict[str, Any], m: str, sd: str, fold: Any) -> Dict[str, Any]:
-    """The val ``calibration.json`` of the neural unit behind ``m`` in ``fold`` (a ``<kind>_covoff`` pass shares its
-    unit's), with ``temperature`` (1/a for Platt); {} for a baseline."""
-    kind = m.removesuffix("_covoff")
+    """The val ``calibration.json`` of the neural unit behind ``m`` in ``fold`` (a ``<kind>_covoff`` or
+    ``<kind>_stage`` pass shares its unit's), with ``temperature`` (1/a for Platt); {} for a baseline."""
+    kind = m.removesuffix("_covoff").removesuffix("_stage")
     rec = T["calibration"].get(f"fold_{fold}/seed_{sd}" + ("" if kind == "model" else f"/{kind}")) or {}
     return rec | ({"temperature": 1.0 / rec["a"]} if "temperature" not in rec and rec.get("a") else {})
 
@@ -2558,7 +2695,7 @@ def _calibration_folds(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "te
                 v = v[v["subgroup"].isna() == cal].drop_duplicates("fold")
                 if len(v):
                     ax.plot(v["value"].astype(float), v["fold"].map(ys), "o", ms=5, mfc=face,
-                            mec="white" if cal else fs.BLUE, mew=0.6 if cal else 1.0, ls="none",
+                            mec=fs.EDGE if cal else fs.BLUE, mew=fs.MARKER_EDGE if cal else 1.0, ls="none",
                             label="calibrated" if cal else "uncalibrated", zorder=3)
             ax.axvline(ref, ls=(0, (2, 2)), color=fs.MUTED, lw=fs.LINE_HAIRLINE)
             if _sel(x, metric=met)["value"].astype(float).abs().max() > 10:
@@ -2574,7 +2711,7 @@ def _calibration_folds(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "te
             _empty(row[2])
             row[2].set(xticks=[], yticks=[])
             continue
-        row[2].plot([t for _, t in temps], [ys[f] for f, _ in temps], "o", ms=5, color=fs.BLUE, mec="white", mew=0.6)
+        row[2].plot([t for _, t in temps], [ys[f] for f, _ in temps], "o", ms=5, color=fs.BLUE, mec=figstyle.EDGE, mew=0.6)
         row[2].axvline(1.0, ls=(0, (2, 2)), color=fs.MUTED, lw=fs.LINE_HAIRLINE)
         row[2].set_xscale("log")
         row[2].set_yticks(list(ys.values()), [""] * len(ys))
@@ -2629,7 +2766,7 @@ def _prevalence_shift(T: Dict[str, Any], c: Dict[str, Any], *, fold: Optional[st
                 with np.errstate(invalid="ignore", divide="ignore"):
                     ax.plot(xs, adjust_ppv_npv(sens, spec, xs)[j], color=color, lw=fs.LINE_REGULAR * 1.2, label=pid)
                     pt = v.at["sens", "n_pos"] / (v.at["sens", "n_pos"] + v.at["sens", "n_neg"])
-                    ax.plot(pt, v.at[what, "value"], "o", ms=5, color=color, mec="white", mew=0.6, zorder=3)
+                    ax.plot(pt, v.at[what, "value"], "o", ms=5, color=color, mec=figstyle.EDGE, mew=0.6, zorder=3)
                     if pi_val is not None and np.isfinite(pi_val):
                         ax.plot(pi_val, adjust_ppv_npv(sens, spec, pi_val)[j], "o", ms=5, mfc="white", mec=color,
                                 zorder=3)
@@ -2678,7 +2815,7 @@ def _decision_curve(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test"
             continue
         ax.fill_between(p["pt"], p["nb_lo"].astype(float), p["nb_hi"].astype(float), color=fs.BLUE, alpha=0.16, lw=0)
         ax.plot(p["pt"], p["net_benefit"], color=fs.BLUE, lw=fs.LINE_EMPHASIS * 2, label="model", zorder=3)
-        ax.plot(p["pt"], p["treat_all"], ls="--", color=fs.ORANGE, lw=fs.LINE_REGULAR, label="treat all")
+        ax.plot(p["pt"], p["treat_all"], color=fs.ORANGE, lw=fs.LINE_REGULAR, label="treat all")
         ax.axhline(0.0, color=fs.INK, lw=fs.LINE_HAIRLINE, label="treat none")
         top = float(np.nanmax([p["net_benefit"].max(), p["treat_all"].max(), 0.01]))
         ax.set(xlim=(p["pt"].min(), p["pt"].max()), ylim=(-0.25 * top, 1.15 * top), xlabel="threshold probability $p_t$",
@@ -2706,7 +2843,7 @@ def _brier_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
     colors = fs.group_colors(CLASSES)
     lines = [("brier", fs.BLUE, "o", "adverse probability", "-"),
              *((f"brier_c{k}", colors[n], "s", f"P({n})", "-") for k, n in enumerate(CLASSES)),
-             ("brier_macro", fs.INK, "D", "macro", "--")]
+             ("brier_macro", fs.INK, "D", "macro", "-")]
     for a, (m, sd) in zip(axes, models):
         x = _sel(d, model_id=m, seed=sd)
         three = bool(len(_sel(x, metric="brier_c0")))  # 1 - P(healthy) is the adverse probability: one line, not two
@@ -2728,7 +2865,8 @@ def _brier_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
         _time_lines(s, axis)
         _x_time(s, axis)
     _tag(fig, "Brier score over time", split=split, fold=fold)
-    fs.caveat_note(fig, text=f"Gaps: fewer than {c['eval']['min_bin_class_n']} GUIDs of a class in the bin. "
+    fs.caveat_note(fig, text=f"Hollow, black ring: no estimate (fewer than {c['eval']['min_bin_class_n']} GUIDs of a class in the bin; "
+                             "the line is joined over it). "
                              f"n strip: {_who(*sm)}.")
     return fig
 
@@ -2742,7 +2880,7 @@ def _forest(ax: Any, v: pd.DataFrame, ys: Dict[str, float], color: str, marker: 
         return
     x = v["value"].astype(float).to_numpy()
     err = np.clip([x - v["ci_lo"].astype(float).to_numpy(), v["ci_hi"].astype(float).to_numpy() - x], 0, None)
-    ax.errorbar(x, v["fold"].map(ys).to_numpy(float) + dy, xerr=err, fmt=marker, ms=4.5, color=color, mec="white",
+    ax.errorbar(x, v["fold"].map(ys).to_numpy(float) + dy, xerr=err, fmt=marker, ms=4.5, color=color, mec=figstyle.EDGE,
                 mew=0.5, elinewidth=fs.LINE_REGULAR, label=label, zorder=3)
 
 
@@ -2828,13 +2966,13 @@ def _seed_spread(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", *
             if len(p):
                 val, lo, hi = (float(p[k].iloc[0]) for k in ("value", "ci_lo", "ci_hi"))
                 ax.errorbar(i, val, yerr=np.clip([[val - lo], [hi - val]], 0, None), fmt="o", ms=6, color=color,
-                            mec="white", mew=0.7, elinewidth=fs.LINE_REGULAR * 1.3, zorder=3)
+                            mec=figstyle.EDGE, mew=0.7, elinewidth=fs.LINE_REGULAR * 1.3, zorder=3)
         ax.set_xticks(range(len(seeds)), seeds, fontsize=fs.FONT_SMALL)
         ax.set(xlabel="seed", ylabel="AUROC", title=m, xlim=(-0.6, len(seeds) - 0.4))
         fs.style_axes(ax, grid="y")
     fs.add_key(fig, [Line2D([], [], marker="o", ms=3, ls="none", color=fs.BLUE, alpha=0.5),
-                     Line2D([], [], marker="o", ms=6, ls="-", color=fs.BLUE, mec="white"),
-                     Line2D([], [], marker="o", ms=6, ls="-", color=fs.ROSE, mec="white")],
+                     Line2D([], [], marker="o", ms=6, ls="-", color=fs.BLUE, mec=figstyle.EDGE),
+                     Line2D([], [], marker="o", ms=6, ls="-", color=fs.ROSE, mec=figstyle.EDGE)],
                ["fold", "pooled, 95% CI", "seed ensemble"])
     _tag(fig, "Seed spread", split=split)
     return fig
@@ -2857,15 +2995,15 @@ def _roc_stage(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", fol
         stats = []
         for i, (m, sd) in enumerate(models):
             color, aucs = palette[i % len(palette)], []
-            for stage, ls in (("first", "-"), ("second", "--")):
+            for stage, shade in (("first", color), ("second", fs.tint(color, 0.5))):
                 g = _sel(r, model_id=m, seed=sd, variant=f"snapshot_{stage}@{at}")
                 if fold is None:
                     for _, h in g[g["fold"] != "pooled"].groupby("fold"):
-                        ax.plot(h["fpr"], h["tpr"], color=color, lw=fs.LINE_THIN * 0.8, alpha=0.2, ls=ls)
+                        ax.plot(h["fpr"], h["tpr"], color=shade, lw=fs.LINE_THIN * 0.8, alpha=0.2)
                 p = g[g["fold"] == one]
                 aucs.append(np.trapezoid(p["tpr"].to_numpy(float), p["fpr"].to_numpy(float)) if len(p) else np.nan)
                 if len(p):
-                    ax.plot(p["fpr"], p["tpr"], color=color, lw=fs.LINE_EMPHASIS * 1.8, ls=ls,
+                    ax.plot(p["fpr"], p["tpr"], color=shade, lw=fs.LINE_EMPHASIS * 1.8,
                             label=_who(m, sd) if stage == "first" else None, zorder=3)
             if np.isfinite(aucs).any():
                 stats.append((color, " | ".join("–" if a != a else f"{a:.2f}" for a in aucs)))
@@ -2879,8 +3017,8 @@ def _roc_stage(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", fol
         _stat_list(ax, stats)
         ax.set(xlabel="FPR", ylabel="sensitivity")
         fs.style_axes(ax)
-    fs.add_key(fig, [Line2D([], [], color=fs.MUTED, ls="-"), Line2D([], [], color=fs.MUTED, ls="--")],
-               ["first stage", "second stage"])
+    fs.add_key(fig, [Line2D([], [], color=fs.MUTED, lw=2), Line2D([], [], color=fs.tint(fs.MUTED, 0.5), lw=2)],
+               ["first stage (full colour)", "second stage (light shade)"])
     _tag(fig, "Stage-specific snapshot ROC", split=split, fold=fold)
     fs.caveat_note(fig, text="Numbers: AUC first | second stage of each model, in its colour.")
     return fig
@@ -3221,7 +3359,7 @@ def _class_strip(ax: Any, wc: Optional[Tuple[pd.DataFrame, np.ndarray]], c: Dict
     t, n = idx["t"].to_numpy(np.float64)[sel], wc[1].sum(2)[sel]
     o, colors = np.argsort(t), fs.group_colors(CLASSES)
     for k, name in enumerate(CLASSES):
-        ax.plot(t[o], n[o, k], marker="o", ms=2.5, lw=fs.LINE_REGULAR, color=colors[name], mec="white", mew=0.3,
+        ax.plot(t[o], n[o, k], marker="o", ms=2.5, lw=fs.LINE_REGULAR, color=colors[name], mec=figstyle.EDGE, mew=0.3,
                 label=f"{name} (n)")
     ax.axhline(c["eval"]["min_bin_class_n"], ls=":", color=fs.MUTED, lw=fs.LINE_HAIRLINE)
     top = float(np.nanmax(n, initial=1.0))
@@ -3413,7 +3551,7 @@ def _per_class_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split
             for k, name in enumerate(CLASSES):
                 r = _rates(_sel(_ovr_rows(x, k, OVR_RATES), metric_type=mt), pid)
                 _series(ax, r["sens"], c, color=colors[name], marker="o", label=None, fold=fold)
-                _series(ax, r["fpr"], c, color=colors[name], marker="^", label=None, fold=fold, ls="--")
+                _series(ax, r["fpr"], c, color=colors[name], marker="^", label=None, fold=fold)
         rows[0].set(ylabel="rate")
         for ax in rows[:4]:
             if not ax.lines:
@@ -3426,8 +3564,8 @@ def _per_class_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split
             fs.style_axes(ax)
         _row_label(rows[3], _who(m, sd))
     fs.add_key(fig, [*(Line2D([], [], color=colors[n], lw=2) for n in CLASSES),
-                     Line2D([], [], color=fs.MUTED, marker="o", ms=4, ls="-"),
-                     Line2D([], [], color=fs.MUTED, marker="^", ms=4, ls="--")],
+                     Line2D([], [], color=fs.MUTED, marker="o", ms=4.5, mec=fs.EDGE, mew=fs.MARKER_EDGE),
+                     Line2D([], [], color=fs.MUTED, marker="^", ms=4.5, mec=fs.EDGE, mew=fs.MARKER_EDGE)],
                [*CLASSES, "recall / sensitivity", "FPR"])
     for ax, title in zip(grid[0], ("Argmax recall", *(f"OvR · {TYPE_LABEL[mt].replace(chr(10), ' ').lower()}"
                                                       for mt in TYPES))):
@@ -3475,7 +3613,8 @@ def _per_class_auroc_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str,
         _time_lines(s, axis)
         _x_time(s, axis)
     _tag(fig, "Per-class AUROC over time", split=split, fold=fold)
-    fs.caveat_note(fig, text=f"Gaps: fewer than {c['eval']['min_bin_class_n']} GUIDs of a class in the bin. "
+    fs.caveat_note(fig, text=f"Hollow, black ring: no estimate (fewer than {c['eval']['min_bin_class_n']} GUIDs of a class in the bin; "
+                             "the line is joined over it). "
                              f"n strip: {_who(*sm)}.")
     return fig
 
@@ -3550,7 +3689,7 @@ def _collapse_vs_binary(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "t
         ax.plot([0, 1], [0, 1], ls=(0, (2, 2)), color=fs.FAINT, lw=fs.LINE_HAIRLINE)
         for name in _order(u["clinical_class"].unique(), "clinical_class"):
             s = (u["clinical_class"] == name).to_numpy(bool)
-            ax.plot(xs[s], ys[s], "o", ms=4, alpha=0.75, color=colors.get(name, fs.FAINT), mec="white", mew=0.4,
+            ax.plot(xs[s], ys[s], "o", ms=4, alpha=0.75, color=colors.get(name, fs.FAINT), mec=figstyle.EDGE, mew=0.4,
                     label=name)
         v = _sel(met, model_id=m, seed=sd).drop_duplicates("metric").set_index("metric") if len(met) else met
         _stat(ax, "\n".join(f"{k} {_value(v, f'collapse/{n}')}" for k, n in (
@@ -3937,7 +4076,7 @@ def _trajectory_page(g: pd.DataFrame, feats: Optional[Tuple[np.ndarray, np.ndarr
 
     ax = axes[0][0]
     s, r = o["s"].to_numpy(np.float64), o["r"].to_numpy(np.float64)
-    ax.plot(x_end, s, marker="o", ms=fs.MARKER_SMALL, lw=fs.LINE_REGULAR, color=fs.BLUE, mec="white", mew=0.4,
+    ax.plot(x_end, s, marker="o", ms=fs.MARKER_SMALL, lw=fs.LINE_REGULAR, color=fs.BLUE, mec=figstyle.EDGE, mew=0.4,
             label="online score")
     ax.plot(x_end, r, drawstyle="steps-post", lw=fs.LINE_EMPHASIS * 2, color=fs.INK, label="running max")
     for p, thr in thresholds.items():
@@ -3955,7 +4094,7 @@ def _trajectory_page(g: pd.DataFrame, feats: Optional[Tuple[np.ndarray, np.ndarr
     if np.isfinite(seg).any():
         e = o["epoch_s"].to_numpy(np.float64)
         ax.hlines(seg, -(e + geometry[1]) / 3600.0, x_end, color=fs.TEAL, lw=fs.LINE_EMPHASIS * 2.4, alpha=0.8)
-        ax.plot(x_end, seg, "o", ms=fs.MARKER_SMALL, color=fs.TEAL, mec="white", mew=0.4)
+        ax.plot(x_end, seg, "o", ms=fs.MARKER_SMALL, color=fs.TEAL, mec=figstyle.EDGE, mew=0.4)
         symlog_axis(ax, seg)
         ax.set(title="Segment score", ylabel="logit (symlog)")
     else:
@@ -3964,7 +4103,7 @@ def _trajectory_page(g: pd.DataFrame, feats: Optional[Tuple[np.ndarray, np.ndarr
     if attn:
         ax = axes[2][0]
         for a, marker, color in zip(attn, "os^", fs.LINE_PALETTE):
-            ax.plot(x_end, o[a].to_numpy(np.float64), marker, ms=fs.MARKER_SMALL + 0.6, color=color, mec="white",
+            ax.plot(x_end, o[a].to_numpy(np.float64), marker, ms=fs.MARKER_SMALL + 0.6, color=color, mec=figstyle.EDGE,
                     mew=0.4, label=a)
         ax.set(ylim=(-0.04, 1.04), title="Pooling attention", ylabel="0-1")
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=fs.FONT_SMALL)
@@ -4234,7 +4373,7 @@ def _compare_metric_types(R: List[Dict[str, Any]], c: Dict[str, Any], *, axis: s
     for ax, mt in zip(rows, TYPES):
         for i, (r, x) in enumerate(zip(R, d)):
             rates = _rates(_sel(x, metric_type=mt), pid)
-            for met, marker, ls, what in (("sens", "o", "-", "sens"), ("fpr", "^", "--", "FPR")):
+            for met, marker, ls, what in (("sens", "o", "-", "sens"), ("fpr", "^", "-", "FPR")):
                 _series(ax, rates[met], c, color=pal[i % len(pal)], marker=marker, ls=ls, label=None)
         if ax.lines:
             if pol.get("alpha"):
@@ -4248,7 +4387,8 @@ def _compare_metric_types(R: List[Dict[str, Any]], c: Dict[str, Any], *, axis: s
         ax.set_title(TYPE_LABEL[mt].replace(chr(10), " "))
     rows[0].set_ylabel("rate")
     fs.add_key(fig, [Line2D([], [], color=pal[i % len(pal)], lw=2) for i in range(len(R))]
-               + [Line2D([], [], color=fs.MUTED, marker="o", ls="-"), Line2D([], [], color=fs.MUTED, marker="^", ls="--")],
+               + [Line2D([], [], color=fs.MUTED, marker="o", mec=fs.EDGE, mew=fs.MARKER_EDGE),
+                  Line2D([], [], color=fs.MUTED, marker="^", mec=fs.EDGE, mew=fs.MARKER_EDGE)],
                [*(r["name"] for r in R), "sensitivity", "FPR"])
     _key(rows[0])
     _n_strip(strips[0], _sel(d[0], metric_type="instantaneous", metric="underpowered"), c)
@@ -4279,7 +4419,7 @@ def _compare_forest(Q: pd.DataFrame, c: Dict[str, Any], names: List[str], *, pid
         y += 1.0 + (0.6 if i and cells[i - 1][0] != cell[0] else 0.0)
         pos[cell] = y
     pal, k = fs.LINE_PALETTE, max(len(names) - 1, 1)
-    fig, axes = _figure(1, len(cols), max(2.6, 0.17 * y + 1.0), width=2.3 * len(cols) + 2.4)
+    fig, axes = _figure(1, len(cols), max(2.6, 0.12 * y + 1.0), width=2.3 * len(cols) + 2.4)
     for ax, (met, p, title) in zip(axes[0], cols):
         g, drawn = q[(q["metric"] == met) & ((q["policy_id"] == p) if p else q["policy_id"].isna())], False
         for j, run in enumerate(names[1:], start=1):
@@ -4290,7 +4430,7 @@ def _compare_forest(Q: pd.DataFrame, c: Dict[str, Any], names: List[str], *, pid
             ys = np.array([pos[(f, m)] + dy for f, m in zip(h["subgroup"], h["subgroup_value"])])
             color, filled = pal[j % len(pal)], (h["p_holm"].astype(float) < 0.05).to_numpy()
             ax.hlines(ys, h["ci_lo"].astype(float), h["ci_hi"].astype(float), colors=color, lw=fs.LINE_REGULAR * 1.3)
-            ax.scatter(x, ys, s=22, edgecolors=np.where(filled, "white", color),
+            ax.scatter(x, ys, s=18, edgecolors=np.where(filled, fs.EDGE, color),
                        facecolors=np.where(filled, color, "white"), linewidths=0.9, zorder=3,
                        label=f"{run} − {names[0]}")
             drawn |= bool(np.isfinite(x).any())

@@ -1,0 +1,12 @@
+# Adaptation (SPEC §10.1 lpft, Kumar 2022; §17 item 7): the head alone for lpft_head_epochs, then the VAE's top
+# target-encoder attention block joins at backbone_lr with early stopping reset. Folds 1-3 and one seed first, as
+# adapt_partial_top_block.yaml.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lpft_top, seeds: [42], folds: [1, 2, 3]}
+  train:
+    regime: lpft
+    unfreeze: [target_encoder.attention_blocks.last]
+    backbone_lr: 1.0e-5
+    lpft_head_epochs: 15

@@ -82,6 +82,7 @@ classifier:
     time_pool: 1
     cache_root: runs/classifier_cache
     cache_dtype: float16
+    drop_floor_channels: false      # §8.5: drop channels whose train std sits under the scale floor (near-constant)
 
   model:
     scope: sequence                 # segment | sequence
@@ -102,7 +103,7 @@ classifier:
     lpft_head_epochs: 30
     loss: {name: bce, weighting: none, beta_en: 0.999, focal_gamma: 2.0, focal_alpha: null,
            logit_adjust_tau: 1.0, label_smoothing: 0.0}
-    loss_weights: {final: 1.0, positions: 0.5, bag: 0.0, segment: 0.3}
+    loss_weights: {final: 1.0, positions: 0.5, bag: 0.0, segment: 0.3, bag_head: segment}  # bag_head: segment | position
     sampler: natural                # natural | class_balanced
     batch_guids: 16
     batch_segments: 256
@@ -150,8 +151,8 @@ classifier:
     time_axes: [to_delivery, from_onset, rel_second_stage, position, elapsed]
     bin_h: 0.5
     min_bin_class_n: 5
-    subgroup_families: [class, source_file, class_x_cs, healthy_x_bg, healthy_bg_x_cs, cs, bg, stage_last,
-                        reached_second_stage, has_tlo, admission_tlo_tertile, labour_duration_tertile,
+    subgroup_families: [class, source_file, class_x_cs, healthy_x_bg, healthy_bg_x_cs, cs, bg, healthy_comparator,
+                        stage_last, reached_second_stage, has_tlo, admission_tlo_tertile, labour_duration_tertile,
                         n_segments_tertile, span_tertile, valid_frac_tertile, late_coverage, shared_test, fold]
     restricted_pairs: [[healthy, acidosis], [healthy, hie], [acidosis, hie]]
     min_subgroup_n: 10
@@ -163,6 +164,7 @@ classifier:
     error_analysis: {top_k: 10}
     attribution: {enabled: false, n_steps: 32}
     covariates_off: false
+    stage_offsets: false            # §11.3: adds the `<kind>_stage` view (per-stage offsets fitted on val negatives)
     bootstrap: {resamples: 2000, refit_threshold: false, seed: 0}
     reference_prevalence: null
     trajectory_pages: {per_class: 3, top_errors: 3}

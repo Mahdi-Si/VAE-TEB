@@ -1,0 +1,7 @@
+# Baseline + 16-s steps: masked mean over 4 steps (§8.4 time_pool). Four times fewer steps for the pooling attention
+# and a four times smaller cache; a new cache fingerprint, so one re-extraction.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_pool4}
+  source: {time_pool: 4}

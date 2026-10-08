@@ -1,0 +1,7 @@
+# Source ablation: every default key, but the channels whose train std sits under the scale floor are dropped per
+# fold (SPEC §8.5 source.drop_floor_channels; the probe's scaler drops them too). Same cache as the baseline.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_src_drop_floor}
+  source: {drop_floor_channels: true}
