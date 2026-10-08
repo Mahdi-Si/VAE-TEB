@@ -2252,8 +2252,9 @@ from teb_vae.lag_attn.eval import stats as vae_stats  # noqa: E402
 TERTILE_FAMILIES = ("admission_tlo_tertile", "labour_duration_tertile", "n_segments_tertile", "span_tertile",
                     "valid_frac_tertile")
 #: The §11.6.1 families in table order; ``covariate:<name>`` families come from the declared covariates.
-SUBGROUP_FAMILIES = ("class", "source_file", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "cs", "bg", "stage_last",
-                     "reached_second_stage", "has_tlo", *TERTILE_FAMILIES, "late_coverage", "shared_test", "fold")
+SUBGROUP_FAMILIES = ("class", "source_file", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "cs", "bg",
+                     "healthy_comparator", "stage_last", "reached_second_stage", "has_tlo", *TERTILE_FAMILIES,
+                     "late_coverage", "shared_test", "fold")
 #: Families whose members hold one clinical class by definition (X10).
 SINGLE_CLASS_FAMILIES = ("class", "source_file", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs")
 #: Documented, never computed (§11.6.1); the report states why instead of drawing an empty line.
@@ -2261,11 +2262,11 @@ EMPTY_FAMILIES = {"acidosis_x_bg": "every acidosis GUID has bg = 1 (§2.3)", "hi
 #: Member-name tokens in display and test order (:func:`member_order`): worst cohort first as ``labels.ordered_groups``
 #: (HIE, acidosis, healthy; the shard cells in reversed canonical order), positive before negative, stages in time
 #: order, tertiles low to high, unknown last. S6 orients every pair by it, so Cliff's delta > 0 = the earlier member higher.
-MEMBER_ORDER = ("hie", "acidosis", "unhealthy", "healthy", "bg", "cs", "pos", "neg", "first", "straddle", "second",
-                "T1", "T2", "T3", "yes", "no", "available", "missing", "unknown")
+MEMBER_ORDER = ("hie", "acidosis", "unhealthy", "healthy", "all", "bg", "cs", "pos", "neg", "first", "straddle",
+                "second", "T1", "T2", "T3", "yes", "no", "available", "missing", "unknown")
 _MEMBER_RANK = {t: i for i, t in enumerate(MEMBER_ORDER)}
 S2_FAMILIES = ("class", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "stage_last", "has_tlo", *TERTILE_FAMILIES)
-ROC_FAMILIES = ("cs", "bg", "stage_last", "has_tlo", *TERTILE_FAMILIES)  # R11: the mixed families
+ROC_FAMILIES = ("cs", "bg", "healthy_comparator", "stage_last", "has_tlo", *TERTILE_FAMILIES)  # R11: mixed families
 K3_FAMILIES = ("cs", "bg", "stage_last", "has_tlo")
 #: S6 family-wise error rate: a module constant, not a config key (the VAE rationale, §11.6.2).
 S_ALPHA = 0.05
@@ -2323,7 +2324,9 @@ def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[
         ``(members, cutpoints)``. ``members`` has one row per (fold, split, guid, subgroup, subgroup_value) a GUID
         satisfies, ordered by family, then member (:func:`member_order`). ``unhealthy`` (acidosis or HIE) overlaps its
         classes in ``class`` and ``class_x_cs``. Tertiles are ``T1`` (<= q1/3), ``T2``, ``T3``, and ``unknown`` for a
-        missing value (no TLO). Other members: ``cs_pos|cs_neg``, ``bg_pos|bg_neg``, ``healthy_bg_pos_cs_neg``, …,
+        missing value (no TLO). Other members: ``cs_pos|cs_neg``, ``bg_pos|bg_neg``,
+        ``all_healthy|bg_healthy|no_bg_healthy`` (every adverse GUID with that healthy subset: the pre-specified
+        comparators, §11.6.1), ``healthy_bg_pos_cs_neg``, …,
         stages ``first|straddle|second|unknown``, ``yes|no`` (reached_second_stage also ``unknown``), the fold
         number, ``available|missing``.
 
@@ -2364,7 +2367,13 @@ def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[
     defs = {
         "class": [cls, unh], "source_file": [g["subgroup"].astype(str)], "class_x_cs": [cls + "_" + cs, unh + "_" + cs],
         "healthy_x_bg": [("healthy_" + bg).where(healthy)], "healthy_bg_x_cs": [("healthy_" + bg + "_" + cs).where(healthy)],
-        "cs": [cs], "bg": [bg], "stage_last": [last["stage"]], "reached_second_stage": [reached],
+        "cs": [cs], "bg": [bg],
+        # §11.6.1 pre-specified healthy comparators: every adverse GUID with all healthy, with the blood-gas (BG+)
+        # healthy only, or with the no-gas (BG-) healthy only; all three are mixed populations
+        "healthy_comparator": [pd.Series("all_healthy", index=g.index),
+                               pd.Series("bg_healthy", index=g.index).where(~healthy | g["bg"].astype(bool)),
+                               pd.Series("no_bg_healthy", index=g.index).where(~healthy | ~g["bg"].astype(bool))],
+        "stage_last": [last["stage"]], "reached_second_stage": [reached],
         "has_tlo": [flag(g["has_tlo"])], "late_coverage": [flag(g["last_t_end_s"] >= -3600.0)],
         "shared_test": [flag(g["shared_test"])],
         "fold": [pd.Series(g.index.get_level_values("fold").astype(str), index=g.index)],
@@ -3757,7 +3766,7 @@ def run_VF(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     baseline, on the pooled OOF test GUIDs under one paired patient-cluster bootstrap (:func:`paired_deltas`, block Q's
     machinery within one run): ΔAUROC of ``score_final_cal`` (with its DeLong p and the Nadeau-Bengio p over folds) and
     Δsens/Δspec at the primary policy, each model on its own basis population at its own fold thresholds. The ablation
-    and diagnostic models (``noind``, ``*_covoff``) are not paired. Both sides keep only the (fold, guid) rows they share
+    and diagnostic models (``noind``, ``*_covoff``, ``*_stage``) are not paired. Both sides keep only the (fold, guid) rows they share
     (a unit that failed under ``--allow-partial`` drops its fold from both), recorded as L14 ``inclusion`` rows.
     ``summary.md`` §4 prints ``table``."""
     models, pid = _models(ctx), eval_config["primary_policy"]

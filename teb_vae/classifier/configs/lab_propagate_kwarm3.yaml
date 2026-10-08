@@ -1,0 +1,7 @@
+# Label ablation (SPEC §17 item 3): every position takes the GUID label with weight 1 (propagate), the first three
+# positions left out of the per-position term (k_warm 3, §6.5): the 2026-10-05 run's strategy on the new baseline.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_propagate_kwarm3}
+  labels: {strategy: propagate, k_warm: 3}

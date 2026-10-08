@@ -41,6 +41,10 @@ GRID = "#E6E8EB"
 SPINE = "#9AA1AB"
 #: Background of a facet strip (the row label of a faceted page).
 STRIP = "#EEF0F3"
+#: The minor grid: one line per time bin or per 0.1 of a rate, lighter than :data:`GRID`.
+GRID_MINOR = "#F2F3F5"
+#: Edge of a filled marker on a trace: a thin dark ring, so the marker does not cut a white gap into its line.
+EDGE = INK
 
 BLUE = "#2F6DB5"
 ORANGE = "#E3812B"
@@ -81,7 +85,9 @@ LINE_REGULAR = 1.1
 LINE_EMPHASIS = 0.95
 LINE_HEAVY = 3.0
 #: Marker diameter (pt) of a point estimate on a trace.
-MARKER_SMALL = 3.6
+MARKER_SMALL = 3.2
+#: Edge width (pt) of a filled marker (:data:`EDGE`).
+MARKER_EDGE = 0.45
 #: Text smaller than the axis labels.
 FONT_TINY = 6.0
 FONT_SMALL = 6.5
@@ -252,7 +258,24 @@ def style_axes(ax: Any, *, grid: str = "both") -> None:
             spine.set_visible(boxed)
     ax.grid(False)
     if not boxed:
-        ax.grid(True, axis={"major": "both"}.get(grid, grid), which="major", color=GRID, lw=0.6, ls="-")
+        axis = {"major": "both"}.get(grid, grid)
+        ax.grid(True, axis=axis, which="major", color=GRID, lw=0.6, ls="-")
+        ax.grid(True, axis=axis, which="minor", color=GRID_MINOR, lw=0.45, ls="-")  # drawn where a minor locator is set
+
+
+def tint(color: str, amount: float) -> str:
+    """Blend a hex colour toward white by ``amount`` in $[0, 1]$: the lighter shade of a member that shares its
+    colour with another (``unhealthy_cs_neg`` beside ``unhealthy_cs_pos``), used instead of a dashed line.
+
+    Args:
+        color: ``'#rrggbb'``.
+        amount: $0$ keeps the colour, $1$ gives white.
+
+    Returns:
+        The blended colour as ``'#rrggbb'``.
+    """
+    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(v + (255 - v) * amount):02x}" for v in rgb)
 
 
 def set_title(fig: Any, text: str) -> None:
