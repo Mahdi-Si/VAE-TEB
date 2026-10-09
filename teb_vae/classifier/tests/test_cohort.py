@@ -65,6 +65,8 @@ def test_tc3_strategy_weights_known_answers():
     np.testing.assert_allclose(_weights("propagate", 1), 1.0)
     for strategy in ("propagate", "horizon", "horizon_decay"):
         np.testing.assert_allclose(_weights(strategy, 0), 1.0)  # negatives: y = 0, ω = 1
+    for strategy in ("horizon", "horizon_decay"):  # labels.time_matched: negatives take the positives' schedule
+        np.testing.assert_allclose(_weights(strategy, 0, time_matched=True), _weights(strategy, 1))
     np.testing.assert_allclose(_weights("final_only", 1), [0, 0, 0, 0, 1])  # k_warm: data.GuidDataset's w_pos
     np.testing.assert_allclose(_weights("mil", 1), 0.0)
 

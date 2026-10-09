@@ -1,5 +1,5 @@
 # Co-training (SPEC §10.6, §13.3): the classifier and the VAE objective together, the posterior's delta heads
-# trainable, L2-SP to the pretrained weights, best.ckpt selected on val/guid_logloss_gated (the preservation gate).
+# trainable, L2-SP to the pretrained weights, best.ckpt selected on val/guid_auroc_gated (the preservation gate).
 # The fragile end of the ladder: read it against the frozen unit it trains beside (summary.md §4).
 base: default.yaml
 

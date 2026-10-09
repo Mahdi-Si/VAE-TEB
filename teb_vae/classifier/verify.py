@@ -149,7 +149,8 @@ def check_np_overshoot(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def check_shuffled_control(summary: Dict[str, Any]) -> Dict[str, Any]:
-    """7: the shuffled-label control's pooled test AUROC <= 0.60 and its CI holds 0.5 (``shuffled_auroc``, B1)."""
+    """7: the shuffled-label control's fold-mean test AUROC <= 0.60 and its t interval over the folds holds 0.5
+    (``shuffled_auroc``, B1, :func:`~teb_vae.classifier.metrics.shuffled_interval`)."""
     return _from_sanity_check(summary, "shuffled_auroc")
 
 

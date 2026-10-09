@@ -119,3 +119,130 @@ def test_bootstrap_reproducible_stratified_and_counts_undefined():
 
 
 # --- T-E4: prevalence re-weighting and friends ------------------------------------------------
+
+
+def test_shuffled_interval_uses_the_fold_spread():
+    """Criterion 7 (§11.15): the t interval over the folds, not the pooled bootstrap CI. The per-fold test AUROCs of
+    run 2026-10-07--17-52's shuffled control hold 0.5 (its pooled CI [0.510, 0.539] did not); one finite fold falls
+    back to the pooled value and CI."""
+    folds = [0.488, 0.486, 0.601, 0.535, 0.603, 0.642, 0.609, 0.572, 0.407, 0.57]
+    point, lo, hi = M.shuffled_interval(folds, 0.524, 0.510, 0.539)
+    assert point == pytest.approx(0.5513) and lo == pytest.approx(0.4997, abs=1e-4) and hi == pytest.approx(0.6029,
+                                                                                                         abs=1e-4)
+    assert M.shuffled_interval([0.6, np.nan], 0.524, 0.510, 0.539) == (0.524, 0.510, 0.539)
+
+
+# --- T-E5: row weights (§11.7 fold weighting) ----------------------------------------------------
+def _weighted_case(n=300, seed=4):
+    """Binary labels with tied scores, a 3-class split of the positives, class probabilities, and 2-row units."""
+    y, s = _data(n=n, seed=seed)
+    rng = np.random.default_rng(seed)
+    y3 = np.where(y == 1, rng.integers(1, 3, n), 0)
+    return y, np.round(s, 1), y3, rng.dirichlet([1.0, 1.0, 1.0], n), np.repeat(np.arange(n // 2), 2)
+
+
+def _points(r):
+    return {m: v["value"] for m, v in r["metrics"].items()}
+
+
+def test_weights_none_and_ones_agree():
+    y, s, y3, P, units = _weighted_case()
+    one, boot, fire, pos = np.ones(y.size), {"resamples": 50, "seed": 1}, s > 0.2, y == 1
+    assert M.threshold_free(y, s, alpha=0.3, w=one) == M.threshold_free(y, s, alpha=0.3)
+    assert M.thresholded(y, s, 0.2, w=one) == M.thresholded(y, s, 0.2)
+    assert M.multiclass(y3, P, w=one) == M.multiclass(y3, P)
+    pts = np.linspace(0.05, 0.9, 18)
+    pd.testing.assert_frame_equal(M.net_benefit(y, expit(s), pts, w=one), M.net_benefit(y, expit(s), pts))
+    r0, r1 = M.roc_points(y, s), M.roc_points(y, s, w=one)
+    assert all(np.array_equal(r0[k], r1[k], equal_nan=True) for k in r0)
+    assert _points(M.bootstrap_rank(y, s, units, alpha=0.3, w=one, **boot)) == _points(
+        M.bootstrap_rank(y, s, units, alpha=0.3, **boot))
+    num, den = np.stack([fire & pos, fire & ~pos]), np.stack([pos, ~pos])
+    for u in (None, units):  # Wilson path, and the cluster bootstrap (two rows per unit)
+        assert all(np.array_equal(a, b, equal_nan=True) for a, b in zip(
+            M.rate_ci(num, den, y, u, w=one, **boot), M.rate_ci(num, den, y, u, **boot)))
+    pop = pd.DataFrame({"y": y, "score": s, "patient": units})  # the `w` column hook of the row writers
+    for rows in ((M._tf_rows(pop, 0.3, boot), M._tf_rows(pop.assign(w=1.0), 0.3, boot)),
+                 (M._thr_rows(pop, 0.2, 0.3, boot), M._thr_rows(pop.assign(w=1.0), 0.2, 0.3, boot))):
+        assert [r["value"] for r in rows[0]] == [r["value"] for r in rows[1]]
+        assert type(rows[0][0]["n_pos"]) is int and type(rows[1][0]["n_pos"]) is int  # all-ones w: the unweighted path
+        assert rows[0][0]["n_pos"] == rows[1][0]["n_pos"] and rows[0][0]["n_neg"] == rows[1][0]["n_neg"]
+
+
+def test_integer_weights_equal_row_duplication():
+    y, s, y3, P, units = _weighted_case()
+    w = np.where(np.arange(y.size) % 3 == 0, 2.0, 1.0)
+    d = np.repeat(np.arange(y.size), w.astype(int))  # each weight-2 row twice
+    tf, td = M.threshold_free(y, s, alpha=0.3, w=w), M.threshold_free(y[d], s[d], alpha=0.3)
+    for m in ("auroc", "auprc", "pauc@0.3", "prevalence", "logloss", "brier", "scaled_brier", "calib_intercept"):
+        assert tf[m] == pytest.approx(td[m], abs=1e-9), m
+    assert M.thresholded(y, s, 0.2, w=w) == pytest.approx(M.thresholded(y[d], s[d], 0.2), abs=1e-9)
+    assert M._rates(s > 0.2, y == 1, w=w) == pytest.approx(M._rates(s[d] > 0.2, y[d] == 1), abs=1e-9)
+    assert M.multiclass(y3, P, w=w) == pytest.approx(M.multiclass(y3[d], P[d]), abs=1e-9)
+    pts = np.linspace(0.05, 0.9, 18)
+    pd.testing.assert_frame_equal(M.net_benefit(y, expit(s), pts, w=w), M.net_benefit(y[d], expit(s[d]), pts),
+                                  atol=1e-9, rtol=0)
+    rw, rd = M.roc_points(y, s, w=w), M.roc_points(y[d], s[d])
+    for k in rw:
+        np.testing.assert_allclose(rw[k], rd[k], atol=1e-9, rtol=0)
+    boot = {"resamples": 50, "seed": 1}
+    assert _points(M.bootstrap_rank(y, s, units, alpha=0.3, w=w, **boot)) == pytest.approx(
+        _points(M.bootstrap_rank(y[d], s[d], units[d], alpha=0.3, **boot)), abs=1e-9)
+    assert _points(M.bootstrap_auroc(y, s, units, 50, 1, w=w)) == pytest.approx(
+        _points(M.bootstrap_auroc(y[d], s[d], units[d], 50, 1)), abs=1e-9)
+
+
+def test_zero_weights_equal_dropping_rows():
+    y, s, y3, P, units = _weighted_case()
+    w = np.random.default_rng(9).uniform(0.1, 1.0, y.size)
+    w[::4], w[2:4] = 0.0, 0.0  # unit 1 loses both rows
+    k, boot, pts = w > 0, {"resamples": 100, "seed": 3}, np.linspace(0.05, 0.9, 18)
+    assert M.threshold_free(y, s, alpha=0.3, w=w) == M.threshold_free(y[k], s[k], alpha=0.3, w=w[k])
+    assert M.threshold_free(y, s, alpha=0.3, w=k * 1.0) == M.threshold_free(y[k], s[k], alpha=0.3)
+    assert M.thresholded(y, s, 0.2, w=w) == M.thresholded(y[k], s[k], 0.2, w=w[k])
+    assert M.multiclass(y3, P, w=w) == M.multiclass(y3[k], P[k], w=w[k])
+    pd.testing.assert_frame_equal(M.net_benefit(y, expit(s), pts, w=w), M.net_benefit(y[k], expit(s[k]), pts, w=w[k]))
+    r0, r1 = M.roc_points(y, s, w=w), M.roc_points(y[k], s[k], w=w[k])
+    assert all(np.array_equal(r0[c], r1[c], equal_nan=True) for c in r0)
+    assert M.bootstrap_rank(y, s, units, alpha=0.3, w=w, **boot) == M.bootstrap_rank(y[k], s[k], units[k], alpha=0.3,
+                                                                                    w=w[k], **boot)
+    assert M.three_class_ci(y3, P, units, alpha=0.3, w=w, **boot) == M.three_class_ci(y3[k], P[k], units[k], alpha=0.3,
+                                                                                    w=w[k], **boot)
+    fire, pos = s > 0.2, y == 1
+    num, den = np.stack([fire & pos, fire & ~pos]), np.stack([pos, ~pos])
+    assert all(np.array_equal(a, b, equal_nan=True) for a, b in zip(
+        M.rate_ci(num, den, y, units, w=w, **boot), M.rate_ci(num[:, k], den[:, k], y[k], units[k], w=w[k], **boot)))
+    pop = pd.DataFrame({"y": y, "score": s, "patient": units, "w": w})
+    for rows in (lambda x: M._thr_rows(x, 0.2, 0.3, boot), lambda x: M._tf_rows(x, 0.3, boot)):
+        assert pd.DataFrame(rows(pop)).equals(pd.DataFrame(rows(pop[k].reset_index(drop=True))))
+
+
+def test_kish_wilson():
+    k, n = np.array([0, 3, 7, 10]), 10
+    lo, hi = M.kish_wilson(np.arange(n)[None, :] < k[:, None], np.ones((k.size, n), bool), np.ones(n))
+    wlo, whi = M.wilson(k, n)
+    assert np.array_equal(lo, wlo) and np.array_equal(hi, whi)  # unit weights: plain Wilson of the counts
+    w = np.r_[np.ones(5), np.full(5, 0.1)]  # half the rows at 0.1
+    hit = np.array([1, 1, 0, 0, 0, 1, 0, 0, 0, 0], bool)
+    n_eff, p = 5.5 ** 2 / 5.05, 2.1 / 5.5  # (sum w)^2 / sum w^2 = 5.99, not 10; sum w hit / sum w
+    assert n_eff == pytest.approx(5.990099, abs=1e-6)
+    elo, ehi = M.wilson(p * n_eff, n_eff)
+    lo, hi = M.kish_wilson(hit, np.ones(10, bool), w)
+    assert lo[0] == pytest.approx(elo, abs=1e-12) and hi[0] == pytest.approx(ehi, abs=1e-12)
+    lo, hi, nu = M.rate_ci(hit, np.ones(10, bool), hit.astype(int), None, resamples=10, seed=0, w=w)  # Wilson path
+    assert lo[0] == pytest.approx(elo, abs=1e-12) and hi[0] == pytest.approx(ehi, abs=1e-12) and np.isnan(nu[0])
+    assert np.isnan(M.kish_wilson(hit, np.zeros(10, bool), w)[0][0])  # empty denominator
+
+
+def test_weight_edge_cases():
+    """A NaN score on a zero-weight row is dropped with the row (a NaN on a kept row still raises); a ``w`` column of
+    ones takes the unweighted path (int counts), and an all-zero one leaves an empty population."""
+    got = M.threshold_free([0, 1, 0], [0.0, 1.0, np.nan], alpha=0.3, w=[1.0, 1.0, 0.0])
+    ref = M.threshold_free([0, 1], [0.0, 1.0], alpha=0.3)
+    assert got["brier"] == pytest.approx(ref["brier"]) and got["logloss"] == pytest.approx(ref["logloss"])
+    with pytest.raises(ValueError):
+        M.threshold_free([0, 1, 0], [0.0, 1.0, np.nan], alpha=0.3, w=[1.0, 1.0, 1.0])
+    f, w = M._weighted(pd.DataFrame({"y": [0, 1], "w": [1.0, 1.0]}))
+    assert w is None and len(f) == 2
+    f, w = M._weighted(pd.DataFrame({"y": [0, 1], "w": [0.0, 0.0]}))
+    assert w is None and f.empty
