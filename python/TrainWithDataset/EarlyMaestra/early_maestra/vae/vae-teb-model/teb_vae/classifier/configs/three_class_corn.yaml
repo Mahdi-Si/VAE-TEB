@@ -1,0 +1,12 @@
+# 3-class healthy / acidosis / HIE with the CORN head (SPEC §9.6; Shi, Cao & Raschka 2023): logit 1 is adverse vs
+# healthy on every GUID, logit 2 is HIE vs acidosis on the adverse GUIDs only, P(Y > 1) = σ(o_1)·σ(o_2). Each
+# cut-point ranks on its own, unlike CORAL's shared score (three_class_ordinal.yaml). On the regularised baseline;
+# eval.stage_offsets off (refused for 3-class). The 2026-10-07 binary run's HIE-vs-acidosis AUROC was 0.549.
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_three_class_corn}
+  labels: {task: three_class, head: corn, aux_3class_weight: 0.0}
+  train:
+    loss: {name: corn}
+  eval: {stage_offsets: false}

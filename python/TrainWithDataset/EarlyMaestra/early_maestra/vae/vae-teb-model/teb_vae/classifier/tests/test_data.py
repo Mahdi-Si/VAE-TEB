@@ -120,18 +120,19 @@ def test_sequence_batches_pad_and_group_by_guid(env):
 
 # ---- samplers ----------------------------------------------------------------------------------
 # ---- shuffled-label control (§10.9.3) ----------------------------------------------------------
-def test_shuffled_labels_stay_within_train(env):
+def test_shuffled_labels_permute_train_and_val_only(env):
     from teb_vae.classifier.config import TASKS
 
     plain, shuffled = _unit(env), _unit(env, shuffle_seed=7)
-    for split in ("val", "test"):
-        pd.testing.assert_frame_equal(plain.frames[split], shuffled.frames[split])
-    a, b = plain.frames["train"], shuffled.frames["train"]
+    pd.testing.assert_frame_equal(plain.frames["test"], shuffled.frames["test"])
     labels = ["y", "class_code"]
-    pd.testing.assert_frame_equal(a.drop(columns=labels), b.drop(columns=labels))  # ω too: the cohort's own
-    ga, gb = (f.groupby("guid")[["y", "class_code"]].first() for f in (a, b))
-    assert sorted(ga["class_code"]) == sorted(gb["class_code"]) and (ga["y"] != gb["y"]).any()
-    assert (gb["y"] == gb["class_code"].map(TASKS["adverse_vs_healthy"])).all()  # pairs permuted together
+    for split in ("train", "val"):  # val too: best.ckpt must not be chosen on the real labels
+        a, b = plain.frames[split], shuffled.frames[split]
+        pd.testing.assert_frame_equal(a.drop(columns=labels), b.drop(columns=labels))  # ω too: the cohort's own
+        ga, gb = (f.groupby("guid")[["y", "class_code"]].first() for f in (a, b))
+        assert sorted(ga["class_code"]) == sorted(gb["class_code"]) and (ga["y"] != gb["y"]).any()
+        assert (gb["y"] == gb["class_code"].map(TASKS["adverse_vs_healthy"])).all()  # pairs permuted together
+    b = shuffled.frames["train"]
     assert shuffled.priors == plain.priors and shuffled.class_counts == plain.class_counts
     assert _unit(env, shuffle_seed=7).frames["train"].equals(b)
     assert not _unit(env, shuffle_seed=8).frames["train"]["y"].equals(b["y"])

@@ -272,19 +272,19 @@ def train_counts(train: pd.DataFrame, k: int) -> Tuple[np.ndarray, np.ndarray]:
             np.bincount(g["class_code"].astype(int) - 1, minlength=3))
 
 
-def shuffle_labels(train: pd.DataFrame, seed: int) -> pd.DataFrame:
-    """§10.9.3: GUID labels (``y`` with its ``class_code``) permuted within the train split; every segment keeps
-    the cohort's ``label_weight``. Rebuilt for the permuted targets, a time-dependent strategy would move each
+def shuffle_labels(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """§10.9.3: GUID labels (``y`` with its ``class_code``) permuted within one train or val split; every segment
+    keeps the cohort's ``label_weight``. Rebuilt for the permuted targets, a time-dependent strategy would move each
     positive-labelled GUID's weight onto its late segments, so late-looking inputs would earn the positive label
     under any permutation and the control would beat 0.5 whenever the true signal is late (on the fixture:
-    per-fold test AUROC 0.83-0.91). With ω fixed, the weighted label expectation of every segment is the train
+    per-fold test AUROC 0.83-0.91). With ω fixed, the weighted label expectation of every segment is the split
     prevalence."""
-    splits = sorted(set(train["split"]))
-    if splits != ["train"]:
-        raise ValueError(f"the shuffled-label control permutes the train split only; got {splits}")
-    per_guid = train.groupby("guid")[["y", "class_code"]].first()
+    splits = sorted(set(frame["split"]))
+    if splits not in (["train"], ["val"]):
+        raise ValueError(f"the shuffled-label control permutes one train or val split; got {splits}")
+    per_guid = frame.groupby("guid")[["y", "class_code"]].first()
     permuted = per_guid.iloc[np.random.default_rng(seed).permutation(len(per_guid))].set_axis(per_guid.index)
-    return train.assign(**{col: train["guid"].map(permuted[col]) for col in ("y", "class_code")})
+    return frame.assign(**{col: frame["guid"].map(permuted[col]) for col in ("y", "class_code")})
 
 
 def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
@@ -296,7 +296,12 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
         run_dir: The run directory (``cohort/`` is read).
         cache: The extract stage's manifest record (``manifest["source"]``).
         fold: Fold id.
-        shuffle_seed: Permute train GUID labels with this seed; val and test are untouched.
+        shuffle_seed: Permute the train GUID labels with this seed and the val GUID labels with ``shuffle_seed + 1``;
+            test is untouched. The permuted val labels only reach the control's own training (val loss, early
+            stopping, ``best.ckpt``): with the real ones, selection keeps the epoch whose near-random function best
+            matches the real signal, and that match carries over to test (run 2026-10-07--17-52: shuffled val/test
+            fold AUROCs moved together, pooled test 0.524 [0.510, 0.539]). Calibration, thresholds and every
+            prediction row read the fold's plain unit and the cohort labels (``run.py``).
     """
     c = getattr(cfg, "classifier", cfg)
     if not cache.get("cache_dir"):
@@ -313,6 +318,7 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
     frames = {split: g.reset_index(drop=True) for split, g in frame.groupby("split")}
     if shuffle_seed is not None:
         frames["train"] = shuffle_labels(frames["train"], shuffle_seed)
+        frames["val"] = shuffle_labels(frames["val"], shuffle_seed + 1)
     train = frames["train"]
     rows = train["row"].to_numpy()
     scaler = fit_scaler(train[["fold", "split", "guid"]], _Rows(store, rows), store.step_mask[rows],
@@ -329,7 +335,7 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
                 f"{unit.n_values} value / {unit.n_attn} attention channels, ctx {unit.context_columns}, "
                 f"{unit.n_cov} covariate columns; train "
                 f"GUIDs per class {unit.class_counts}" + ("" if shuffle_seed is None
-                                                          else f"; train labels shuffled (seed {shuffle_seed})"))
+                                                          else f"; train and val labels shuffled (seed {shuffle_seed})"))
     return unit
 
 

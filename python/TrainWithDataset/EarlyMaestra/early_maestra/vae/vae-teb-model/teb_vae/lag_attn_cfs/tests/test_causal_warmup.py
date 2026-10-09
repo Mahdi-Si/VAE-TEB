@@ -126,6 +126,29 @@ def test_the_source_is_never_gated_by_the_budget(threshold: int) -> None:
     )
 
 
+def test_causal_source_channels_narrows_the_source_by_choice() -> None:
+    r"""``causal_source_channels`` is the one source narrowing that is a choice: ``[0]`` keeps
+    $S_0$ alone, unsorted input is sorted, and the declared vectors stay whole so a figure can
+    still draw what was dropped. Every malformed value is refused by the key's name."""
+    resolved = resolve_warmup_budget(
+        causal_config(causal_source_channels=[0], causal_align_reference=None)
+    )
+    assert resolved is not None
+    assert resolved.source.keep_index == (0,)
+    assert resolved.source.warmup_steps == (int(rebased()["up_st"][0]),)
+    assert resolved.source.declared_width == CAUSAL_C_U
+    assert resolved.source.block_counts() == (("up_st", 1, 36), ("up_ph", 0, 15))
+
+    resolved = resolve_warmup_budget(
+        causal_config(causal_source_channels=[40, 0, 3], causal_align_reference=None)
+    )
+    assert resolved is not None and resolved.source.keep_index == (0, 3, 40)
+
+    for bad in ([], [0, 0], [CAUSAL_C_U], [-1], "0", [0.5]):
+        with pytest.raises(ValueError, match="causal_source_channels"):
+            resolve_warmup_budget(causal_config(causal_source_channels=bad))
+
+
 def test_dropping_the_source_scattering_block_narrows_the_declared_stream() -> None:
     r"""``use_up_st: false`` leaves ``up_ph`` alone, whose fastest channel already waits $41$ steps.
 

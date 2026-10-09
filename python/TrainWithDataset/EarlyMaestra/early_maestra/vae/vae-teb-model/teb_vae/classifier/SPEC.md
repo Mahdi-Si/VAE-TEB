@@ -578,7 +578,7 @@ One row per (fold, split, guid):
 | `cs_outcome` | — | — | — | 2 | target = `cs`. For exploring the treatment paradox only; `cs` is still never an input |
 
 **Head options:**
-- `labels.head ∈ {binary, multiclass, ordinal}`. `binary` requires K = 2. `ordinal` requires an ordered K ≥ 3.
+- `labels.head ∈ {binary, multiclass, ordinal, corn}`. `binary` requires K = 2. `ordinal` and `corn` require an ordered K ≥ 3.
 - `labels.aux_3class_weight` (λ₃, default 0) adds a 3-class auxiliary head to a binary task.
 
 **Cohort filters (`cohort.*`):**
@@ -610,7 +610,9 @@ All strategies produce, per segment (segment scope) or per position (sequence sc
 - GUIDs with Σω = 0 contribute only through the final or bag terms.
 - Without this, long labours dominate the loss [R: Plain BCE — clustering].
 
-**Symmetry caution.** `horizon` excludes early segments of positive GUIDs but keeps all segments of negative GUIDs. The model can then learn "late-labour appearance" as a positive cue. That is acceptable for training, but evaluation MUST be time-matched (§6.6), and the per-checkpoint metrics of §11.5 expose any such bias.
+**Symmetry caution.** `horizon` excludes early segments of positive GUIDs but keeps all segments of negative GUIDs. The model can then learn "late-labour appearance" as a positive cue. Evaluation MUST be time-matched (§6.6), and the per-checkpoint metrics of §11.5 expose any such bias. The 2026-10-07 runs showed it: at `np30`, sensitivity 0.566 in second stage against 0.127 in first, healthy specificity 0.673 against 0.955.
+
+**`labels.time_matched`** (default `false`; `horizon` and `horizon_decay` only, refused otherwise): negative GUIDs take the positives' schedule, `ω_n = 1[Δ_n ≤ H]` or `2^{−max(0, Δ_n − H)/h}`, so the training weights are time-matched too. GUID-equal weighting still gives every GUID with Σω > 0 one unit of weight; under `horizon` a GUID with no segment within H of delivery contributes through the final term only, in both classes. Ablation `lab_time_matched.yaml`.
 
 ### 6.6 Evaluation windows (`labels.eval_window`)
 
@@ -871,6 +873,7 @@ The segment token is `z = MLP([e ‖ c])`, where `c` is the context vector (§7.
   - `binary`: 1 logit.
   - `multiclass`: K logits, softmax.
   - `ordinal` (CORAL, Cao 2020): shared score g(x) plus K−1 ordered biases, `P(Y > k) = σ(g + b_k)`. The biases are kept ordered by a cumulative-softplus parametrisation. The alarm score is `g + b_1 = logit P(Y ≥ 1)`: the same ranking as `g` for every cut-point, and on the probability scale that calibration, log loss and the fixed policy assume [R: ordinal].
+  - `corn` (CORN, Shi, Cao & Raschka 2023; added 2026-10-07): K−1 free conditional logits `o_k = logit P(Y > k | Y > k−1)`, bias-initialised from the train prior. For the 3 classes, `o_1` is adverse-vs-healthy on every GUID and `o_2` is HIE-vs-acidosis on the adverse GUIDs only; the chain rule `P(Y > k) = Π_{j≤k} σ(o_j)` keeps the class probabilities consistent while each cut-point keeps its own ranking (unlike CORAL's shared `g`). This is the targets `healthy 0 0 / acidosis 1 0 / HIE 1 1` with independent logits. The alarm score is `o_1 = logit P(Y ≥ 1)`. Loss `corn`; calibration `temperature` fits one T per conditional logit on its own population; the prediction tables carry `p_c0..2` (no `ord_score`), so the OvR thresholds and every 3-class analysis read it as they read a multiclass head.
 - **Segment-local head** (sequence scope, optional, `model.segment_head: true`): a small MLP on z_n *before* the aggregator. It gives true segment-level scores from the same model. Its loss weight is `train.loss_weights.segment`.
 - **Multi-task:** a binary main head plus a 3-class auxiliary head (λ₃), sharing the trunk.
 
@@ -913,6 +916,7 @@ With p = σ(s), y ∈ {0, 1}, and w_y the class weights:
 | `ce` / `weighted_ce` / `focal_ce` | multiclass analogues | 3-class |
 | `coral` | Σ_k BCE(1[y > k], σ(g + b_k)) | ordinal |
 | `cumulative_link` | proportional-odds negative log-likelihood | ordinal alternative |
+| `corn` | Σ_k 1[y ≥ k] · BCE(1[y > k], σ(o_k)) on the conditional logits (task k on the rows that passed cut k−1) | `labels.head: corn` |
 
 **Supporting options:**
 - **`train.loss.weighting`:** `none` (default), `inverse`, `sqrt_inverse`, or `effective_number` (β = 0.999; Cui 2019).
@@ -955,7 +959,7 @@ L = λ_final · mean_g ℓ(y_g, s_g(N_g))
 - **Schedule.** Linear warm-up of 200 steps, then cosine to 0.05·lr. Max 150 epochs. Grad clip 1.0 by norm. fp32 for frozen regimes; bf16 autocast MAY be enabled for online regimes.
 - **EMA of weights** (`train.ema`, default 0.999; `null` disables). Implemented by Lightning's `EMAWeightAveraging` callback (§10.10.2), with `use_buffers=False`: the VAE's integer and bool index buffers do not survive an EMA lerp. Used for validation and the final checkpoint.
 - **Early stopping** (`advanced_config.callbacks.early_stopping`, built by `GraphModelBase`, §10.10.2):
-  - Monitor: `val/guid_logloss` (default: GUID-level, final-position, unweighted, after prior correction) or `val/guid_auroc`.
+  - Monitor: `val/guid_auroc` (**default** since 2026-10-08: GUID-level, final-position) or `val/guid_logloss` (unweighted, after prior correction). In run 2026-10-07--17-52 the log loss bottomed at epoch 0–2 in every fold while the AUROC kept rising to epoch 6–26 (+0.02 to +0.06 on val): the log loss rises as the score scale grows, which temperature calibration (§10.8) corrects afterwards.
   - Patience 25. Tie-break: lower val loss, then the earlier epoch.
   - **Do not** select on sensitivity-at-FPR or AUPRC. They swing by several points per epoch at about 20–100 validation positives [R: Plain BCE].
 - **Checkpoint.** The best EMA weights are saved as `model_checkpoints/best.ckpt` (`ModelCheckpoint(filename="best")`, §10.10.2). Gradient clipping is `advanced_config.trainer.gradient_clip_val`. Predictions are always made from `best.ckpt`, never from last-epoch weights. The previous v0 classifier had this bug.
@@ -1000,7 +1004,7 @@ The **gate**: an epoch is selectable only if relative forecast MSE ≤ `train.co
 
 | Method | Details |
 |---|---|
-| `temperature` (**default**) | Binary and multiclass: fit T > 0 by LBFGS on val NLL (prior-corrected logits). Ordinal: scale g and refit the K−1 offsets. 3-class calibration is computed in log space (the alarm logit from the log-probabilities); stored probabilities are clipped to [1e-12, 1 − 1e-12]. T (binary and 3-class) is bounded to [1/100, 100] |
+| `temperature` (**default**) | Binary and multiclass: fit T > 0 by LBFGS on val NLL (prior-corrected logits). Ordinal: scale g and refit the K−1 offsets. CORN: one T per conditional logit, each on its own population (the second on the adverse val GUIDs), the logits recovered from the stored class probabilities. 3-class calibration is computed in log space (the alarm logit from the log-probabilities); stored probabilities are clipped to [1e-12, 1 − 1e-12]. T (binary and 3-class) is bounded to [1/100, 100] |
 | `platt` | Binary: a, b on the logit |
 | `none` | |
 
@@ -1019,7 +1023,7 @@ These run automatically per fold with the same cohort, splits and evaluation eng
 2. **Shortcut baseline.** Logistic regression on metadata only: `n_segments`, recording span, `has_tlo`, `has_ss`, and mean `valid_frac`. **These are never model inputs.**
    - If its val AUROC exceeds `baselines.shortcut_warn_auroc` (default 0.60), the report prints a prominent warning.
    - That would mean cohort construction lets the models exploit length or missingness shortcuts (§2.5).
-3. **Shuffled-label control.** The main model trained with GUID labels permuted within the train split (one seed, frozen regime). Expected AUROC is about 0.5. A value > 0.6 is flagged as a pipeline leak.
+3. **Shuffled-label control.** The main model trained with GUID labels permuted within the train split (one seed, frozen regime). Its early stopping and `best.ckpt` read val labels permuted within the val split too (seed + 1): with the real val labels, selection keeps the epoch whose near-random function best matches the real signal, and that match carries over to test (run 2026-10-07--17-52: pooled test AUROC 0.524 [0.510, 0.539], val and test fold AUROCs moving together). Calibration, thresholds and the prediction rows use the real labels. Expected AUROC is about 0.5. A fold mean > 0.6, or a t interval over the folds that excludes 0.5, is flagged as a pipeline leak (criterion 7).
 
 ### 10.10 Training framework integration (`train/`), callbacks, monitoring and MLflow **[DECISION]**
 
@@ -1119,14 +1123,14 @@ A unit failure is recorded (status `failed` with a traceback in `fold_results.js
 | 9 | `EMAWeightAveraging(decay=train.ema)` | Lightning 2.6.5 (`lightning/pytorch/callbacks/weight_averaging.py:366`) | `train.ema` not null | EMA weights are used for validation and written into the checkpoint. No custom EMA code |
 | 10 | `MLflowRunLoggingCallback` | base, when MLflow is on (`train/callbacks.py:412`) | `tracking.mlflow.enabled` | Architecture text and parameter counts. **`log_model: false`** in unit configs, otherwise every unit registers a model version |
 | 11 | `LpftUnfreezeCallback` (P7) | `train.py`, modelled on the old `TwoStageVaeUnfreeze` | `train.regime: lpft` | At `lpft_head_epochs`: unfreeze the allowlist (its param group at `backbone_lr` is registered from the start with grads off, which keeps the per-group LR schedule consistent; early stopping is suspended in stage 1), reset EarlyStopping (`wait_count = 0`, `best_score` reset), log `train/stage = 2`. Appends to `train_results/stage_transitions.jsonl` (epoch, n_params trainable/frozen, prefixes, backbone_lr, iso time) |
-| 12 | `PreservationGateCallback` (P7) | `train.py` | `train.regime: cotrain` | Per epoch on the fixed validation subset: logs `val/forecast_mse_rel`, `val/kld_active_frac`, `val/logvar_prior_floor_frac`, `val/delta_mu_sat_frac`. Sets `val/gate_ok ∈ {0, 1}`. The checkpoint monitor becomes `<monitor>_gated` (default `val/guid_logloss_gated`; = +∞ when the gate fails), read from the GUID metrics, else any metric logged that validation epoch. Registered right after #1, so it reads that epoch's GUID metrics and logs before #2 (F4). Early stopping keeps the ungated monitor: Lightning stops on a non-finite one. Appends `train_results/preservation.jsonl` |
+| 12 | `PreservationGateCallback` (P7) | `train.py` | `train.regime: cotrain` | Per epoch on the fixed validation subset: logs `val/forecast_mse_rel`, `val/kld_active_frac`, `val/logvar_prior_floor_frac`, `val/delta_mu_sat_frac`. Sets `val/gate_ok ∈ {0, 1}`. The checkpoint monitor becomes `<monitor>_gated` (default `val/guid_auroc_gated`; ±∞ against the mode when the gate fails), read from the GUID metrics, else any metric logged that validation epoch. Registered right after #1, so it reads that epoch's GUID metrics and logs before #2 (F4). Early stopping keeps the ungated monitor: Lightning stops on a non-finite one. Appends `train_results/preservation.jsonl` |
 
 **What `GuidEpochMetricsCallback` logs.** The same formulas as the evaluation engine, imported from `metrics.py` so training and evaluation can never disagree:
 
 | Metric | Definition |
 |---|---|
-| `val/guid_logloss` | the early-stopping monitor (§10.5) |
-| `val/guid_auroc`, `val/guid_auprc`, `val/guid_pauc30` | McClish pAUC at FPR ≤ 0.3 |
+| `val/guid_logloss` | the alternative early-stopping monitor (§10.5) |
+| `val/guid_auroc`, `val/guid_auprc`, `val/guid_pauc30` | `val/guid_auroc` is the default early-stopping monitor (§10.5); McClish pAUC at FPR ≤ 0.3 |
 | `val/guid_brier`, `val/guid_ece` | ECE with equal-mass bins |
 | `val/seg_auroc` | on the time-matched eval window |
 | `val/sens_at_fpr30` | empirical, at the validation quantile. **Monitoring only**, never used for selection |
@@ -1528,7 +1532,7 @@ This section carries over and extends the previous pipeline's 22-filter subgroup
   | Member | Colour |
   |---|---|
   | cs+ / cs− | blue `#2F6DB5` / violet `#7B5EA7` |
-  | bg+ / bg− | orange `#E3812B` / teal `#2A9D8F` |
+  | bg+ / bg− | orange `#E3812B` / teal `#2A9D8F`; in `healthy_bg_x_cs` the cs− cell is the lighter shade (`figstyle.tint`, 0.45) of its bg colour |
   | tertiles T1-T3 | sequential blues `#8DB3E2`, `#3F78C2`, `#1D3F7A` |
   | stage | first `#6C8FC7`, straddle `#7B5EA7`, second `#C8475B`, unknown grey `#A7AEB8` |
 
@@ -1545,6 +1549,12 @@ This section carries over and extends the previous pipeline's 22-filter subgroup
   - Shared test GUIDs: under `first_fold`, only the lowest-fold row is kept; under `exclude`, they are dropped. The other variant is also reported as a sensitivity analysis.
 - **AUROC and pAUC:** the per-fold mean ± SD is primary. Pooled OOF AUROC on **calibrated** scores is secondary and labelled as such.
 - **Validation aggregates** are computed the same way and labelled *optimistic (used for selection)*.
+
+**Fold weighting of per-fold test rows (since 2026-10-08).** Every fold's test split holds the same augmented healthy no-BG GUIDs (§2.5; 906 in run 2026-10-07--17-52: 77 % of a fold's healthy GUIDs against 25 % of the pooled ones; per-fold test prevalence 0.19 against 0.43 pooled). Unweighted, the per-fold metrics described a population the pooled ones do not: fold-mean test AUROC 0.698 against 0.654 pooled, AUPRC 0.40 against 0.59, and the pooled line fell outside the per-fold envelope of the time-resolved figures in about half the bins for specificity, FPR and AUROC. So every per-fold **test** metric is computed on the weighted fold population: a GUID in the test sets of K evaluated folds weighs $1/K$ in each (`metrics.fold_weights_of`; 0 for a shared GUID under `shared_test_policy: exclude`), so its K copies add up to the one GUID pooling keeps and every fold has the pooled composition.
+- What is weighted: counts (`tp`, `fp`, … metric rows and the `n_pos`/`n_neg` columns become weighted float sums), rates, threshold-free metrics (sklearn `sample_weight`; calibration fits with sample weights; ECE/E50/E90 on weighted quantiles), ROC/PR curves and their vertical average, decision curves, 3-class metrics (Hand–Till computed per pair, as sklearn 1.8's OvO takes no weights), alarm summaries (weighted means and quantiles; `alarms.parquet` carries `w`), power rules (`eval.min_subgroup_n`, `eval.min_bin_class_n` compare the weighted n).
+- CIs: Wilson at the Kish effective size $n_\mathrm{eff} = (\sum w)^2 / \sum w^2$ (`metrics.kish_wilson`); bootstraps multiply each unit's multiplicity by its row weight.
+- **Pooled rows are unchanged** (bit-identical), and so are **val** rows: val GUIDs also repeat across folds (nested val sampling, every class), but that repetition does not skew a fold's composition (per-fold val prevalence 0.50, as pooled), and each fold's thresholds and calibration were selected on its unweighted val population.
+- Consequences: per-fold rows are comparable with the pooled ones (weighted fold-mean test AUROC 0.654 = pooled 0.654 in that run), so fold mean ± SD, fold min–max bands and heterogeneity (H) describe the cohort's population; fold bands now contain the pooled line except where `first_fold` pooling scores a shared GUID by fold 1's model alone while the folds average its K decisions (0.5 % of the specificity/FPR cells in that run; pooled AUROC is no weighted mean of fold AUROCs, so it can sit outside their range). `summary.json` records `results.fold_weighting: inverse_k`; the report labels an evaluation without it as having unweighted per-fold values. The `fold` subgroup family (§11.6.1) partitions the **pooled** population, so under `first_fold` its fold 1 holds every shared GUID.
 
 **Bootstrap (`eval.bootstrap`):**
 - GUID-level (patient-level if a map is given), outcome-stratified, percentile intervals, B = 2000.
@@ -1727,12 +1737,12 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
 | ID | Analysis | Definition | Outputs | Old |
 |---|---|---|---|---|
 | S1 | Subgroup table | For every family member: counts, threshold-free metrics (mixed), sens or spec at every policy with CIs, underpowered flags | `evaluation/tables/subgroups.parquet` | subgroup long CSV (counts lost, A4) |
-| S2 | Subgroup curves vs time | Facet figure: rows = families, columns = the 3 metric types; one colour per member (named in the legend), one marker per rate: sensitivity ● where the member holds adverse GUIDs, specificity ■ and FPR ▲ where it holds healthy ones (§11.6). Two pages per axis: the clinical families (class; class_x_cs; healthy_x_bg; healthy_bg_x_cs; stage_last; has_tlo) and the tertile families. × axes, primary policy | figs `subgroups_vs_time_<axis>_<policy>`, `subgroups_tertiles_vs_time_<axis>_<policy>` | 8 subgroup PNGs per type (diagnosis, cs/bg stratifications, healthy combos) |
+| S2 | Subgroup curves vs time | Facet figure: rows = families, columns = the 3 metric types; one colour per member (named in the legend), one marker per rate: sensitivity ● where the member holds adverse GUIDs, specificity ■ and FPR ▲ where it holds healthy ones (§11.6). Two pages per axis: the clinical families (class; class_x_cs; healthy_x_bg; healthy_bg_x_cs; stage_last; has_tlo) and the tertile families. × axes, primary policy. Rows: every family for pooled test and for each fold's test group (but `fold`), the `class` family for val. Each page has a `_folds` twin (≥ 2 folds, `eval.fold_band: minmax`): line = the all-fold rate Σ num / Σ den over the folds' weighted counts (each GUID once, a shared test GUID as the mean of its K folds' decisions), band = the min–max of the per-fold test rates (`report.fold_rates`), both from the per-fold `tp`/`fp` rows and `n_pos`/`n_neg` columns, which are weighted (§11.7), so the line is a weighted mean of the fold rates and lies in the band (checked on 127,016 bins of run 2026-10-07--17-52). Every fold with a GUID of the class in the bin counts, however thin; a point is hollow where the median fold has fewer than `eval.min_subgroup_n` GUIDs of the class (weighted). An evaluation without `results.fold_weighting` draws the pooled line only, labelled as having unweighted per-fold rows | figs `subgroups_vs_time_<axis>_<policy>`, `subgroups_tertiles_vs_time_<axis>_<policy>`, each `+ _folds` | 8 subgroup PNGs per type (diagnosis, cs/bg stratifications, healthy combos) |
 | S3 | Subgroup forest | One panel per family: AUROC and pAUC (mixed), sens/spec/FPR at the primary policy, calibration slope; CIs, underpowered hollow | fig `subgroup_forest` | new |
 | S4 | Δ vs complement | ΔAUROC and Δsens/Δspec with paired-bootstrap CIs, Holm-adjusted within the family; the figure adds ΔFPR = −Δspec (mirrored interval, same p) | table + fig `subgroup_delta` | new |
-| S5 | Restricted pairs | healthy∪acidosis, healthy∪hie, acidosis∪hie: AUROC, ROC (R11), subtype sensitivity at each policy, × metric types vs time | fig `restricted_pairs_<axis>` | "binary by underlying class" (sens only) |
+| S5 | Restricted pairs | healthy∪acidosis, healthy∪hie, acidosis∪hie: AUROC, ROC (R11), subtype sensitivity at each policy, × metric types vs time; a `_folds` twin with the S2 fold band, plus each fold's rate as a thin faint line | figs `restricted_pairs_<axis>`, `restricted_pairs_<axis>_folds` | "binary by underlying class" (sens only) |
 | S6 | Family tests | Kruskal–Wallis → Holm → pairwise Mann–Whitney + Cliff's δ → Holm, on score distributions per class | table `subgroup_tests.parquet` | new (VAE convention) |
-| S8 | Subgroup family pages | One wide page per clinical family (`class`, `class_x_cs`, `healthy_x_bg`, `healthy_bg_x_cs`, `cs`, `bg`): rows = the 3 metric types on hours before delivery, columns = sensitivity, specificity and FPR, one solid line per member (sensitivity where the member holds adverse GUIDs, specificity and FPR where it holds healthy ones); primary model and policy; the S2 rows of that family. Acidosis x BG and HIE x BG are not drawn: every adverse GUID is BG+ (§2.3) | fig `family_<family>_to_delivery` | the previous pipeline's diagnosis, CS, BG and healthy BG x CS plots, one per family |
+| S8 | Subgroup family pages | One wide page per clinical family (`class`, `class_x_cs`, `healthy_x_bg`, `healthy_bg_x_cs`, `cs`, `bg`): rows = the 3 metric types on hours before delivery, columns = sensitivity, specificity and FPR, one solid line per member (sensitivity where the member holds adverse GUIDs, specificity and FPR where it holds healthy ones); primary model and policy; the S2 rows of that family. Acidosis x BG and HIE x BG are not drawn: every adverse GUID is BG+ (§2.3). A `_folds` twin with the S2 fold band, plus each fold's rate as a thin faint line (one rate per panel; the S2 pages draw the band only, as up to nine traces share a panel there) | figs `family_<family>_to_delivery`, `family_<family>_to_delivery_folds` | the previous pipeline's diagnosis, CS, BG and healthy BG x CS plots, one per family |
 | S7 | Covariate availability strata | S1/S3 for `covariate:<name>` and `has_tlo`; with `eval.covariates_off`, the covariate-on vs covariate-off comparison | fig `covariate_strata` | new |
 
 #### Block K — Calibration
@@ -1881,7 +1891,7 @@ These follow `teb_vae/lag_attn_cfs/eval/run.py` and `teb_vae/lag_attn/eval/repor
 4. `selection_lock.json` existed before every test prediction (lock timestamp < test prediction timestamp) (L5).
 5. Headline metrics are finite (pooled and fold mean: FAIL otherwise). A headline whose per-fold values include NaN folds (`n_folds_nan > 0`) is INCONCLUSIVE, naming the metric.
 6. NP-policy FPR overshoot: the pooled test FPR ≤ α + a binomial tolerance (95%, n_neg). Otherwise FAIL, naming the policy.
-7. Shuffled-label control AUROC ≤ 0.60, and its CI includes 0.5.
+7. Shuffled-label control: the fold-mean test AUROC ≤ 0.60, and its 95 % t interval over the folds (`mean ± t_{0.975,k−1}·SD/√k`, `metrics.shuffled_interval`) includes 0.5. Each fold trains its own control, so the fold spread holds the training variation; the pooled bootstrap CI holds only test sampling (±0.015 against a fold SD of 0.072 in run 2026-10-07--17-52) and is reported beside it. With one fold, the pooled value and its bootstrap CI are tested.
 8. The primary model's (`metrics.primary_model`: `model`'s seed ensemble, else its first seed, else the probe) pooled test AUROC > shortcut baseline AUROC (point estimate); INCONCLUSIVE if the CIs overlap. Other seeds, `frozen`, `noind` and `*_covoff` rows are listed, never gated.
 9. committed_overall is monotone; the end-point consistency checks of M7 pass.
 10. Missingness confound below threshold, or the `no_indicator` ablation present.
@@ -1956,6 +1966,7 @@ classifier:
     decay_halflife_h: 0.5           # horizon_decay only
     k_warm: 0                       # auto = 3 for propagate, 0 otherwise (§6.5); sequence scope only
     eval_window: all                # all | horizon | stage:first | stage:second
+    time_matched: false             # horizon* only: negatives take the positives' weight schedule (§6.5)
 
   context:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # clip | signed (§7.1)
@@ -2111,7 +2122,7 @@ advanced_config:
       log_config_artifact: true
       tags: {}
   callbacks:
-    early_stopping: {enabled: true, monitor: val/guid_logloss, mode: min, patience: 25, min_delta: 0.0}
+    early_stopping: {enabled: true, monitor: val/guid_auroc, mode: max, patience: 25, min_delta: 0.0}
     model_checkpoint: {save_last: true}   # monitor/mode are the early-stopping ones (§10.10.2 row 6); a different value is refused
     classifier_plotting: {enabled: true, every_n_epochs: 5, file_format: pdf,
                           train_eval_every: 5, train_eval_guids: 256}
@@ -2150,7 +2161,7 @@ The strict pydantic schema validates `classifier:`. The base validates `general_
 - `three_class.yaml`: `task: three_class`, `head: multiclass`, `loss: weighted_ce` with `weighting: sqrt_inverse` (plain `ce` ignores the weighting).
 - `cotrain.yaml`.
 - `regularised.yaml`: the **baseline of every ablation** since 2026-10-07 (the 10-fold run of that day overfitted by epoch 10 at a val AUROC plateau of 0.65): one transformer layer at d 64, causal-conv step encoder, dropout 0.2–0.3, segment dropout 0.3, weight decay 5e-2, lr 3e-4, 60 epochs, selection on `val/guid_auroc`, seeds 42–44 (a seed ensemble), plus that run's labels (`horizon_decay`, H 1 h, half-life 0.5 h), training window (last 6 h) and `eval.stage_offsets: true`.
-- The §17 ablations, each `base: regularised.yaml` plus one delta: `reg_pool4.yaml` (`time_pool: 4`); sources `src_mu_prior.yaml` (no `delta_mu`), `src_drop_floor.yaml`, `src_mu_prior_target_state.yaml`, `src_states.yaml` (`target_state` + `source_state`), `src_st_ph.yaml` (ST/PH direct), `src_st_ph_mu_prior.yaml` (`vae+hdf5`); context `ctx_off.yaml`, `ctx_stage_only.yaml`; labels `lab_halflife_1h.yaml`, `lab_halflife_2h.yaml`, `lab_horizon_2h.yaml`, `lab_propagate_kwarm3.yaml`, `lab_mil_bag.yaml` (`bag_head: position`); `full_window.yaml`; adaptation `adapt_partial_top_block.yaml`, `adapt_lpft_top_block.yaml` (folds 1–3, one seed). `sweep.py` runs a list of them and `compare`s the finished runs; `feature_rank.py` reports per-channel spread and effective rank of a cache.
+- The §17 ablations, each `base: regularised.yaml` plus one delta: `reg_pool4.yaml` (`time_pool: 4`); sources `src_mu_prior.yaml` (no `delta_mu`), `src_drop_floor.yaml`, `src_mu_prior_target_state.yaml`, `src_states.yaml` (`target_state` + `source_state`), `src_st_ph.yaml` (ST/PH direct), `src_st_ph_mu_prior.yaml` (`vae+hdf5`); context `ctx_off.yaml`, `ctx_stage_only.yaml`; labels `lab_halflife_1h.yaml`, `lab_halflife_2h.yaml`, `lab_horizon_2h.yaml`, `lab_propagate_kwarm3.yaml`, `lab_mil_bag.yaml` (`bag_head: position`); `full_window.yaml`; adaptation `adapt_partial_top_block.yaml`, `adapt_lpft_top_block.yaml` (folds 1–3, one seed). `sweep.py` runs a list of them and `compare`s the finished runs; `feature_rank.py` reports per-channel spread and effective rank of a cache. `three_class_corn.yaml` and `three_class_ordinal.yaml` run the 3-class task on the baseline with the CORN and the CORAL head (`eval.stage_offsets` off: refused for 3-class). `lab_time_matched.yaml` (`labels.time_matched: true`, §6.5) tests the stage confound; it is in `sweep.py`'s first batch.
 
 ---
 
@@ -2277,7 +2288,7 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
 | T-C4 | Fold checks: split and patient overlap raise; pretraining exposure | `test_cohort.py` |
 | T-C5 | Covariate as-of join is causal and respects `max_age`; stage and TLO context hide the future | `test_cohort.py` |
 | T-L1 | Forbidden columns never reach a batch | `test_data.py` |
-| T-D1 | Sequence batch contract and padding; train-only fits and priors; shuffled labels stay within train | `test_data.py` |
+| T-D1 | Sequence batch contract and padding; train-only fits and priors; shuffled labels permute train and val only, never test | `test_data.py` |
 | T-S1 | `VaeSource` on the tiny trf_cfs checkpoint: shapes, step mask, derived keys; `load_task` keeps every checkpoint hyperparameter; every VAE family resolves its binding | `test_sources.py` |
 | T-S3 | Cache: once per unique segment, aligned, resumable, fingerprint mismatch refused | `test_sources.py` |
 | T-S4 | Scaler: train-only, recording weighting, floor | `test_sources.py` |
@@ -2523,6 +2534,11 @@ Full discussion is in [`RESEARCH.md`](RESEARCH.md). The references that ground d
 
 ## CHANGELOG
 
+- 2026-10-08 (later) — **Fold weighting of per-fold test rows (§11.7)** and **fold bands for the subgroup time figures (block S).** Every per-fold test metric is computed on the weighted fold population (`metrics.fold_weights_of`: a shared test GUID weighs 1/K in each of its K folds; pooled and val rows bit-identical), through `w=` on the metric primitives (`threshold_free`, `thresholded`, `multiclass`, `net_benefit`, `roc_points`, `bootstrap_rank`, `bootstrap_auroc`, `rate_ci` with `kish_wilson`, `three_class_ci`, `_stat_ci`) and a `w` column on the per-fold populations; `summary.json` records `results.fold_weighting: inverse_k`; `alarms.parquet` gains `w`. In run 2026-10-07--17-52 the fold-mean test AUROC moves from 0.698 to 0.654 (= pooled) and the pooled line leaves the fold envelope in 0.5 % of the specificity/FPR cells instead of 47.7 %. The report weights the per-fold curves it computes itself (PR, OvR, reliability) and labels per-fold values in figure notes and `summary.md`. S2 writes per-fold test rows for every family but `fold`, and S2, S5 and S8 each get a `_folds` twin (pooled line over the per-fold min–max; thin fold lines on S5 and S8). `healthy_bg_x_cs` draws its cs− cells as the lighter shade of their bg colour. `config.digest` leaves a key added later out at its default (`_LATER_DEFAULTS`: `labels.time_matched: false`), so run dirs made before the key keep their digest. Tests `tests/test_fold_band.py`, `tests/test_fold_weights.py`, `tests/test_metrics.py` (weighted primitives).
+
+- 2026-10-08 — After run `2026-10-07--17-52-25-trf_cfs_adverse_seq` (default.yaml, full 12.4-h training window; verify FAIL on criterion 7, shuffled pooled test AUROC 0.524 [0.510, 0.539]). **Shuffled control (§10.9.3):** `data.build_unit(shuffle_seed=)` also permutes the val labels (seed + 1), so the control's early stopping and `best.ckpt` never read the real labels; its lock, calibration, thresholds and prediction rows still use the plain unit. **Criterion 7 (§11.15):** the fold-mean test AUROC with a t interval over the folds (`metrics.shuffled_interval`); the pooled bootstrap CI (test sampling only) is reported beside it. **Selection (§10.5):** `default.yaml` early-stops and checkpoints on `val/guid_auroc` (max); `regularised.yaml` inherits it; `cotrain` selects on `val/guid_auroc_gated`. **Labels (§6.5):** `labels.time_matched` (default false) and `configs/lab_time_matched.yaml`, added to `sweep.py`'s first batch. Tests: `test_data.py` (val permuted, test untouched), `test_cohort.py` (time-matched weights), `test_metrics.py` (`shuffled_interval`). Not run yet (test policy: before commit).
+
+- 2026-10-07 (later) — `labels.head: corn` with `train.loss.name: corn` (§6.3, §9.6, §10.2, §10.8): the CORN head of Shi, Cao & Raschka 2023, K−1 free conditional logits with chain-rule probabilities (`losses.corn_log_probs`), prior-initialised biases, a temperature per conditional logit (`train.fit_calibration(head=)`, `_corn_logits` / `_corn_logp`), prediction rows as a multiclass head's (`p_c0..2`, alarm logit rebuilt from `p_c*_cal` in `calibrate_frames`). Configs `three_class_corn.yaml`, `three_class_ordinal.yaml`.
 - 2026-10-07 — After the first real 10-fold run (`2026-10-07--13-30-04-trf_cfs_adverse_seq`: test GUID AUROC 0.713 ± 0.028 fold mean, 0.671 pooled; probe 0.662 / 0.639; best epochs 3–10, train AUROC 0.98 by epoch 30; 60 of 64 `delta_mu` channels under the scale floor; AUROC 0.64 against BG+ healthy vs 0.73 against BG− healthy; alarm rules and score smoothing no lever at val-reselected thresholds). **Config and code:** `source.kind: vae+hdf5` (`CombinedSource`, §8.2); `source.drop_floor_channels` (§8.5; channels under the floor always warned and counted); `train.loss_weights.bag_head` (§10.3); `eval.stage_offsets` and the `<kind>_stage` prediction rows (§11.3; `thresholds.fit_stage_offsets`, `train.apply_stage_offsets`, `run.STAGE_FILES`, locked with the unit); the `healthy_comparator` subgroup family (§11.6.1; in `ROC_FAMILIES`, summary §3 "Healthy comparator (pre-specified)"); summary §5 states the NP umbrella's cost against the empirical cap of the same α; `train.unfreeze` accepts `<list>.last`; `SCHEMA_VERSION` 6. **Configs:** `regularised.yaml` becomes the ablation baseline (§13.3) and 17 one-delta ablation configs; `sweep.py` and `feature_rank.py` (§13.3).
 - 2026-09-30 — Figures: every time-resolved trace is one continuous line (`report._estimate_line`: bold with filled markers where powered, faint with hollow markers where underpowered; before, underpowered bins were loose markers and a fully underpowered member had no line); S8 family pages added (block S); time pages (`_stack`, the S2/S5/X10 grid, S8) drawn at `WINDOWS_FIGURE_WIDTH` (13 in) so a 12-hour window of half-hour bins (24 points) stays readable; R13 merges bins so at most 12 windows are drawn, each GUID's latest snapshot per merged window (`report._merge_windows`). Checked on the fixture tiled to 12 h (`tmp/classifier_figure_preview/layout_12h.py`).
 - 2026-09-30 — Test suite pruned at the owner's request (532 tests, ~28 min with slow ones, to one end-to-end test plus 135 quick ones, <1 min): §15 lists what stays. Deleted: every figure/report/subgroup/time-resolved/compare/ensemble/multiclass-block/MLflow/attribution test file and the other slow runs; T-X1 is now the fold-parallel smoke and carries T-L2. Also: `report.py` writes `summary.md`/`comparison.md` as UTF-8 (the platform default made `report` fail on Windows).
