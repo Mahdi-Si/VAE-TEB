@@ -52,7 +52,9 @@ from teb_vae.classifier.config import (
 from teb_vae.classifier.data import (
     OnlineReader, SegmentDataset, UnitData, build_unit, collate_segments, make_loader, without_indicators,
 )
-from teb_vae.classifier.losses import class_weights, compute_loss, coral_log_probs, criterion, prior_offset
+from teb_vae.classifier.losses import (
+    class_weights, compute_loss, coral_log_probs, corn_log_probs, criterion, prior_offset,
+)
 from teb_vae.classifier.model import ClassifierNet, aggregate, n_params, running_aggregate
 from teb_vae.classifier.sources import OnlineFeatures, VaeSource
 from teb_vae.classifier.thresholds import fpr_threshold, stage_stratum
@@ -160,6 +162,10 @@ def _rows(net: ClassifierNet, out: Mapping[str, torch.Tensor], batch: Mapping[st
         r["p3"] = o.softmax(-1)[mask]
         if seq and "seg" in out:
             r["p3_seg"] = (out["seg"] - off).softmax(-1)[mask]
+    elif head.kind == "corn":  # chain-rule probabilities; the alarm logit o_1 is logit(1 - p_c0), as for multiclass
+        r["p3"] = corn_log_probs(o).exp()[mask]
+        if seq and "seg" in out:
+            r["p3_seg"] = corn_log_probs(out["seg"] - off).exp()[mask]
     elif aux is not None:
         r["p3"] = aux.softmax(-1)[mask]
     return {k: v.detach().float().cpu().numpy() for k, v in r.items()}
@@ -672,7 +678,7 @@ def prior_correction(c: Classifier, unit: UnitData) -> List[float]:
                                     loss.logit_adjust_tau if adjusted else 0.0))
     if c.train.sampler == "class_balanced":
         offsets.append(prior_offset(class_weights(unit.class_counts, "inverse")))
-    if c.labels.head == "ordinal" or not offsets:
+    if c.labels.head in ("ordinal", "corn") or not offsets:
         return [0.0] * k_out
     off = sum(offsets)
     return [0.0, off][-k_out:] if isinstance(off, float) else off.tolist()
@@ -900,8 +906,8 @@ def train_unit(cfg: Config, run_dir: Any, manifest: Mapping[str, Any], *, fold: 
 
     Writes under ``unit_dir(run_dir, fold, seed, kind)``: ``model_checkpoints/{resolved_config.yaml, best.ckpt,
     last.ckpt}``, ``train_results/*``, ``setup.json``, ``scaler.json``, ``fold_results.json``. ``kind="shuffled"``
-    trains on train labels permuted with ``seed + 1000·fold``, ``kind="noind"`` on the ``no_indicator`` context
-    (:func:`~teb_vae.classifier.data.without_indicators`), ``kind="frozen"`` on the cache under
+    trains on train labels permuted with ``seed + 1000·fold`` and selects ``best.ckpt`` on permuted val labels too,
+    ``kind="noind"`` on the ``no_indicator`` context (:func:`~teb_vae.classifier.data.without_indicators`), ``kind="frozen"`` on the cache under
     :func:`~teb_vae.classifier.config.frozen_baseline` (an online regime's frozen baseline, §10.1), as the shuffled
     control is ("one seed, frozen regime", §10.9.3). A failure is recorded (``status: failed`` + traceback) and
     re-raised only with ``run.fail_fast``; a cotrain unit whose every epoch failed the preservation gate is one (§10.6:
@@ -1128,8 +1134,27 @@ def _coral_logp(o: np.ndarray) -> np.ndarray:
     return coral_log_probs(torch.as_tensor(o, dtype=torch.float64)).numpy()
 
 
-def fit_calibration(guid_logits: Any, y: Any, method: str, *, p3: Any = None, ord_score: Any = None) -> Dict[str, Any]:
+def _corn_logp(o: np.ndarray) -> np.ndarray:
+    """:func:`~teb_vae.classifier.losses.corn_log_probs` on numpy conditional logits (n, K-1) -> (n, K)."""
+    return corn_log_probs(torch.as_tensor(o, dtype=torch.float64)).numpy()
+
+
+def _corn_logits(p3: Any) -> np.ndarray:
+    """The CORN conditional logits (n, K-1) behind class probabilities (n, K): ``logit(P(Y >= k+1) / P(Y >= k))``;
+    the exact inverse of :func:`_corn_logp` away from the clip (NaN rows stay NaN)."""
+    p = np.clip(np.asarray(p3, dtype=np.float64), 1e-300, None)
+    tail = np.cumsum(p[:, ::-1], axis=1)[:, ::-1]  # P(Y >= k)
+    return logit(np.clip(tail[:, 1:] / tail[:, :-1], P_EPS, 1.0 - P_EPS))
+
+
+def fit_calibration(guid_logits: Any, y: Any, method: str, *, p3: Any = None, ord_score: Any = None,
+                    head: Optional[str] = None) -> Dict[str, Any]:
     """Fit on val GUID-level (final-position) prior-corrected predictions.
+
+    ``head`` names a 3-class head explicitly (``multiclass`` | ``ordinal`` | ``corn``); without it ``p3`` means
+    multiclass and ``ord_score`` ordinal. ``corn`` (``p3``): one temperature per conditional logit, recovered from
+    the class probabilities (:func:`_corn_logits`), each fitted on its own population: ``T_1`` on every val GUID
+    against ``y > 0``, ``T_2`` on the adverse val GUIDs against ``y > 1`` (1 when that population holds one class).
 
     Binary (no ``p3`` / ``ord_score``): the scalar logits against ``y > 0``. ``temperature``: T > 0 by L-BFGS on the
     NLL of ``s / T`` over ``log T`` within [1/100, 100], as the 3-class T below; ``platt``: ``a·s + b`` (unpenalised
@@ -1146,12 +1171,30 @@ def fit_calibration(guid_logits: Any, y: Any, method: str, *, p3: Any = None, or
     """
     s, n = np.asarray(guid_logits, dtype=np.float64), int(np.size(guid_logits))
     if p3 is not None or ord_score is not None:
-        head, t = ("multiclass" if p3 is not None else "ordinal"), np.asarray(y, dtype=np.int64)
+        head, t = head or ("multiclass" if p3 is not None else "ordinal"), np.asarray(y, dtype=np.int64)
         if method == "none":
             return {"method": "none", "head": head}
         if method != "temperature":
             raise ValueError(f"calibration.method {method!r} does not fit a {head} head (temperature | none)")
         rows = np.arange(n)
+        if head == "corn":
+            o, temps, total = _corn_logits(p3), [], 0.0
+            for k in range(o.shape[1]):
+                keep = t >= k  # task k lives on the rows that passed cut k-1
+                tk, zk = (t[keep] > k).astype(np.float64), o[keep, k]
+                if not 0 < tk.sum() < tk.size:
+                    temps.append(1.0)
+                    continue
+
+                def nll(v: np.ndarray, tk: np.ndarray = tk, zk: np.ndarray = zk) -> float:
+                    z = zk / np.exp(v[0])
+                    return -float(np.mean(tk * log_expit(z) + (1 - tk) * log_expit(-z)))
+
+                res = minimize(nll, np.zeros(1), method="L-BFGS-B", bounds=[LOG_T_BOUNDS])
+                temps.append(float(np.exp(res.x[0])))
+                total += float(res.fun)
+            return {"method": "temperature", "head": head, "temperatures": temps, "temperature": temps[0],
+                    "nll": total, "n": n}
         if head == "multiclass":
             lp = np.log(np.clip(np.asarray(p3, dtype=np.float64), 1e-300, None))
 
@@ -1203,7 +1246,8 @@ def unit_calibration(c: Classifier, guids: pd.DataFrame) -> Dict[str, Any]:
     if c.labels.task != "three_class":
         return fit_calibration(guids["score_final"], guids["y"], c.calibration.method)
     kw = {"ord_score": guids["ord_score"]} if c.labels.head == "ordinal" else {"p3": guids[P3]}
-    cal = fit_calibration(guids["score_final"], guids["class_code"] - 1, c.calibration.method, **kw)
+    cal = fit_calibration(guids["score_final"], guids["class_code"] - 1, c.calibration.method, head=c.labels.head,
+                          **kw)
     if c.model.scope == "segment":
         cal["segment_scope"] = {"aggregators": list(c.model.segment_aggregators), "lse_tau": c.model.lse_tau}
     return cal
@@ -1217,8 +1261,8 @@ def apply_calibration(logits: Any, cal: Mapping[str, Any]) -> Any:
         return logits
     if cal.get("head") == "ordinal":
         return cal["scale"] * logits + cal["shift"]
-    if cal.get("head") == "multiclass":
-        raise ValueError("a multiclass alarm logit is calibrated through its class probabilities (calibrate_frames)")
+    if cal.get("head") in ("multiclass", "corn"):
+        raise ValueError(f"a {cal['head']} alarm logit is calibrated through its class probabilities (calibrate_frames)")
     if cal["method"] == "temperature":
         return logits / cal["temperature"]
     if cal["method"] == "platt":
@@ -1241,6 +1285,8 @@ def calibrated_logp(p3: Any, cal: Mapping[str, Any], ord_score: Any = None) -> n
     if cal["head"] == "ordinal":
         g = np.asarray(ord_score, dtype=np.float64)
         return _coral_logp(cal["scale"] * g[:, None] + np.asarray(cal["offsets"]))
+    if cal["head"] == "corn":  # a T per conditional logit, then the chain rule again
+        return _corn_logp(_corn_logits(np.exp(lp)) / np.asarray(cal["temperatures"], dtype=np.float64))
     z = lp / cal["temperature"]
     return z - logsumexp(z, axis=1, keepdims=True)
 
@@ -1267,8 +1313,8 @@ def calibrate_frames(seg: pd.DataFrame, gd: pd.DataFrame, cal: Mapping[str, Any]
     3-class record (``cal["head"]``) adds ``p_c<k>_cal`` on every row and ``ord_score`` (NaN for a multiclass head).
 
     Binary and ordinal alarm logits go through :func:`apply_calibration` (increasing and affine, so it commutes with
-    the segment aggregators, bar lse, as in P3). A multiclass one is rebuilt from the calibrated probabilities of the
-    output it came from (``p_c*``; ``pseg_c*`` for a sequence-scope segment head), so ``σ(score_cal) = 1 - p_c0_cal``;
+    the segment aggregators, bar lse, as in P3). A multiclass or CORN one is rebuilt from the calibrated probabilities
+    of the output it came from (``p_c*``; ``pseg_c*`` for a sequence-scope segment head), so ``σ(score_cal) = 1 - p_c0_cal``;
     in segment scope (``cal["segment_scope"]``) the online and GUID scores re-aggregate ``logit_seg_cal``. NaN stays
     NaN. ``ponytail:`` segment-scope GUID probabilities are segment means, calibrated as one row (an ordinal GUID from
     its ``ord_score``, read like ``score_final``), so they are not the mean of the segments' ``p_c*_cal``.
@@ -1279,7 +1325,7 @@ def calibrate_frames(seg: pd.DataFrame, gd: pd.DataFrame, cal: Mapping[str, Any]
         seg, gd = (f.assign(ord_score=f["ord_score"] if "ord_score" in f else NAN,
                             **dict(zip([f"{c}_cal" for c in P3], np.clip(np.exp(lp), P_EPS, 1.0 - P_EPS).T)))
                    for f, lp in ((seg, lp_seg), (gd, lp_gd)))
-    if head != "multiclass" or cal["method"] == "none":
+    if head not in ("multiclass", "corn") or cal["method"] == "none":
         return (seg.assign(**{f"{c}_cal": apply_calibration(seg[c], cal) for c in ("logit_seg", "logit_online")}),
                 gd.assign(**{f"{c}_cal": apply_calibration(gd[c], cal) for c in scores}))
     online = _alarm_lp(lp_seg)

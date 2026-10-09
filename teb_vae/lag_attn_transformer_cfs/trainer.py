@@ -143,7 +143,7 @@ def _resolve_cli_config_path(config_path: str) -> str:
 #: Config used when the module is launched with no ``--config`` -- i.e. an IDE's Run button.
 #: ``--config`` on the command line always wins over this value. A relative path is resolved against
 #: the repository root, not the working directory.
-RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/default.yaml"
+RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/ua_s0_only.yaml"
 
 
 if __name__ == "__main__":

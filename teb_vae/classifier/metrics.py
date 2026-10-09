@@ -51,57 +51,115 @@ METRIC_COLUMNS: Tuple[str, ...] = (
 )
 
 
-def _yl(y: Any, logit: Any) -> Tuple[np.ndarray, np.ndarray]:
+def _yl(y: Any, logit: Any, w: Any = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Labels and scores as flat arrays; raises on a length mismatch or a NaN score. With row weights ``w`` a NaN score
+    on a zero-weight row is allowed, as that row is dropped (:func:`_nonzero`), so a zero weight stays exactly a
+    dropped row (a wrongly sized ``w`` is left for :func:`_nonzero` to refuse)."""
     y = np.asarray(y, dtype=np.int64).reshape(-1)
     s = np.asarray(logit, dtype=np.float64).reshape(-1)
-    if y.size != s.size or np.isnan(s).any():
-        raise ValueError(f"{y.size} labels vs {s.size} scores ({int(np.isnan(s).sum())} NaN)")
+    bad = np.isnan(s)
+    if w is not None and np.size(w) == s.size:
+        bad &= np.asarray(w, np.float64).reshape(-1) != 0
+    if y.size != s.size or bad.any():
+        raise ValueError(f"{y.size} labels vs {s.size} scores ({int(bad.sum())} NaN)")
     return y, s
 
 
-def _ece(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -> float:
-    """ECE over equal-mass bins, binned exactly as ``calibration_curve(strategy='quantile')``."""
-    ids = np.searchsorted(np.quantile(p, np.linspace(0, 1, n_bins + 1))[1:-1], p)
-    return float(np.abs(np.bincount(ids, weights=y - p)).sum() / y.size)
+def _nonzero(w: Any, n: int, *rows: Any) -> Tuple[Any, ...]:
+    """``(w, *rows)`` without the zero-weight rows: ``w`` validated as one finite weight $w_i \\ge 0$ per row, each of
+    ``rows`` (row-aligned on axis 0; None passes) cut to the rows with $w_i > 0$. A zero weight is then exactly a
+    dropped row, bootstrap strata and draws included (§11.7 fold weighting: a shared GUID under ``exclude``).
+    ``w=None`` (unweighted) returns everything unchanged."""
+    if w is None:
+        return (None, *rows)
+    w = np.asarray(w, np.float64).reshape(-1)
+    if w.size != n or not np.isfinite(w).all() or (w < 0).any():
+        raise ValueError(f"{w.size} weights for {n} rows, or a weight is negative or not finite")
+    k = w > 0
+    return (w[k], *(None if r is None else np.asarray(r)[k] for r in rows))
 
 
-def threshold_free(y: Any, logit: Any, *, alpha: float) -> Dict[str, float]:
+def _wquantile(x: np.ndarray, q: Any, w: Optional[np.ndarray] = None) -> Any:
+    """Weighted quantile, the type-7 (``np.quantile`` default) rule generalised: the sorted values sit at the centres
+    of their weight mass $c_i = \\sum_{j \\le i} w_j - w_i/2$, rescaled to $[0, 1]$ from the first to the last, and
+    $q$ interpolates linearly between them. Equal weights are exactly ``np.quantile`` (that path is taken), so
+    ``w=None`` and $w = 1$ agree bit for bit; integer weights are not row duplication (type 7 of the duplicated rows
+    puts the copies at distinct positions). Zero-weight rows are ignored."""
+    if w is not None:
+        x, w = x[w > 0], w[w > 0]
+    if w is None or np.all(w == w[0]):
+        return np.quantile(x, q)
+    o = np.argsort(x, kind="stable")
+    c = np.cumsum(w[o]) - 0.5 * w[o]
+    return np.interp(q, (c - c[0]) / (c[-1] - c[0]), x[o])
+
+
+def _ece(y: np.ndarray, p: np.ndarray, n_bins: int = 10, w: Optional[np.ndarray] = None) -> float:
+    """ECE over equal-mass bins, binned exactly as ``calibration_curve(strategy='quantile')``.
+
+    With row weights ``w``: bins at the weighted quantiles of ``p`` (:func:`_wquantile`), and
+    $\\mathrm{ECE} = \\sum_b \\lvert \\sum_{i \\in b} w_i (y_i - p_i) \\rvert / \\sum_i w_i$; zero-weight rows change
+    nothing. $w = 1$ is the unweighted value bit for bit."""
+    w = np.ones(y.size) if w is None else w
+    ids = np.searchsorted(_wquantile(p, np.linspace(0, 1, n_bins + 1), w)[1:-1], p)
+    return float(np.abs(np.bincount(ids, weights=w * (y - p))).sum() / w.sum())
+
+
+def threshold_free(y: Any, logit: Any, *, alpha: float, w: Any = None) -> Dict[str, float]:
     """Ranking and calibration metrics of calibrated logits (§11.4).
 
     ``calib_intercept`` is calibration-in-the-large (slope fixed at 1, logit as offset);
     ``calib_slope`` the unpenalised logistic slope of y on the logit. ICI/E50/E90 use a cubic
     B-spline logistic smooth of y on the logit (Austin & Steyerberg, LOWESS-free). Ranking and
     recalibration metrics are NaN when a class is missing; logloss/brier/ece stay defined.
+
+    ``w``: optional row weights $w_i \\ge 0$ (§11.7 fold weighting; :func:`fold_weights_of`), giving each metric on
+    the weighted population. Zero-weight rows are dropped first (:func:`_nonzero`); sklearn takes the rest as
+    ``sample_weight`` (AUROC, AUPRC, pAUC, logloss, Brier, scaled Brier, the slope and the ICI smooth); prevalence
+    and ICI are weighted means, E50/E90 weighted quantiles (:func:`_wquantile`), ECE :func:`_ece`'s weighted form,
+    and the intercept solves $\\sum_i w_i \\,\\sigma(a + s_i) = \\sum_i w_i y_i$. Integer weights equal duplicated
+    rows for every metric but ECE/E50/E90 (quantile positions). ``w=None`` is the unweighted path, unchanged; $w = 1$
+    gives the same values bit for bit.
     """
-    y, s = _yl(y, logit)
+    y, s = _yl(y, logit, w)
+    w, y, s = _nonzero(w, y.size, y, s)
+    ww = 1.0 if w is None else w  # 1.0 * x is exact: the unweighted intercept is unchanged
     p = expit(s)
     out = dict.fromkeys(("auroc", "auprc", "prevalence", f"pauc@{alpha:g}", "logloss", "brier",
                          "scaled_brier", "calib_intercept", "calib_slope", "ece", "ici", "e50", "e90"), NAN)
     if y.size == 0:
         return out
-    out.update(prevalence=float(y.mean()), logloss=float(log_loss(y, p, labels=[0, 1])),
-               brier=float(brier_score_loss(y, p, labels=[0, 1])), ece=_ece(y, p))
+    out.update(prevalence=float(np.average(y, weights=w)),
+               logloss=float(log_loss(y, p, labels=[0, 1], sample_weight=w)),
+               brier=float(brier_score_loss(y, p, labels=[0, 1], sample_weight=w)), ece=_ece(y, p, w=w))
     if not 0 < y.sum() < y.size:
         return out
     b = float(np.abs(s).max()) + 40.0  # bracket: f(-b) < 0 < f(b) whenever both classes exist
     smooth = make_pipeline(SplineTransformer(n_knots=4, degree=3, include_bias=False),  # unpenalised, as the slope:
-                           LogisticRegression(C=np.inf, max_iter=1000)).fit(s[:, None], y)  # L2 shrinks it flat
+                           LogisticRegression(C=np.inf, max_iter=1000)  # L2 shrinks it flat
+                           ).fit(s[:, None], y, logisticregression__sample_weight=w)
     gap = np.abs(smooth.predict_proba(s[:, None])[:, 1] - p)
     out.update({
-        "auroc": float(roc_auc_score(y, s)),
-        "auprc": float(average_precision_score(y, s)),
-        f"pauc@{alpha:g}": float(roc_auc_score(y, s, max_fpr=alpha)),
-        "scaled_brier": float(d2_brier_score(y, p)),
-        "calib_intercept": float(brentq(lambda a: expit(a + s).sum() - y.sum(), -b, b)),
-        "calib_slope": float(LogisticRegression(C=np.inf, max_iter=1000).fit(s[:, None], y).coef_[0, 0]),
-        "ici": float(gap.mean()), "e50": float(np.quantile(gap, 0.5)), "e90": float(np.quantile(gap, 0.9)),
+        "auroc": float(roc_auc_score(y, s, sample_weight=w)),
+        "auprc": float(average_precision_score(y, s, sample_weight=w)),
+        f"pauc@{alpha:g}": float(roc_auc_score(y, s, max_fpr=alpha, sample_weight=w)),
+        "scaled_brier": float(d2_brier_score(y, p, sample_weight=w)),
+        "calib_intercept": float(brentq(lambda a: (ww * expit(a + s)).sum() - (ww * y).sum(), -b, b)),
+        "calib_slope": float(LogisticRegression(C=np.inf, max_iter=1000).fit(s[:, None], y,
+                                                                              sample_weight=w).coef_[0, 0]),
+        "ici": float(np.average(gap, weights=w)), "e50": float(_wquantile(gap, 0.5, w)),
+        "e90": float(_wquantile(gap, 0.9, w)),
     })
     return out
 
 
-def confusion_rates(tp: int, fp: int, tn: int, fn: int) -> Dict[str, float]:
-    """Counts plus rates. NaN only when a class count is 0; PPV/NPV/F1 are 0 when never fired."""
-    tp, fp, tn, fn = int(tp), int(fp), int(tn), int(fn)
+def confusion_rates(tp: Any, fp: Any, tn: Any, fn: Any) -> Dict[str, float]:
+    """Counts plus rates. NaN only when a class count is 0; PPV/NPV/F1 are 0 when never fired.
+
+    Integer counts come back as ints; weighted counts (any float, §11.7 fold weighting) come back as floats, same
+    rules (a weighted class total of 0 is a missing class)."""
+    cast = int if all(isinstance(x, (int, np.integer)) for x in (tp, fp, tn, fn)) else float
+    tp, fp, tn, fn = cast(tp), cast(fp), cast(tn), cast(fn)
     P, N, pp, pn = tp + fn, tn + fp, tp + fp, tn + fn
 
     def rate(a: float, d: float, empty: float = NAN) -> float:
@@ -112,7 +170,7 @@ def confusion_rates(tp: int, fp: int, tn: int, fn: int) -> Dict[str, float]:
     with np.errstate(divide="ignore", invalid="ignore"):
         lr_pos, lr_neg = float(np.float64(sens) / (1.0 - spec)), float((1.0 - np.float64(sens)) / spec)
     return {
-        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn), "sens": sens, "spec": spec,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn, "sens": sens, "spec": spec,
         "fpr": 1.0 - spec, "ppv": rate(tp, pp, 0.0), "npv": rate(tn, pn, 0.0),
         "bal_acc": (sens + spec) / 2.0,
         "mcc": NAN if P == 0 or N == 0 else rate(tp * tn - fp * fn, den, 0.0),
@@ -120,36 +178,55 @@ def confusion_rates(tp: int, fp: int, tn: int, fn: int) -> Dict[str, float]:
     }
 
 
-def thresholded(y: Any, logit: Any, thr: float) -> Dict[str, float]:
-    """Confusion and rates of the rule ``logit > thr`` (§11.4); includes ``threshold``."""
-    y, s = _yl(y, logit)
-    tn, fp, fn, tp = confusion_matrix(y, (s > thr).astype(np.int64), labels=[0, 1]).ravel()
+def thresholded(y: Any, logit: Any, thr: float, w: Any = None) -> Dict[str, float]:
+    """Confusion and rates of the rule ``logit > thr`` (§11.4); includes ``threshold``. ``w``: optional row weights
+    (``confusion_matrix``'s ``sample_weight``; zero-weight rows dropped), so the counts are weighted floats."""
+    y, s = _yl(y, logit, w)
+    w, y, s = _nonzero(w, y.size, y, s)
+    tn, fp, fn, tp = confusion_matrix(y, (s > thr).astype(np.int64), labels=[0, 1], sample_weight=w).ravel()
     return confusion_rates(tp, fp, tn, fn) | {"threshold": float(thr)}
 
 
-def multiclass(y: Any, P: Any) -> Dict[str, float]:
+def multiclass(y: Any, P: Any, w: Any = None) -> Dict[str, float]:
     """3-class (K-class) metrics of probabilities ``P`` (n, K); argmax for the hard ones.
 
     RPS is normalised by K-1 (0 = perfect, 1 = worst). AUROC-type metrics (and the OvR AUPRC) are NaN
     when a needed class is absent; recall is NaN for an absent class, so ``bal_acc`` is too; precision
     and F1 are 0 for a class argmax never predicts (the binary PPV rule).
+
+    ``w``: optional row weights (zero-weight rows dropped first, :func:`_nonzero`), sklearn's ``sample_weight``
+    everywhere it takes one and a weighted mean for RPS. sklearn refuses ``sample_weight`` for
+    ``multi_class='ovo'``, so the weighted Hand-Till AUROC is its definition computed here: the mean over class
+    pairs $(i, j)$ of $\\tfrac12[A(i \\mid j) + A(j \\mid i)]$, each $A$ the weighted binary AUROC of
+    ``P[:, i]`` (resp. ``P[:, j]``) on the rows of classes $i$ and $j$ (exactly sklearn's ``ovo`` macro
+    average at unit weights). ``w=None`` is the unweighted path, unchanged.
     """
     y = np.asarray(y, dtype=np.int64).reshape(-1)
     P = np.asarray(P, dtype=np.float64)
+    w, y, P = _nonzero(w, y.size, y, P)
     K, labels, pred = P.shape[1], list(range(P.shape[1])), P.argmax(1)
     full = len(np.unique(y)) == K
-    out = {f"{name}_ovr_c{k}": float(fn(y == k, P[:, k])) if 0 < (y == k).sum() < y.size else NAN
+    out = {f"{name}_ovr_c{k}": float(fn(y == k, P[:, k], sample_weight=w)) if 0 < (y == k).sum() < y.size else NAN
            for name, fn in (("auroc", roc_auc_score), ("auprc", average_precision_score)) for k in labels}
-    rec = recall_score(y, pred, labels=labels, average=None, zero_division=np.nan)
-    prec = precision_score(y, pred, labels=labels, average=None, zero_division=0)
-    f1 = f1_score(y, pred, labels=labels, average=None, zero_division=0)
+    rec = recall_score(y, pred, labels=labels, average=None, zero_division=np.nan, sample_weight=w)
+    prec = precision_score(y, pred, labels=labels, average=None, zero_division=0, sample_weight=w)
+    f1 = f1_score(y, pred, labels=labels, average=None, zero_division=0, sample_weight=w)
     obs = (y[:, None] <= np.arange(K - 1)).astype(np.float64)
+    if not full:
+        hand_till = NAN
+    elif w is None:
+        hand_till = float(roc_auc_score(y, P, multi_class="ovo", labels=labels))
+    else:
+        pair = [(roc_auc_score(y[m] == i, P[m, i], sample_weight=w[m])
+                 + roc_auc_score(y[m] == j, P[m, j], sample_weight=w[m])) / 2.0
+                for i in labels for j in labels if i < j for m in [(y == i) | (y == j)]]
+        hand_till = float(np.mean(pair))
     out.update({
-        "auroc_macro": float(roc_auc_score(y, P, multi_class="ovr", labels=labels)) if full else NAN,
-        "auroc_hand_till": float(roc_auc_score(y, P, multi_class="ovo", labels=labels)) if full else NAN,
-        "qwk": float(cohen_kappa_score(y, pred, labels=labels, weights="quadratic")),
-        "rps": float(((np.cumsum(P, 1)[:, :-1] - obs) ** 2).sum(1).mean() / (K - 1)),
-        "macro_f1": float(f1_score(y, pred, labels=labels, average="macro", zero_division=0)),
+        "auroc_macro": float(roc_auc_score(y, P, multi_class="ovr", labels=labels, sample_weight=w)) if full else NAN,
+        "auroc_hand_till": hand_till,
+        "qwk": float(cohen_kappa_score(y, pred, labels=labels, weights="quadratic", sample_weight=w)),
+        "rps": float(np.average(((np.cumsum(P, 1)[:, :-1] - obs) ** 2).sum(1), weights=w) / (K - 1)),
+        "macro_f1": float(f1_score(y, pred, labels=labels, average="macro", zero_division=0, sample_weight=w)),
         "bal_acc": float(np.mean(rec)),
         **{f"{name}_c{k}": float(v[k]) for name, v in (("recall", rec), ("precision", prec), ("f1", f1))
            for k in labels},
@@ -157,13 +234,22 @@ def multiclass(y: Any, P: Any) -> Dict[str, float]:
     return out
 
 
-def net_benefit(y: Any, p: Any, pts: Sequence[float]) -> pd.DataFrame:
-    """Decision curve ``NB = TP/N - FP/N * pt/(1-pt)`` (rule ``p > pt``) with treat-all/none."""
+def net_benefit(y: Any, p: Any, pts: Sequence[float], w: Any = None) -> pd.DataFrame:
+    """Decision curve ``NB = TP/N - FP/N * pt/(1-pt)`` (rule ``p > pt``) with treat-all/none.
+
+    ``w``: optional row weights, $\\mathrm{TP}/N = \\sum_i w_i [\\text{fire}_i \\wedge y_i] / \\sum_i w_i$ (likewise FP
+    and the prevalence of treat-all); ``w=None`` is the unweighted path, unchanged."""
     y = np.asarray(y, dtype=np.int64).reshape(-1)
     pts = np.asarray(pts, dtype=np.float64)
-    fire, w, pi = np.asarray(p)[None, :] > pts[:, None], pts / (1.0 - pts), y.mean()
-    tp, fp = (fire & (y == 1)).mean(1), (fire & (y == 0)).mean(1)
-    return pd.DataFrame({"pt": pts, "net_benefit": tp - fp * w, "treat_all": pi - (1 - pi) * w, "treat_none": 0.0})
+    w, y, p = _nonzero(w, y.size, y, np.asarray(p).reshape(-1))
+    fire, odds = p[None, :] > pts[:, None], pts / (1.0 - pts)
+    if w is None or not w.size:  # all weights 0: the empty population's NaNs, as dropping every row
+        pi, tp, fp = y.mean(), (fire & (y == 1)).mean(1), (fire & (y == 0)).mean(1)
+    else:
+        w = w / w.sum()
+        pi, tp, fp = w @ y, (fire & (y == 1)) @ w, (fire & (y == 0)) @ w
+    return pd.DataFrame({"pt": pts, "net_benefit": tp - fp * odds, "treat_all": pi - (1 - pi) * odds,
+                         "treat_none": 0.0})
 
 
 def wilson(k: Any, n: Any, confidence: float = 0.95) -> Tuple[Any, Any]:
@@ -177,6 +263,22 @@ def wilson(k: Any, n: Any, confidence: float = 0.95) -> Tuple[Any, Any]:
     lo = np.where(n > 0, np.where(k == 0, 0.0, c - d), NAN)
     hi = np.where(n > 0, np.where(k == n, 1.0, c + d), NAN)
     return (float(lo), float(hi)) if lo.ndim == 0 else (lo, hi)
+
+
+def kish_wilson(num: Any, den: Any, w: Any, confidence: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
+    """Wilson interval of each row's weighted proportion at Kish's effective sample size (§11.7 fold weighting).
+
+    ``num``, ``den``: ``(C, n)`` bool over rows (``num`` within ``den``), ``w``: ``(n,)`` row weights. Row $c$ has
+    $\\hat p = \\sum_i w_i\\,\\mathrm{num}_{ci} / \\sum_i w_i\\,\\mathrm{den}_{ci}$ and
+    $n_\\mathrm{eff} = (\\sum_i w_i\\,\\mathrm{den}_{ci})^2 / \\sum_i w_i^2\\,\\mathrm{den}_{ci}$, and gets
+    :func:`wilson` of $(\\hat p\\, n_\\mathrm{eff}, n_\\mathrm{eff})$. Example: 10 rows, 5 at weight 1 and 5 at 0.1,
+    give $n_\\mathrm{eff} = 5.5^2 / 5.05 \\approx 5.99$, not 10. Unit weights give :func:`wilson` of the counts
+    exactly ($\\hat p\\, n_\\mathrm{eff}$ is computed as $\\sum w\\,\\mathrm{num} \\cdot \\sum w\\,\\mathrm{den} /
+    \\sum w^2 \\mathrm{den}$). NaN where the weighted denominator is 0."""
+    num, den, w = np.atleast_2d(num), np.atleast_2d(den), np.asarray(w, np.float64).reshape(-1)
+    k, s1, s2 = num @ w, den @ w, den @ (w * w)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return wilson(k * s1 / s2, s1 * s1 / s2, confidence)
 
 
 def adjust_ppv_npv(sens: float, spec: float, prevalence: float) -> Tuple[float, float]:
@@ -330,7 +432,7 @@ def _chunks(resamples: int, n: int, cells: int = 4_000_000) -> list:
 
 
 def bootstrap_auroc(y: Any, s: Any, units: Any = None, B: int = 2000, seed: int = 0, *,
-                    confidence: float = 0.95) -> Dict[str, Any]:
+                    confidence: float = 0.95, w: Any = None) -> Dict[str, Any]:
     """Vectorised :func:`bootstrap_ci` of AUROC.
 
     Same resampling scheme (outcome-stratified cluster percentile bootstrap over ``units``), but each
@@ -338,18 +440,23 @@ def bootstrap_auroc(y: Any, s: Any, units: Any = None, B: int = 2000, seed: int 
     weighs the cumulative weight of the negatives below it (ties 1/2), read off one sort of the
     negatives. B draws cost O(B n) array work instead of B sklearn calls. ``units=None``: every row is
     its own unit (GUID level), so each class's multiplicities are drawn directly (they are
-    exchangeable within the class). Needs both classes.
+    exchangeable within the class). Needs both classes. ``w``: optional row weights (zero-weight rows
+    dropped first, :func:`_nonzero`); the point and every draw weigh each row by $w_i$ times its unit's
+    multiplicity.
 
     Returns:
         :func:`bootstrap_ci`'s ``{metrics: {"auroc": {value, ci_lo, ci_hi, n_undefined}}, record}``.
     """
-    y, s = _yl(y, s)
+    y, s = _yl(y, s, w)
+    w, y, s, units = _nonzero(w, y.size, y, s, units)
     pos = np.flatnonzero(y == 1)
     neg = np.flatnonzero(y == 0)
     neg = neg[np.argsort(s[neg], kind="stable")]
     lt, le = np.searchsorted(s[neg], s[pos], side="left"), np.searchsorted(s[neg], s[pos], side="right")
 
     def auc(Wp: np.ndarray, Wn: np.ndarray) -> np.ndarray:
+        if w is not None:
+            Wp, Wn = Wp * w[pos], Wn * w[neg]
         C = np.concatenate([np.zeros((len(Wn), 1), Wn.dtype), np.cumsum(Wn, axis=1)], axis=1)
         with np.errstate(invalid="ignore", divide="ignore"):
             return (Wp * (C[:, lt] + C[:, le])).sum(1, dtype=np.float64) / (2.0 * Wp.sum(1, dtype=np.float64) * C[:, -1])
@@ -371,25 +478,30 @@ def bootstrap_auroc(y: Any, s: Any, units: Any = None, B: int = 2000, seed: int 
 
 
 def bootstrap_rank(y: Any, s: Any, units: Any, *, alpha: float, resamples: int, seed: int,
-                   confidence: float = 0.95) -> Dict[str, Any]:
+                   confidence: float = 0.95, w: Any = None) -> Dict[str, Any]:
     """Vectorised :func:`bootstrap_ci` of AUROC, AUPRC and pAUC@alpha over cluster ``units``: each
     draw a row of unit multiplicities (:func:`_unit_draws`, so its AUROC draws are
     :func:`bootstrap_auroc`'s), the metrics the weighted rank statistics of one shared sort
-    (:func:`_rank_stats`, exactly sklearn's with unit weights). Needs both classes."""
-    y, s = _yl(y, s)
+    (:func:`_rank_stats`, exactly sklearn's with unit weights). Needs both classes. ``w``: optional row
+    weights (zero-weight rows dropped first, :func:`_nonzero`); the point and every draw weigh each row by
+    $w_i$ times its unit's multiplicity."""
+    y, s = _yl(y, s, w)
+    w, y, s, units = _nonzero(w, y.size, y, s, units)
     order, starts, _ = _ranked(s)
     M, codes = _unit_draws(y, units, resamples, seed)
-    point = {m: float(v[0]) for m, v in _rank_stats(*_curve(y, np.ones((1, y.size)), order, starts), alpha).items()}
+    W1 = np.ones((1, y.size)) if w is None else w[None, :]
+    point = {m: float(v[0]) for m, v in _rank_stats(*_curve(y, W1, order, starts), alpha).items()}
     draws = {m: np.empty(resamples) for m in point}
     for sl in _chunks(resamples, y.size):
-        for m, v in _rank_stats(*_curve(y, M[sl][:, codes], order, starts), alpha).items():
+        Wd = M[sl][:, codes] if w is None else M[sl][:, codes] * W1
+        for m, v in _rank_stats(*_curve(y, Wd, order, starts), alpha).items():
             draws[m][sl] = v
     return _percentile_ci(point, draws, method="cluster outcome-stratified percentile bootstrap (vectorised rank "
                           "statistics)", resamples=resamples, seed=seed, confidence=confidence, n=M.shape[1])
 
 
 def rate_ci(num: Any, den: Any, y: Any, units: Any = None, *, resamples: int, seed: int,
-            confidence: float = 0.95) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            confidence: float = 0.95, w: Any = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(ci_lo, ci_hi, n_undefined)`` of each row's rate ``num[c].sum() / den[c].sum()`` (``(C, n)`` bool over
     rows, ``num`` within ``den``).
 
@@ -398,9 +510,17 @@ def rate_ci(num: Any, den: Any, y: Any, units: Any = None, *, resamples: int, se
     independent, so that row falls back to the outcome-stratified cluster percentile bootstrap (:func:`_unit_draws`
     on labels ``y``) of the ratio over all clusters; a draw with an empty denominator is undefined, left out of the
     percentiles and counted in ``n_undefined`` (§11.7: never silently dropped). NaN CIs where ``den`` is empty.
+
+    ``w``: optional row weights (§11.7 fold weighting), the rate then
+    $\\sum w\\,\\mathrm{num} / \\sum w\\,\\mathrm{den}$. Zero-weight rows are dropped first (:func:`_nonzero`), so
+    they neither count as a cluster's decision nor enter the strata. The Wilson path becomes :func:`kish_wilson`; the bootstrap path weighs each row by $w_i$ times its
+    unit's multiplicity.
     """
     num, den = np.atleast_2d(num), np.atleast_2d(den)
-    lo, hi = wilson(num.sum(1), den.sum(1), confidence)
+    if w is not None:
+        w, numT, denT, y, units = _nonzero(w, num.shape[1], num.T, den.T, y, units)
+        num, den = numT.T, denT.T
+    lo, hi = wilson(num.sum(1), den.sum(1), confidence) if w is None else kish_wilson(num, den, w, confidence)
     nu = np.full(len(num), NAN)
     if units is None:
         return lo, hi, nu
@@ -415,20 +535,24 @@ def rate_ci(num: Any, den: Any, y: Any, units: Any = None, *, resamples: int, se
     multi = (D > 1).any(1)
     if multi.any():
         M = _unit_draws(np.asarray(y).reshape(-1), units, resamples, seed)[0]
+        Nu, Du = (per_unit(num[multi]), D[multi]) if w is None else (per_unit(num[multi] * w), per_unit(den[multi] * w))
         with np.errstate(invalid="ignore", divide="ignore"):
-            d = (per_unit(num[multi]) @ M.T) / (D[multi] @ M.T)
+            d = (Nu @ M.T) / (Du @ M.T)
         a = (1.0 - confidence) / 2.0
         lo[multi], hi[multi] = np.nanquantile(d, [a, 1.0 - a], axis=1)
         nu[multi] = np.isnan(d).sum(1)
     return lo, hi, nu
 
 
-def roc_points(y: Any, s: Any) -> Dict[str, np.ndarray]:
+def roc_points(y: Any, s: Any, w: Any = None) -> Dict[str, np.ndarray]:
     """``roc_curve(drop_intermediate=False)`` that also takes ``-inf`` scores (R3's not-yet-monitored
-    GUIDs): ``fpr, tpr, thr`` (from ``+inf`` down) plus ``precision`` = TP/(TP+FP), NaN before any alarm."""
-    y, s = _yl(y, s)
+    GUIDs): ``fpr, tpr, thr`` (from ``+inf`` down) plus ``precision`` = TP/(TP+FP), NaN before any alarm.
+    ``w``: optional row weights, so TP and FP are cumulative weights (zero-weight rows dropped, with their
+    thresholds)."""
+    y, s = _yl(y, s, w)
+    w, y, s = _nonzero(w, y.size, y, s)
     order, starts, thr = _ranked(s)
-    P, N = _curve(y, np.ones((1, y.size)), order, starts)
+    P, N = _curve(y, np.ones((1, y.size)) if w is None else w[None, :], order, starts)
     TP, FP = np.r_[0.0, P[0].cumsum()], np.r_[0.0, N[0].cumsum()]
     with np.errstate(invalid="ignore", divide="ignore"):
         return {"fpr": FP / FP[-1], "tpr": TP / TP[-1], "thr": np.r_[np.inf, thr], "precision": TP / (TP + FP)}
@@ -609,6 +733,31 @@ def level_units(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dict[str, 
             for k, v in out.items()}
 
 
+def fold_weights_of(frame: pd.DataFrame, policy: str, split: str) -> np.ndarray:
+    """Row weights of the per-fold populations of ``frame`` (§11.7 fold weighting): ``1/K`` for a row whose GUID
+    appears in K of the folds in ``frame``, so the K per-fold copies of a shared test GUID add up to the one GUID
+    :func:`pool_rows` keeps; 0 for a shared GUID under ``data.shared_test_policy: exclude``, which pooling drops. Every
+    other row weighs 1.
+
+    ``frame`` holds every fold of one model/seed/split (columns ``fold``, ``guid``, ``shared_test``), one or more rows
+    per GUID and fold (segment populations repeat the GUID). Pass the whole frame, then split it by fold: K is counted
+    over the folds the frame holds. Why: each fold's test set holds the same augmented healthy no-BG GUIDs (§2.5; 906 in
+    the 2026-10-07 run, 77 % of a fold's healthy GUIDs against 25 % pooled), so unweighted per-fold metrics are not
+    comparable with the pooled ones (fold-mean test AUROC 0.698 unweighted, 0.654 weighted, pooled 0.654).
+
+    **Test only**: every val row weighs 1. Val GUIDs repeat across folds too (nested val sampling, every class: 1414
+    of 2542 val GUIDs sit in 2–9 folds' val splits), but that repetition does not skew a fold's composition (per-fold val
+    prevalence 0.50, as pooled), and each fold's thresholds and calibration were selected on its unweighted val
+    population, which its val rows must keep describing."""
+    if split != "test":
+        return np.ones(len(frame))
+    k = frame.groupby("guid")["fold"].transform("nunique").to_numpy(np.float64)
+    w = 1.0 / k
+    if policy == "exclude":
+        w = np.where(frame["shared_test"].to_numpy(bool), 0.0, w)
+    return w
+
+
 def pool_rows(units: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
     """Pooled OOF rows, de-duplicated like :func:`pooled_confusion` (lowest fold kept, or dropped).
 
@@ -619,20 +768,42 @@ def pool_rows(units: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
     return u[~shared] if policy == "exclude" else u[~(shared & u["unit"].duplicated())]
 
 
+def _weighted(frame: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
+    """``(frame, w)``: a population with an optional ``w`` column (§11.7 fold weighting, :func:`fold_weights_of`)
+    cut to its rows with $w_i > 0$ (:func:`_nonzero`, which validates the weights), and those weights; ``(frame,
+    None)`` (unweighted) without the column, or when every kept weight is 1 (a fold without shared GUIDs, a one-fold
+    run), so such a population takes the unweighted path bit for bit, int counts included, as the time-resolved groups
+    do (:func:`_fold_weighted`). May be empty (every row weighted 0); callers skip an empty population."""
+    if "w" not in frame:
+        return frame, None
+    w, i = _nonzero(frame["w"], len(frame), np.arange(len(frame)))
+    return frame.iloc[i], (None if np.all(w == 1.0) else w)
+
+
+def _class_counts(pos: np.ndarray, w: Optional[np.ndarray]) -> Dict[str, Any]:
+    """``n_pos``/``n_neg`` of a population: ints unweighted, the classes' weight sums (floats) with weights ``w``."""
+    if w is None:
+        return {"n_pos": int(pos.sum()), "n_neg": int((~pos).sum())}
+    return {"n_pos": float(w[pos].sum()), "n_neg": float(w[~pos].sum())}
+
+
 def _tf_rows(u: pd.DataFrame, alpha: float, boot: Mapping[str, Any], **keys: Any) -> list:
-    """Threshold-free rows of one population; patient-cluster bootstrap CIs on the ranking metrics."""
+    """Threshold-free rows of one population; patient-cluster bootstrap CIs on the ranking metrics. A ``w`` column
+    weighs the rows (:func:`_weighted`): every metric, CI and ``n_pos``/``n_neg`` is then the weighted one."""
+    u, w = _weighted(u)
     y, s = u["y"].to_numpy(np.int64), u["score"].to_numpy(np.float64)
-    ci = (bootstrap_rank(y, s, u["patient"], alpha=alpha, **boot)["metrics"] if 0 < y.sum() < y.size else None)
-    return metric_rows(threshold_free(y, s, alpha=alpha), ci, metric_type="threshold_free", denominator="n/a",
-                       n_pos=int(y.sum()), n_neg=int(y.size - y.sum()), **keys)
+    ci = (bootstrap_rank(y, s, u["patient"], alpha=alpha, w=w, **boot)["metrics"] if 0 < y.sum() < y.size else None)
+    return metric_rows(threshold_free(y, s, alpha=alpha, w=w), ci, metric_type="threshold_free", denominator="n/a",
+                       **_class_counts(y == 1, w), **keys)
 
 
 def _prop_ci(fire: np.ndarray, pos: np.ndarray, units: Any, alpha: Optional[float],
-             boot: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
+             boot: Mapping[str, Any], w: Optional[np.ndarray] = None) -> Dict[str, Dict[str, float]]:
     """CIs of the single proportions (:data:`_PROP`) of one population's decisions: :func:`rate_ci`
-    (Wilson; the patient-cluster bootstrap where a patient holds two of the rows)."""
+    (Wilson; the patient-cluster bootstrap where a patient holds two of the rows), with optional row weights ``w``
+    (Kish-Wilson or the weighted bootstrap)."""
     lo, hi, nu = rate_ci(np.stack([fire & pos, ~fire & ~pos, fire & ~pos, fire & pos, ~fire & ~pos]),
-                         np.stack([pos, ~pos, ~pos, fire, ~fire]), pos, units, **boot)
+                         np.stack([pos, ~pos, ~pos, fire, ~fire]), pos, units, w=w, **boot)
     ci = {m: {"ci_lo": float(a), "ci_hi": float(b), "n_undefined": float(u)} for m, a, b, u in zip(_PROP, lo, hi, nu)}
     if alpha is not None:
         ci["fpr_overshoot"] = ci["fpr"] | {k: ci["fpr"][k] - alpha for k in ("ci_lo", "ci_hi")}
@@ -643,10 +814,14 @@ def _with_overshoot(vals: Dict[str, Any], alpha: Optional[float]) -> Dict[str, A
     return vals | ({"fpr_overshoot": vals["fpr"] - alpha} if alpha is not None else {})
 
 
-def _rates(fire: np.ndarray, pos: np.ndarray, i: Any = slice(None)) -> Dict[str, float]:
-    """:func:`confusion_rates` of the decisions ``fire`` against ``pos`` on the rows ``i``."""
+def _rates(fire: np.ndarray, pos: np.ndarray, i: Any = slice(None), w: Optional[np.ndarray] = None) -> Dict[str, float]:
+    """:func:`confusion_rates` of the decisions ``fire`` against ``pos`` on the rows ``i``; with row weights ``w``
+    (aligned with ``fire``) the counts are weight sums (floats)."""
     f, p = fire[i], pos[i]
-    return confusion_rates((f & p).sum(), (f & ~p).sum(), (~f & ~p).sum(), (~f & p).sum())
+    if w is None:
+        return confusion_rates((f & p).sum(), (f & ~p).sum(), (~f & ~p).sum(), (~f & p).sum())
+    x = np.asarray(w, np.float64)[i]
+    return confusion_rates(x[f & p].sum(), x[f & ~p].sum(), x[~f & ~p].sum(), x[~f & p].sum())
 
 
 def _derived(tp: Any, fp: Any, tn: Any, fn: Any) -> Dict[str, np.ndarray]:
@@ -662,26 +837,31 @@ def _derived(tp: Any, fp: Any, tn: Any, fn: Any) -> Dict[str, np.ndarray]:
 
 
 def _rate_cis(fire: np.ndarray, pos: np.ndarray, units: Any, alpha: Optional[float],
-              boot: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
+              boot: Mapping[str, Any], w: Optional[np.ndarray] = None) -> Dict[str, Dict[str, float]]:
     """CIs of one population's decisions: :func:`_prop_ci` on the proportions, the outcome-stratified patient-cluster
     bootstrap on the derived rates (:data:`_DERIVED`), vectorised: each draw's confusion counts are its unit
-    multiplicities (:func:`_unit_draws`) times the units' counts, so no statistic runs once per draw in Python."""
+    multiplicities (:func:`_unit_draws`) times the units' counts, so no statistic runs once per draw in Python.
+    ``w``: optional row weights (zero-weight rows dropped first, :func:`_nonzero`); the units' counts are then their
+    rows' weight sums."""
+    w, fire, pos, units = _nonzero(w, pos.size, fire, pos, units)
     M, codes = _unit_draws(pos.astype(np.int64), units, boot["resamples"], boot["seed"])
-    counts = [M @ np.bincount(codes, weights=x, minlength=M.shape[1]) for x in
+    counts = [M @ np.bincount(codes, weights=x if w is None else x * w, minlength=M.shape[1]) for x in
               (fire & pos, fire & ~pos, ~fire & ~pos, ~fire & pos)]
-    point = {k: v for k, v in _rates(fire, pos).items() if k in _DERIVED}
-    return _prop_ci(fire, pos, units, alpha, boot) | _percentile_ci(
+    point = {k: v for k, v in _rates(fire, pos, w=w).items() if k in _DERIVED}
+    return _prop_ci(fire, pos, units, alpha, boot, w=w) | _percentile_ci(
         point, _derived(*counts), method="patient-cluster outcome-stratified percentile bootstrap (vectorised counts)",
         resamples=boot["resamples"], seed=boot["seed"], confidence=0.95, n=M.shape[1])["metrics"]
 
 
 def _thr_rows(pop: pd.DataFrame, thr: float, alpha: Optional[float], boot: Mapping[str, Any], **keys: Any) -> list:
-    """Per-fold thresholded rows with :func:`_rate_cis`."""
+    """Per-fold thresholded rows with :func:`_rate_cis`; a ``w`` column weighs the rows (:func:`_weighted`), so
+    the rates, their CIs and ``n_pos``/``n_neg`` are the weighted ones."""
+    pop, w = _weighted(pop)
     s, pos = pop["score"].to_numpy(np.float64), pop["y"].to_numpy(np.int64) == 1
     fire = s > thr
-    return metric_rows(_with_overshoot(_rates(fire, pos), alpha) | {"threshold": thr},
-                       _rate_cis(fire, pos, pop["patient"], alpha, boot), threshold=thr, n_pos=int(pos.sum()),
-                       n_neg=int((~pos).sum()), **keys)
+    return metric_rows(_with_overshoot(_rates(fire, pos, w=w), alpha) | {"threshold": thr},
+                       _rate_cis(fire, pos, pop["patient"], alpha, boot, w=w), threshold=thr,
+                       **_class_counts(pos, w), **keys)
 
 
 def _pooled_ci(flagged: pd.DataFrame, thr_by_fold: Mapping[int, float], policy: str, split: str,
@@ -719,6 +899,15 @@ def policy_populations(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dic
     return {k: (e, pd.concat(f, ignore_index=True)) for k, (e, f) in out.items()}
 
 
+def _fold_w(frame: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
+    """``frame`` (every fold of one model/seed/split: ``fold``, ``guid``, ``shared_test``) with its §11.7 fold weights
+    as a ``w`` column (:func:`fold_weights_of`) on test, for the per-fold rows: split the result by fold, so each fold
+    is scored on the weighted fold population (:func:`_weighted`). Val comes back unchanged, without ``w``, so its rows
+    take the unweighted path bit for bit. Pool ``frame`` itself, never the result: :func:`pool_rows` keeps each GUID
+    once at weight 1."""
+    return frame.assign(w=fold_weights_of(frame, policy, split)) if split == "test" else frame
+
+
 def _three_class_rows(ctx: SimpleNamespace, m: str, sd: str, split: str, alpha: float, policy: str,
                       boot: Mapping[str, Any]) -> list:
     """§11.4 3-class rows of one model/seed/split, per fold and pooled (:func:`pool_rows`), at GUID level and, for a
@@ -740,7 +929,8 @@ def _three_class_rows(ctx: SimpleNamespace, m: str, sd: str, split: str, alpha: 
 
     The other rows' ``n_pos``/``n_neg`` count adverse/healthy units. CIs: :func:`three_class_ci` (patient clusters)
     on every metric but the confusion counts (and, as :func:`_tf_rows`, the collapses' non-ranking metrics). Empty
-    for a model without class probabilities.
+    for a model without class probabilities. Per-fold test rows are on the weighted fold population (:func:`_fold_w`),
+    so their confusion counts and ``n_pos``/``n_neg`` are weight sums (floats); pooled and val rows are unweighted.
     """
     lab, rows = ctx.cfg["labels"], []
     head = lab["head"] if lab["task"] == "three_class" else "aux3"
@@ -756,26 +946,29 @@ def _three_class_rows(ctx: SimpleNamespace, m: str, sd: str, split: str, alpha: 
         if not set(cols) <= set(u.columns) or not len(u) or u[cols].isna().any(axis=None):
             continue
         u = u.assign(patient=cluster(u))
-        for fold, f in [*((str(k), x) for k, x in u.groupby("fold")), ("pooled", pool_rows(u, policy, split))]:
+        uw = _fold_w(u, policy, split)
+        for fold, f in [*((str(k), x) for k, x in uw.groupby("fold")), ("pooled", pool_rows(u, policy, split))]:
+            f, w = _weighted(f)
+            if not len(f):  # a fold of shared GUIDs only, all weighted 0 under `exclude`: no population to score
+                continue
             y, P = f["class_code"].to_numpy(np.int64) - 1, f[cols].to_numpy(np.float64)
             o = f["ord_score"].to_numpy(np.float64) if "ord_score" in f and f["ord_score"].notna().all() else None
             k = _keys(ctx, m, sd, split=split, level=level, fold=fold, head=head, metric_type="threshold_free",
                       denominator="n/a", eval_window=lab["eval_window"] if level == "segment" else None)
-            mc, cm = multiclass(y, P), confusion_matrix(y, P.argmax(1), labels=[0, 1, 2])
-            ci = three_class_ci(y, P, f["patient"], alpha=alpha, ords=o, **boot)["metrics"]
-            n = dict(n_pos=int((y > 0).sum()), n_neg=int((y == 0).sum()))
+            mc, cm = multiclass(y, P, w), confusion_matrix(y, P.argmax(1), labels=[0, 1, 2], sample_weight=w)
+            ci = three_class_ci(y, P, f["patient"], alpha=alpha, ords=o, w=w, **boot)["metrics"]
+            n = _class_counts(y > 0, w)
             prob = {x: v for x, v in mc.items() if x.startswith(("auroc", "auprc")) or x == "rps"}
             if o is not None:
-                prob |= {f"ordinal_auroc_{name}": float(roc_auc_score(pos, o)) if 0 < pos.sum() < pos.size else NAN
-                         for name, pos in (("adverse", y > 0), ("hie", y == 2))}
+                prob |= {f"ordinal_auroc_{name}": float(roc_auc_score(pos, o, sample_weight=w))
+                         if 0 < pos.sum() < pos.size else NAN for name, pos in (("adverse", y > 0), ("hie", y == 2))}
             argmax = {x: v for x, v in mc.items() if x not in prob} | {
                 f"confusion_t{i}_p{j}": cm[i, j] for i in range(3) for j in range(3)}
             rows += metric_rows(prob, ci, **k, **n) + metric_rows(argmax, ci, policy_id="argmax", policy_basis="argmax",
                                                                   **k, **n)
             for name, pos, q in (("adverse_vs_healthy", y > 0, P[:, 1] + P[:, 2]), ("hie_vs_rest", y == 2, P[:, 2])):
-                tf = threshold_free(pos, _logit(np.clip(q, 1e-12, 1 - 1e-12)), alpha=alpha)
-                rows += metric_rows({f"{name}/{x}": v for x, v in tf.items()}, ci, n_pos=int(pos.sum()),
-                                    n_neg=int((~pos).sum()), **k)
+                tf = threshold_free(pos, _logit(np.clip(q, 1e-12, 1 - 1e-12)), alpha=alpha, w=w)
+                rows += metric_rows({f"{name}/{x}": v for x, v in tf.items()}, ci, **_class_counts(pos, w), **k)
     return rows
 
 
@@ -787,6 +980,12 @@ def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir
     ``data.shared_test_policy``, plus the other shared-test policy as a sensitivity row
     (``subgroup='shared_test_policy'``; H3 light). Val rows are the optimistic, selection-side copy.
     A model with class probabilities adds the 3-class rows of :func:`_three_class_rows` (with CIs).
+
+    Every per-fold test row is on the weighted fold population (§11.7 fold weighting, :func:`_fold_w`): a shared test
+    GUID weighs $1/K$ in each of its $K$ folds (0 under ``exclude``), so each fold has the pooled composition and its
+    ``n_pos``/``n_neg`` are weight sums. Unweighted, every fold's test set holds the 906 shared healthy GUIDs (77 % of
+    its healthy GUIDs, 25 % pooled), and the fold-mean test AUROC was 0.698 against 0.654 pooled. Pooled and val rows
+    are unweighted.
     """
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     other = {"first_fold": "exclude", "exclude": "first_fold"}[policy]
@@ -796,7 +995,7 @@ def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir
         for split in SPLITS:
             for level, units in level_units(ctx, m, sd, split).items():
                 k = _keys(ctx, m, sd, split=split, level=level, eval_window=win if level == "segment" else None)
-                for fold, u in units.groupby("fold"):
+                for fold, u in _fold_w(units, policy, split).groupby("fold"):
                     rows += _tf_rows(u, alpha, boot, fold=str(fold), **k)
                 rows += _tf_rows(pool_rows(units, policy, split), alpha, boot, fold="pooled", **k)
             rows += _three_class_rows(ctx, m, sd, split, alpha, policy, boot)
@@ -807,7 +1006,7 @@ def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir
                           metric_type=basis if basis in _DENOM else None, denominator=_DENOM.get(basis, "n/a"),
                           axis=None if e["at"] == "end" else e["axis"], t=NAN if e["at"] == "end" else float(e["at"]),
                           eval_window=win if level == "segment" else None)
-                for fold, p in pop.groupby("fold"):
+                for fold, p in _fold_w(pop, policy, split).groupby("fold"):
                     rows += _thr_rows(p, ents[fold]["threshold"], a, boot, fold=str(fold), **k)
                 flagged = pop if split == "test" else pop.assign(shared_test=pop["unit"].duplicated(keep=False))
                 thr_by_fold = {f: x["threshold"] for f, x in ents.items()}
@@ -821,6 +1020,8 @@ def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir
     return {"rows": rows, **_meta(ctx), "plan": {
         "models": [list(x) for x in _models(ctx)], "splits": list(SPLITS), "pauc_alpha": alpha,
         "shared_test_policy": policy, "sensitivity_policy": other, "val": VAL_LABEL,
+        "fold_weights": "per-fold test rows: a shared test GUID weighs 1/K in each of its K folds (0 under exclude); "
+                        "pooled and val rows unweighted",
         "exclude_last_min": ctx.cfg["eval"]["exclude_last_min"],
         "intervals": {"proportions": "wilson 95% (one decision per patient; else the patient-cluster bootstrap)",
                       "ranking_and_derived": {"method": "patient-cluster outcome-stratified percentile bootstrap",
@@ -847,22 +1048,26 @@ def vertical_average(curves: Sequence[Tuple[np.ndarray, np.ndarray]], grid: np.n
                          "n_folds": len(V)})
 
 
-def _roc(y: Any, s: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return roc_curve(y, s, drop_intermediate=False)  # dropping collinear points would break the step read
+def _roc(y: Any, s: Any, w: Any = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``roc_curve`` with every point (dropping collinear ones would break the step read); ``w``: optional row weights
+    (``sample_weight``; sklearn drops the zero-weight rows), None the unweighted curve."""
+    return roc_curve(y, s, sample_weight=w, drop_intermediate=False)
 
 
 def run_R1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """R1: GUID final-score ROC per fold, pooled (+ patient-cluster bootstrap band on ``ROC_GRID``) and the
-    vertical average across folds -> ``roc_points.parquet`` (fold, split, level, variant, fpr, tpr, thr, ...)."""
+    vertical average across folds -> ``roc_points.parquet`` (fold, split, level, variant, fpr, tpr, thr, ...). The
+    per-fold test curves (and so the vertical average) are on the weighted fold populations (:func:`_fold_w`)."""
     policy, frames = ctx.cfg["data"]["shared_test_policy"], []
     boot = dict(resamples=eval_config["bootstrap"]["resamples"], seed=eval_config["bootstrap"]["seed"])
     for m, sd in _models(ctx):
         for split in SPLITS:
             u, key = level_units(ctx, m, sd, split)["guid"], dict(model_id=m, seed=sd, split=split, level="guid")
             curves = []
-            for fold, f in u.groupby("fold"):
+            for fold, f in _fold_w(u, policy, split).groupby("fold"):
+                f, w = _weighted(f)
                 if f["y"].nunique() == 2:
-                    fpr, tpr, thr = _roc(f["y"], f["score"])
+                    fpr, tpr, thr = _roc(f["y"], f["score"], w)
                     curves.append((fpr, tpr))
                     frames.append(pd.DataFrame({**key, "fold": str(fold), "variant": "score_final",
                                                 "fpr": fpr, "tpr": tpr, "thr": thr}))
@@ -888,16 +1093,19 @@ def run_R1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 
 
 def run_R9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """R9: oracle test TPR at FPR <= f (``eval.report_tpr_at_fpr``), per fold and pooled; never a decision."""
+    """R9: oracle test TPR at FPR <= f (``eval.report_tpr_at_fpr``), per fold (weighted fold populations,
+    :func:`_fold_w`) and pooled; never a decision."""
     policy, rows = ctx.cfg["data"]["shared_test_policy"], []
     for m, sd in _models(ctx):
         u = level_units(ctx, m, sd, "test")["guid"]
-        for fold, g in [*((str(f), x) for f, x in u.groupby("fold")), ("pooled", pool_rows(u, policy, "test"))]:
+        uw = _fold_w(u, policy, "test")
+        for fold, g in [*((str(f), x) for f, x in uw.groupby("fold")), ("pooled", pool_rows(u, policy, "test"))]:
+            g, w = _weighted(g)
             if g["y"].nunique() < 2:
                 continue
-            fpr, tpr, _ = _roc(g["y"], g["score"])
+            fpr, tpr, _ = _roc(g["y"], g["score"], w)
             rows += metric_rows({f"tpr@fpr{f:g}": tpr_at(fpr, tpr, f) for f in eval_config["report_tpr_at_fpr"]},
-                                fold=fold, n_pos=int(g["y"].sum()), n_neg=int((g["y"] == 0).sum()),
+                                fold=fold, **_class_counts(g["y"].to_numpy() == 1, w),
                                 **_keys(ctx, m, sd, split="test", level="guid", policy_id="oracle", policy_basis="guid_final",
                                         metric_type="threshold_free", denominator="n/a"))
     return {"rows": rows, **_meta(ctx), "plan": {"label": "oracle (read off the test ROC; never used for decisions)"}}
@@ -937,7 +1145,8 @@ def _rows_frame(ctx: SimpleNamespace) -> pd.DataFrame:
 
 
 def run_T2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """T2: FPR overshoot (test FPR - alpha) per fold and pooled, per FPR-cap policy; needs ``metrics``.
+    """T2: FPR overshoot (test FPR - alpha) per fold and pooled, per FPR-cap policy; needs ``metrics`` (whose per-fold
+    test rows are on the weighted fold populations, so the per-fold overshoots are weighted FPRs minus alpha).
 
     An ``np_umbrella`` policy's record adds ``tolerance``, the 95% binomial tolerance on the pooled negatives
     (``binom.ppf(0.95, n_neg, alpha) / n_neg - alpha``), and the folds that fell back to empirical. Sanity
@@ -977,6 +1186,23 @@ def run_T2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             "overshoot": out, "sanity": sanity}
 
 
+def shuffled_interval(per_fold: Any, pooled: float, pooled_lo: float, pooled_hi: float) -> Tuple[float, float, float]:
+    """``(point, lo, hi)`` criterion 7 tests (§11.15): the fold-mean test AUROC of the shuffled-label control with a
+    95 % t interval over the folds, ``mean ± t_{0.975, k-1}·SD/√k``.
+
+    Each fold trains its own control, so the spread across folds holds the training variation. The pooled bootstrap
+    CI holds only the test sampling of fixed models: in run 2026-10-07--17-52 it was ±0.015 while the per-fold AUROCs
+    had an SD of 0.072, so a null control failed by chance. With fewer than 2 finite folds, the pooled value and its
+    bootstrap CI are returned. ``ponytail:`` the folds share training data, so the t interval is somewhat too narrow
+    (Bates 2024); a nested-CV interval if this criterion fails near the edge."""
+    a = np.asarray(per_fold, float)
+    a = a[np.isfinite(a)]
+    if len(a) < 2:
+        return pooled, pooled_lo, pooled_hi
+    half = float(student_t.ppf(0.975, len(a) - 1) * a.std(ddof=1) / np.sqrt(len(a)))
+    return float(a.mean()), float(a.mean()) - half, float(a.mean()) + half
+
+
 def run_B1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """B1/B3: baseline table (AUROC with CI, sens at each policy) and the shortcut warning; needs ``metrics``."""
     if not ctx.rows:
@@ -1008,12 +1234,17 @@ def run_B1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                 warnings.append(f"WARNING: {detail}: cohort construction lets length/missingness predict the label")
                 logger.warning(warnings[-1])
         if m == "shuffled" and len(pooled):
-            v, lo, hi = (float(pooled[k].iloc[0]) for k in ("value", "ci_lo", "ci_hi"))
-            over = bool(v > SHUFFLED_WARN_AUROC or not lo <= 0.5 <= hi)
-            detail = f"shuffled-label control pooled test AUROC {v:.3f} [{lo:.3f}, {hi:.3f}]"
-            sanity["shuffled_auroc"] = {"verdict": "fail" if over else "pass", "detail": detail, "value": v}
+            v, plo, phi = (float(pooled[k].iloc[0]) for k in ("value", "ci_lo", "ci_hi"))
+            folds = per.to_numpy(float)
+            point, lo, hi = shuffled_interval(folds, v, plo, phi)
+            over = bool(point > SHUFFLED_WARN_AUROC or not lo <= 0.5 <= hi)
+            detail = (f"shuffled-label control test AUROC fold mean {point:.3f} [{lo:.3f}, {hi:.3f}] "
+                      f"(t interval over {int(np.isfinite(folds).sum())} folds); "
+                      f"pooled {v:.3f} [{plo:.3f}, {phi:.3f}] (bootstrap, test sampling only)")
+            sanity["shuffled_auroc"] = {"verdict": "fail" if over else "pass", "detail": detail, "value": point}
             if over:
-                warnings.append(f"WARNING: {detail}: > {SHUFFLED_WARN_AUROC} or CI excludes 0.5, a pipeline leak")
+                warnings.append(f"WARNING: {detail}: > {SHUFFLED_WARN_AUROC} or interval excludes 0.5, a pipeline "
+                                f"leak")
                 logger.warning(warnings[-1])
     return {**_meta(ctx), "plan": {"baselines": list(BASELINES), "shortcut_warn_auroc": warn_at},
             "table": table, "warnings": warnings, "sanity": sanity}
@@ -1247,7 +1478,8 @@ def _prep(seg: pd.DataFrame, ents: Mapping, pids: list, seg_ents: Mapping, seg_p
     ``first`` each GUID's first row; ``T`` (G, P) its fold's guid-level thresholds; per policy (P, n)
     ``ex`` = s > thr (raw), ``latch`` = r > thr and ``la`` the state under ``eval.alarm_rule``.
     ``T6``/``pids6`` add the segment-level policies (M6). ``pat`` (G,) each GUID's patient code
-    (:func:`cluster`), None when every patient has one GUID in the group (the bootstraps' fast path)."""
+    (:func:`cluster`), None when every patient has one GUID in the group (the bootstraps' fast path). ``w`` (G,) the
+    GUIDs' fold weights, None here (unweighted); :func:`_fold_weighted` sets it on a per-fold test group."""
     o = _online(seg)
     gi = pd.factorize(o["guid"])[0]
     first = np.flatnonzero(np.r_[True, gi[1:] != gi[:-1]])
@@ -1265,7 +1497,26 @@ def _prep(seg: pd.DataFrame, ents: Mapping, pids: list, seg_ents: Mapping, seg_p
     return SimpleNamespace(pat=None if pat.max(initial=-1) + 1 == pat.size else pat,
         o=o, gi=gi, first=first, s=s, r=r, y=o["y"].to_numpy()[first] == 1, guid=o["guid"].to_numpy()[first],
         st=o["stage"].map(STAGE_CODES).fillna(0).to_numpy(np.int64), T=T, T6=np.c_[T, table(seg_ents, seg_pids)],
-        pids=pids, pids6=pids + seg_pids, basis=basis, ex=ex, latch=latch, la=la, clocks={})
+        pids=pids, pids6=pids + seg_pids, basis=basis, ex=ex, latch=latch, la=la, clocks={}, w=None)
+
+
+def _fold_weighted(groups: list, units: pd.DataFrame, policy: str, split: str) -> list:
+    """``groups`` with ``U.w`` (G,) set on each per-fold group: its GUIDs' :func:`fold_weights_of` over ``units`` (one
+    row per (fold, guid) of every fold), so every per-fold time-resolved row is computed on the weighted fold
+    population (§11.7 fold weighting: a shared test GUID at $1/K$ in each of its K folds, 0 under
+    ``shared_test_policy: exclude``). ``U.w`` stays None (the unweighted path, bit for bit) on the pooled group, which
+    keeps each GUID once, and on a group whose weights are all 1 (every val group)."""
+    w = pd.Series(fold_weights_of(units, policy, split), pd.MultiIndex.from_frame(units[["fold", "guid"]]))
+    for f, U in groups:
+        x = None if f == "pooled" else w.loc[int(f)].reindex(U.guid).to_numpy(np.float64)
+        U.w = None if x is None or (x == 1.0).all() else x
+    return groups
+
+
+def _gsum(a: np.ndarray, w: Optional[np.ndarray], axis: int) -> np.ndarray:
+    """Sum of the bool array ``a`` over its GUID axis ``axis``: the count, or with GUID weights ``w`` (:func:`_prep`'s
+    ``U.w``) the weight sum $\\sum_g w_g a_g$ (floats)."""
+    return a.sum(axis) if w is None else np.moveaxis(a, axis, -1) @ w
 
 
 def _clock(U: SimpleNamespace, axis: str) -> np.ndarray:
@@ -1286,7 +1537,8 @@ def _tr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Optional[li
 
     Segments are :func:`segments` (after ``eval.exclude_last_min``, as threshold selection). The
     pooled group keeps each GUID once (:func:`pool_rows`, ``data.shared_test_policy``), each with its
-    own fold's thresholds. None (recorded in ``inclusion``) for a model without an online or segment
+    own fold's thresholds. Each per-fold test group carries its GUIDs' fold weights ``U.w``
+    (:func:`_fold_weighted`). None (recorded in ``inclusion``) for a model without an online or segment
     score, i.e. the GUID-level shortcut.
     """
     cache = ctx.__dict__.setdefault("tr_cache", {})
@@ -1308,7 +1560,7 @@ def _tr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Optional[li
     args = (ents, pids, seg_ents, seg_pids, ev["alarm_rule"])
     groups = [(str(f), _prep(x, *args)) for f, x in kept.groupby("fold")]
     groups.append(("pooled", _prep(kept.merge(keep, on=["fold", "guid"]), *args)))
-    cache[(m, sd, split)] = groups
+    cache[(m, sd, split)] = groups = _fold_weighted(groups, units, policy, split)
     return groups
 
 
@@ -1410,22 +1662,25 @@ def _long(vals: Mapping[str, Tuple], *, pids: list, basis: list, thr: np.ndarray
 
 
 def _rate_vals(hit: np.ndarray, pop: np.ndarray, y: np.ndarray, pat: Optional[np.ndarray], under: np.ndarray,
-               live: np.ndarray, cp: np.ndarray, boot: Mapping[str, Any]) -> Dict[str, Tuple]:
+               live: np.ndarray, cp: np.ndarray, boot: Mapping[str, Any],
+               w: Optional[np.ndarray] = None) -> Dict[str, Tuple]:
     """``{metric: (value, ci_lo, ci_hi, keep)}`` of (P, K) alarm rates of the decisions ``hit`` (P, G, K)
     within the population ``pop`` (G, K): tp/fp always; sens/spec/fpr NaN when underpowered; PPV/NPV at
     checkpoints and end only. CIs: :func:`rate_ci` over the patients ``pat`` (Wilson; the cluster
-    bootstrap in a cell where a patient holds two of its GUIDs)."""
+    bootstrap in a cell where a patient holds two of its GUIDs). ``w`` (G,): optional GUID fold weights
+    (:func:`_fold_weighted`); tp/fp are then weight sums (floats), every rate their weighted ratio and every CI
+    :func:`rate_ci`'s weighted one (Kish-Wilson, or the weighted bootstrap)."""
     P, G, K = hit.shape
     yp, ok = y[:, None], live & ~under
-    tp, fp = (hit & yp).sum(1), (hit & ~yp).sum(1)
-    n_pos, n_neg = (pop & yp).sum(0), (pop & ~yp).sum(0)
+    tp, fp = _gsum(hit & yp, w, 1), _gsum(hit & ~yp, w, 1)
+    n_pos, n_neg = _gsum(pop & yp, w, 0), _gsum(pop & ~yp, w, 0)
 
     def ci(num: np.ndarray, den: np.ndarray, cols: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         lo, hi, nu = np.full((P, K), NAN), np.full((P, K), NAN), np.full((P, K), NAN)
         c = np.flatnonzero(cols)
         if c.size:
             rows = [np.broadcast_to(x, (P, G, K))[:, :, c].transpose(0, 2, 1).reshape(-1, G) for x in (num, den)]
-            lo[:, c], hi[:, c], nu[:, c] = (x.reshape(P, c.size) for x in rate_ci(*rows, y, pat, **boot))
+            lo[:, c], hi[:, c], nu[:, c] = (x.reshape(P, c.size) for x in rate_ci(*rows, y, pat, w=w, **boot))
         return lo, hi, nu
 
     with np.errstate(invalid="ignore", divide="ignore"):  # confusion_rates: PPV/NPV 0 when never fired
@@ -1448,23 +1703,25 @@ def _rate_vals(hit: np.ndarray, pop: np.ndarray, y: np.ndarray, pat: Optional[np
 def _tf_block(y: np.ndarray, pop: np.ndarray, score: np.ndarray, *, names: Tuple[str, ...], under: np.ndarray,
               live: np.ndarray, t: np.ndarray, point: np.ndarray, rank_ci: np.ndarray, alpha: float,
               boot: Mapping[str, Any], n_pos: np.ndarray, n_neg: np.ndarray, units: Optional[np.ndarray] = None,
-              **keys: Any) -> dict:
+              w: Optional[np.ndarray] = None, **keys: Any) -> dict:
     """Threshold-free rows (``names`` of auroc, auprc, pauc@alpha) of each live point's population
     ``pop[:, k]`` scored ``score[:, k]``; an AUROC bootstrap CI where ``rank_ci``; NaN when
-    underpowered or single-class."""
+    underpowered or single-class. ``w`` (G,): optional GUID fold weights (:func:`_fold_weighted`); the rank
+    statistics and the bootstrap are then the weighted ones, on the GUIDs with $w_g > 0$."""
     cols: Dict[str, list] = {c: [] for c in ("t", "point", "n_pos", "n_neg", "metric", "value", "ci_lo", "ci_hi",
                                              "n_boot_undefined")}
     for k in np.flatnonzero(live):
-        sel = pop[:, k]
+        sel = pop[:, k] if w is None else pop[:, k] & (w > 0)
         yk, sk = y[sel].astype(np.int64), score[sel, k]
+        wk = None if w is None else w[sel]
         vals = dict.fromkeys(names, (NAN, NAN, NAN, NAN))
         if not under[k] and 0 < yk.sum() < yk.size:
             o, st, _ = _ranked(sk)
-            vals = {m: (float(v[0]), NAN, NAN, NAN) for m, v in
-                    _rank_stats(*_curve(yk, np.ones((1, yk.size)), o, st), alpha).items() if m in names}
+            vals = {m: (float(v[0]), NAN, NAN, NAN) for m, v in _rank_stats(
+                *_curve(yk, np.ones((1, yk.size)) if wk is None else wk[None, :], o, st), alpha).items() if m in names}
             if rank_ci[k]:
                 c = bootstrap_auroc(yk, sk, None if units is None else units[sel], boot["resamples"],
-                                    boot["seed"])["metrics"]["auroc"]
+                                    boot["seed"], w=wk)["metrics"]["auroc"]
                 vals["auroc"] = (c["value"], c["ci_lo"], c["ci_hi"], c["n_undefined"])
         for m in names:
             for c, v in zip(cols, (t[k], point[k], n_pos[k], n_neg[k], m, *vals[m])):
@@ -1478,8 +1735,10 @@ def _mt_frames(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, ev: Ma
     fp, sens, spec, fpr; PPV/NPV at checkpoints/end), the threshold-free companions (snapshot AUROC,
     AUPRC, pAUC; cumulative AUROC), and the ``underpowered`` marker; all GUIDs and per stage (§11.5.4,
     the stage of the snapshot / of n*; committed_overall is not stratified: an unmonitored GUID has no
-    stage at c*). AUROC CIs where ``rank_ci`` (stage strata: checkpoints and end only). Also returns
-    the committed_overall counts for the M7 checks."""
+    stage at c*). AUROC CIs where ``rank_ci`` (stage strata: checkpoints and end only). A per-fold test group
+    (``U.w``, :func:`_fold_weighted`) gives the weighted fold population: ``n_pos``/``n_neg``, tp/fp and the power
+    rule (``eval.min_bin_class_n``) on weight sums, rates, rankings and CIs weighted. Also returns the unweighted
+    committed_overall counts for the M7 checks (the decision logic they test does not depend on the weights)."""
     mn, yp = ev["min_bin_class_n"], U.y[:, None]
     kind = pts["kind"].to_numpy()
     cp = np.isin(kind, ("checkpoint", "end"))
@@ -1491,14 +1750,14 @@ def _mt_frames(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, ev: Ma
     pops += [(mt, name, pop & (st == code), dec, sc) for name, code in STAGE_CODES.items() for mt, _, pop, dec, sc in pops[:2]]
     blocks, overall = [], {}
     for mt, stratum, pop, dec, score in pops:
-        n_pos, n_neg = (pop & yp).sum(0), (pop & ~yp).sum(0)
+        n_pos, n_neg = _gsum(pop & yp, U.w, 0), _gsum(pop & ~yp, U.w, 0)
         live = n_pos + n_neg > 0
         if not live.any():
             continue
         under = (n_pos < mn) | (n_neg < mn)
-        rates = _rate_vals(dec & pop, pop, U.y, U.pat, under, live, cp, boot)
+        rates = _rate_vals(dec & pop, pop, U.y, U.pat, under, live, cp, boot, w=U.w)
         if mt == "committed_overall":
-            overall = {"tp": rates["tp"][0], "fp": rates["fp"][0]}
+            overall = {"tp": ((dec & pop) & yp).sum(1), "fp": ((dec & pop) & ~yp).sum(1)}
         t = pts["t_inst" if mt == "instantaneous" else "t_comm"].to_numpy()
         k = keys | {"metric_type": mt, "denominator": _DENOM[mt]} | (
             {"subgroup": "stage", "subgroup_value": stratum} if stratum else {})
@@ -1509,7 +1768,7 @@ def _mt_frames(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, ev: Ma
         if score is not None:
             names = (*_RANK, f"pauc@{alpha:g}") if mt == "instantaneous" else ("auroc",)
             blocks.append(_tf_block(U.y, pop, score, names=names, under=under, live=live, alpha=alpha, boot=boot,
-                                    rank_ci=rank_ci if stratum is None else rank_ci & cp, units=U.pat,
+                                    rank_ci=rank_ci if stratum is None else rank_ci & cp, units=U.pat, w=U.w,
                                     **cnt, **(k | {"metric_type": "threshold_free"})))
     return blocks, overall
 
@@ -1519,7 +1778,9 @@ def _seg_frames(U: SimpleNamespace, axis: str, edges: np.ndarray, ev: Mapping[st
     """M6 column blocks: segment-level instantaneous per bin (every segment in b, ``logit_seg_cal``,
     every policy incl. segment-level ones) and segment AUROC/AUPRC/pAUC per bin; all segments and per
     stage (the segment's own). Patient-cluster CIs when ``ci`` (stratum 'all'; :func:`rate_ci`). ``n_pos`` /
-    ``n_neg`` count segments; underpowered counts GUIDs."""
+    ``n_neg`` count segments; underpowered counts GUIDs. A per-fold test group (``U.w``) weighs each segment by its
+    GUID's fold weight: segment and GUID counts become weight sums, rates and rankings weighted, and zero-weight GUIDs
+    drop out."""
     sc = U.o["logit_seg_cal"].to_numpy(np.float64)
     c = _clock(U, axis)
     b = np.searchsorted(edges, c, side="left") - 1
@@ -1527,22 +1788,24 @@ def _seg_frames(U: SimpleNamespace, axis: str, edges: np.ndarray, ev: Mapping[st
     if not ok.any():
         return []
     nb, G, P = edges.size - 1, U.first.size, len(U.pids6)
+    wG = np.ones(G) if U.w is None else U.w  # GUID weights; 1.0 * a count is exact, so unweighted stays bit for bit
     t = (-1.0 if axis == "to_delivery" else 1.0) * (edges[:-1] + edges[1:]) / 2.0 + 0.0
     thr = U.T6[0] if keys["fold"] != "pooled" else np.full(P, NAN)
     names, blocks = (*_RANK, f"pauc@{alpha:g}"), []
     for stratum, code in ((None, None), *STAGE_CODES.items()):
-        R = np.flatnonzero(ok & ((U.st == code) if code else True))
+        R = np.flatnonzero(ok & ((U.st == code) if code else True) & (wG[U.gi] > 0))
         if not R.size:
             continue
         y, s, g, bb = U.y[U.gi[R]], sc[R], U.gi[R], b[R]
+        wr = wG[g]
         cl = g if U.pat is None else U.pat[g]  # the bootstrap cluster of each segment
         hits = s[None, :] > U.T6[g].T
-        n_pos, n_neg = np.bincount(bb, y, nb), np.bincount(bb, ~y, nb)
-        tp = np.stack([np.bincount(bb, h & y, nb) for h in hits])
-        fp = np.stack([np.bincount(bb, h & ~y, nb) for h in hits])
+        n_pos, n_neg = np.bincount(bb, y * wr, nb), np.bincount(bb, ~y * wr, nb)
+        tp = np.stack([np.bincount(bb, (h & y) * wr, nb) for h in hits])
+        fp = np.stack([np.bincount(bb, (h & ~y) * wr, nb) for h in hits])
         pair = np.unique(bb * G + g)
-        g_pos = np.bincount(pair // G, U.y[pair % G], nb)
-        under = np.minimum(g_pos, np.bincount(pair // G, minlength=nb) - g_pos) < max(ev["min_bin_class_n"], 1)
+        g_pos = np.bincount(pair // G, U.y[pair % G] * wG[pair % G], nb)
+        under = np.minimum(g_pos, np.bincount(pair // G, wG[pair % G], nb) - g_pos) < max(ev["min_bin_class_n"], 1)
         live = n_pos + n_neg > 0
         with np.errstate(invalid="ignore", divide="ignore"):
             sens, fpr = np.where(under, NAN, tp / n_pos), np.where(under, NAN, fp / n_neg)
@@ -1552,15 +1815,18 @@ def _seg_frames(U: SimpleNamespace, axis: str, edges: np.ndarray, ev: Mapping[st
             if under[j]:
                 continue
             yj, sj, cj, hj = y[Rj], s[Rj], cl[Rj], hits[:, Rj]
+            wj = None if U.w is None else wr[Rj]
             o, st, _ = _ranked(sj)
-            for m, v in _rank_stats(*_curve(yj.astype(np.int64), np.ones((1, yj.size)), o, st), alpha).items():
+            for m, v in _rank_stats(*_curve(yj.astype(np.int64), np.ones((1, yj.size)) if wj is None else wj[None, :],
+                                            o, st), alpha).items():
                 tf[m][0, j] = v[0]
             if ci and stratum is None:
                 lo, hi, nu = rate_ci(np.r_[hj & yj, hj & ~yj],
-                                     np.r_[np.broadcast_to(yj, hj.shape), np.broadcast_to(~yj, hj.shape)], yj, cj, **boot)
+                                     np.r_[np.broadcast_to(yj, hj.shape), np.broadcast_to(~yj, hj.shape)], yj, cj,
+                                     w=wj, **boot)
                 s_lo[:, j], f_lo[:, j], s_hi[:, j], f_hi[:, j] = lo[:P], lo[P:], hi[:P], hi[P:]
                 s_nu[:, j], f_nu[:, j] = nu[:P], nu[P:]
-                r = bootstrap_auroc(yj, sj, cj, boot["resamples"], boot["seed"])["metrics"]["auroc"]
+                r = bootstrap_auroc(yj, sj, cj, boot["resamples"], boot["seed"], w=wj)["metrics"]["auroc"]
                 tf["auroc"][1:, j] = r["ci_lo"], r["ci_hi"], r["n_undefined"]
         k = keys | {"axis": axis, "level": "segment", "denominator": "bin_present"} | (
             {"subgroup": "stage", "subgroup_value": stratum} if stratum else {})
@@ -1606,7 +1872,9 @@ def run_M(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     threshold-free companions; M6 for models with segment scores; M7 sanity; L14 inclusion records.
 
     Threshold-free bootstrap CIs are computed for the pooled group at every point and per fold at
-    checkpoints and end; rates always carry binomial bootstrap CIs.
+    checkpoints and end; rates always carry binomial bootstrap CIs. Per-fold test rows are computed on the
+    weighted fold population (:func:`_fold_weighted`, :func:`_mt_frames`, :func:`_seg_frames`): a shared test GUID
+    weighs $1/K$ in each of its K folds, so the folds' weighted counts add up to the pooled ones.
     """
     ev, alpha = eval_config, primary_alpha(eval_config)
     boot = _boot(ev)
@@ -1710,16 +1978,24 @@ def _alarm_arrays(U: SimpleNamespace, la: np.ndarray) -> Dict[str, np.ndarray]:
 
 
 def _stat_ci(x: np.ndarray, stat: Callable, boot: Mapping[str, Any], units: Optional[np.ndarray] = None,
-             confidence: float = 0.95) -> Tuple[float, float, float]:
+             confidence: float = 0.95, w: Optional[np.ndarray] = None) -> Tuple[float, float, float]:
     """(value, ci_lo, ci_hi) of ``stat`` (``np.mean`` or ``np.median``) over GUIDs: percentile bootstrap
     of the GUIDs, or with ``units`` of their patients (a patient's GUIDs weigh together). The median is the
-    weighted lower median, for the value and every draw alike. NaN if empty."""
+    weighted lower median, for the value and every draw alike. NaN if empty.
+
+    ``w``: optional GUID weights (§11.7 fold weighting, :func:`fold_weights_of`). Zero-weight GUIDs are dropped first
+    (:func:`_nonzero`); the sample and every draw then weigh GUID $i$ by $w_i$ times its unit's multiplicity, so the
+    mean is $\\sum_i w_i x_i / \\sum_i w_i$ and the median the weighted lower median. ``w=None`` is the unweighted
+    path, unchanged bit for bit."""
+    w, x, units = _nonzero(w, x.size, x, units)
     if not x.size:
         return NAN, NAN, NAN
     B, rng = boot["resamples"], np.random.default_rng(boot["seed"])
     codes, names = pd.factorize(np.arange(x.size) if units is None else np.asarray(units))
     o = np.argsort(x, kind="stable")
     W = np.vstack([np.ones(x.size), _counts(len(names), B, rng)[:, codes[o]]])  # row 0: the sample itself
+    if w is not None:
+        W = W * w[o]
     C = np.cumsum(W, axis=1)
     d = (W @ x[o]) / C[:, -1] if stat is np.mean else x[o][np.argmax(C >= C[:, -1:] / 2.0, axis=1)]
     a = (1.0 - confidence) / 2.0
@@ -1731,7 +2007,14 @@ def run_A(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     ``alarms.parquet`` (one row per model, seed, fold, split, policy, rule, GUID) and ``level='alarm'``
     rows per fold and pooled: event sensitivity/FPR, lead time and time-to-first-false-alarm median
     and IQR, alarm burden, alarms per detection, and the detection / false-alarm curves vs hours
-    before delivery (bin right edges and checkpoints)."""
+    before delivery (bin right edges and checkpoints).
+
+    A per-fold test group is its weighted fold population (``U.w``, :func:`_fold_weighted`; §11.7 fold weighting):
+    ``n_pos``/``n_neg`` and the event counts are weight sums, the event and curve fractions weighted ratios with
+    :func:`rate_ci`'s weighted CIs, burden means weighted means, lead-time and time-to-first-false-alarm medians weighted
+    lower medians (:func:`_stat_ci`) and their quartiles weighted quantiles (:func:`_wquantile`); a zero-weight GUID
+    (a shared one under ``shared_test_policy: exclude``) leaves the fold population. ``alarms.parquet`` carries each
+    GUID's weight ``w`` (1 on val and on the folds without shared GUIDs)."""
     ev = eval_config
     boot, rules = _boot(ev), ["latch"] + (["k_of_n"] if ev["alarm_rule"]["kind"] == "k_of_n" else [])
     tables, rows = [], []
@@ -1745,9 +2028,11 @@ def run_A(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
             kinds = ["bin"] * (edges.size - 1 if edges.size else 0) + ["checkpoint"] * len(ev["checkpoints_h"])
             for fold, U in groups:
                 G = U.first.size
+                live = np.ones(G, bool) if U.w is None else U.w > 0  # the GUIDs of the (weighted) fold population
 
-                def pat(sel: np.ndarray, U: SimpleNamespace = U) -> Optional[np.ndarray]:
-                    return None if U.pat is None else U.pat[sel]
+                def by(sel: np.ndarray, U: SimpleNamespace = U) -> Dict[str, Optional[np.ndarray]]:
+                    """:func:`_stat_ci`'s ``units`` (patients) and ``w`` (fold weights) of the GUIDs ``sel``."""
+                    return {"units": None if U.pat is None else U.pat[sel], "w": None if U.w is None else U.w[sel]}
 
                 for rule in rules:
                     A = _alarm_arrays(U, U.latch if rule == "latch" else U.la)
@@ -1758,34 +2043,38 @@ def run_A(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
                             "policy_id": np.repeat(U.pids, G), "rule": rule, "guid": np.tile(U.guid, len(U.pids)),
                             "y": np.tile(U.y.astype(np.int64), len(U.pids)),
                             "clinical_class": np.tile(U.o["clinical_class"].to_numpy()[U.first], len(U.pids)),
-                            "threshold": np.repeat(thr, G), **{c: v.ravel() for c, v in A.items()}}))
+                            "threshold": np.repeat(thr, G), **{c: v.ravel() for c, v in A.items()},
+                            "w": np.tile(np.ones(G) if U.w is None else U.w, len(U.pids))}))
                     base = _keys(ctx, m, sd, split=split, fold=fold, level="alarm", metric_type="alarm", denominator="all",
                                  axis="to_delivery", subgroup="alarm_rule", subgroup_value=rule)
-                    n_pos, n_neg = int(U.y.sum()), int((~U.y).sum())
+                    n = _class_counts(U.y, U.w)
+                    n_pos, n_neg = n["n_pos"], n["n_neg"]
                     for p, pid in enumerate(U.pids):
-                        k = base | dict(policy_id=pid, policy_basis=U.basis[pid], threshold=thr[p], n_pos=n_pos, n_neg=n_neg)
+                        k = base | dict(policy_id=pid, policy_basis=U.basis[pid], threshold=thr[p], **n)
                         al = A["alarmed"][p]
-                        tp, fp = int((al & U.y).sum()), int((al & ~U.y).sum())
+                        tp, fp = _gsum(al & U.y, U.w, 0), _gsum(al & ~U.y, U.w, 0)
                         (s_lo, f_lo), (s_hi, f_hi), (s_nu, f_nu) = rate_ci(
-                            np.stack([al & U.y, al & ~U.y]), np.stack([U.y, ~U.y]), U.y, U.pat, **boot)
+                            np.stack([al & U.y, al & ~U.y]), np.stack([U.y, ~U.y]), U.y, U.pat, w=U.w, **boot)
                         stat = {"event_sens": (tp / n_pos if n_pos else NAN, s_lo, s_hi, s_nu),
                                 "event_fpr": (fp / n_neg if n_neg else NAN, f_lo, f_hi, f_nu),
                                 "alarms_per_detection": (fp / tp if tp else NAN, NAN, NAN),
-                                "burden_pos_mean": _stat_ci(A["burden"][p][U.y], np.mean, boot, pat(U.y)),
-                                "burden_neg_mean": _stat_ci(A["burden"][p][~U.y], np.mean, boot, pat(~U.y))}
-                        for name, sel in (("lead_time", al & U.y), ("ttfa", al & ~U.y)):
+                                "burden_pos_mean": _stat_ci(A["burden"][p][U.y], np.mean, boot, **by(U.y)),
+                                "burden_neg_mean": _stat_ci(A["burden"][p][~U.y], np.mean, boot, **by(~U.y))}
+                        for name, sel in (("lead_time", al & U.y & live), ("ttfa", al & ~U.y & live)):
                             x = A["lead_time_h" if name == "lead_time" else "time_to_first_alarm_h"][p][sel]
-                            stat[f"{name}_median_h"] = _stat_ci(x, np.median, boot, pat(sel))
+                            stat[f"{name}_median_h"] = _stat_ci(x, np.median, boot, **by(sel))
                             for q in (25, 75):
-                                stat[f"{name}_q{q}_h"] = (float(np.quantile(x, q / 100)) if x.size else NAN, NAN, NAN)
+                                stat[f"{name}_q{q}_h"] = (float(_wquantile(x, q / 100, by(sel)["w"])) if x.size else NAN,
+                                                          NAN, NAN)
                         rows += metric_rows({mm: v[0] for mm, v in stat.items()},
                                             {mm: {"ci_lo": v[1], "ci_hi": v[2], "n_undefined": (v[3:] or (None,))[0]}
                                              for mm, v in stat.items()}, point="end", t=NAN, **k)
                         c_first = A["first_alarm_t_s"][p] / 3600.0
                         hit = c_first[None, :] <= cs[:, None]  # alarmed by c* (NaN = never)
-                        dp, dn = (hit & U.y).sum(1), (hit & ~U.y).sum(1)
+                        dp, dn = _gsum(hit & U.y, U.w, 1), _gsum(hit & ~U.y, U.w, 1)
                         lo, hi, nu = rate_ci(np.r_[hit & U.y, hit & ~U.y],
-                                             np.repeat(np.stack([U.y, ~U.y]), len(cs), axis=0), U.y, U.pat, **boot)
+                                             np.repeat(np.stack([U.y, ~U.y]), len(cs), axis=0), U.y, U.pat, w=U.w,
+                                             **boot)
                         (p_lo, n_lo), (p_hi, n_hi), (p_nu, n_nu) = np.split(lo, 2), np.split(hi, 2), np.split(nu, 2)
                         for i, (c_, kd) in enumerate(zip(cs, kinds)):
                             rows += metric_rows({"detection_frac": dp[i] / n_pos if n_pos else NAN,
@@ -1818,7 +2107,8 @@ def run_R2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     the GUIDs available (``committed_cumulative@<h>``), over all GUIDs with -inf for the unmonitored
     (``committed_overall@<h>``), and of the snapshot inside the staleness window (``snapshot@<h>``);
     per fold and pooled, val and test, ``level='online'``. ``precision`` next to ``tpr`` (= recall)
-    is the PR curve."""
+    is the PR curve. Per-fold test curves weigh each GUID by its fold weight ``U.w`` (§11.7), so their
+    ``n_pos``/``n_neg`` are weight sums."""
     ev, frames = eval_config, []
     for m, sd in _models(ctx):
         for split in SPLITS:
@@ -1832,12 +2122,12 @@ def run_R2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                     for name, sel, score in (("committed_cumulative", V.avail[:, k], U.r[row]),
                                              ("committed_overall", V.elig, np.where(V.avail[:, k], U.r[row], -np.inf)),
                                              ("snapshot", V.inst[:, k], U.s[row])):
-                        y = U.y[sel]
+                        w, y, sc = _nonzero(None if U.w is None else U.w[sel], int(sel.sum()), U.y[sel], score[sel])
                         if 0 < y.sum() < y.size:
                             frames.append(pd.DataFrame({
                                 "model_id": m, "seed": sd, "fold": fold, "split": split, "level": "online",
                                 "variant": f"{name}@{'end' if kind == 'end' else f'{t:g}'}", "axis": "to_delivery", "t": t,
-                                **roc_points(y, score[sel]), "n_pos": int(y.sum()), "n_neg": int((~y).sum())}))
+                                **roc_points(y, sc, w), **_class_counts(y, w)}))
     return {**_meta(ctx), "n_rows": _append_roc(out_dir, frames, _ROC_P4), "plan": {
         "variants": [f"{v}<h|end>" for v in _ROC_P4], "pr": "precision vs tpr (recall) of the same rows (R6)",
         "t": "hours before delivery (NaN at end)"}}
@@ -1846,7 +2136,7 @@ def run_R2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 def run_R5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """R5: segment-level ROC on the time-matched eval window (``in_eval_window`` rows, ``logit_seg_cal``),
     per fold and pooled (variant ``segment``), with the pooled GUID-cluster bootstrap band on
-    ``ROC_GRID`` (``segment:band``)."""
+    ``ROC_GRID`` (``segment:band``). Per-fold test curves are on the weighted fold populations (:func:`_fold_w`)."""
     policy, boot, frames = ctx.cfg["data"]["shared_test_policy"], _boot(eval_config), []
     for m, sd in _models(ctx):
         for split in SPLITS:
@@ -1854,13 +2144,14 @@ def run_R5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             if u is None:
                 continue
             key = dict(model_id=m, seed=sd, split=split, level="segment", eval_window=ctx.cfg["labels"]["eval_window"])
-            for fold, f in [*((str(k), x) for k, x in u.groupby("fold")), ("pooled", pool_rows(u, policy, split))]:
+            uw = _fold_w(u, policy, split)
+            for fold, f in [*((str(k), x) for k, x in uw.groupby("fold")), ("pooled", pool_rows(u, policy, split))]:
+                f, w = _weighted(f)
                 y = f["y"].to_numpy(np.int64)
                 if not 0 < y.sum() < y.size:
                     continue
-                r = roc_points(y, f["score"])
-                frames.append(pd.DataFrame({**key, "fold": fold, "variant": "segment", **r,
-                                            "n_pos": int(y.sum()), "n_neg": int(y.size - y.sum())}))
+                r = roc_points(y, f["score"], w)
+                frames.append(pd.DataFrame({**key, "fold": fold, "variant": "segment", **r, **_class_counts(y == 1, w)}))
                 if fold == "pooled":
                     lo, hi = roc_band(y, f["score"], f["patient"], ROC_GRID, **boot)
                     frames.append(pd.DataFrame({**key, "fold": fold, "variant": "segment:band", "fpr": ROC_GRID,
@@ -1869,11 +2160,19 @@ def run_R5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
         "window": ctx.cfg["labels"]["eval_window"], "band": "pooled patient-cluster bootstrap 95%, step read"}}
 
 
-def _count_rows(fire: np.ndarray, y: np.ndarray, units: Any, boot: Mapping[str, Any], **keys: Any) -> list:
-    """tp, fp, sens, spec, fpr rows of one decision per GUID row (``fire``, ``y`` bool); :func:`rate_ci` CIs."""
-    tp, fp, n_pos, n_neg = int((fire & y).sum()), int((fire & ~y).sum()), int(y.sum()), int((~y).sum())
+def _count_rows(fire: np.ndarray, y: np.ndarray, units: Any, boot: Mapping[str, Any], w: Any = None,
+                **keys: Any) -> list:
+    """tp, fp, sens, spec, fpr rows of one decision per GUID row (``fire``, ``y`` bool); :func:`rate_ci` CIs. ``w``:
+    optional row weights (§11.7 fold weights; zero-weight rows dropped first, :func:`_nonzero`), so the counts and
+    ``n_pos``/``n_neg`` are weight sums and the CIs :func:`rate_ci`'s weighted ones."""
+    w, fire, y, units = _nonzero(w, y.size, fire, y, units)
+
+    def tot(sel: np.ndarray) -> Any:
+        return int(sel.sum()) if w is None else float(w[sel].sum())
+
+    tp, fp, n_pos, n_neg = tot(fire & y), tot(fire & ~y), tot(y), tot(~y)
     (s_lo, f_lo), (s_hi, f_hi), (s_nu, f_nu) = rate_ci(np.stack([fire & y, fire & ~y]), np.stack([y, ~y]), y, units,
-                                                       **boot)
+                                                       w=w, **boot)
     sens, fpr = tp / n_pos if n_pos else NAN, fp / n_neg if n_neg else NAN
     return metric_rows({"tp": tp, "fp": fp, "sens": sens, "spec": 1.0 - fpr, "fpr": fpr},
                        {"sens": {"ci_lo": s_lo, "ci_hi": s_hi, "n_undefined": s_nu},
@@ -1884,8 +2183,9 @@ def _count_rows(fire: np.ndarray, y: np.ndarray, units: Any, boot: Mapping[str, 
 def run_R8(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """R8 decision-horizon ribbon: at each c* in ``eval.decision_horizons_h`` every FPR-cap policy's
     threshold is re-selected on VAL (committed_overall basis at c*, to_delivery, running max), then
-    val and test sens/FPR are read at c* on the committed_overall population, per fold and pooled.
-    Rows: ``level='online'``, ``subgroup='decision_horizon'``, ``subgroup_value=t=h``."""
+    val and test sens/FPR are read at c* on the committed_overall population, per fold (test: the weighted fold
+    population, :func:`_fold_w`) and pooled. Rows: ``level='online'``, ``subgroup='decision_horizon'``,
+    ``subgroup_value=t=h``."""
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     boot = _boot(ev)
     pols = [p for p in ev["thresholds"] if p["policy"] == "fpr_cap" and p["basis"] != "segment"]
@@ -1919,11 +2219,11 @@ def run_R8(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             k = _keys(ctx, m, sd, split=sp, level="online", metric_type="committed_overall", denominator="all",
                       axis="to_delivery", t=h, point="checkpoint", policy_id=pid, policy_basis="committed_overall",
                       subgroup="decision_horizon", subgroup_value=f"{h:g}")
-            parts = [(str(fo), x, float(x["threshold"].iloc[0])) for fo, x in g.groupby("fold")]
+            parts = [(str(fo), x, float(x["threshold"].iloc[0])) for fo, x in _fold_w(g, policy, sp).groupby("fold")]
             parts.append(("pooled", pool_rows(g.assign(unit=g["guid"]), policy, sp), NAN))
             for fold, x, thr in parts:
-                rows += _count_rows(x["fired"].to_numpy(), x["y"].to_numpy() == 1, x["patient"], boot, fold=fold,
-                                    threshold=thr, **k)
+                rows += _count_rows(x["fired"].to_numpy(), x["y"].to_numpy() == 1, x["patient"], boot, w=x.get("w"),
+                                    fold=fold, threshold=thr, **k)
     return {"rows": rows, **_meta(ctx), "failed": failed, "plan": {
         "horizons_h": list(ev["decision_horizons_h"]), "policies": [p["id"] for p in pols],
         "basis": "committed_overall at c* (to_delivery, latch), re-selected on val per fold"}}
@@ -1942,7 +2242,10 @@ def _patient_draws(units: pd.DataFrame, patients: Any, resamples: int, seed: int
 
 
 def _refit_threshold(pol: Mapping[str, Any], y: np.ndarray, s: np.ndarray, w: np.ndarray) -> float:
-    """``pol``'s threshold on the resampled basis (row ``i`` repeated ``w[i]`` times); NaN when it cannot be chosen."""
+    """``pol``'s threshold on the resampled basis (row ``i`` repeated ``w[i]`` times); NaN when it cannot be chosen.
+
+    ``w`` holds integer bootstrap multiplicities only: the refit runs on val, whose rows carry no fold weight
+    (:func:`fold_weights_of` is test-only), so repeating rows is exactly the selection's own unweighted dispatch."""
     idx = np.repeat(np.arange(y.size), w.astype(np.int64))
     try:
         return policy_threshold(pol, y[idx], s[idx])["threshold"]
@@ -1950,14 +2253,17 @@ def _refit_threshold(pol: Mapping[str, Any], y: np.ndarray, s: np.ndarray, w: np
         return NAN
 
 
-def _refit_rates(pop: pd.DataFrame, thr: np.ndarray, code: np.ndarray, M: np.ndarray, at: np.ndarray
-                 ) -> Dict[str, np.ndarray]:
+def _refit_rates(pop: pd.DataFrame, thr: np.ndarray, code: np.ndarray, M: np.ndarray, at: np.ndarray,
+                 w: Any = None) -> Dict[str, np.ndarray]:
     """sens / spec / fpr per draw of the test basis rows ``pop`` fired at their fold's draw threshold ``thr[b, code]``
-    (``thr`` (B, folds)), each row weighing its patient's multiplicity ``M[b, at]``; NaN where a threshold is."""
+    (``thr`` (B, folds)), each row weighing its patient's multiplicity ``M[b, at]``; NaN where a threshold is. ``w``:
+    optional row weights (§11.7 fold weights), so row $i$ weighs $w_i\\,M_{b,\\mathrm{at}_i}$; None is unweighted."""
     y, s = pop["y"].to_numpy() == 1, pop["score"].to_numpy(np.float64)
     out = {k: np.full(len(thr), NAN) for k in ("sens", "fpr")}
     for sl in _chunks(len(thr), len(pop)):
         W, fire = M[sl][:, at], s > thr[sl][:, code]
+        if w is not None:
+            W = W * np.asarray(w, np.float64)
         with np.errstate(invalid="ignore", divide="ignore"):
             out["sens"][sl] = (W * (fire & y)).sum(1) / (W * y).sum(1)
             out["fpr"][sl] = (W * (fire & ~y)).sum(1) / (W * ~y).sum(1)
@@ -1977,7 +2283,9 @@ def refit_rows(ctx: SimpleNamespace, m: str, sd: str, pops: Mapping[str, Any], b
     twice counts twice), re-selects every policy on that fold's resampled val basis population with the selection's
     own dispatch (:func:`~teb_vae.classifier.thresholds.policy_threshold`), then scores a resample of the fold's test
     GUIDs (seed ``seed + 10000 + fold``; pooled: of the pooled test GUIDs, seed ``seed + 20000``, each row at its own
-    fold's replicate threshold). The point value is the fixed-threshold one (:func:`run_metrics`' rows).
+    fold's replicate threshold). The point value is the fixed-threshold one (:func:`run_metrics`' rows). A fold's test
+    rows weigh their fold weight times the multiplicity (:func:`_fold_w`; zero-weight GUIDs leave the draws too), as
+    :func:`run_metrics`' per-fold rows; val and pooled rows are unweighted.
 
     The val scores are the calibrated ones: binary temperature / Platt (a > 0) and the ordinal map are increasing per
     fold, so for a rank policy (fpr_cap, youden, sens_target) re-selecting on them is exactly refitting the calibration,
@@ -2007,20 +2315,21 @@ def refit_rows(ctx: SimpleNamespace, m: str, sd: str, pops: Mapping[str, Any], b
                   axis=None if e0["at"] == "end" else e0["axis"], t=NAN if e0["at"] == "end" else float(e0["at"]),
                   point="end" if e0["at"] == "end" else "checkpoint", subgroup="threshold_refit", subgroup_value="refit")
         chosen = np.array([ents[f]["threshold"] for f in folds])
-        parts = [(f, tpop[tpop["fold"] == f], _sel(gd["test"], fold=f), seed + 10_000 + f) for f in folds]
+        tw, uw = _fold_w(tpop, policy, "test"), _fold_w(gd["test"], policy, "test")  # per-fold test: fold weights
+        parts = [(f, *(_weighted(x[x["fold"] == f])[0] for x in (tw, uw)), seed + 10_000 + f) for f in folds]
         parts.append(("pooled", pool_rows(tpop, policy, "test"), pool_rows(gd["test"], policy, "test"), seed + 20_000))
         for fold, t, units, sd_ in parts:
-            code = pd.Index(folds).get_indexer(t["fold"])
+            code, w = pd.Index(folds).get_indexer(t["fold"]), None if "w" not in t else t["w"].to_numpy(np.float64)
             M, at = _patient_draws(units, t["patient"], B, sd_)
-            point = {x: float(v[0]) for x, v in _refit_rates(t, chosen[None], code, np.ones((1, M.shape[1])), at).items()}
-            draws, j = _refit_rates(t, thr, code, M, at), None if fold == "pooled" else folds.index(fold)
+            point = {x: float(v[0])
+                     for x, v in _refit_rates(t, chosen[None], code, np.ones((1, M.shape[1])), at, w).items()}
+            draws, j = _refit_rates(t, thr, code, M, at, w), None if fold == "pooled" else folds.index(fold)
             if j is not None:
                 point, draws = point | {"threshold": float(chosen[j])}, draws | {"threshold": thr[:, j]}
             ci = _percentile_ci(point, draws, method="refit bootstrap (§11.7 b)", resamples=B, seed=sd_,
                                 confidence=0.95, n=M.shape[1])["metrics"]
-            n_pos = int((t["y"] == 1).sum())
             rows += metric_rows(point, ci, fold=str(fold), threshold=NAN if j is None else float(chosen[j]),
-                                n_pos=n_pos, n_neg=int(len(t) - n_pos), **k)
+                                **_class_counts(t["y"].to_numpy() == 1, w), **k)
     return rows
 
 
@@ -2029,7 +2338,8 @@ def run_T3(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     ``eval.bootstrap.refit_threshold``, the refit bootstrap (:func:`refit_rows`: the refitted thresholds' spread and
     test rates whose CIs carry threshold noise); (c) val and test sens/FPR on each FPR-cap policy's basis population when
     its threshold moves by -2..+2 validation order statistics (sorted val basis negatives, ties
-    included), per fold and pooled; rows ``subgroup='threshold_perturbation'``, value ``+j``."""
+    included), per fold (test: the weighted fold population, :func:`_fold_w`) and pooled; rows
+    ``subgroup='threshold_perturbation'``, value ``+j``."""
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     kinds, boot = {p["id"]: p["policy"] for p in ev["thresholds"]}, _boot(ev)
     per: Dict[str, Dict[str, float]] = {}
@@ -2066,10 +2376,11 @@ def run_T3(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                 pop = pops[sp][(level, pid)][1]
                 for j, thr in thr_j.items():
                     k = _keys(ctx, m, sd, split=sp, subgroup_value=f"{j:+d}", **key)
-                    for fold, p in pop.groupby("fold"):
-                        vals = thresholded(p["y"], p["score"], thr[fold])
+                    for fold, p in _fold_w(pop, policy, sp).groupby("fold"):
+                        p, w = _weighted(p)
+                        vals = thresholded(p["y"], p["score"], thr[fold], w)
                         ci = _prop_ci(p["score"].to_numpy(np.float64) > thr[fold], p["y"].to_numpy() == 1, p["patient"],
-                                      None, boot)
+                                      None, boot, w=w)
                         rows += metric_rows({x: vals[x] for x in ("sens", "spec", "fpr")}, ci,
                                             fold=str(fold), threshold=thr[fold], n_pos=vals["tp"] + vals["fn"],
                                             n_neg=vals["tn"] + vals["fp"], **k)
@@ -2223,6 +2534,9 @@ def evaluate(run_dir: Any, cfg: Any, *, only: Optional[Sequence[str]] = None,
     rep.set("sanity", {"checks": ctx.sanity, "failed": sorted(k for k, v in ctx.sanity.items() if v["verdict"] == "fail")})
     rep.set("config_digest", ctx.digest)
     rep.set("config", ctx.cfg)
+    # §11.7: per-fold test rows on the weighted fold population (fold_weights_of: a shared GUID at 1/K); report reads
+    # the key to tell these evaluations from older, unweighted ones
+    rep.set("fold_weighting", "inverse_k")
     rep.set("labels", {"val": VAL_LABEL, "oracle": "tpr@fpr rows: read off the test ROC, never a decision",
                        "auroc": "per-fold mean +/- SD primary; pooled OOF AUROC secondary"})
     rep.set("arguments", {"run_dir": str(ctx.run_dir), "only": list(only or []), "skip": list(skip or [])})
@@ -2444,21 +2758,18 @@ def _policy_pops(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dict[Tupl
     return cache[(m, sd, split)]
 
 
-def _rank_point(y: np.ndarray, s: np.ndarray, alpha: float) -> Dict[str, float]:
-    """AUROC, AUPRC and pAUC@alpha point values (:func:`_rank_stats`: sklearn's; NaN with one class)."""
+def _rank_point(y: np.ndarray, s: np.ndarray, alpha: float, w: Optional[np.ndarray] = None) -> Dict[str, float]:
+    """AUROC, AUPRC and pAUC@alpha point values (:func:`_rank_stats`: sklearn's; NaN with one class). ``w``: optional
+    row weights (§11.7 fold weighting), the weighted rank statistics; a zero-weight row adds nothing."""
     o, st, _ = _ranked(np.asarray(s, np.float64))
     y = np.asarray(y, np.int64)
+    W = np.ones((1, y.size)) if w is None else np.asarray(w, np.float64)[None, :]
     with np.errstate(invalid="ignore", divide="ignore"):
-        return {m: float(v[0]) for m, v in _rank_stats(*_curve(y, np.ones((1, y.size)), o, st), alpha).items()}
+        return {m: float(v[0]) for m, v in _rank_stats(*_curve(y, W, o, st), alpha).items()}
 
 
 def _s_models(ctx: SimpleNamespace) -> list:
     return [x for x in _models(ctx) if x[0] != "shuffled"]
-
-
-def _folds(units: pd.DataFrame, policy: str, split: str) -> list:
-    """``[(fold label, rows)]``: every fold, then the pooled OOF rows (:func:`pool_rows`)."""
-    return [*((str(f), x) for f, x in units.groupby("fold")), ("pooled", pool_rows(units, policy, split))]
 
 
 def _guid_col(ctx: SimpleNamespace, m: str, sd: str, split: str, x: pd.DataFrame, col: str) -> np.ndarray:
@@ -2494,20 +2805,23 @@ def _s_frame(blocks: list) -> pd.DataFrame:
 
 
 def _s1_rates(ctx: SimpleNamespace, x: pd.DataFrame, fire: np.ndarray, mn: int, boot: Mapping[str, Any],
-              **keys: Any) -> Dict[str, Any]:
+              w: Optional[np.ndarray] = None, **keys: Any) -> Dict[str, Any]:
     """S1 thresholded column block (:func:`_s_frame`) of one population ``x`` (fold, guid, y, patient) and its decisions ``fire``, per cell: what
     the cell's population reports (§11.6): healthy-only tn, fp, spec, fpr; unhealthy-only tp, fn, sens; mixed those
     plus PPV and NPV. Rates carry :func:`rate_ci` CIs (Wilson; the patient-cluster bootstrap where a patient holds two
     of the cell's rows); a rate whose class count is below ``mn`` (``eval.min_subgroup_n``) is NaN and
     ``underpowered``, its estimate in ``value_raw``. PPV/NPV are 0 when the rule never fires (:func:`confusion_rates`).
-    ``keys`` fill the other columns."""
+    ``w``: optional row weights (a per-fold test population, §11.7 fold weighting): the counts, ``n_pos``/``n_neg``
+    and the power rule become weight sums, the rates weighted ratios with weighted CIs. ``keys`` fill the other
+    columns."""
     cells, Mm = _cells(ctx), _member_matrix(ctx, x["fold"], x["guid"])
     pos, n = x["y"].to_numpy() == 1, len(x)
     num = np.stack([fire & pos, ~fire & ~pos, fire & ~pos, fire & pos, ~fire & ~pos])  # the _PROP order
     den = np.stack([pos, ~pos, ~pos, fire, ~fire])
     N, D = Mm[None] & num[:, None], Mm[None] & den[:, None]  # (5, C, n)
-    k, d = N.sum(2), D.sum(2)
-    lo, hi, nu = (v.reshape(5, -1) for v in rate_ci(N.reshape(-1, n), D.reshape(-1, n), pos, x["patient"], **boot))
+    k, d = _gsum(N, w, 2), _gsum(D, w, 2)
+    lo, hi, nu = (v.reshape(5, -1) for v in rate_ci(N.reshape(-1, n), D.reshape(-1, n), pos, x["patient"], w=w,
+                                                     **boot))
     n_pos, n_neg = d[0], d[1]
     with np.errstate(invalid="ignore", divide="ignore"):
         rate = np.where(d > 0, k / d, NAN)
@@ -2541,7 +2855,9 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     * per GUID-level policy, on its basis population at each fold's own threshold: :func:`_s1_rates`.
 
     A metric needing a class with fewer than ``eval.min_subgroup_n`` GUIDs is NaN with ``underpowered`` (estimate in
-    ``value_raw``). Also writes ``subgroup_cutpoints.json``.
+    ``value_raw``). Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; §11.7 fold
+    weighting): counts, ``n_pos``/``n_neg`` and the power rule on weight sums, rates and rankings weighted. Also writes
+    ``subgroup_cutpoints.json``.
     """
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     alpha, boot, mn = primary_alpha(ev), _boot(ev), ev["min_subgroup_n"]
@@ -2559,10 +2875,11 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     for m, sd in _s_models(ctx):
         for split in SPLITS:
             k0 = _keys(ctx, m, sd, split=split, level="guid")
-            for fold, x in _folds(level_units(ctx, m, sd, split)["guid"], policy, split):
+            for fold, x, w in _folds_and_pooled(level_units(ctx, m, sd, split)["guid"], policy, split):
                 Mm, y, sc = _member_matrix(ctx, x["fold"], x["guid"]), x["y"].to_numpy(np.int64), x["score"].to_numpy(np.float64)
-                n_pos, n_neg = (Mm & (y == 1)).sum(1), (Mm & (y == 0)).sum(1)
-                nseg = Mm @ np.nan_to_num(_guid_col(ctx, m, sd, split, x, "n_segments").astype(np.float64))
+                n_pos, n_neg = _gsum(Mm & (y == 1), w, 1), _gsum(Mm & (y == 0), w, 1)
+                nseg = Mm @ (np.nan_to_num(_guid_col(ctx, m, sd, split, x, "n_segments").astype(np.float64))
+                             * (1.0 if w is None else w))
                 live = np.flatnonzero(n_pos + n_neg)
                 with np.errstate(invalid="ignore", divide="ignore"):
                     counts = {"n_guids": n_pos + n_neg, "n_segments": nseg, "prevalence": n_pos / (n_pos + n_neg)}
@@ -2573,11 +2890,11 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                     "n_pos": np.tile(n_pos[live], 3), "n_neg": np.tile(n_neg[live], 3)})
                 for i in live[popn[live] == "mixed"]:
                     k = k0 | dict(fold=fold, subgroup=sub[i], subgroup_value=val[i])
-                    ex, n, under = {"population": "mixed"}, dict(n_pos=int(n_pos[i]), n_neg=int(n_neg[i])), bool(min(n_pos[i], n_neg[i]) < mn)
+                    ex, n, under = {"population": "mixed"}, dict(n_pos=n_pos[i].item(), n_neg=n_neg[i].item()), bool(min(n_pos[i], n_neg[i]) < mn)
                     if fold == "pooled" and split == "test" and not under:
                         rows += [r | ex | {"underpowered": False, "value_raw": r["value"]} for r in _tf_rows(x[Mm[i]], alpha, boot, **k)]
                         continue
-                    pt = _rank_point(y[Mm[i]], sc[Mm[i]], alpha)
+                    pt = _rank_point(y[Mm[i]], sc[Mm[i]], alpha, None if w is None else w[Mm[i]])
                     rows += [r | ex | {"underpowered": under, "value_raw": pt[r["metric"]]} for r in metric_rows(
                         {mm: NAN if under else pt[mm] for mm in rank}, metric_type="threshold_free", denominator="n/a", **n, **k)]
             for (level, pid), (ents, pop) in _policy_pops(ctx, m, sd, split).items():
@@ -2588,9 +2905,9 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                 k = _keys(ctx, m, sd, split=split, level=level, policy_id=pid, policy_basis=basis,
                           metric_type=basis if basis in _DENOM else None, denominator=_DENOM.get(basis, "n/a"),
                           axis=None if e["at"] == "end" else e["axis"], t=NAN if e["at"] == "end" else float(e["at"]))
-                for fold, x in _folds(pop, policy, split):
+                for fold, x, w in _folds_and_pooled(pop, policy, split):
                     fire = x["score"].to_numpy(np.float64) > x["fold"].map(thr).to_numpy(np.float64)
-                    blocks.append(_s1_rates(ctx, x, fire, mn, boot, **k, fold=fold,
+                    blocks.append(_s1_rates(ctx, x, fire, mn, boot, w=w, **k, fold=fold,
                                             threshold=NAN if fold == "pooled" else thr[int(fold)]))
     table = pd.concat([f for f in (_s_frame(blocks), pd.DataFrame(rows)) if len(f)], ignore_index=True) \
         if rows or blocks else pd.DataFrame()
@@ -2610,8 +2927,14 @@ def _cell_time_blocks(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame,
     over ``U``'s GUIDs) under the policies ``U.pids[pidx]``, at the points ``pts`` (the :func:`_view` ``V``): tp and
     sens for cells ``has_pos``, fp, spec and fpr for cells ``has_neg`` (:func:`rate_ci` CIs), and the ``underpowered``
     marker (a needed class below ``eval.min_subgroup_n`` GUIDs at the point: that class's rates are NaN, the other
-    class's stay). Metric names carry ``suffix`` (X10: ``_ovr_c<k>``)."""
-    mn, kind, G = ev["min_subgroup_n"], pts["kind"].to_numpy(), U.first.size
+    class's stay). Metric names carry ``suffix`` (X10: ``_ovr_c<k>``).
+
+    A per-fold test group (``U.w``, :func:`_fold_weighted`) gives the weighted fold population (§11.7 fold weighting):
+    ``tp``/``fp`` and ``n_pos``/``n_neg`` are weight sums (a shared test GUID counts $1/K$ in each of its K folds), the
+    rates their weighted ratios with :func:`rate_ci`'s weighted CIs, and the power rule compares the weighted class
+    counts. The folds' weighted counts then add up to the pooled group's (each GUID once), and the pooled rate is a
+    weighted mean of the fold rates (the ``*_folds`` figures' line and band)."""
+    mn, kind, G, w = ev["min_subgroup_n"], pts["kind"].to_numpy(), U.first.size, U.w
     C, P, K = len(cells), len(pidx), len(pts)
     thr = U.T[0, pidx] if keys["fold"] != "pooled" else np.full(P, NAN)
     yp, hp, hn = U.y[None, None, :, None], has_pos[:, None, None], has_neg[:, None, None]
@@ -2622,15 +2945,15 @@ def _cell_time_blocks(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame,
                          ("committed_overall", np.broadcast_to(V.elig[:, None], V.avail.shape), la)):
         in_c = Mm[:, None, :, None] & pop[None, None]  # (C, 1, G, K)
         hit = in_c & dec[None]  # (C, P, G, K)
-        n_pos, n_neg = (in_c & yp).sum(2), (in_c & ~yp).sum(2)
-        tp, fp = (hit & yp).sum(2), (hit & ~yp).sum(2)
+        n_pos, n_neg = _gsum(in_c & yp, w, 2), _gsum(in_c & ~yp, w, 2)
+        tp, fp = _gsum(hit & yp, w, 2), _gsum(hit & ~yp, w, 2)
         live = n_pos + n_neg > 0
         u_pos, u_neg = hp & (n_pos < mn), hn & (n_neg < mn)  # per class: a thin class voids only its own rates
         under = u_pos | u_neg
 
         def ci(num: np.ndarray, den: np.ndarray) -> Tuple[np.ndarray, ...]:
             flat = [np.moveaxis(np.broadcast_to(a, hit.shape), 2, 3).reshape(-1, G) for a in (num, den)]
-            return tuple(v.reshape(C, P, K) for v in rate_ci(*flat, U.y, U.pat, **boot))
+            return tuple(v.reshape(C, P, K) for v in rate_ci(*flat, U.y, U.pat, w=w, **boot))
 
         (s_lo, s_hi, s_nu), (f_lo, f_hi, f_nu) = ci(hit & yp, in_c & yp), ci(hit & ~yp, in_c & ~yp)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -2663,20 +2986,24 @@ def _sub_view(V: SimpleNamespace, pts: pd.DataFrame, sel: np.ndarray) -> Tuple[S
 
 def run_S2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """S2: the three metric types vs time per member (:func:`_cell_time_blocks` on the :func:`run_M` groups and views),
-    primary model and policy, every axis, bins, checkpoints and end: every family for pooled test; the ``class`` family
-    for the per-fold test groups and for val (the §11.10 core set). ``level='online'`` rows in ``metrics.parquet``."""
+    primary model and policy, every axis, bins, checkpoints and end: every family for pooled test and for each fold's
+    test group (but the ``fold`` family, one member there); the ``class`` family for val (the §11.10 core set).
+    ``level='online'`` rows in ``metrics.parquet``. The per-fold test rows are computed on the weighted fold population
+    (``U.w``, :func:`_fold_weighted`): their ``tp``/``fp`` and ``n_pos``/``n_neg`` are weight sums, which the
+    ``*_folds`` figures read for their line and band; val rows are unweighted."""
     ev, pid, boot = eval_config, eval_config["primary_policy"], _boot(eval_config)
     pm, cells, frames = primary_model(_models(ctx)), _cells(ctx), []
     has_pos, has_neg = (cells["population"] != "healthy_only").to_numpy(), (cells["population"] != "unhealthy_only").to_numpy()
+    fam = cells["subgroup"].to_numpy()
+    rows = {"pooled": np.ones(len(cells), bool), "fold": fam != "fold", "val": fam == "class"}
     for split in SPLITS if pm else ():
         groups = _tr_groups(ctx, *pm, split)
         if not groups or pid not in groups[0][1].pids:
             continue
         grids = _grids(groups, ev["time_axes"], ev["bin_h"])
         for fold, U in groups:
-            full = split == "test" and fold == "pooled"
-            Mm = _member_matrix(ctx, U.o["fold"].to_numpy()[U.first], U.guid) & (
-                True if full else (cells["subgroup"] == "class").to_numpy()[:, None])
+            which = "val" if split != "test" else "pooled" if fold == "pooled" else "fold"
+            Mm = _member_matrix(ctx, U.o["fold"].to_numpy()[U.first], U.guid) & rows[which][:, None]
             keys = _keys(ctx, *pm, split=split, fold=fold, level="online")
             for axis in ev["time_axes"]:
                 pts = _points(axis, grids[axis], ev)
@@ -2687,7 +3014,7 @@ def run_S2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     frame = _blocks_frame(frames) if frames else None
     return {"frame": frame, **_meta(ctx), "n_rows": 0 if frame is None else int(len(frame)), "plan": {
         "model": pm and list(pm), "policy": pid, "axes": list(ev["time_axes"]), "min_subgroup_n": ev["min_subgroup_n"],
-        "scope": "pooled test: every family; per-fold test and val: the class family (§11.10 core set)"}}
+        "scope": "pooled test: every family; per-fold test: every family but `fold`; val: the class family"}}
 
 
 def _deltas(ctx: SimpleNamespace, x: pd.DataFrame, fire: Optional[np.ndarray], boot: Mapping[str, Any],
@@ -2771,23 +3098,25 @@ def run_S5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     (:data:`MEMBER_ORDER`) positive, ``subgroup_value`` ``<positive>_vs_<other>``; the AUROC of the GUID final score, per
     fold (point) and pooled (patient-cluster bootstrap CI), val and test, every model but the shuffled control. The
     subtype sensitivity at each policy is the S1 ``class`` row of the positive class, and the shared FPR the ``healthy``
-    one (§11.6.1: identical across pairs, reported once); S2 carries them vs time."""
+    one (§11.6.1: identical across pairs, reported once); S2 carries them vs time. Per-fold test rows are on the
+    weighted fold population (:func:`_folds_and_pooled`): weighted AUROC, ``n_pos``/``n_neg`` and the power rule on
+    weight sums."""
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     boot, mn, rows = _boot(ev), ev["min_subgroup_n"], []
     for m, sd in _s_models(ctx):
         for split in SPLITS:
             k0 = _keys(ctx, m, sd, split=split, level="guid", subgroup=RESTRICTED, metric_type="threshold_free",
                        denominator="n/a")
-            for fold, x in _folds(level_units(ctx, m, sd, split)["guid"], policy, split):
+            for fold, x, w in _folds_and_pooled(level_units(ctx, m, sd, split)["guid"], policy, split):
                 cls = _guid_col(ctx, m, sd, split, x, "clinical_class").astype(str)
                 for pair in ev["restricted_pairs"]:
                     hi_, lo_ = member_order(pair)
                     sel = np.isin(cls, [hi_, lo_])
-                    yp, s = cls[sel] == hi_, x["score"].to_numpy(np.float64)[sel]
-                    n_pos, n_neg = int(yp.sum()), int((~yp).sum())
+                    yp, s, ws = cls[sel] == hi_, x["score"].to_numpy(np.float64)[sel], None if w is None else w[sel]
+                    n_pos, n_neg = _gsum(yp, ws, 0).item(), _gsum(~yp, ws, 0).item()
                     r = dict(value=NAN, ci_lo=NAN, ci_hi=NAN, value_raw=NAN, underpowered=min(n_pos, n_neg) < mn)
                     if n_pos and n_neg:
-                        r["value_raw"] = _rank_point(yp, s, 0.3)["auroc"]
+                        r["value_raw"] = _rank_point(yp, s, 0.3, ws)["auroc"]
                         if not r["underpowered"]:  # CIs pooled only (per fold: point values, as S1)
                             ci = bootstrap_auroc(yp, s, x["patient"].to_numpy()[sel], boot["resamples"],
                                                  boot["seed"])["metrics"]["auroc"] if fold == "pooled" else {}
@@ -2921,7 +3250,8 @@ def run_K3(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 def _ovr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str, k: int) -> Optional[list]:
     """:func:`_tr_groups` of class k's one-vs-rest view (§11.3 T5, as ``thresholds.ovr_thresholds`` selected it): target
     ``class_code - 1 == k``, online and segment scores ``logit(p_c<k>_cal)``, the GUID-level thresholds of
-    ``thresholds.json[unit]['ovr'][k]``. None without them or without an online/segment class probability."""
+    ``thresholds.json[unit]['ovr'][k]``, per-fold test groups with their fold weights ``U.w`` (:func:`_fold_weighted`).
+    None without them or without an online/segment class probability."""
     ents = {int(key.split("|")[2]): {p: e for p, e in ((per.get(str(k)) or {}).get("guid") or {}).items() if "skipped" not in e}
             for key, per in ctx.thr_ovr.items() if key.split("|")[:2] == [m, sd]}
     pids, col, seg = _tr_pids(ctx.cfg["eval"], ents), f"p_c{k}_cal", segments(ctx, m, sd, split)
@@ -2933,11 +3263,11 @@ def _ovr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str, k: int) -> Op
     seg = ovr_view(seg, k, OVR_SEGMENT_SCORES)
     if seg[list(OVR_SEGMENT_SCORES)].isna().all(axis=None):  # no causal per-segment class probability
         return None
-    units = seg.drop_duplicates(["fold", "guid"])
-    keep = pool_rows(units.assign(unit=units["guid"]), ctx.cfg["data"]["shared_test_policy"], split)[["fold", "guid"]]
+    units, policy = seg.drop_duplicates(["fold", "guid"]), ctx.cfg["data"]["shared_test_policy"]
+    keep = pool_rows(units.assign(unit=units["guid"]), policy, split)[["fold", "guid"]]
     args = (ents, pids, {}, [], ctx.cfg["eval"]["alarm_rule"])
-    return [*((str(f), _prep(g, *args)) for f, g in seg.groupby("fold")),
-            ("pooled", _prep(seg.merge(keep, on=["fold", "guid"]), *args))]
+    return _fold_weighted([*((str(f), _prep(g, *args)) for f, g in seg.groupby("fold")),
+                           ("pooled", _prep(seg.merge(keep, on=["fold", "guid"]), *args))], units, policy, split)
 
 
 def run_X10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
@@ -3003,8 +3333,11 @@ H3_METRICS = ("auroc", "auprc", "brier", "calib_intercept", "calib_slope", "sens
 
 
 def _folds_and_pooled(u: pd.DataFrame, policy: str, split: str) -> list:
-    """``[(fold label, rows)]``: every fold, then the pooled rows (:func:`pool_rows`)."""
-    return [*((str(f), x) for f, x in u.groupby("fold")), ("pooled", pool_rows(u, policy, split))]
+    """``[(fold label, rows, w)]``: every fold on its weighted fold population (:func:`_fold_w` then :func:`_weighted`:
+    zero-weight rows dropped, ``w`` the others' weights; None on val), then the pooled rows (:func:`pool_rows`, ``w``
+    None)."""
+    return [*((str(f), *_weighted(x)) for f, x in _fold_w(u, policy, split).groupby("fold")),
+            ("pooled", pool_rows(u, policy, split), None)]
 
 
 def _guid_units(ctx: SimpleNamespace, m: str, sd: str, split: str, score: str) -> pd.DataFrame:
@@ -3049,6 +3382,12 @@ def run_K(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
       PPV/NPV at the test prevalence are the observed ``ppv``/``npv`` rows.
     * K6 -> ``decision_curve.parquet``: :func:`net_benefit` of the calibrated probability over :data:`DC_PTS`, test,
       per fold and pooled, the pooled one with a patient-cluster bootstrap band (``nb_lo``, ``nb_hi``).
+
+    Per-fold test rows and curves are on the weighted fold populations (:func:`_folds_and_pooled`), so a fold's
+    ``pi_test`` is its weighted prevalence (about the pooled 0.43, not the 0.19 of its full test set). The K5 shift
+    itself keeps each fold's unweighted test prevalence (:func:`prior_shifted`): the pooled rows read it, and they stay
+    as they were. ``ponytail:`` so a fold's ``pi_test`` row is not the prevalence its scores were shifted to; shift to
+    the weighted one (which changes the pooled K5 rows) if K5 becomes a reported result.
     """
     if not ctx.rows:
         raise RuntimeError("K reads the metric rows; run the 'metrics' analysis first")
@@ -3056,8 +3395,8 @@ def run_K(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     alpha, boot, pi_ref = primary_alpha(ev), _boot(ev), ev["reference_prevalence"]
     rows, curves = [], []
 
-    def calib(u: pd.DataFrame) -> Dict[str, float]:
-        tf = threshold_free(u["y"], u["score"], alpha=alpha)
+    def calib(u: pd.DataFrame, w: Optional[np.ndarray]) -> Dict[str, float]:
+        tf = threshold_free(u["y"], u["score"], alpha=alpha, w=w)
         return {k: tf[k] for k in CALIB_NAMES}
 
     for m, sd in _models(ctx):
@@ -3065,24 +3404,25 @@ def run_K(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
         for sp, u in units.items():
             k = _keys(ctx, m, sd, split=sp, level="guid", metric_type="threshold_free", denominator="n/a",
                       subgroup="calibration", subgroup_value="uncalibrated")
-            for fold, x in _folds_and_pooled(u, policy, sp):
-                rows += metric_rows(calib(x), fold=fold, n_pos=int(x["y"].sum()), n_neg=int((x["y"] == 0).sum()), **k)
+            for fold, x, w in _folds_and_pooled(u, policy, sp):
+                rows += metric_rows(calib(x, w), fold=fold, **_class_counts(x["y"].to_numpy() == 1, w), **k)
         test, val = units["test"], units["val"]
         if not len(test) or not len(val):
             continue
         shifted = test.assign(score=prior_shifted(test, val))
         k = _keys(ctx, m, sd, split="test", level="guid", metric_type="threshold_free", denominator="n/a",
                   subgroup="prevalence_shift")
-        pi_val = {f: v["y"].mean() for f, v in _folds_and_pooled(val, policy, "val")}
-        for fold, x in _folds_and_pooled(shifted, policy, "test"):
-            n = dict(n_pos=int(x["y"].sum()), n_neg=int((x["y"] == 0).sum()))
-            rows += metric_rows(calib(x), fold=fold, subgroup_value="prior_shift", **n, **k)
-            rows += metric_rows({"pi_val": pi_val.get(fold, NAN), "pi_test": x["y"].mean()}, fold=fold,
+        pi_val = {f: v["y"].mean() for f, v, _ in _folds_and_pooled(val, policy, "val")}
+        for fold, x, w in _folds_and_pooled(shifted, policy, "test"):
+            n = _class_counts(x["y"].to_numpy() == 1, w)
+            rows += metric_rows(calib(x, w), fold=fold, subgroup_value="prior_shift", **n, **k)
+            pi_test = x["y"].mean() if w is None else float(np.average(x["y"], weights=w))
+            rows += metric_rows({"pi_val": pi_val.get(fold, NAN), "pi_test": pi_test}, fold=fold,
                                 subgroup_value="prevalence", **n, **k)
-        for fold, x in _folds_and_pooled(test.assign(score=test["score_final_cal"]), policy, "test"):
+        for fold, x, w in _folds_and_pooled(test.assign(score=test["score_final_cal"]), policy, "test"):
             y, p = x["y"].to_numpy(np.int64), expit(x["score"].to_numpy(np.float64))
-            nb = net_benefit(y, p, DC_PTS).assign(model_id=m, seed=sd, split="test", fold=fold, n_pos=int(y.sum()),
-                                                  n_neg=int(y.size - y.sum()), nb_lo=NAN, nb_hi=NAN)
+            nb = net_benefit(y, p, DC_PTS, w).assign(model_id=m, seed=sd, split="test", fold=fold,
+                                                     **_class_counts(y == 1, w), nb_lo=NAN, nb_hi=NAN)
             if fold == "pooled" and y.size:
                 nb["nb_lo"], nb["nb_hi"] = _nb_band(y, p, x["patient"], boot)
             curves.append(nb)
@@ -3132,7 +3472,11 @@ def run_H(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 
     * H1: :func:`i_squared` of the per-fold GUID AUROC per model/seed/split, SE = bootstrap CI width / (2 z_0.975)
       (rows ``fold='pooled'``, ``subgroup='fold_heterogeneity'``, ``subgroup_value='auroc'``: ``i2``, ``cochran_q``,
-      ``cochran_q_p``, ``fold_sd``); the per-fold values the forest draws are ``run_metrics``' rows.
+      ``cochran_q_p``, ``fold_sd``); the per-fold values the forest draws are ``run_metrics``' rows. On test those rows
+      are the weighted fold populations' AUROCs with their weighted bootstrap CIs (§11.7 fold weighting), so Q and
+      $I^2$ compare folds of the pooled composition. ``ponytail:`` the folds still share the shared test GUIDs (at
+      $1/K$ each), so their estimates are positively correlated and Q runs somewhat low; a fold-covariance Q if $I^2$
+      becomes a decision input.
     * H3: the pooled test threshold-free GUID rows under the shared-test policy that is not ``data.shared_test_policy``
       (``subgroup='shared_test_policy'``; its thresholded rows are ``run_metrics``'), and ``shared_test.parquet``:
       :data:`H3_METRICS` under ``first_fold`` and ``exclude`` side by side with n and the difference.
@@ -3179,7 +3523,8 @@ def run_R10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pa
     """R10: at every ``eval.checkpoints_h`` and end, the snapshot ROC (R4's population: the GUID's last segment in the
     staleness window) restricted to snapshots in the first stage and in the second stage (the snapshot segment's
     stage, §11.5.4), per fold and pooled, val and test -> ``roc_points`` variants ``snapshot_first@<h|end>`` and
-    ``snapshot_second@<h|end>`` (``level='online'``)."""
+    ``snapshot_second@<h|end>`` (``level='online'``). Per-fold test curves weigh each GUID by its fold weight ``U.w``
+    (§11.7), so their ``n_pos``/``n_neg`` are weight sums."""
     ev, frames = eval_config, []
     for m, sd in _models(ctx):
         for split in SPLITS:
@@ -3192,12 +3537,13 @@ def run_R10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pa
                     st = U.st[V.row[:, k]]
                     for stage, code in STAGE_CODES.items():
                         sel = V.inst[:, k] & (st == code)
-                        y = U.y[sel]
+                        w, y, sc = _nonzero(None if U.w is None else U.w[sel], int(sel.sum()), U.y[sel],
+                                            U.s[V.row[sel, k]])
                         if 0 < y.sum() < y.size:
                             frames.append(pd.DataFrame({
                                 "model_id": m, "seed": sd, "fold": fold, "split": split, "level": "online",
                                 "variant": f"snapshot_{stage}@{'end' if kind == 'end' else f'{t:g}'}", "axis": "to_delivery",
-                                "t": t, **roc_points(y, U.s[V.row[sel, k]]), "n_pos": int(y.sum()), "n_neg": int((~y).sum())}))
+                                "t": t, **roc_points(y, sc, w), **_class_counts(y, w)}))
     prefixes = tuple(f"snapshot_{s}@" for s in STAGE_CODES)
     return {**_meta(ctx), "n_rows": _append_roc(out_dir, frames, prefixes), "plan": {
         "variants": [f"{p}<h|end>" for p in prefixes], "stage": "of the snapshot segment (first | second)"}}
@@ -3240,7 +3586,9 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     sigma(s) against y and, when the segments carry the 3-class ``p_c*_cal``, ``brier_c{k}`` of each calibrated class
     probability against 1[class = k] and ``brier_macro``, their mean. ``level='online'``, ``metric_type=
     'threshold_free'``, ``denominator='bin_present'``; NaN where a class has fewer than ``eval.min_bin_class_n`` GUIDs
-    (M's rule). The pooled rows carry a patient-cluster bootstrap CI of the mean (one weighted product per axis)."""
+    (M's rule). The pooled rows carry a patient-cluster bootstrap CI of the mean (one weighted product per axis).
+    Per-fold test rows weigh each GUID by its fold weight ``U.w`` (§11.7): the means, ``n_pos``/``n_neg`` and the
+    ``min_bin_class_n`` rule are on the weighted counts."""
     ev = eval_config
     boot, mn, blocks = _boot(ev), ev["min_bin_class_n"], []
     p3 = [f"p_c{k}_cal" for k in range(3)]
@@ -3263,7 +3611,10 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                     if V is None:
                         continue
                     pop = V.inst
+                    popf = pop.astype(np.float64) if U.w is None else pop * U.w[:, None]  # fold weights (§11.7)
                     n_pos, n_neg = (pop & U.y[:, None]).sum(0), (pop & ~U.y[:, None]).sum(0)
+                    if U.w is not None:  # weighted fold counts: the power rule and `live` read them
+                        n_pos, n_neg = popf[U.y].sum(0), popf[~U.y].sum(0)
                     live = n_pos + n_neg > 0
                     if not live.any():
                         continue
@@ -3272,7 +3623,6 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                         E |= {f"brier_c{k}": (P3[V.row, k] - (cls == k)[:, None]) ** 2 for k in range(3)}
                         E["brier_macro"] = sum(E[f"brier_c{k}"] for k in range(3)) / 3.0
                     ok = live & (n_pos >= mn) & (n_neg >= mn)
-                    popf = pop.astype(np.float64)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         vals = {k_: np.where(ok, (popf * e).sum(0) / popf.sum(0), NAN) for k_, e in E.items()}
                     lo = {k_: np.full(pop.shape[1], NAN) for k_ in E}
@@ -3381,15 +3731,20 @@ def _mc_stats(y: np.ndarray, P: np.ndarray, W: np.ndarray, *, alpha: float,
 
 
 def three_class_ci(y: Any, P: Any, units: Any, *, alpha: float, resamples: int, seed: int,
-                   ords: Optional[np.ndarray] = None, confidence: float = 0.95) -> Dict[str, Any]:
+                   ords: Optional[np.ndarray] = None, confidence: float = 0.95, w: Any = None) -> Dict[str, Any]:
     """:func:`bootstrap_ci` of every :func:`_mc_stats` metric, vectorised: outcome-stratified cluster draws over
-    ``units`` (:func:`_unit_draws`, strata = the 3-class label sets), all metrics on the same draws."""
+    ``units`` (:func:`_unit_draws`, strata = the 3-class label sets), all metrics on the same draws. ``w``: optional
+    row weights (zero-weight rows dropped first, :func:`_nonzero`); the point and every draw weigh each row by $w_i$
+    times its unit's multiplicity."""
     y, P = np.asarray(y, np.int64).reshape(-1), np.asarray(P, np.float64)
+    w, y, P, units, ords = _nonzero(w, y.size, y, P, units, ords)
     M, codes = _unit_draws(y, units, resamples, seed)
-    point = {m: float(v[0]) for m, v in _mc_stats(y, P, np.ones((1, y.size)), alpha=alpha, ords=ords).items()}
+    W1 = np.ones((1, y.size)) if w is None else w[None, :]
+    point = {m: float(v[0]) for m, v in _mc_stats(y, P, W1, alpha=alpha, ords=ords).items()}
     draws = {m: np.empty(resamples) for m in point}
     for sl in _chunks(resamples, y.size):
-        for m, v in _mc_stats(y, P, M[sl][:, codes], alpha=alpha, ords=ords).items():
+        Wd = M[sl][:, codes] if w is None else M[sl][:, codes] * W1
+        for m, v in _mc_stats(y, P, Wd, alpha=alpha, ords=ords).items():
             draws[m][sl] = v
     return _percentile_ci(point, draws, method="cluster outcome-stratified percentile bootstrap (3-class label sets; "
                           "vectorised weighted statistics)", resamples=resamples, seed=seed, confidence=confidence,
@@ -3407,10 +3762,14 @@ def _argmax_block(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, P: 
     (its last segment in the instantaneous window, so one row per GUID: :func:`_view`) against its class
     (``P``: the class probabilities of ``U``'s rows). ``confusion_t{i}_p{j}`` counts, :data:`ARGMAX_TR` from them
     (:func:`confusion_stats`); a metric is NaN when a class it needs has fewer than ``mn`` GUIDs in the bin. Recall and
-    top-1 accuracy carry :func:`rate_ci` CIs (Wilson; the patient-cluster bootstrap where a patient holds two GUIDs)."""
+    top-1 accuracy carry :func:`rate_ci` CIs (Wilson; the patient-cluster bootstrap where a patient holds two GUIDs).
+    A per-fold test group (``U.w``, :func:`_fold_weighted`) gives the weighted fold population: the confusion counts,
+    ``n_pos``/``n_neg`` and the power rule are weight sums, the metrics :func:`confusion_stats` of the weighted
+    confusion, the CIs weighted."""
     y = U.o["class_code"].to_numpy(np.int64)[U.first] - 1
     pred, inst, npt = P.argmax(1)[V.row], V.inst, len(pts)
-    C = np.bincount((np.arange(npt) * 9 + y[:, None] * 3 + pred)[inst], minlength=npt * 9).reshape(npt, 3, 3)
+    wt = None if U.w is None else np.broadcast_to(U.w[:, None], inst.shape)[inst]
+    C = np.bincount((np.arange(npt) * 9 + y[:, None] * 3 + pred)[inst], wt, npt * 9).reshape(npt, 3, 3)
     st, n_c = confusion_stats(C), C.sum(2)
     under, live, nan = n_c < mn, n_c.sum(1) > 0, np.full(npt, NAN)
     hit = inst & (pred == y[:, None])
@@ -3418,12 +3777,12 @@ def _argmax_block(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, P: 
     for name in ARGMAX_TR:
         u = under[:, int(name[-1])] if name.startswith("recall") else under.any(1)
         den = inst & (y == int(name[-1]))[:, None] if name.startswith("recall") else inst
-        lo, hi, nu = (rate_ci((hit & den).T, den.T, y, U.pat, **boot) if name.startswith(("recall", "top1"))
+        lo, hi, nu = (rate_ci((hit & den).T, den.T, y, U.pat, w=U.w, **boot) if name.startswith(("recall", "top1"))
                       else (nan, nan, nan))
         vals[name] = (np.where(u, NAN, st[name]), np.where(u, NAN, lo), np.where(u, NAN, hi), live, np.where(u, NAN, nu))
     return _long(vals, pids=["argmax"], basis=["argmax"], thr=np.full(1, NAN), t=pts["t_inst"].to_numpy(),
-                 point=pts["kind"].to_numpy(), n_pos=(inst & (y > 0)[:, None]).sum(0),
-                 n_neg=(inst & (y == 0)[:, None]).sum(0), **keys)
+                 point=pts["kind"].to_numpy(), n_pos=_gsum(inst & (y > 0)[:, None], U.w, 0),
+                 n_neg=_gsum(inst & (y == 0)[:, None], U.w, 0), **keys)
 
 
 def _sub_ctx(ctx: SimpleNamespace, **repl: Any) -> SimpleNamespace:
@@ -3470,8 +3829,9 @@ def _ovr_frames(ctx: SimpleNamespace, m: str, sd: str, split: str, ev: Mapping[s
 def run_X(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """X3, X5-X7: a ``three_class`` run's time-resolved rows on every ``eval.time_axes`` axis, per fold and pooled,
     val and test, ``level='online'`` (the M engine's groups, :func:`_tr_groups`): the argmax snapshot rows
-    (:func:`_argmax_block`) and the primary policy's per-class OvR rows (:func:`_ovr_frames`). Not applicable to a
-    binary task; a model without calibrated class probabilities on its segments is skipped."""
+    (:func:`_argmax_block`) and the primary policy's per-class OvR rows (:func:`_ovr_frames`). Per-fold test rows are
+    on the weighted fold population (``U.w``, :func:`_fold_weighted`). Not applicable to a binary task; a model without
+    calibrated class probabilities on its segments is skipped."""
     ev, task = eval_config, ctx.cfg["labels"]["task"]
     if task != "three_class":
         return {**_meta(ctx), "plan": {"applicable": False, "reason": f"labels.task {task} is not three_class"}}
@@ -3512,6 +3872,19 @@ def aux_collapse(f: pd.DataFrame, task: str) -> np.ndarray:
     return _logit(np.clip(q, 1e-12, 1 - 1e-12))
 
 
+def _wspearman(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
+    """Weighted Spearman correlation of ``a`` and ``b`` with row weights ``w``: the weighted Pearson correlation of the
+    weighted mid-ranks, a value's rank being $\\sum_{x_j < x_i} w_j + \\tfrac12 \\sum_{x_j = x_i} w_j$. Integer weights
+    give the Spearman correlation of the duplicated rows (their mid-ranks differ by the constant $\\tfrac12$)."""
+    def rank(x: np.ndarray) -> np.ndarray:
+        inv = np.unique(x, return_inverse=True)[1]
+        tw = np.bincount(inv, w)
+        return (np.cumsum(tw) - tw / 2.0)[inv]
+
+    c = np.cov(rank(a), rank(b), aweights=w)
+    return float(c[0, 1] / np.sqrt(c[0, 0] * c[1, 1]))
+
+
 def run_X9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """X9 collapse consistency of a multi-task binary run (``labels.aux_3class_weight > 0``), per model with aux
     probabilities, fold and pooled, val and test, GUID level, metric names ``collapse/<name>``:
@@ -3522,6 +3895,10 @@ def run_X9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
       (:func:`~teb_vae.classifier.thresholds.select_thresholds` on the aux-scored val rows), and on each policy's
       basis population ``disagreement`` (Wilson CI) is the fraction of GUIDs whose two decisions differ,
       ``binary_only`` / ``aux_only`` the GUIDs only that score alarms.
+
+    Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; §11.7 fold weighting): weighted
+    AUROCs and their bootstrap, the weighted Spearman correlation (:func:`_wspearman`), a weighted disagreement
+    fraction with its Kish-Wilson CI, and weight sums for the GUID counts and ``n_pos``/``n_neg``.
     """
     from scipy.stats import spearmanr
 
@@ -3555,14 +3932,16 @@ def run_X9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
         for split in SPLITS:
             u = _sel(g, split=split)
             u = u.assign(unit=u["guid"], patient=cluster(u))
-            for fold, f in [*((str(k), x) for k, x in u.groupby("fold")), ("pooled", pool_rows(u, policy, split))]:
+            for fold, f, w in _folds_and_pooled(u, policy, split):
                 y, vals, ci = f["y"].to_numpy(np.int64), {}, {}
                 for name, col in (("auroc_binary", "score_final_cal"), ("auroc_aux", "aux")):
-                    r = (bootstrap_auroc(y, f[col], f["patient"], boot["resamples"], boot["seed"])["metrics"]["auroc"]
+                    r = (bootstrap_auroc(y, f[col], f["patient"], boot["resamples"], boot["seed"], w=w)["metrics"]["auroc"]
                          if 0 < y.sum() < y.size else {"value": NAN})
                     vals[f"collapse/{name}"], ci[f"collapse/{name}"] = r["value"], r
-                vals["collapse/spearman"] = float(spearmanr(f["score_final_cal"], f["aux"]).statistic) if len(f) > 2 else NAN
-                rows += metric_rows(vals, ci, n_pos=int(y.sum()), n_neg=int(y.size - y.sum()), **_keys(
+                a, b = f["score_final_cal"].to_numpy(np.float64), f["aux"].to_numpy(np.float64)
+                vals["collapse/spearman"] = NAN if len(f) <= 2 else float(spearmanr(a, b).statistic) if w is None \
+                    else _wspearman(a, b, w)
+                rows += metric_rows(vals, ci, **_class_counts(y == 1, w), **_keys(
                     ctx, m, sd, split=split, fold=fold, level="guid", metric_type="threshold_free", denominator="n/a"))
             (eb, pb), (ea, pa) = (policy_populations(x, m, sd, split).get(("guid", pid), ({}, None)) for x in (ctx, sub))
             if pb is None or pa is None:
@@ -3574,16 +3953,16 @@ def run_X9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             k = _keys(ctx, m, sd, split=split, level="guid", policy_id=pid, policy_basis=e0["basis"],
                       metric_type=e0["basis"] if e0["basis"] in _DENOM else None, denominator=_DENOM.get(e0["basis"], "n/a"),
                       axis=None if e0["at"] == "end" else e0["axis"], t=NAN if e0["at"] == "end" else float(e0["at"]))
-            for fold, f in [*((str(x), q) for x, q in j.groupby("fold")), ("pooled", pool_rows(j, policy, split))]:
+            for fold, f, w in _folds_and_pooled(j, policy, split):
                 d, y = (f["db"] != f["da"]).to_numpy(), f["y"].to_numpy() == 1
-                lo, hi, nu = rate_ci(d[None], np.ones((1, d.size), bool), y, f["patient"], **boot)
-                rows += metric_rows({"collapse/disagreement": d.mean() if d.size else NAN,
-                                     "collapse/binary_only": int((f["db"] & ~f["da"]).sum()),
-                                     "collapse/aux_only": int((f["da"] & ~f["db"]).sum())},
+                lo, hi, nu = rate_ci(d[None], np.ones((1, d.size), bool), y, f["patient"], w=w, **boot)
+                rows += metric_rows({"collapse/disagreement": np.average(d, weights=w) if d.size else NAN,
+                                     "collapse/binary_only": _gsum((f["db"] & ~f["da"]).to_numpy(), w, 0),
+                                     "collapse/aux_only": _gsum((f["da"] & ~f["db"]).to_numpy(), w, 0)},
                                     {"collapse/disagreement": {"ci_lo": float(lo[0]), "ci_hi": float(hi[0]),
                                                                "n_undefined": float(nu[0])}},
                                     fold=fold, threshold=eb[int(fold)]["threshold"] if fold != "pooled" else NAN,
-                                    n_pos=int(y.sum()), n_neg=int((~y).sum()), **k)
+                                    **_class_counts(y, w), **k)
     return {"rows": rows, **_meta(ctx), "plan": {
         "aux_score": "logit of the aux head's raw probability of the task's positive classes (p_c1 + p_c2 for "
                      "adverse_vs_healthy)", "binary_score": "score_final_cal",
@@ -3962,7 +4341,7 @@ def run_names(paths: Sequence[Any]) -> list:
 def _q_side(ctx: SimpleNamespace, name: str, pm: Optional[Tuple[str, str]] = None) -> SimpleNamespace:
     """One compared run (``name``): its primary model's (or ``pm``'s) pooled OOF test rows, ``guid`` (:func:`level_units`,
     sorted by (fold, guid), so two runs' rows align for DeLong), its per-fold test GUID AUROC ``fold_auroc``
-    (``score_final_cal``, for Nadeau-Bengio) and ``pols``, per GUID-level policy ``(thresholds entry, basis population
+    (``score_final_cal`` on the weighted fold population, :func:`_fold_w`, for Nadeau-Bengio) and ``pols``, per GUID-level policy ``(thresholds entry, basis population
     with fire)`` at each fold's own threshold."""
     pm, st = pm or primary_model(_models(ctx)), ctx.cfg["data"]["shared_test_policy"]
     if pm is None:
@@ -3973,10 +4352,12 @@ def _q_side(ctx: SimpleNamespace, name: str, pm: Optional[Tuple[str, str]] = Non
             x = pool_rows(pop, st, "test")
             thr = x["fold"].map({f: e["threshold"] for f, e in ents.items()}).to_numpy(np.float64)
             pols[pid] = (next(iter(ents.values())), x.assign(fire=x["score"].to_numpy(np.float64) > thr))
-    g = level_units(ctx, *pm, "test")["guid"]
-    return SimpleNamespace(pm=pm, name=name, pols=pols,
-                           fold_auroc={int(f): float(roc_auc_score(x["y"], x["score"])) if 0 < x["y"].sum() < len(x) else NAN
-                                       for f, x in g.groupby("fold")},
+    g, fold_auroc = level_units(ctx, *pm, "test")["guid"], {}
+    for f, x in _fold_w(g, st, "test").groupby("fold"):  # the weighted fold populations, as run_metrics' fold rows
+        x, w = _weighted(x)
+        fold_auroc[int(f)] = (float(roc_auc_score(x["y"], x["score"], sample_weight=w)) if 0 < x["y"].sum() < len(x)
+                              else NAN)
+    return SimpleNamespace(pm=pm, name=name, pols=pols, fold_auroc=fold_auroc,
                            guid=pool_rows(g, st, "test").sort_values(["fold", "guid"], ignore_index=True),
                            keys=_keys(ctx, *pm, split="test", level="guid", fold="pooled", point="n/a",
                                       denominator="n/a"))

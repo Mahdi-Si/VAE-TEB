@@ -1,0 +1,54 @@
+# The uterine-activity stream reduced to ONE channel: the order-zero scattering coefficient S_0 of
+# `up_st` -- the low-passed uterine pressure, i.e. the contraction waveform itself, at a 13.3 s
+# group delay and a warm-up of 0 steps in the trimmed window -- with every first-order `up_st`
+# channel and the whole `up_ph` block dropped. With no channel waiting, the source adapter builds
+# neither availability term and is the plain per-step projection. The lag attention then reads, at lag l, a per-step map of S_0 at stored step
+# t - l and nothing else. `lag_kv_source: adapter` is inherited from default.yaml and is what
+# keeps the source at one step of reach: the adapter is Linear -> LayerNorm -> GELU -> residual
+# MLP applied per step, with no convolution and no attention over the source's time axis.
+#
+# THE FORECAST CLOCK IS `physical`, and the pairing with the single channel is the point. On the
+# stored clock a slow FHR channel's scored element carries content up to ~250 s BEFORE the S_0
+# sample the attention reads at lag 0, so the "forecast" of that channel predates its own
+# conditioning. The physical clock advances each kept target channel by
+# round(0.875 (tau_c - 13.3 s) / 4 s) steps, so every scored cell carries content at
+# 4 (t + 1 + tau) - 0.875 * 13.3 s, and the S_0 content at lag l sits exactly 4 (1 + tau + l) s
+# earlier than it: 4 s to 272 s, strictly positive for every lag, horizon step and channel. For
+# the S_0 / fhr_st S_0 pair the filter delay cancels exactly, both being the same low-pass; for
+# the other channels the ordering holds up to the centroid convention and the +-2 s rounding.
+# It costs anchors, as default.yaml documents: the ceiling drops from T_valid = 270 to 185
+# (51 dense anchors) and the stride follows it to 5, i.e. 11 tiles at phase 0 and 10 otherwise.
+#
+# `causal_source_channels` names DECLARED indices into the concatenated `up_st ++ up_ph` stream.
+# `c_u` stays 46: the data boundary still checks the batch at the declared width, and the gate
+# narrows it to the named channels. The checkpoint's model_kwargs stamps the resolved
+# `source_keep_index`, so a run is rebuildable without this file. `source_lag_warmth_frac_ph`
+# reads a constant 1.0 on this arm (an empty block is warm at every step) and measures nothing;
+# `source_lag_warmth_frac_st` is S_0's alone.
+#
+# `max_lag` is inherited at 37 (148 s). With the physical clock the content delay a (lag, horizon)
+# cell can read is 4 (1 + tau + l) s, so the 20 to 60 s contraction-to-deceleration band is
+# readable at horizon steps tau <= 13 (60 s end) and tau <= 4 (20 s end); beyond that the
+# proximate contraction sample lies after the anchor and is not yet recorded, whatever the window.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/ua_s0_only.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    # Declared index 0 of up_st ++ up_ph: S_0, the low-passed UP. Resolved by
+    # teb_vae/lag_attn_cfs/causal_warmup.py into `source_keep_index`; refused if empty, repeated
+    # or outside [0, c_u).
+    causal_source_channels: [0]
+    causal_target_forecast_clock: physical
+    anchor_stride: 5
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_ua_s0_physclock
+      tags:
+        variant: lag_attn_trf_cfs_ua_s0_physclock
