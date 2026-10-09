@@ -3,7 +3,9 @@
 * :func:`loss_fn` validates ``train.loss`` against ``labels.head`` and returns the per-element loss
   ``ℓ(logits (..., K_out), y (...)) -> (...)``: ``bce | weighted_bce | focal | logit_adjusted`` (binary),
   ``ce | weighted_ce | focal_ce`` (multiclass), ``coral | cumulative_link`` (ordinal: Σ_k BCE on the K-1
-  cumulative logits, or the proportional-odds NLL ``-log P(Y = y)`` of :func:`coral_log_probs`).
+  cumulative logits, or the proportional-odds NLL ``-log P(Y = y)`` of :func:`coral_log_probs`), ``corn`` (CORN,
+  Shi 2023: BCE on the K-1 conditional logits ``o_k = logit P(Y > k | Y > k-1)``, task k on the rows with
+  ``y >= k`` only; class probabilities by the chain rule, :func:`corn_log_probs`).
 * :func:`set_loss`: the batch-level ``auc_margin | pauc`` (binary; ``(s, y, w) -> scalar``), no per-element form.
   :func:`criterion` is the one entry for both kinds (``(s, y, w) -> scalar``); ``train.py`` calls it once at setup so
   a bad config fails before the first step.
@@ -123,8 +125,17 @@ def loss_fn(cfg: LossCfg, head: str, class_weights: Optional[Sequence[float]] = 
         nll = -lp.gather(-1, y.long()[..., None])[..., 0]
         return (1 - eps) * nll - eps * lp.mean(-1)  # label smoothing as in F.cross_entropy
 
+    def corn(o: Tensor, y: Tensor) -> Tensor:
+        """Σ_k 1[y >= k] · BCE(o_k, 1[y > k]): conditional task k is defined on the rows that passed cut k-1."""
+        k = torch.arange(o.shape[-1], device=o.device)
+        yk = y.long()[..., None]
+        t = (yk > k).float() * (1 - eps) + eps / 2
+        # ponytail: the tasks are pooled under the caller's row weights (Σ w ℓ / Σ w), not normalised per task as
+        # in the paper's batch estimator; per-task means if the HIE task's few rows look under-weighted
+        return (F.binary_cross_entropy_with_logits(o, t, reduction="none") * (yk >= k).float()).sum(-1)
+
     return {"binary": binary, "multiclass": multiclass,
-            "ordinal": cumulative_link if name == "cumulative_link" else coral}[head]
+            "ordinal": cumulative_link if name == "cumulative_link" else coral, "corn": corn}[head]
 
 
 def set_loss(name: str, alpha: Optional[float] = None, margin: float = 1.0) -> Crit:
@@ -182,6 +193,15 @@ def coral_log_probs(o: Tensor) -> Tensor:
     hi = F.pad(o, (1, 0), value=math.inf)
     lo = F.pad(o, (0, 1), value=-math.inf)
     return F.logsigmoid(hi) + F.logsigmoid(-lo) + torch.log(-torch.expm1(lo - hi))
+
+
+def corn_log_probs(o: Tensor) -> Tensor:
+    """Class log-probabilities (..., K) of the K-1 CORN conditional logits ``o_k = logit P(Y > k | Y > k-1)``
+    (chain rule): ``log P(Y > k) = Σ_{j<=k} log σ(o_j)``, ``log P(Y = k) = log P(Y > k-1) + log σ(-o_k)`` and the
+    last class ``log P(Y = K-1) = log P(Y > K-2)``. Consistent by construction: P(Y > k) never exceeds P(Y > k-1)."""
+    gt = F.logsigmoid(o).cumsum(-1)  # log P(Y > k), k = 0..K-2
+    prev = F.pad(gt[..., :-1], (1, 0), value=0.0)  # log P(Y > k-1), with log P(Y > -1) = 0
+    return torch.cat([prev + F.logsigmoid(-o), gt[..., -1:]], -1)
 
 
 def _wmean(v: Tensor, w: Tensor) -> Tensor:

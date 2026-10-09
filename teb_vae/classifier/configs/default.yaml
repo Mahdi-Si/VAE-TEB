@@ -48,6 +48,8 @@ classifier:
     decay_halflife_h: 0.5           # horizon_decay only
     k_warm: 0                       # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
     eval_window: all                # all | horizon | stage:first | stage:second
+    time_matched: false             # horizon* only: negatives take the positives' weight schedule too (§6.5);
+                                    # ablation lab_time_matched.yaml (the 2026-10-07 runs scored stage, not outcome)
 
   context:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # signed: pre-onset time until onset (ablation)
@@ -197,7 +199,9 @@ advanced_config:
       log_config_artifact: true
       tags: {}
   callbacks:
-    early_stopping: {enabled: true, monitor: val/guid_logloss, mode: min, patience: 25, min_delta: 0.0}
+    # Ranking, not log loss: in run 2026-10-07--17-52 val/guid_logloss bottomed at epoch 0-2 in every fold, while
+    # val/guid_auroc kept rising to epoch 6-26 (+0.02 to +0.06); temperature calibration fixes the scale afterwards.
+    early_stopping: {enabled: true, monitor: val/guid_auroc, mode: max, patience: 25, min_delta: 0.0}
     model_checkpoint: {save_last: true}   # monitor/mode = early_stopping's (§10.10.2 #6)
     classifier_plotting: {enabled: true, every_n_epochs: 5, file_format: pdf,
                           train_eval_every: 5, train_eval_guids: 256}

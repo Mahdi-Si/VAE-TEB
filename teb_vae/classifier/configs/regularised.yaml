@@ -47,4 +47,4 @@ classifier:
 
 advanced_config:
   callbacks:
-    early_stopping: {monitor: val/guid_auroc, mode: max, patience: 20}
+    early_stopping: {patience: 20}  # monitor val/guid_auroc (max), as default.yaml
