@@ -218,11 +218,13 @@ def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minut
 
 # ---- tasks and labeling strategies (§6.3, §6.5, §6.6) ------------------------------------------
 def strategy_weights(delta_h: Any, y: Any, is_last: Any, *, strategy: str, horizon_h: float,
-                     decay_halflife_h: float) -> np.ndarray:
+                     decay_halflife_h: float, time_matched: bool = False) -> np.ndarray:
     """Per-segment loss weight ω_n (§6.5); the target is always the GUID's ``y``.
 
-    Negatives (``y == 0``) get 1 under ``propagate``/``horizon*``. ``final_only`` weights only
-    the last position (both classes); ``mil`` has no per-segment term (all 0). ``k_warm`` is not here: it drops
+    Negatives (``y == 0``) get 1 under ``propagate``/``horizon*``, unless ``time_matched``: then the ``horizon*``
+    schedule weighs every GUID, so early (first-stage) segments of negatives no longer teach "early-looking means
+    healthy" while those of positives are silent (the 2026-10-07 runs' second-stage detector). ``final_only`` weights
+    only the last position (both classes); ``mil`` has no per-segment term (all 0). ``k_warm`` is not here: it drops
     positions from the per-position loss only (``data.GuidDataset``'s ``w_pos``), never the segment-local term.
     """
     delta, positive = np.asarray(delta_h, float), np.asarray(y) > 0
@@ -231,12 +233,12 @@ def strategy_weights(delta_h: Any, y: Any, is_last: Any, *, strategy: str, horiz
     if strategy == "mil":
         return np.zeros_like(delta)
     if strategy == "horizon":
-        w = np.where(positive, (delta <= horizon_h).astype(float), 1.0)
+        w = (delta <= horizon_h).astype(float)
     elif strategy == "horizon_decay":
-        w = np.where(positive, 2.0 ** (-np.maximum(0.0, delta - horizon_h) / decay_halflife_h), 1.0)
+        w = 2.0 ** (-np.maximum(0.0, delta - horizon_h) / decay_halflife_h)
     else:  # propagate
-        w = np.ones_like(delta)
-    return w
+        return np.ones_like(delta)
+    return w if time_matched else np.where(positive, w, 1.0)
 
 
 def warm_positions(labels: LabelsCfg, scope: str) -> int:
@@ -310,7 +312,7 @@ def guid_table(seg: pd.DataFrame, labels: LabelsCfg, cohort: CohortCfg) -> Tuple
     is_last = retained & (seg["seg_pos"] == seg.groupby(KEYS)["seg_pos"].transform("max"))
     weight = strategy_weights(
         seg["hours_to_delivery"], seg["y"].fillna(0).to_numpy(int), is_last, strategy=labels.strategy,
-        horizon_h=labels.horizon_h, decay_halflife_h=labels.decay_halflife_h)
+        horizon_h=labels.horizon_h, decay_halflife_h=labels.decay_halflife_h, time_matched=labels.time_matched)
     seg["label_weight"] = np.where(retained, weight, 0.0)
     # bins: every retained segment; the per-bin segment metrics come from the M6 time-resolved analysis.
     window = {"all": True, "bins": True, "horizon": seg["hours_to_delivery"] <= labels.horizon_h,

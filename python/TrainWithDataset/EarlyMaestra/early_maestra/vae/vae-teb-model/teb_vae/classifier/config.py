@@ -41,10 +41,14 @@ HEAD_LOSSES: Dict[str, Tuple[str, ...]] = {
     "binary": ("bce", "weighted_bce", "focal", "logit_adjusted", "auc_margin", "pauc"),
     "multiclass": ("ce", "weighted_ce", "focal_ce"),
     "ordinal": ("coral", "cumulative_link"),
+    "corn": ("corn",),
 }
 
 #: Execution knobs that never change a result, so they are left out of the digest (§14.1 resume).
 _UNDIGESTED_RUN_KEYS = ("device", "devices", "num_workers", "report_workers")
+#: ``(block, key, default)`` of keys added after runs were made: left out of the digest at their default, which is the
+#: behaviour before the key existed, so those run dirs keep their digest (resume, evaluate, report).
+_LATER_DEFAULTS = (("labels", "time_matched", False),)
 #: Run-dir schema version, hashed into :func:`digest`, so a run dir written under an older schema is refused on
 #: resume. Bump it whenever a run-dir schema changes (cohort/prediction columns, context width, file layout).
 SCHEMA_VERSION = 6  # 3: raw covariate columns in cohort/segments.parquet, covariate_availability.parquet (P5);
@@ -109,19 +113,23 @@ class CohortCfg(_Block):
 
 class LabelsCfg(_Block):
     task: Literal[tuple(TASKS)]  # type: ignore[valid-type]
-    head: Literal["binary", "multiclass", "ordinal"]
+    head: Literal["binary", "multiclass", "ordinal", "corn"]
     aux_3class_weight: NonNegativeFloat
     strategy: Literal["propagate", "horizon", "horizon_decay", "final_only", "mil"]
     horizon_h: PositiveFloat
     decay_halflife_h: PositiveFloat
     k_warm: Union[Literal["auto"], NonNegativeInt]  # auto: 3 for propagate, 0 otherwise (cohort.warm_positions)
     eval_window: Literal["all", "horizon", "bins", "stage:first", "stage:second"]
+    # §6.5: horizon* weights for negatives too (default False: run configs written before 2026-10-08 omit the key)
+    time_matched: bool = False
 
     @model_validator(mode="after")
     def _head_fits_task(self) -> "LabelsCfg":
         k = 3 if self.task == "three_class" else 2
-        if (self.head == "binary" and k != 2) or (self.head == "ordinal" and k < 3):
+        if (self.head == "binary" and k != 2) or (self.head in ("ordinal", "corn") and k < 3):
             raise ValueError(f"labels.head={self.head!r} does not fit task {self.task!r} (K={k})")
+        if self.time_matched and self.strategy not in ("horizon", "horizon_decay"):
+            raise ValueError(f"labels.time_matched needs strategy horizon | horizon_decay, got {self.strategy!r}")
         return self
 
 
@@ -256,7 +264,7 @@ class ModelCfg(_Block):
 class LossCfg(_Block):
     name: Literal[
         "bce", "weighted_bce", "focal", "logit_adjusted", "auc_margin", "pauc", "ce",
-        "weighted_ce", "focal_ce", "coral", "cumulative_link",
+        "weighted_ce", "focal_ce", "coral", "cumulative_link", "corn",
     ]
     weighting: Literal["none", "inverse", "sqrt_inverse", "effective_number"]
     beta_en: float = Field(ge=0.0, lt=1.0)  # 1.0 makes every effective-number weight 0/0
@@ -513,8 +521,8 @@ def selection_monitor(advanced: Mapping[str, Any], regime: Optional[str] = None)
     monitor's ``_gated`` twin (±∞ on an epoch the preservation gate fails, §10.10.2 #12). Early stopping keeps the
     ungated one: it stops on a non-finite monitor."""
     es = (advanced.get("callbacks") or {}).get("early_stopping") or {}
-    monitor = es.get("monitor", "val/guid_logloss")
-    return monitor + ("_gated" if regime == "cotrain" else ""), es.get("mode", "min")
+    monitor = es.get("monitor", "val/guid_auroc")
+    return monitor + ("_gated" if regime == "cotrain" else ""), es.get("mode", "max")
 
 
 def ovr_enabled(c: Classifier) -> bool:
@@ -543,6 +551,9 @@ def digest(cfg: Config) -> str:
     payload = cfg.model_dump(mode="json") | {"schema_version": SCHEMA_VERSION}
     for key in _UNDIGESTED_RUN_KEYS:
         payload["classifier"]["run"].pop(key)
+    for block, key, default in _LATER_DEFAULTS:
+        if payload["classifier"][block].get(key) == default:
+            payload["classifier"][block].pop(key)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

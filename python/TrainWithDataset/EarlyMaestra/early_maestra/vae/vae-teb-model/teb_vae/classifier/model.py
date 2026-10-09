@@ -19,9 +19,10 @@ Batch and output keys follow the P3/P4 contract (CONTRACT.md). One option per co
   ``attention_mil`` (gated attention with a cumulative masked softmax). No softmax row is ever empty
   (the diagonal is never masked; masked_softmax zeroes empty rows), so padding never yields NaN.
 * Heads (§9.6): MLP(d -> hidden -> K_out), zero last layer, prior bias (``logit π`` / ``log π_k`` /
-  CORAL cumulative logits with ordered biases ``b_k = b_1 - Σ_{j<k} softplus(δ_j)``). Each output ``X``
-  comes with ``X_score``: binary logit | ``log Σ_{k≥1} p_k - log p_0`` | CORAL ``g + b_1 = logit P(Y ≥ 1)``
-  (ranks like ``g``; every consumer reads ``σ(score)`` as P(adverse)).
+  CORAL cumulative logits with ordered biases ``b_k = b_1 - Σ_{j<k} softplus(δ_j)`` / CORN conditional logits
+  ``o_k = logit P(Y > k | Y > k-1)``, K-1 free logits, Shi 2023). Each output ``X`` comes with ``X_score``: binary
+  logit | ``log Σ_{k≥1} p_k - log p_0`` | CORAL ``g + b_1`` | CORN ``o_1``, the last two ``= logit P(Y ≥ 1)``
+  (every consumer reads ``σ(score)`` as P(adverse)).
 
 :func:`aggregate` / :func:`running_aggregate` give the post-hoc segment-scope GUID scores (§11.2).
 """
@@ -197,7 +198,8 @@ class Aggregator(nn.Module):
 
 # ---- heads (§9.6) ------------------------------------------------------------------------------
 class Head(nn.Module):
-    """MLP(d -> hidden -> K_out): 1 logit (binary), K logits (multiclass) or K-1 CORAL cumulative logits."""
+    """MLP(d -> hidden -> K_out): 1 logit (binary), K logits (multiclass), K-1 CORAL cumulative logits (ordinal) or
+    K-1 CORN conditional logits (corn: ``o_k = logit P(Y > k | Y > k-1)``, each cut-point ranked on its own)."""
 
     def __init__(self, n_in: int, hidden: int, p: float, kind: str, k: int,
                  prior: Optional[Sequence[float]]) -> None:
@@ -206,12 +208,16 @@ class Head(nn.Module):
         pi = torch.as_tensor([1.0 / k] * k if prior is None else prior, dtype=torch.float64).clamp(1e-6, 1)
         pi = pi / pi.sum()
         self.mlp = nn.Sequential(nn.Linear(n_in, hidden), nn.GELU(), nn.Dropout(p))
-        self.out = nn.Linear(hidden, k if kind == "multiclass" else 1, bias=kind != "ordinal")
+        self.out = nn.Linear(hidden, k if kind == "multiclass" else k - 1 if kind == "corn" else 1,
+                             bias=kind != "ordinal")
         nn.init.zeros_(self.out.weight)
         if kind == "binary":
             nn.init.constant_(self.out.bias, math.log(pi[1] / pi[0]))
         elif kind == "multiclass":
             self.out.bias.data.copy_(pi.log())
+        elif kind == "corn":  # b_k = logit P(Y > k | Y > k-1) = logit(P(Y >= k+1) / P(Y >= k))
+            tail = pi.flip(0).cumsum(0).flip(0)  # P(Y >= k)
+            self.out.bias.data.copy_(torch.logit(tail[1:] / tail[:-1]).float())
         else:  # CORAL: b_k = logit P(Y > k), kept ordered via b_1 - cumsum(softplus(gaps))
             b = torch.logit(1 - pi.cumsum(0)[:-1])
             self.bias_first = nn.Parameter(b[:1].float())
@@ -231,7 +237,7 @@ class Head(nn.Module):
             return o[..., 0]
         if self.kind == "multiclass":
             return o[..., 1:].logsumexp(-1) - o[..., 0]
-        return o[..., 0]  # CORAL g + b_1 = logit P(Y >= 1)
+        return o[..., 0]  # CORAL g + b_1, or CORN o_1: both logit P(Y >= 1)
 
 
 # ---- the network -------------------------------------------------------------------------------

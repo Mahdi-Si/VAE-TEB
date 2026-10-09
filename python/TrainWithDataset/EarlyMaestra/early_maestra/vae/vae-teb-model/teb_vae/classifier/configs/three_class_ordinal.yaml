@@ -1,0 +1,11 @@
+# 3-class healthy / acidosis / HIE with the CORAL ordinal head (SPEC §9.6; Cao, Mirjalili & Raschka 2020): one
+# severity score g plus two ordered biases, P(Y > k) = σ(g + b_k), so every cut-point shares one ranking. The twin
+# of three_class_corn.yaml on the regularised baseline; eval.stage_offsets off (refused for 3-class).
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_three_class_ordinal}
+  labels: {task: three_class, head: ordinal, aux_3class_weight: 0.0}
+  train:
+    loss: {name: coral}
+  eval: {stage_offsets: false}

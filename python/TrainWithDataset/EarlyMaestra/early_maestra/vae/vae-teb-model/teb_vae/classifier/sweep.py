@@ -127,14 +127,16 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: launch the command line wins per key; a key left at None here is simply not set.
 RUN_ARGS: Dict[str, Any] = {
     # Configs in run order (relative to the repo root). The first is the comparison's reference. This list is the
-    # first batch of the 2026-10-07 plan (SPEC §17): the regularised baseline, then one source, representation and
-    # context ablation each; every other configs/*.yaml of §13.3 can be appended (the adapt_*.yaml ones are slow).
+    # first batch of the 2026-10-07 plan (SPEC §17): the regularised baseline, then one source, representation,
+    # context and label ablation each (lab_time_matched: the stage confound, added 2026-10-08); every other
+    # configs/*.yaml of §13.3 can be appended (the adapt_*.yaml ones are slow).
     "configs": [
         "teb_vae/classifier/configs/regularised.yaml",
         "teb_vae/classifier/configs/src_mu_prior.yaml",
         "teb_vae/classifier/configs/src_mu_prior_target_state.yaml",
         "teb_vae/classifier/configs/src_st_ph.yaml",
         "teb_vae/classifier/configs/ctx_off.yaml",
+        "teb_vae/classifier/configs/lab_time_matched.yaml",
     ],
     # None or a list of "classifier.<path>=<value>" strings applied to every run: the paths a real run needs,
     #   ["classifier.data.kfold_root=/data/.../k_fold_cross_validation_dataset",

@@ -73,6 +73,9 @@ TASK_LEVEL_KEYS = (
     # target's. Task-level for the same reason as the key above and for one more: what it produces
     # is a second keep-index and a second shift tuple on one stream, which is a resolution result.
     "causal_align_reference_source",
+    # The source channel choice: resolved by the same resolver into `source_keep_index`, which
+    # the constructor takes; the key itself names no constructor argument.
+    "causal_source_channels",
     # The forecast clock: resolved against the shards' delay vectors into the signed
     # `target_forecast_shift` tuple the constructor takes, exactly as the alignment references
     # resolve into theirs.
@@ -587,6 +590,44 @@ def test_the_tiny_variant_resolves_through_the_driver_into_the_shipped_decoder(t
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid
+
+
+def test_the_ua_s0_variant_reads_one_source_channel_on_the_physical_clock(shipped, tmp_path):
+    r"""``ua_s0_only.yaml`` moves three ``VAE_model`` leaves and its identity, and nothing else;
+    resolved through the real driver on the committed fixture those leaves give a source gate of
+    width $1$ (declared index $0$, $S_0$), a one-channel adapter, and the physical clock's ceiling
+    $T_{\mathrm{valid}} - \max_c s_c$ -- and the model forwards at that geometry."""
+    import torch
+
+    variant = load_config(str(_CONFIG_DIR / "ua_s0_only.yaml"))
+    mine, theirs = _flatten(variant), _flatten(shipped)
+    assert set(mine) - set(theirs) == {f"{_VAE}.causal_source_channels"}
+    moved = {path for path in theirs if mine[path] != theirs[path]} - set(_IDENTITY_PATHS)
+    assert moved == {f"{_VAE}.causal_target_forecast_clock", f"{_VAE}.anchor_stride"}
+    assert _get(variant, f"{_VAE}.causal_target_forecast_clock") == "physical"
+
+    # The same three leaves over the tiny config, which is what points at the committed shard.
+    tiny = load_config(str(_TINY))
+    for key in ("causal_source_channels", "causal_target_forecast_clock", "anchor_stride"):
+        tiny["model_config"]["VAE_model"][key] = _get(variant, f"{_VAE}.{key}")
+    kwargs = _model_kwargs_from(tiny, tmp_path)
+    assert kwargs["source_keep_index"] == (0,)
+    # $S_0$'s stored warm-up of 5 steps sits inside the loader's 15-step trim, so it rebases to 0.
+    assert kwargs["source_warmup_steps"] == (0,)
+    assert "source_align_delays" not in kwargs
+
+    model = SeqVaeLagAttnTrfCfs(**kwargs)
+    assert model.source_gate is not None and model.source_gate.out_channels == 1
+    assert model.source_adapter.in_dim == 1
+    assert model.anchor_ceiling == model.geometry.t_valid - max(kwargs["target_forecast_shift"])
+
+    vae = _get(tiny, _VAE)
+    length, c_y, c_u = vae["sequence_length"], vae["c_y"], vae["c_u"]
+    y_st, y_ph = torch.randn(2, length, 36), torch.randn(2, length, c_y - 36)
+    with torch.no_grad():
+        out = model(y_st, y_ph, torch.randn(2, length, c_u), anchor_phase=0)
+    assert out["source_state"].shape == (2, length, model.d_model)
+    assert out["mu_full"].shape[-1] == model.decoder_out_channels
 
 
 def test_the_local_variant_reads_the_same_shard_as_its_encoder_sibling(smoke_hie):
