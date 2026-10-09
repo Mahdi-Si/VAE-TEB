@@ -181,8 +181,8 @@ def ensemble_scores(scored: Sequence[Tuple[pd.DataFrame, pd.DataFrame]]) -> Tupl
 def _fold_unit(cfg: Config, run_dir: Path, source: Mapping[str, Any], fold: int, kind: str,
                built: Dict[bool, UnitData]) -> UnitData:
     """The fold's data for ``kind``, built once per context variant into ``built``: ``noind`` drops the missing
-    flags (:func:`without_indicators`); every other kind shares the plain unit (``shuffled`` differs in train labels
-    only, which its own ``train_unit`` rebuilds)."""
+    flags (:func:`without_indicators`); every other kind shares the plain unit (``shuffled`` differs in its train and
+    val labels, which its own ``train_unit`` rebuilds; its lock and predictions use this plain unit)."""
     variant = kind == "noind"
     if variant not in built:
         built[variant] = build_unit(without_indicators(cfg.classifier) if variant else cfg, run_dir, source, fold)
@@ -228,7 +228,7 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
     """Step 4: calibration fit on the val GUID rows (§10.8, :func:`unit_calibration`), every threshold policy on the
     calibrated val rows (§11.3; on ``three_class`` also per class one-vs-rest, ``thresholds.json["ovr"]``), then
     ``selection_lock.json`` last, digesting ``files``. The val selections go to the unit's MLflow child (§10.10.5).
-    ``unit`` may be the fold's unshuffled data for the shuffled unit: only train labels differ, never val.
+    ``unit`` is the fold's unshuffled data for the shuffled unit too: its permuted val labels only steer its training.
     A unit with no causal per-position score (non-causal, no segment head) is thresholded like the shortcut
     (:func:`~teb_vae.classifier.thresholds.guid_level_policies`); one without a segment score (``segment_head:
     false``) skips its ``segment``-basis policies (recorded ``skipped``). ``scored``: the val scores, when they do not

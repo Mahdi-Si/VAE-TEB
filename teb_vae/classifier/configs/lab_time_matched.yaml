@@ -1,0 +1,9 @@
+# Label ablation (SPEC §6.5 labels.time_matched, added 2026-10-08): the horizon_decay weight schedule applies to the
+# negatives too, so early (first-stage) segments of healthy GUIDs stop teaching "early-looking means healthy" while
+# the positives' early segments are silent. The 2026-10-07 runs scored stage more than outcome (np30 sensitivity
+# 0.55-0.57 in second stage against 0.13-0.22 in first stage; healthy specificity 0.67 vs 0.96).
+base: regularised.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seq_reg_lab_time_matched}
+  labels: {time_matched: true}

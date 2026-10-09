@@ -169,6 +169,7 @@ BUDGET_KEY = "model_config.VAE_model.causal_warmup_budget_steps"
 REACH_KEY = "model_config.VAE_model.causal_reach_budget_s"
 ALIGN_KEY = "model_config.VAE_model.causal_align_reference"
 ALIGN_SOURCE_KEY = "model_config.VAE_model.causal_align_reference_source"
+SOURCE_CHANNELS_KEY = "model_config.VAE_model.causal_source_channels"
 TARGET_FORECAST_CLOCK_KEY = "model_config.VAE_model.causal_target_forecast_clock"
 LEG_ALIGNMENT_KEY = "model_config.VAE_model.causal_leg_alignment"
 PHASE_OPERATOR_KEY = "model_config.VAE_model.causal_phase_operator"
@@ -919,6 +920,65 @@ def _resolve_source_reference_delay(
     return nearest
 
 
+def _resolve_source_channels(setting: Any, declared_width: int) -> Tuple[int, ...]:
+    r"""Resolve ``causal_source_channels`` into the keep-index the source alignment starts from.
+
+    The one place the source stream is narrowed by **choice**. The warm-up budget never gates the
+    source and the alignment drops only what it cannot shift, so without this key the model reads
+    every declared source channel. The key names declared indices into the concatenated
+    ``up_st ++ up_ph`` stream: ``[0]`` keeps the order-zero scattering coefficient $S_0$ alone,
+    the low-passed uterine pressure at a $13.3$ s group delay, and drops every first-order channel
+    and the whole phase block. ``c_u`` stays the declared width; the gate narrows it.
+
+    Args:
+        setting: ``None`` for every declared channel, or a sequence of declared channel indices.
+        declared_width: The declared source width $c_u$ the indices are positional into.
+
+    Returns:
+        The strictly ascending keep-index; the identity when the setting is ``None``.
+
+    Raises:
+        ValueError: If the setting is not a sequence of integers, is empty, repeats an index, or
+            names an index outside $[0, c_u)$.
+    """
+    if setting is None:
+        return tuple(range(int(declared_width)))
+    if isinstance(setting, (str, bytes)) or not isinstance(setting, Sequence):
+        raise ValueError(
+            f"{SOURCE_CHANNELS_KEY}={setting!r} is not a list of channel indices. It takes the "
+            f"declared indices into the concatenated source stream (up_st first, then up_ph), "
+            f"or null for every channel."
+        )
+    # ``bool`` is an ``int`` subclass and ``int(0.5)`` is ``0``, so a plain conversion would admit
+    # ``[true]`` and ``[0.5]`` as channel 0 or 1 with nothing saying so.
+    if any(
+        isinstance(index, bool) or not isinstance(index, (int, np.integer)) for index in setting
+    ):
+        raise ValueError(
+            f"{SOURCE_CHANNELS_KEY}={setting!r} holds a non-integer entry; each entry is a "
+            f"declared channel index."
+        )
+    indices = [int(index) for index in setting]
+    if not indices:
+        raise ValueError(
+            f"{SOURCE_CHANNELS_KEY} is empty: a stream with zero channels builds a model that "
+            f"trains to completion having never read it. Name at least one index, or set null."
+        )
+    if len(set(indices)) != len(indices):
+        raise ValueError(
+            f"{SOURCE_CHANNELS_KEY}={indices} repeats an index. The gate gathers each named "
+            f"channel once, so a repeat is a typo rather than a weight."
+        )
+    outside = sorted(index for index in indices if index < 0 or index >= int(declared_width))
+    if outside:
+        raise ValueError(
+            f"{SOURCE_CHANNELS_KEY} names {outside}, outside the declared source width "
+            f"[0, {int(declared_width)}). The indices are positional into the up_st ++ up_ph "
+            f"stream at the width c_u declares."
+        )
+    return tuple(sorted(indices))
+
+
 def _align_stream(
     name: str,
     delay_s: Sequence[float],
@@ -1114,7 +1174,9 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
             configured expectation; if the alignment reference is neither ``'target_max'`` nor a
             number, matches no kept target channel, or leaves a stream with no channel at all; if
             the source reference is not a number, is set against an unaligned target, or matches no
-            stored source channel; or if the floor and stride leave a phase with no anchor at all.
+            stored source channel; if ``causal_source_channels`` is not a non-empty list of
+            distinct declared source indices; or if the floor and stride leave a phase with no
+            anchor at all.
     """
     model_config = config.get("model_config") or {}
     vae_config = model_config.get("VAE_model") or {}
@@ -1226,12 +1288,13 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     target_keep, target_align = _align_stream(
         "target", target_delay_s, target_keep, reference_delay_s
     )
-    # The source keep-index is the identity **until** a reference is configured. It is not derived
-    # from the warm-up budget and must not be: the source's slowest channels carry the contraction
-    # envelope, and gating them on the budget would drop almost the whole ``up_ph`` block against a
-    # lag search that exists to find the 20 to 120 s contraction-to-deceleration delay. What the
-    # alignment removes is a different set for a different reason -- the channels *above* the
-    # reference, which cannot be shifted onto it without reading their own future -- and that is a
+    # The source keep-index is the identity **until** a reference is configured, or until
+    # ``causal_source_channels`` names a subset by choice. It is not derived from the warm-up
+    # budget and must not be: the source's slowest channels carry the contraction envelope, and
+    # gating them on the budget would drop almost the whole ``up_ph`` block against a lag search
+    # that exists to find the 20 to 120 s contraction-to-deceleration delay. What the alignment
+    # removes is a different set for a different reason -- the channels *above* the reference,
+    # which cannot be shifted onto it without reading their own future -- and that is a
     # correctness requirement rather than a warm-up policy.
     #
     # WHICH reference is the dual scheme's one decision, and it is priced in exactly this line. On
@@ -1241,7 +1304,9 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     source_keep, source_align = _align_stream(
         "source",
         source_delay_s,
-        tuple(range(len(source_warmup))),
+        _resolve_source_channels(
+            vae_config.get("causal_source_channels"), len(source_warmup)
+        ),
         reference_delay_s if source_reference_delay_s is None else source_reference_delay_s,
     )
 
