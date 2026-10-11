@@ -1856,3 +1856,37 @@ joint density). Both reach `raw_sample_score` through
 `lag_attn_transformer_cfs` ships them on as its final revision, together with a longer horizon,
 local keys and a shorter lag window, so the encoder edge between the two cfs cells is closed:
 `lag_attn_transformer_cfs/DESIGN.md` (amendment of the same date) is the record.
+
+## Amendment (2026-10-11): the source is gated at the floor, and the persistence gather is masked
+
+Two corrections to the as-built record, one of them a code change in the shared mixins.
+
+**The prior-clock premise did not hold on the shipped source set.** §8.2 and the config comments
+state that the availability staircase is constant on every scored anchor because the floor refusal
+clears $\max_c(W'_c + d_c)$. That refusal covers the *target* stream; the source is not
+budget-gated, and on the integer shards four `up_st` channels (delays 476 to 791 s) come warm at
+steps 162, 194, 233 and 278, inside the scored range, so the staircase took four distinct rows
+there and the prior's clock projection was live. Those channels are warm in 66%, 42%, 14% and 0% of
+the (anchor, lag) pairs the attention reads and their envelope spreads (223 to 282 s) exceed the
+whole lag window, so they could not move the attention either. Both cfs defaults now name the
+source channels whose rebased warm-up fits the floor (`causal_source_channels`, 42 of 46: every
+`up_st` channel but those four, the whole `up_ph` block), after which the clock *at the anchor* is
+constant on the scored anchors as the premise says; the posterior's lagged view of the channels with
+$W'_c \in (97, 134]$ still varies at anchors below $W'_c + 37$, which `source_lag_warmth_frac_*`
+reports and `kld_source_null` prices. The measurement of one distinct row over the scored range was
+made on the planted fixture, whose source is aligned and dropped above the reference, and is labelled
+so. Configs reading the legacy 51-wide shards restate the list in that layout or pin `null`.
+
+**The persistence gather is masked by the channel's own warm-up.** `_anchor_target_values` read the
+raw stored target at the anchor with no mask, while `_check_anchor_floor` admits $F = B - 1$, at
+which the slowest kept channel is cold at the anchor itself; at the shipped $F = B = 134$ nothing
+was wrong, one step lower the mean head would have received assumed pre-recording floats through
+the persistence weight with nothing reporting it. The gather now multiplies by
+$\mathbb 1[u \ge W'_c]$ on the step $u$ actually read, from a new non-persistent buffer
+`target_warm_steps` the input mixin registers beside the tertile buffers (all zeros on the ungated
+arm, so a per-call host-to-device copy is avoided). At every shipped floor the mask is all ones and
+the forward is bitwise what it was. It is the precondition for the physical-clock arm
+`lag_attn_transformer_cfs/configs/ua_s0_only.yaml`, whose floor is now the clock's own
+$\max_c(W'_c - s_c) - 1 = 48$ rather than the stored clock's 134 (137 dense anchors against 51):
+with no input alignment the shifted-inputs half of the refusal does not bind, and the constructor
+refuses 47 by name.

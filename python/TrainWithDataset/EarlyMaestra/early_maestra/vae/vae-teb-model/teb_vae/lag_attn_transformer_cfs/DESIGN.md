@@ -1166,3 +1166,15 @@ and squared-error readouts take the mask only.
 > lean-limit: the residual model is AR(1) per channel with no cross-channel term; replace with a
 > low-rank cross-channel innovation covariance when the evaluation's residual diagnostics show the
 > remaining correlation is across channels rather than across steps.
+
+## Amendment (2026-10-11): source gated at the floor; persistence masked; the ua_s0 arm's floor
+
+Shared with the conv-LSTM cell and recorded once in `lag_attn_cfs/DESIGN.md` (amendment of the
+same date): `default.yaml` now names the 42 source channels whose warm-up fits the anchor floor
+(`causal_source_channels`), because the four slowest `up_st` channels came warm inside the scored
+range and falsified the prior-clock premise §10 restates; the persistence gather in the shared
+target mixin is masked by each channel's own warm-up; and `ua_s0_only.yaml` ships the physical
+clock's own floor of 48 at stride 13 (137 dense anchors, 10 to 11 tiles) rather than the stored
+clock's 134. The key is equal on the encoder edge and declared on the target edge, where the
+two-sided stream has no warm-up to fit. The legacy-width configs (`smoke_hie.yaml`, `planted.yaml`,
+`sweep_legacy_dualref_physclock.yaml`) restate the list in the 36 + 15 layout or pin `null`.

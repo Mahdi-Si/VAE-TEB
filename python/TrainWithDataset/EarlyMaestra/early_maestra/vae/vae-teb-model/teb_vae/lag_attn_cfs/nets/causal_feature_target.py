@@ -895,12 +895,16 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         residual at the anchor's own stored step, the freshest causal value the stream has. The
         stored clock is both at once, and bitwise the historical gather.
 
-        **At the anchor step, not at the last valid step before it.** The evaluation's persistence
-        baseline gathers the last *observed* step, which it can because it holds the decimated
-        validity weight; no validity signal enters the training forward, and the at-anchor
-        definition is sound there without one -- an anchor is target-warm by the constructor's own
-        floor refusal, and an anchor invalid at its own step is fully masked in the loss, so the
-        residual scores nothing on it.
+        **At the anchor step, not at the last valid step before it, and masked by the channel's
+        own warm-up.** The evaluation's persistence baseline gathers the last *observed* step,
+        which it can because it holds the decimated validity weight; no validity signal enters the
+        training forward, and an anchor invalid at its own step is fully masked in the loss, so
+        the residual scores nothing on it. Warmth is not left to the floor: the refusal admits
+        $F = B - 1$, at which the slowest kept channel is still cold at the anchor itself, and a
+        physical-clock floor sits far below $B$, so a value read at a step below its channel's
+        warm-up -- assumed pre-recording history on no defined scale -- is zeroed here rather than
+        handed to the mean head. The mask is $\mathbb 1[u \ge W'_c]$ on the step $u$ actually
+        read, which is the one statement that is right on all three clocks.
 
         Args:
             target_features: The concatenated target stream $(B, T, c_y)$ in **declared** channel
@@ -918,14 +922,21 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         shift = getattr(self, "target_forecast_shift", None)
         if not shift or min(shift) >= 0:
             index = anchors.to(torch.long)[:, :, None].expand(-1, -1, gathered.shape[-1])
-            return gathered.gather(1, index)
-        # Only a delaying clock moves this gather, and the offsets are safe by the floor: the
-        # constructor refuses any anchor below max_c(W'_c + d_c), which bounds t_a - d_c >= 0.
-        offsets = torch.tensor(
-            [min(int(s), 0) for s in shift], dtype=torch.long, device=gathered.device
-        )
-        index = anchors.to(torch.long)[:, :, None] + offsets[None, None, :]
-        return gathered.gather(1, index)
+        else:
+            # Only a delaying clock moves this gather, and the offsets are safe by the floor: the
+            # constructor refuses any anchor below max_c(W'_c + d_c), which bounds t_a - d_c >= 0.
+            offsets = torch.tensor(
+                [min(int(s), 0) for s in shift], dtype=torch.long, device=gathered.device
+            )
+            index = anchors.to(torch.long)[:, :, None] + offsets[None, None, :]
+        values = gathered.gather(1, index)
+        # Zero below the channel's own warm-up, on the step actually read. The buffer is the input
+        # mixin's (``target_warm_steps``, all zeros on the ungated arm), so a model built without
+        # it is the unmasked gather it always was.
+        waits = getattr(self, "target_warm_steps", None)
+        if waits is None:
+            return values
+        return values * (index >= waits).to(values.dtype)
 
     @torch.no_grad()
     def _gap_by_kept_channel(
