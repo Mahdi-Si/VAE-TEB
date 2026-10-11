@@ -59,6 +59,10 @@ model_config:
     causal_phase_operator: ratio_power_v0
     c_y: 102
     c_u: 51
+    # Every declared source channel, PINNED: the default's list indexes the integer layout, and the
+    # instrument's source set must not move with a default's gating; the single reference below
+    # already drops everything above 402 s.
+    causal_source_channels: null
     # The three pinned deltas. See the header.
     max_lag: 90
     # The horizon and its half-life, PINNED at the values every recorded gate was measured under.

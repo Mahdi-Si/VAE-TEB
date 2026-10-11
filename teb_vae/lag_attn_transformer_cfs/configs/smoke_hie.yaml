@@ -70,6 +70,9 @@ model_config:
     causal_phase_operator: ratio_power_v0
     c_y: 102
     c_u: 51
+    # The default's source gating restated in the legacy 36 + 15 layout: the same rule, W'_c <= 134,
+    # which again drops `up_st` 32-35 and keeps the whole `up_ph` block (indices 36-50 here).
+    causal_source_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
     # ONLY the ramp length. The endpoint is inherited, deliberately: this config must track whatever
     # weight default.yaml ships, or the dev-box reading stops being a reading of the shipped model.
     # The ramp itself cannot be inherited -- 50 epochs is 1% of a 5,000-epoch production run and a

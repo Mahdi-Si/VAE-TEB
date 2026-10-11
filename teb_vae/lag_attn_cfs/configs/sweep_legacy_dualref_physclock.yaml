@@ -26,6 +26,9 @@ model_config:
   VAE_model:
     c_y: 102
     c_u: 51
+    # Every declared channel: the default's list indexes the integer layout, and the source
+    # reference below drops everything above 288 s anyway, which subsumes the gating.
+    causal_source_channels: null
     causal_phase_operator: ratio_power_v0
     causal_align_reference: target_max
     causal_align_reference_source: 288.2672
