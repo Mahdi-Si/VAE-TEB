@@ -67,6 +67,7 @@ def test_no_buffer_is_a_running_statistic_so_the_broadcast_is_safe_to_skip():
         "novelty_tertile_id",
         "source_block_warm_st",
         "source_block_warm_ph",
+        "target_warm_steps",
     ):
         assert name in buffers, name
         assert name not in model.state_dict(), f"{name} reaches a checkpoint"

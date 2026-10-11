@@ -446,6 +446,9 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         # coefficients already describe the instant they are stored at, so there is no per-channel
         # staleness for a clock to correct on the question side.
         f"{_VAE}.causal_target_forecast_clock",
+        # Which source channels the model reads, named so the source's warm-up fits the anchor
+        # floor; a two-sided stream is honest at every step and has no warm-up to fit.
+        f"{_VAE}.causal_source_channels",
         # The four architecture switches whose off-state is bitwise the two-sided model. They are
         # ABSENT from that config rather than set to their off-values, which is the stronger
         # statement: the two-sided cells never take these keys, so no config of theirs can drift
@@ -593,22 +596,24 @@ def test_the_tiny_variant_resolves_through_the_driver_into_the_shipped_decoder(t
 
 
 def test_the_ua_s0_variant_reads_one_source_channel_on_the_physical_clock(shipped, tmp_path):
-    r"""``ua_s0_only.yaml`` moves three ``VAE_model`` leaves and its identity, and nothing else;
+    r"""``ua_s0_only.yaml`` moves four ``VAE_model`` leaves and its identity, and nothing else;
     resolved through the real driver on the committed fixture those leaves give a source gate of
-    width $1$ (declared index $0$, $S_0$), a one-channel adapter, and the physical clock's ceiling
-    $T_{\mathrm{valid}} - \max_c s_c$ -- and the model forwards at that geometry."""
+    width $1$ (declared index $0$, $S_0$), a one-channel adapter, the physical clock's ceiling
+    $T_{\mathrm{valid}} - \max_c s_c$ and its own floor $\max_c(W'_c - s_c) - 1$ -- and the model
+    forwards at that geometry."""
     import torch
 
     variant = load_config(str(_CONFIG_DIR / "ua_s0_only.yaml"))
     mine, theirs = _flatten(variant), _flatten(shipped)
-    assert set(mine) - set(theirs) == {f"{_VAE}.causal_source_channels"}
+    assert set(mine) == set(theirs)
     moved = {path for path in theirs if mine[path] != theirs[path]} - set(_IDENTITY_PATHS)
-    assert moved == {f"{_VAE}.causal_target_forecast_clock", f"{_VAE}.anchor_stride"}
+    leaves = ("causal_source_channels", "causal_target_forecast_clock", "anchor_stride", "warmup_period")
+    assert moved == {f"{_VAE}.{key}" for key in leaves}
     assert _get(variant, f"{_VAE}.causal_target_forecast_clock") == "physical"
 
-    # The same three leaves over the tiny config, which is what points at the committed shard.
+    # The same four leaves over the tiny config, which is what points at the committed shard.
     tiny = load_config(str(_TINY))
-    for key in ("causal_source_channels", "causal_target_forecast_clock", "anchor_stride"):
+    for key in leaves:
         tiny["model_config"]["VAE_model"][key] = _get(variant, f"{_VAE}.{key}")
     kwargs = _model_kwargs_from(tiny, tmp_path)
     assert kwargs["source_keep_index"] == (0,)
@@ -620,6 +625,14 @@ def test_the_ua_s0_variant_reads_one_source_channel_on_the_physical_clock(shippe
     assert model.source_gate is not None and model.source_gate.out_channels == 1
     assert model.source_adapter.in_dim == 1
     assert model.anchor_ceiling == model.geometry.t_valid - max(kwargs["target_forecast_shift"])
+    # The floor is the physical clock's own scored-target minimum, not the stored clock's B - 1:
+    # with no input alignment the shifted-inputs half of the refusal does not bind.
+    assert model.warmup_period == max(
+        wait - shift
+        for wait, shift in zip(kwargs["target_warmup_steps"], kwargs["target_forecast_shift"])
+    ) - 1
+    with pytest.raises(ValueError, match="anchor floor"):
+        SeqVaeLagAttnTrfCfs(**{**kwargs, "warmup_period": model.warmup_period - 1})
 
     vae = _get(tiny, _VAE)
     length, c_y, c_u = vae["sequence_length"], vae["c_y"], vae["c_u"]
