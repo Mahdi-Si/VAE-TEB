@@ -13,11 +13,16 @@
 # conditioning. The physical clock advances each kept target channel by
 # round(0.875 (tau_c - 13.3 s) / 4 s) steps, so every scored cell carries content at
 # 4 (t + 1 + tau) - 0.875 * 13.3 s, and the S_0 content at lag l sits exactly 4 (1 + tau + l) s
-# earlier than it: 4 s to 272 s, strictly positive for every lag, horizon step and channel. For
+# earlier than it: 4 s to 268 s, strictly positive for every lag, horizon step and channel. For
 # the S_0 / fhr_st S_0 pair the filter delay cancels exactly, both being the same low-pass; for
 # the other channels the ordering holds up to the centroid convention and the +-2 s rounding.
-# It costs anchors, as default.yaml documents: the ceiling drops from T_valid = 270 to 185
-# (51 dense anchors) and the stride follows it to 5, i.e. 11 tiles at phase 0 and 10 otherwise.
+# The ceiling drops from T_valid = 270 to 185, as default.yaml documents -- but the FLOOR is not the
+# stored clock's 134. With no input alignment the shifted-inputs half of the floor refusal does not
+# bind, and the scored-target half is max_c(W'_c - s_c) - 1 = 48 (the slowest kept channel, W' 134
+# advanced by 85), so `warmup_period: 48` keeps 137 dense anchors against the 51 that floor 134
+# leaves; the persistence gather is masked below each channel's own warm-up, which is what makes an
+# anchor below 134 sound. `anchor_stride: 13` tiles that span into 11 tiles at phase 0 and 10-11
+# otherwise, the count the shipped stride-5 tiling had over 51.
 #
 # `causal_source_channels` names DECLARED indices into the concatenated `up_st ++ up_ph` stream.
 # `c_u` stays 46: the data boundary still checks the batch at the declared width, and the gate
@@ -28,7 +33,7 @@
 #
 # `max_lag` is inherited at 37 (148 s). With the physical clock the content delay a (lag, horizon)
 # cell can read is 4 (1 + tau + l) s, so the 20 to 60 s contraction-to-deceleration band is
-# readable at horizon steps tau <= 13 (60 s end) and tau <= 4 (20 s end); beyond that the
+# readable at horizon steps tau <= 14 (60 s end) and tau <= 4 (20 s end); beyond that the
 # proximate contraction sample lies after the anchor and is not yet recorded, whatever the window.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
@@ -42,7 +47,9 @@ model_config:
     # or outside [0, c_u).
     causal_source_channels: [0]
     causal_target_forecast_clock: physical
-    anchor_stride: 5
+    # The physical clock's own floor (see the header); the constructor refuses 47 by name.
+    warmup_period: 48
+    anchor_stride: 13
 
 advanced_config:
   tracking:
