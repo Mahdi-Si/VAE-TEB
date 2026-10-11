@@ -391,11 +391,16 @@ model_config:
     # the boundary lands on the ~0.008 Hz frequency edge both phase selections already use, rather
     # than on an arbitrary cut. The four dropped channels wait 162, 194, 233 and 278 steps.
     #
-    # The SOURCE is never gated BY THIS BUDGET: its slowest channels carry the contraction envelope,
-    # and dropping them to make every reachable lag warm would cost almost the whole `up_ph` block
-    # against a lag search that exists to find the 20-120 s contraction-to-deceleration delay. All
-    # 46 survive it, the availability mechanism announces per step when each arrives, and the
-    # residual is MEASURED -- `source_lag_warmth_frac_st` and `_ph`.
+    # The SOURCE is gated at the same threshold through `causal_source_channels` below, and the two
+    # keys are one decision. A source channel whose warm-up exceeds the anchor floor is cold at some
+    # scored anchor, so its availability keeps switching across the region the KL is measured on --
+    # the clock the prior's conditioning further down exists to cancel -- and its content is stale
+    # by more than the lag window is wide. W'_c <= 134 drops exactly the four slowest `up_st`
+    # channels (delays 476-791 s, warm at steps 162, 194, 233 and 278; the last is never warm
+    # anywhere inside the lag window) and keeps all ten `up_ph`. The every-lag-warm criterion
+    # W'_c <= 97 would also cost four `up_ph` channels and is NOT applied: the residual -- channels
+    # with W'_c in (97, 134] are cold at the far lags of the first anchors -- is MEASURED instead,
+    # `source_lag_warmth_frac_st` and `_ph`.
     #
     # The ALIGNMENT below is a different rule and does drop four of them, for a different reason:
     # a channel slower than the reference could only reach it by being read from a LATER stored
@@ -403,6 +408,18 @@ model_config:
     # policy about how much of a segment to spend waiting, and it takes `up_st` 32-35 while leaving
     # all fifteen `up_ph` standing.
     causal_warmup_budget_steps: 134
+
+    # --- Which SOURCE channels the model reads ----------------------------------
+    # Declared indices into the concatenated `up_st ++ up_ph` stream (36 + 10 under the integer
+    # operator). The budget above gates the target only, so this names the source channels whose
+    # rebased warm-up fits the anchor floor: every `up_st` channel but the four slowest, and the
+    # whole `up_ph` block. `c_u` stays 46 -- the data boundary checks the batch at the declared
+    # width and the gate narrows it -- and the checkpoint's model_kwargs stamps the resolved
+    # `source_keep_index`. `null` reads every declared channel, which is the pre-2026-10-11 arm. A
+    # config reading the LEGACY 51-wide shards restates the list in that layout (smoke_hie.yaml) or
+    # sets null where the alignment's own drop rule already removes everything above 288 s
+    # (sweep_legacy_dualref_physclock.yaml) or the planted geometry is pinned (planted.yaml).
+    causal_source_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]
 
     # --- Causal CHANNEL ALIGNMENT: one clock per input stream -------------------
     # Every one-sided filter carries its own group delay, spanning 13.3 s to 791.0 s across a
@@ -782,12 +799,17 @@ model_config:
     #
     # WHAT THE PRIOR IS GIVEN, and it is not the obvious thing. The intuitive clock is the
     # availability staircase the source adapter masks and announces with -- which channels have
-    # arrived by step t. That is PROVABLY INERT here: the constructor refuses any anchor floor below
-    # max_c(W'_c + d_c), which is exactly the last step at which the staircase changes, so every
-    # SCORED anchor sees the same all-ones vector and a constant through a LayerNorm and a linear
-    # map is an offset the head's biases already span. Measured: 18 distinct rows over t in [0, 300)
-    # and exactly ONE over the scored [134, 270), with the resulting projection learning to a weight
-    # RMS fifty times below every other matrix in the head and kld_source_null unmoved.
+    # arrived by step t. It is inert on the scored anchors ONLY IF every source channel is warm by
+    # the floor. The floor refusal guarantees that for the TARGET stream alone; the source is not
+    # budget-gated, and on the integer shards four `up_st` channels came warm at steps 162, 194,
+    # 233 and 278, inside the scored [134, 270), so the staircase took four distinct rows there and
+    # the projection was live. `causal_source_channels` above now drops those four, after which
+    # every SCORED anchor sees the same all-ones vector and a constant through a LayerNorm and a
+    # linear map is an offset the head's biases already span. (The measurement of 18 distinct rows
+    # over t in [0, 300) and exactly ONE over the scored [134, 270), with the projection learning
+    # to a weight RMS fifty times below every other matrix in the head and kld_source_null
+    # unmoved, was made on the planted fixture, whose source is aligned and dropped above the
+    # reference.)
     #
     # What survives past the floor is the source ENCODER'S MEMORY of the warm-up transient -- h_u at
     # t >= F still carries the pattern of channels arriving one by one, because the encoder is
@@ -804,9 +826,13 @@ model_config:
     # contamination.
     #
     # UNDER THE SHIPPED `lag_kv_source: adapter` the pathway has no memory, so the paragraph above
-    # describes the `conv_stem` / `encoder` comparators: here the clock is constant over the scored
-    # anchors and the projection can only learn an offset. It stays on so the comparator arms
-    # differ from this file in their K/V memory alone.
+    # describes the `conv_stem` / `encoder` comparators: here the clock at step t is the staircase
+    # at t alone, constant over the scored anchors once the source is gated at the floor, and the
+    # projection can only learn an offset. What the posterior still sees that the prior does not is
+    # the staircase at the LAGGED steps t - l: channels with W'_c in (97, 134] are cold at the far
+    # lags of anchors below W'_c + 37, which `source_lag_warmth_frac_*` reports and
+    # `kld_source_null` prices. It stays on so the comparator arms differ from this file in their
+    # K/V memory alone.
     #
     # WHAT IT COSTS. One LayerNorm and one bias-free d_model x d_model projection on the prior head's
     # own input, plus one extra source encode per forward -- at BATCH 1, since a zero stream encodes
