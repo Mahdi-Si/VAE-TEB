@@ -63,6 +63,9 @@ TASK_LEVEL_KEYS = (
     # produces is a second keep-index and a second shift tuple on one stream only, which is a
     # resolution result and not an architecture choice.
     "causal_align_reference_source",
+    # The source channel choice: resolved by the same resolver into `source_keep_index`, which
+    # the constructor takes; the key itself names no constructor argument.
+    "causal_source_channels",
     # The forecast clock: resolved against the shards' delay vectors into the signed
     # `target_forecast_shift` tuple the constructor takes, exactly as the alignment references
     # resolve into theirs.
@@ -191,6 +194,10 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
         "which clock the forecast target is SCORED on, which has no two-sided counterpart: a "
         "symmetric bank's coefficients already describe the instant they are stored at, so there "
         "is no per-channel staleness for a clock to correct on the question side"
+    ),
+    "model_config.VAE_model.causal_source_channels": (
+        "which source channels the model reads, named so every one is warm by the anchor floor; "
+        "a two-sided stream is honest at every step and has no warm-up to fit"
     ),
     "advanced_config.callbacks.early_stopping.enabled": (
         "the training controls: this row stops on val/total_loss where the comparison model runs "

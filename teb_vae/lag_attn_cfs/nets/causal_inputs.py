@@ -52,10 +52,12 @@ arriving in the readout as though the source had informed the forecast. Under
 subtracted afterwards.
 
 **What the prior is given is not the announcement itself**, and the distinction is the whole of
-:meth:`CausalWarmupInputs._prior_clock`. The staircase $\mathbb 1[t \ge W'_c + d_c]$ is *constant on
-every scored anchor* -- the constructor refuses any floor below $\max_c(W'_c + d_c)$, which is
-exactly the last step at which it changes -- so a prior conditioned on it gains an offset its biases
-already span. What survives past the floor is the source **encoder's memory** of the arrivals, and
+:meth:`CausalWarmupInputs._prior_clock`. The staircase $\mathbb 1[t \ge W'_c + d_c]$ is constant on
+every scored anchor once every *source* channel is warm by the floor -- the floor refusal
+guarantees that for the target stream only, and the shipped configs secure it for the source by
+naming the channels whose warm-up fits the floor (``causal_source_channels``) -- so a prior
+conditioned on it gains an offset its biases already span. What survives past the floor is the
+source **encoder's memory** of the arrivals, and
 the prior is therefore conditioned on the encode of a **zeroed** source stream: the same tensor the
 source-null control feeds the posterior, carrying no information about the source's values, detached
 so no gradient couples the two pathways.
@@ -379,14 +381,19 @@ class CausalWarmupInputs:
           \in \mathbb R^{1 \times T \times d_{\mathrm{model}}} .$$
 
         **Why this and not the announcement itself.** The obvious clock is the availability
-        staircase $\mathbb 1[t \ge W'_c + d_c]$ the adapter masks and announces with. It is inert:
-        the constructor refuses any anchor floor below $\max_c (W'_c + d_c)$, which is exactly the
-        last step at which that staircase changes, so **every scored anchor sees an all-ones
+        staircase $\mathbb 1[t \ge W'_c + d_c]$ the adapter masks and announces with. It is inert
+        only once every source channel is warm by the floor: the floor refusal guarantees
+        $F \ge \max_c (W'_c + d_c)$ for the **target** stream, and the source is not budget-gated,
+        so a source channel slower than the floor keeps switching the staircase inside the scored
+        range -- four ``up_st`` channels did, at steps 162, 194, 233 and 278 on the integer
+        shards, until the shipped configs named the channels that fit the floor
+        (``causal_source_channels``). With that in place **every scored anchor sees an all-ones
         vector** -- a constant, which a ``LayerNorm`` and a linear map turn into an offset the
-        prior head's biases already span. Measured on the planted fixture: eighteen distinct rows
-        over $t \in [0, 300)$ and exactly one over the scored $[134, 270)$, with the resulting
-        projection learning to a weight RMS fifty times below every other matrix in the head and
-        ``kld_source_null`` unmoved.
+        prior head's biases already span. Measured on the planted fixture, whose source is
+        aligned and dropped above the reference: eighteen distinct rows over $t \in [0, 300)$ and
+        exactly one over the scored $[134, 270)$, with the resulting projection learning to a
+        weight RMS fifty times below every other matrix in the head and ``kld_source_null``
+        unmoved.
 
         What actually reaches the KL past the floor is the source **pathway's memory** of the
         warm-up transient: $h^u_t$ at $t \ge F$ still carries the pattern of channels arriving one
@@ -496,6 +503,19 @@ class CausalWarmupInputs:
                 self._resolve_warm_tertiles(
                     self.target_warmup_steps or tuple(0 for _ in range(kept_target))
                 ),
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+        # Each kept channel's own warm-up, for the persistence gather's mask: a stored value read
+        # at a step below it is assumed pre-recording history, and the floor refusal admits
+        # F = B - 1, where the slowest channel is still cold at the anchor itself. Zeros on the
+        # ungated arm, where every step is honest; a buffer rather than a per-call tensor so the
+        # training step issues no host-to-device copy.
+        self.register_buffer(
+            "target_warm_steps",
+            torch.tensor(
+                self.target_warmup_steps or tuple(0 for _ in range(kept_target)),
                 dtype=torch.long,
             ),
             persistent=False,

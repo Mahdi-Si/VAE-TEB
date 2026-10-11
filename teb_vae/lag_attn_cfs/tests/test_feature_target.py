@@ -26,6 +26,7 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     TINY_STRIDE,
     TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
+    TINY_TARGET_WARMUP_STEPS,
     build,
     make_streams,
     tiny_align_kwargs,
@@ -215,6 +216,29 @@ def test_the_persistence_gather_clamps_to_the_scored_clocks_past() -> None:
                 assert float(values[sample, position, slot]) == float(
                     stream[sample, anchor + TINY_FORECAST_DELAY[slot], declared]
                 )
+
+
+def test_the_persistence_gather_is_zero_below_a_channels_own_warm_up() -> None:
+    r"""$Y^{0}$ is read masked: a channel the anchor has not reached hands the decoder $0$, not the
+    assumed pre-recording float stored there. The floor refusal admits $F = B - 1$, at which the
+    slowest kept channel is cold at the anchor itself, so the first anchor exercises the mask on
+    the fixture; every warm entry is the raw value, position by position."""
+    model = build(tiny_warmup_kwargs())
+    stream = _patterned(BATCH, model.geometry.t, model.c_y)
+    anchors = torch.tensor([[5, 9], [6, 10]])
+    assert int(anchors.min()) < max(TINY_TARGET_WARMUP_STEPS)
+
+    values = model._anchor_target_values(stream, anchors)
+    for sample in range(BATCH):
+        for position in range(2):
+            anchor = int(anchors[sample, position])
+            for slot, declared in enumerate(TINY_TARGET_KEEP_INDEX):
+                expected = (
+                    float(stream[sample, anchor, declared])
+                    if anchor >= TINY_TARGET_WARMUP_STEPS[slot]
+                    else 0.0
+                )
+                assert float(values[sample, position, slot]) == expected
 
 
 def test_the_anchor_ceiling_moves_by_the_largest_advance_and_only_then() -> None:
