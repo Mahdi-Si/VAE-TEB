@@ -25,6 +25,12 @@ per recording keeps every recording one unit; the pages' segment-level draw woul
 recording contribute several segments to a class's mean. The cap is
 ``eval_config.caps.attribution_segments``.
 
+**A late-window strata pass follows the main pass**
+(:mod:`~teb_vae.lag_attn_cfs.eval.attribution_strata`): in the last two hours before delivery it
+attributes high- against low-$K_t$ anchors, and anchors inside against between contractions, and
+compares them as paired differences per recording, by class. Its cap is
+``eval_config.caps.attribution_strata_segments`` and its block is ``strata``.
+
 **What is joined rather than recomputed.** The frequency band of every declared input channel
 comes off the channel map ``band_partition`` persisted; the occlusion analysis's per-band delta
 and the band-resolved skill come off their own tables where those passes ran in this directory,
@@ -38,7 +44,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import attribution_pass, lag_axis
+from teb_vae.lag_attn_cfs.eval import attribution_pass, attribution_strata, lag_axis
 from teb_vae.lag_attn_cfs.eval import attributions as core
 from teb_vae.lag_attn_cfs.eval.dataset_rows import dataset_index_map
 from teb_vae.lag_attn_cfs.eval.frames import grouped_frame_entry
@@ -88,18 +94,37 @@ def run_attribution_analysis(
     record = dict(getattr(collection, "record", None) or {})
     model = task.orig_model
     n_lags = int(model.lag_attn.L)
+    index_map = dataset_index_map(loader)
+    lag_seconds = lag_axis.compensated_seconds_axis(n_lags, delay_steps)
+    channel_map = attribution_pass.read_channel_map(results_dir)
     block = attribution_pass.run_pass(
-        task, loader, per_sample, dataset_index_map(loader), core.ATTENTION_CELL,
+        task, loader, per_sample, index_map, core.ATTENTION_CELL,
         eval_config=eval_config, results_dir=results_dir,
-        lag_seconds=lag_axis.compensated_seconds_axis(n_lags, delay_steps),
+        lag_seconds=lag_seconds,
         break_after_s=lag_axis.break_tolerance_s(record),
         segment_stride_s=lag_axis.segment_stride_s(record),
-        channel_map=attribution_pass.read_channel_map(results_dir),
+        channel_map=channel_map,
         occlusion=attribution_pass.read_occlusion_summary(results_dir),
         spectral=attribution_pass.read_spectral_bands(results_dir),
         delay_steps=delay_steps,
         per_anchor=getattr(collection, "per_anchor", None),
     )
+    # The late-window strata: high against low K_t and inside against between contractions.
+    caps = dict(eval_config.get("caps") or {})
+    configured = dict(eval_config.get("occlusion_bands") or {})
+    block["strata"] = attribution_strata.run_strata(
+        task, loader, attribution_pass.labelled_segments(per_sample), index_map, core.ATTENTION_CELL,
+        per_anchor=getattr(collection, "per_anchor", None),
+        anchor_vectors=getattr(collection, "anchor_vectors", None),
+        cap=int(caps.get(attribution_strata.STRATA_CAP_NAME) or attribution_strata.DEFAULT_STRATA_SEGMENTS),
+        seed=int(eval_config.get("seed", 0)) + core.DRAW_SEED_OFFSET,
+        window_s=float(eval_config.get("event_lag_window_s") or attribution_strata.DEFAULT_CONTRACTION_WINDOW_S),
+        directory=results_dir / core.ANALYSIS_DIRNAME, lag_seconds=lag_seconds,
+        lag_bands={str(name): (int(span[0]), int(span[1])) for name, span in configured.items()},
+        channel_groups=core.channel_groups_from_map(channel_map), n_steps=core.IG_STEPS,
+        caveat=core.ATTRIBUTION_NOTE,
+    )
+    block["files"] = list(block.get("files", [])) + list(block["strata"]["files"])
     block["grouped_frames"] = [
         grouped_frame_entry(
             ANALYSIS_DIRNAME, core.RECORDINGS_FILENAME, attribution_pass.RECORDING_VALUE_COLUMNS
