@@ -24,6 +24,17 @@ one segment per recording -- and compares the classes with one rule throughout:
   to one, so its class mean shows *where* the readout looked; its centroid and unnormalised total
   are tested.
 
+**Totals scale with the divergence; shares do not.** The cohort anchors are each segment's own
+top $30\%$ of $K_t$, so "high KL" is relative to the segment, and one class's high-KL anchors can
+sit below another class's at every level. Integrated gradients sum to the readout change, so the
+source total of ``kld`` is close to $K_t - K_{\mathrm{null}}$, and a class difference in totals is
+largely a class difference in $K_t$. The figure therefore compares the **unsigned lag share**
+(each anchor's $|a_\ell|$ divided by its sum) between classes, and the scale-free metrics --
+``lag_centroid_s`` and ``lagshare_<band>`` -- are tested beside the totals. Every recording also
+carries ``level_kld_at_anchor``, the $K_t$ of its attributed anchors, in its own family, so the
+table states how far apart the classes' coupling levels are. The late-window strata pass
+(:mod:`~teb_vae.lag_attn_cfs.eval.attribution_strata`) adds a comparison at one matched level.
+
 **Read the tests as descriptive.** The model was trained on healthy recordings only, so ACIDOSIS
 and HIE are out of distribution, and a class difference in attribution is a difference in how the
 fitted model responds, not a physiological finding.
@@ -32,7 +43,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,6 +69,10 @@ COHORT_READOUTS: Tuple[str, ...] = (core.READOUT_KLD, core.READOUT_PRED_GAP)
 #: Grad-CAM costs one forward and one backward, so every main readout gets it.
 GRADCAM_READOUTS: Tuple[str, ...] = core.MAIN_READOUTS
 
+#: The per-recording column of the $K_t$ at the attributed anchors: the readout value of the
+#: ``kld`` rows, averaged per recording. Its own Holm family, ``level:kld``.
+LEVEL_COLUMN = "level_kld_at_anchor"
+
 BOOTSTRAP_RESAMPLES = 1000
 CONFIDENCE = 0.95
 ALPHA = 0.05
@@ -74,7 +89,17 @@ CLASS_FIGURE = "attribution_classes"
 CLASS_MAP_FIGURE = "attribution_class_maps"
 GRADCAM_FIGURE = "gradcam_classes"
 
-PAIR_COLOURS: Tuple[str, ...] = (figures.COLOR_VERMILLION, figures.COLOR_PURPLE, figures.COLOR_BLUE)
+#: Class-pair colours. None of them is a class colour: vermillion and orange read as HIE and
+#: acidosis beside the class panels, so a pair drawn in them was read as a class.
+PAIR_COLOURS: Tuple[str, ...] = (figures.COLOR_BLACK, figures.COLOR_BLUE, figures.COLOR_PURPLE)
+
+#: The ``target`` Grad-CAM view is $T$ offsets wide, one per stored step, and its per-step share is
+#: noise at the cohort's size. The figures sum it into bins of this many steps ($32$ s), so a bin
+#: is still a share and the bins still sum to one. The tables keep the per-step profile.
+TARGET_BIN_STEPS = 8
+
+#: Height of one significance mark below a difference curve, as a fraction of the axes height.
+RUG_HEIGHT = 0.025
 
 
 # =============================================================================
@@ -161,6 +186,62 @@ def difference_band(left: np.ndarray, right: np.ndarray, *, seed: int) -> Tuple[
     return (difference, *_percentiles(_resampled_means(left, rng) - _resampled_means(right, rng)))
 
 
+def bin_offsets(matrix: np.ndarray, width: int = TARGET_BIN_STEPS) -> np.ndarray:
+    r"""Sum consecutive offsets of per-row shares into bins of ``width`` offsets.
+
+    Args:
+        matrix: $(N, W)$ shares, ``NaN`` where an offset is not part of a row's map.
+        width: Offsets per bin.
+
+    Returns:
+        $(N, \lfloor W / w \rfloor)$ with $w$ = ``width``, ``NaN`` where every offset of a bin is
+        ``NaN``. A partial last bin is dropped: it holds fewer offsets than the others, so its
+        share would drop for that reason alone. It is the far end of the history.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    n_bins = max(matrix.shape[1] // int(width), 1)
+    blocks = matrix[:, : n_bins * int(width)].reshape(matrix.shape[0], n_bins, -1)
+    return np.where(np.isfinite(blocks).any(axis=2), np.nansum(blocks, axis=2), np.nan)
+
+
+def mark_excluding_zero(ax: Any, x: np.ndarray, lo: np.ndarray, hi: np.ndarray, *, colour: str, slot: int) -> int:
+    """Mark the positions where a difference band excludes zero, as a rug under the curves.
+
+    Each band gets its own rug row (``slot``), so the marks of several bands do not overlap.
+
+    Args:
+        ax: The difference panel.
+        x: The positions, $(W,)$.
+        lo: The lower band edge, $(W,)$.
+        hi: The upper band edge, $(W,)$.
+        colour: The colour of the band's curve.
+        slot: The rug row, $0$ at the bottom.
+
+    Returns:
+        How many positions were marked.
+    """
+    lo, hi = np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        marked = (lo > 0.0) | (hi < 0.0)
+    if not marked.any():
+        return 0
+    step = float(np.median(np.diff(x))) if len(x) > 1 else 1.0
+    bottom = RUG_HEIGHT * (1.4 * slot + 0.4)
+    for centre in np.asarray(x, dtype=np.float64)[marked]:
+        ax.axvspan(centre - 0.5 * step, centre + 0.5 * step, ymin=bottom, ymax=bottom + RUG_HEIGHT,
+                   color=colour, linewidth=0.0)
+    return int(marked.sum())
+
+
+def reserve_rug(ax: Any, n_slots: int) -> None:
+    """Lower the y-axis floor so that ``n_slots`` rug rows sit under the data, not over it."""
+    if n_slots <= 0:
+        return
+    fraction = RUG_HEIGHT * (1.4 * n_slots + 0.6)
+    low, high = ax.get_ylim()
+    ax.set_ylim(low - fraction * (high - low) / (1.0 - fraction), high)
+
+
 def class_pairs(order: Sequence[str]) -> List[Tuple[str, str]]:
     """Every class pair, more severe first, in the order ``order`` lists the classes."""
     return [(order[i], order[j]) for i in range(len(order)) for j in range(i + 1, len(order))]
@@ -188,19 +269,33 @@ def recording_metrics(
 
     Returns:
         ``(metrics, families)``: indexed by ``guid`` with the class column, and
-        ``{family: [column, ...]}`` with one family per method and readout.
+        ``{family: [column, ...]}`` with one family per method and readout, plus ``level:kld``
+        with :data:`LEVEL_COLUMN`, the $K_t$ of the recording's attributed anchors.
     """
     pieces: List[pd.DataFrame] = []
     families: Dict[str, List[str]] = {}
+    if len(rows):
+        level = ((rows["readout"] == core.READOUT_KLD) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)).to_numpy()
+        if level.any():
+            families["level:kld"] = [LEVEL_COLUMN]
+            pieces.append(rows.loc[level, ["guid", labels.CLASS_COLUMN]].assign(
+                **{LEVEL_COLUMN: rows.loc[level, "value_input"].to_numpy(dtype=np.float64)}))
     for readout in COHORT_READOUTS:
         keep = ((rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)).to_numpy() if len(rows) else np.zeros(0, bool)
         if not keep.any():
             continue
         subset = rows[keep].copy()
-        profile, _total = gradcam.normalise(np.abs(np.asarray(vectors["lag_profile"])[keep]))
+        unsigned = np.abs(np.asarray(vectors["lag_profile"], dtype=np.float64)[keep])
+        profile, _total = gradcam.normalise(unsigned)
         subset["lag_centroid_s"] = gradcam.centroid(profile, lag_seconds)
         names = {"source_total": "source_total", "source_abs_total": "source_abs_total", "lag_centroid_s": "lag_centroid_s"}
         names.update({f"lagband_{band}": f"lagband_{band}" for band in lag_bands if f"lagband_{band}" in subset})
+        # The scale-free partner of each band sum: the band's share of the unsigned lag profile.
+        for band, positions in core.lag_band_groups(lag_bands, unsigned.shape[1]).items():
+            # A row with no attribution mass has an all-NaN profile: its share is unmeasured, not 0.
+            reached = np.isfinite(profile[:, positions]).any(axis=1) if positions.size else np.zeros(len(profile), bool)
+            subset[f"lagshare_{band}"] = np.where(reached, np.nansum(profile[:, positions], axis=1), np.nan) if positions.size else np.nan
+            names[f"lagshare_{band}"] = f"lagshare_{band}"
         renamed = {column: f"ig_{readout}_{name}" for column, name in names.items()}
         families[f"ig:{readout}"] = list(renamed.values())
         pieces.append(subset[["guid", labels.CLASS_COLUMN, *names]].rename(columns=renamed))
@@ -287,15 +382,19 @@ def class_tests(metrics: pd.DataFrame, families: Mapping[str, Sequence[str]], *,
 # =============================================================================
 # Figures
 # =============================================================================
-def _class_lines(ax: Any, x: np.ndarray, groups: Mapping[str, np.ndarray], *, seed: int, title: str, xlabel: str, ylabel: str, legend: bool) -> None:
-    """Class means with bootstrap bands on one axis."""
+def _class_lines(
+    ax: Any, x: np.ndarray, groups: Mapping[str, np.ndarray], *, seed: int, title: str, xlabel: str, ylabel: str,
+    legend: bool, notes: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Class means with bootstrap bands on one axis; ``notes`` adds a per-class legend suffix."""
     colours = figures.group_colors(list(groups))
     drawn = False
     for name, curves in groups.items():
         if not len(curves):
             continue
         mean, lo, hi = mean_band(curves, seed=seed)
-        ax.plot(x, mean, color=colours[name], linewidth=figures.LINE_EMPHASIS, label=f"{name} (n={len(curves)})")
+        suffix = f", {notes[name]}" if notes and name in notes else ""
+        ax.plot(x, mean, color=colours[name], linewidth=figures.LINE_EMPHASIS, label=f"{name} (n={len(curves)}{suffix})")
         ax.fill_between(x, lo, hi, color=colours[name], alpha=0.2, linewidth=0.0)
         drawn = True
     _finish(ax, drawn, title=title, xlabel=xlabel, ylabel=ylabel, legend=legend)
@@ -311,8 +410,10 @@ def _difference_lines(ax: Any, x: np.ndarray, groups: Mapping[str, np.ndarray], 
         colour = PAIR_COLOURS[index % len(PAIR_COLOURS)]
         ax.plot(x, difference, color=colour, linewidth=figures.LINE_EMPHASIS, label=f"{left} − {right}")
         ax.fill_between(x, lo, hi, color=colour, alpha=0.2, linewidth=0.0)
+        mark_excluding_zero(ax, x, lo, hi, colour=colour, slot=index)
         drawn = True
     ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN)
+    reserve_rug(ax, len(class_pairs(list(groups))))
     _finish(ax, drawn, title=title, xlabel=xlabel, ylabel=ylabel, legend=legend)
 
 
@@ -349,39 +450,56 @@ def build_class_figure(
 ) -> Any:
     r"""The integrated-gradient class comparison, one row per cohort readout.
 
-    Left: the class-mean signed source attribution by lag, with 95% bootstrap bands over
-    recordings. Middle: every class pair's difference of means with its band; a band that excludes
-    zero marks lags where the two classes differ. Right: the per-recording source total by class,
-    titled with the Holm-adjusted Kruskal--Wallis $p$.
+    (1) The class-mean signed source attribution by lag, with 95% bootstrap bands over recordings;
+    the legend gives each class's median $K_t$ at the attributed anchors, because the anchors are
+    each segment's own top $30\%$ and the classes' levels differ. (2) The class-mean **unsigned lag
+    share**, each anchor's $|a_\ell| / \sum_\ell |a_\ell|$, which does not scale with $K_t$.
+    (3) Every class pair's difference of shares with its band; the rug marks the lags where a band
+    excludes zero, one rug row per pair. (4) The per-recording lag centroid by class, titled with
+    the Holm-adjusted Kruskal--Wallis $p$. Panels 2--4 are the class comparison; panel 1 shows
+    the magnitude it is drawn from.
 
     Returns:
         The figure.
     """
-    figure, axes = figures.new_figure(max(len(COHORT_READOUTS), 1), 3, height_per_row=2.8, width=15.0)
+    figure, axes = figures.new_figure(max(len(COHORT_READOUTS), 1), 4, height_per_row=2.2, width=figures.WINDOWS_FIGURE_WIDTH)
+    notes = kl_level_notes(metrics)
     for index, readout in enumerate(COHORT_READOUTS):
         short = core.READOUT_SHORT.get(readout, readout)
         keep = ((rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)).to_numpy() if len(rows) else np.zeros(0, bool)
         unit = str(rows.loc[keep, "unit"].iloc[0]) if keep.any() else ""
         if keep.any():
-            _guids, classes, curves = per_recording(rows[keep], np.asarray(vectors["lag_profile"])[keep])
+            signed = np.asarray(vectors["lag_profile"], dtype=np.float64)[keep]
+            _guids, classes, curves = per_recording(rows[keep], signed)
             groups = by_class(classes, curves)
+            _guids, classes, shares = per_recording(rows[keep], gradcam.normalise(np.abs(signed))[0])
+            share_groups = by_class(classes, shares)
         else:
-            groups = {}
-        _class_lines(axes[index, 0], lag_seconds, groups, seed=seed, title=f"{short}: source attribution by lag, class means",
-                     xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel=f"attribution ({unit})", legend=index == 0)
-        _difference_lines(axes[index, 1], lag_seconds, groups, seed=seed, title=f"{short}: class differences",
-                          xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel=f"difference ({unit})", legend=index == 0)
-        metric = f"ig_{readout}_source_total"
+            groups, share_groups = {}, {}
+        _class_lines(axes[index, 0], lag_seconds, groups, seed=seed, title=f"{short}: signed source attribution",
+                     xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel=f"attribution ({unit})", legend=index == 0, notes=notes)
+        _class_lines(axes[index, 1], lag_seconds, share_groups, seed=seed, title=f"{short}: unsigned lag share",
+                     xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="share per lag", legend=False)
+        _difference_lines(axes[index, 2], lag_seconds, share_groups, seed=seed, title=f"{short}: class differences of share",
+                          xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="difference of shares", legend=index == 0)
+        metric = f"ig_{readout}_lag_centroid_s"
         if metric in metrics.columns:
             order = labels.ordered_groups(sorted(metrics[labels.CLASS_COLUMN].dropna().astype(str).unique()), labels.CLASS_COLUMN)
             samples = {name: metrics.loc[metrics[labels.CLASS_COLUMN] == name, metric].to_numpy(dtype=np.float64) for name in order}
-            figures.violin_panel(axes[index, 2], samples, title=f"{short}: source total per recording; {_test_label(stats, metric)}",
-                                 ylabel=f"attribution ({unit})", colors=figures.group_colors(order))
-            axes[index, 2].axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN)
+            figures.violin_panel(axes[index, 3], samples, title=f"lag centroid; {_test_label(stats, metric)}",
+                                 ylabel="centroid of |a| (s)", colors=figures.group_colors(order))
         else:
-            core._empty(axes[index, 2], f"{short}: source total per recording")
+            core._empty(axes[index, 3], f"{short}: lag centroid per recording")
     figures.caveat_note(figure, caveat)
     return figure
+
+
+def kl_level_notes(metrics: pd.DataFrame) -> Dict[str, str]:
+    r"""Per class, ``median K_t = x`` over recordings of :data:`LEVEL_COLUMN`, for a legend."""
+    if metrics.empty or LEVEL_COLUMN not in metrics.columns:
+        return {}
+    medians = metrics.groupby(labels.CLASS_COLUMN)[LEVEL_COLUMN].median()
+    return {str(name): f"median $K_t$={value:.2g}" for name, value in medians.items() if np.isfinite(value)}
 
 
 def build_class_map_figure(lag_channel: Mapping[Tuple[str, str, str, str], Mapping[str, Any]], *, lag_seconds: np.ndarray, caveat: str) -> Any:
@@ -398,7 +516,7 @@ def build_class_map_figure(lag_channel: Mapping[Tuple[str, str, str, str], Mappi
     order = labels.ordered_groups(sorted({key[3] for key in lag_channel}), labels.CLASS_COLUMN)
     pairs = class_pairs(order)
     n_cols = max(len(order) + len(pairs), 1)
-    figure, axes = figures.new_figure(max(len(COHORT_READOUTS), 1), n_cols, height_per_row=2.8, width=3.8 * n_cols)
+    figure, axes = figures.new_figure(max(len(COHORT_READOUTS), 1), n_cols, height_per_row=2.2, width=2.4 * n_cols)
     half = 0.5 * float(SECONDS_PER_STEP)
     for index, readout in enumerate(COHORT_READOUTS):
         short = core.READOUT_SHORT.get(readout, readout)
@@ -437,6 +555,26 @@ def build_class_map_figure(lag_channel: Mapping[Tuple[str, str, str, str], Mappi
     return figure
 
 
+def view_axis(view: str, matrix: np.ndarray, lag_seconds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """The displayed form of one Grad-CAM view and its x axis.
+
+    Args:
+        view: One of :data:`~.gradcam.VIEWS`.
+        matrix: $(N, W)$ per-row shares.
+        lag_seconds: The lag axis of the ``source`` and ``attention`` views.
+
+    Returns:
+        ``(matrix, x)``: the ``target`` view binned by :func:`bin_offsets` on a bin-centre axis in
+        minutes; the other views unchanged on the lag axis in seconds.
+    """
+    matrix = np.asarray(matrix)
+    if view != "target":
+        return matrix, np.asarray(lag_seconds)[: matrix.shape[1]]
+    binned = bin_offsets(matrix)
+    centres = (np.arange(binned.shape[1]) + 0.5) * TARGET_BIN_STEPS * float(SECONDS_PER_STEP) / 60.0
+    return binned, centres
+
+
 def build_gradcam_figure(
     gradcam_rows: pd.DataFrame,
     gradcam_vectors: Mapping[str, np.ndarray],
@@ -449,29 +587,30 @@ def build_gradcam_figure(
 
     Each Grad-CAM map is a share that sums to one over its offsets, so a class mean shows where the
     readout looked and a difference band that excludes zero marks offsets where two classes looked
-    differently. The target view is on a minutes axis over the history after the warm-up floor; the source and
-    attention views share the lag axis of the other lag figures.
+    differently, and the rug under the difference curves marks those offsets. The target view is on
+    a minutes axis over the history after the warm-up floor, summed into :data:`TARGET_BIN_STEPS`
+    bins; the source and attention views share the lag axis of the other lag figures.
 
     Returns:
         The figure.
     """
     readouts = [r for r in GRADCAM_READOUTS if len(gradcam_rows) and (gradcam_rows["readout"] == r).any()] or list(GRADCAM_READOUTS)
-    figure, axes = figures.new_figure(len(readouts), 2 * len(gradcam.VIEWS), height_per_row=2.6, width=20.0)
+    figure, axes = figures.new_figure(len(readouts), 2 * len(gradcam.VIEWS), height_per_row=1.9, width=figures.WINDOWS_FIGURE_WIDTH)
     for index, readout in enumerate(readouts):
         short = core.READOUT_SHORT.get(readout, readout)
         keep = (gradcam_rows["readout"] == readout).to_numpy() if len(gradcam_rows) else np.zeros(0, bool)
         for col, view in enumerate(gradcam.VIEWS):
             if keep.any():
-                matrix = np.asarray(gradcam_vectors[view])[keep]
+                matrix, x = view_axis(view, np.asarray(gradcam_vectors[view])[keep], lag_seconds)
                 _guids, classes, curves = per_recording(gradcam_rows[keep], matrix)
                 groups = by_class(classes, curves)
-                x = gradcam.offset_seconds(matrix.shape[1]) / 60.0 if view == "target" else np.asarray(lag_seconds)[:matrix.shape[1]]
             else:
                 groups, x = {}, np.zeros(0)
             xlabel = "offset before the anchor (min)" if view == "target" else COEFFICIENT_LAG_AXIS_LABEL
             name = gradcam.VIEW_TITLES[view]
+            share = f"share per {TARGET_BIN_STEPS * SECONDS_PER_STEP:g} s" if view == "target" else "share per lag"
             _class_lines(axes[index, 2 * col], x, groups, seed=seed, title=f"{name}: class means", xlabel=xlabel,
-                         ylabel=f"{short}\nGrad-CAM share", legend=index == 0 and col == 0)
+                         ylabel=f"{short}\nGrad-CAM {share}", legend=index == 0 and col == 0)
             _difference_lines(axes[index, 2 * col + 1], x, groups, seed=seed, title=f"{name}: class differences", xlabel=xlabel,
                               ylabel="difference of shares", legend=index == 0 and col == 0)
     figures.caveat_note(figure, caveat)
@@ -548,6 +687,8 @@ def run_class_contrast(
 
 __all__ = [
     "COHORT_CAP_NAME", "COHORT_READOUTS", "DEFAULT_COHORT_SEGMENTS", "GRADCAM_READOUTS",
+    "LEVEL_COLUMN", "PAIR_COLOURS", "TARGET_BIN_STEPS", "bin_offsets", "kl_level_notes", "mark_excluding_zero",
+    "reserve_rug", "view_axis",
     "build_class_figure", "build_class_map_figure", "build_gradcam_figure", "by_class",
     "class_pairs", "class_tests", "difference_band", "mean_band", "per_recording",
     "recording_metrics", "run_class_contrast",
