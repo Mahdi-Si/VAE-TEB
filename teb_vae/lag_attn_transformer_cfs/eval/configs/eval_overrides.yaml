@@ -280,6 +280,12 @@ eval_config:
   #                  integrated gradients of `kld` and `pred_gap` plus Grad-CAM, about a fifth of
   #                  an `attribution_segments` segment: roughly 4 s per segment on one RTX 4080
   #                  laptop GPU for the shipped transformer, so about 10 min here.
+  #   attribution_strata_segments
+  #              72  SEGMENTS the late-window STRATA pass draws (24 recordings per class, one late
+  #                  segment each), from segments that start at most 2 h before delivery. Each
+  #                  segment is attributed once per stratum (high and low K_t, inside and between
+  #                  contractions, one pooled K_t band) under both baselines, about seven cohort
+  #                  segments each, so about 40 min here.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -293,6 +299,7 @@ eval_config:
     attribution_segments: 144
     attribution_segments_per_recording: 4
     attribution_cohort_segments: 150
+    attribution_strata_segments: 72
     # NOT a retention cap: it bounds how many segments the input-level occlusion readout
     # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
     # and it scores one anchor per segment, so the honest denominator is segments rather than
