@@ -399,9 +399,8 @@ model_config:
     #   * the 20-60 s band sits at lags -0.1 to 38.9 of [0, 90] (realised offset
     #     kappa*(tau_u - tau_y) = -99.66 s, canonical timeline): clear of the far edge at every
     #     horizon step and clear of the near edge at all but the last, where the 20 s end sits
-    #     0.1 lag (0.3 s) below lag 0 at h = 29. Earlier printouts quoted 8.5-47.5 (unscaled
-    #     offset AND a -20 s dataset-shift term) and 4.9-43.9 (scaled, still with the shift
-    #     term); both are superseded. Against the single reference's -25.0 to 14.0. Whether
+    #     0.1 lag (0.3 s) below lag 0 at h = 29. Earlier printouts quoted 8.5-47.5 and 4.9-43.9;
+    #     both are superseded. Against the single reference's -25.0 to 14.0. Whether
     #     this marginal graze warrants re-pricing the pin is a CFS-12 experiment question, not
     #     a comment edit;
     #   * `up_ph` keeps 9 of 15 channels, above the 8 required. The four casualties are the slowest
@@ -454,8 +453,7 @@ model_config:
     # RECURRENCE window: at the retained source clock 288.2672 and max_lag 90 the every-step
     # readable content-delay window is [360.6, 604.6] s at the realised offset
     # kappa*(288.2672 - 13.3047) = 240.6 s on the canonical stored timeline (earlier printouts
-    # quoted [374.9, 618.9] s from the unscaled offset and [340.6, 584.6] s with a -20 s
-    # dataset-shift term; both superseded) -- the previous one-to-two contractions
+    # quoted [374.9, 618.9] s from the unscaled offset; superseded) -- the previous one-to-two contractions
     # of the 2-5 min IUP cycle. Re-price with warmup_budget.py (it prints this window per
     # candidate under a physical-clock config); a faster source clock cannot help, because
     # reaching even 240 s at every step keeps at most one `up_ph` channel.

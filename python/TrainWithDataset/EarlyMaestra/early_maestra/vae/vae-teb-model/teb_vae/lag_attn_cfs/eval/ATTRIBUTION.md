@@ -2,7 +2,7 @@
 
 This guide explains how the `attribution` analysis relates a model output to the input coefficients that influenced it. It covers the lag-attention forecasters, including the conv-LSTM and transformer variants, and the lag-slot transformer in `lag_slot_transformer_cfs`. The latter is also called the **lag-residual model** because it combines per-lag proposals into a bounded latent update.
 
-Start with sections 1–4 to understand the method and read its results. Sections 5–7 explain the saved files, selection, and cost. Sections 8–10 provide implementation details and recorded fixture findings. Section 11 lists what to check on a trained model. Section 13 explains how the classes are compared over many recordings, and the Grad-CAM views that the comparison adds.
+Start with sections 1–4 to understand the method and read its results. Sections 5–7 explain the saved files, selection, and cost. Sections 8–10 provide implementation details and recorded fixture findings. Section 11 lists what to check on a trained model. Section 13 explains how the classes are compared over many recordings, and the Grad-CAM views that the comparison adds. Section 14 compares high- and low-$K_t$ anchors, and anchors inside and between contractions, in the last two hours before delivery.
 
 [EVAL.md](EVAL.md) explains the overall evaluation workflow, and [FIGURE_GUIDE.md](FIGURE_GUIDE.md) explains the individual plots. The lag-residual model runs the same attribution implementation as its own registered `attribution` analysis under the shared runner; see [its evaluation guide](../../lag_slot_transformer_cfs/eval/EVAL.md).
 
@@ -21,6 +21,7 @@ Start with sections 1–4 to understand the method and read its results. Section
 - [11. What to record from a production run](#11-what-to-record-from-a-production-run)
 - [12. Interpretation limits](#12-interpretation-limits)
 - [13. Class comparison and Grad-CAM](#13-class-comparison-and-grad-cam)
+- [14. Late-window strata: high against low $K_t$, and contractions](#14-late-window-strata-high-against-low-k_t-and-contractions)
 
 ## 1. What attribution tells you
 
@@ -315,7 +316,7 @@ The lag-band table records `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_
 | `attribution_time_to_delivery.pdf` | The source attribution total and the lag centroid of every attributed anchor against hours before delivery, by class. |
 | `attribution_blocks.pdf` | Per readout, the unsigned share and the signed sum of the attribution in each of the four input blocks. |
 | `attribution_horizon.pdf` | The per-step score at the first and the last horizon step: stream totals, and the source and target attribution by offset per step. |
-| `attribution_classes.pdf` | Per cohort readout: the class-mean source attribution by lag with bootstrap bands, every class pair's difference with its band, and the per-recording source total by class with the Holm-adjusted Kruskal–Wallis $p$. |
+| `attribution_classes.pdf` | Per cohort readout: the class-mean signed source attribution by lag with each class's median $K_t$, the class-mean unsigned lag share, every class pair's difference of shares with its band, and the per-recording lag centroid by class with the Holm-adjusted Kruskal–Wallis $p$. |
 | `attribution_class_maps.pdf` | Per cohort readout: the class-mean unsigned source attribution by lag and channel, and the difference map of every class pair. |
 | `gradcam_classes.pdf` | Per main readout and Grad-CAM view: the class-mean profile and every class pair's difference, with bootstrap bands. |
 | `traces/<class>/<guid>_<subgroup>_attribution_trace.pdf` | The raw FHR and UP of every segment on the top rows, then the attribution lag maps of the divergence and of the forecast gap through one recording beside the model lag map, with each readout's agreement, totals and values on the hours-before-delivery axis. Every panel shares its colour scale or $y$ range across the traced recordings. |
@@ -582,15 +583,94 @@ A family is one method and one readout, for example `ig:kld` or `gradcam:pred_ga
 
 | Family | Metrics per recording |
 | --- | --- |
-| `ig:<readout>` | `source_total` (signed), `source_abs_total`, `lag_centroid_s` (centroid of the unsigned lag profile), and `lagband_<band>` for every configured band |
+| `level:kld` | `level_kld_at_anchor`: the $K_t$ of the recording's attributed anchors |
+| `ig:<readout>` | `source_total` (signed), `source_abs_total`, `lag_centroid_s` (centroid of the unsigned lag profile), `lagband_<band>` for every configured band, and `lagshare_<band>`, the band's share of the unsigned lag profile |
 | `gradcam:<readout>` | `<view>_centroid_s` and `<view>_total` for each of the three views |
+
+**The anchors are not at one coupling level.** The cohort takes each segment's own top $30\%$ of $K_t$ (section 7), so a healthy "high-KL" anchor can sit below an HIE "low-KL" one. The integrated gradients of `kld` sum to roughly $K_t - K_{\mathrm{null}}$, so a class difference in `source_total`, `source_abs_total` or `lagband_<band>` is largely a class difference in $K_t$. The `level:kld` row states how far apart the levels are. The scale-free metrics, `lag_centroid_s`, `lagshare_<band>` and the Grad-CAM centroids, do not scale with $K_t$, and `attribution_classes.pdf` draws the unsigned lag share for this reason. Section 14 adds a comparison at one matched $K_t$ level.
 
 A positive Cliff's $\delta$ means the more severe class runs higher. The statistics come from the shared `teb_vae.lag_attn.eval.stats` module, so they mean the same as in every other class table of the pipeline.
 
 ### 13.4 Reading the comparison
 
 - **Read the difference panels first.** A band that excludes zero marks offsets where two classes differ. A band that straddles zero says the cohort cannot separate them there.
+- **The rug is pointwise.** Each mark is a $95\%$ band at one lag, with no adjustment over lags, so about $5\%$ of lags carry a mark by chance. Read runs of adjacent marks, and confirm them in the tables.
+- **Compare shares and centroids before totals.** Totals carry the class's $K_t$ level; see the note under the metric table.
 - **Bands and tests are over recordings.** The cohort draws one segment per recording, so the sample size is the recording count in each legend.
 - **The classes are out of distribution.** The checkpoint trained on healthy recordings only. A class difference describes how the fitted model responds to ACIDOSIS and HIE input, not a physiological mechanism.
 - **The difference maps carry no per-cell test.** Treat an isolated cell as noise, and treat a coherent band of channels or lags as a pattern to check in the tables.
 - **Grad-CAM shares compare location, not size.** Compare sizes with `<view>_total` in the stats table.
+
+## 14. Late-window strata: high against low $K_t$, and contractions
+
+`attribution_strata.py` asks two paired questions in the last $2$ hours before delivery (`LATE_WINDOW_HOURS`), and it compares the classes at one matched coupling level. The cohort pass of section 13 cannot do either, because it attributes only each segment's high-KL anchors, and only from the middle segment of each recording.
+
+### 14.1 The strata
+
+Each anchor of a late segment can fall in up to three strata:
+
+| Stratum | Rule |
+| --- | --- |
+| `kl_high` | $K_t$ at or above the $0.7$ quantile of its own segment's $K_t$ |
+| `kl_low` | $K_t$ at or below the $0.3$ quantile of its own segment's $K_t$ |
+| `ua_contraction` | $0 \le a < w$, with $a$ = `seconds_since_contraction` and $w$ = `event_lag_window_s` ($120$ s by default) |
+| `ua_quiet` | $a \ge w$, or no onset behind the anchor, in a segment that holds at least one `ua_contraction` anchor |
+| `kl_matched` | $K_t$ inside one band of the **pooled** late-window $K_t$ distribution: the same nats for every class |
+
+**Tiers within a recording, one level between classes.** The two KL tiers are cut per segment. That is right for the paired contrast, because A and B come from the same recording. It is wrong for a class comparison, because one tier can mean $0.5$ nats in one class and $3$ nats in another. The `kl_matched` stratum is the class comparison: the clean late anchors of every class are pooled and cut into `MATCHED_BANDS` $= 5$ equal-count bands of $K_t$. For each band, each class counts its recordings with an anchor in it. The chosen band is the one whose smallest class count is largest. A tie goes to the narrowest band in nats, because the top band of a skewed $K_t$ distribution can span an order of magnitude, inside which the classes are not matched. The band edges and the counts are in the summary under `strata.rule.matched`.
+
+The contraction age comes from the collection pass, which runs the one contraction detector of `events.py` on the raw UP trace. The `ua_quiet` rule needs a contraction in the same segment, so a flat or missing UP trace is not read as "between contractions". Every anchor must also reach the clean forecast coverage of section 7.
+
+### 14.2 Selection and what is attributed
+
+1. Keep the segments that start at most $2$ h before delivery and that hold both KL strata. Of each recording's kept segments, keep only those that hold the most strata, so the drawn segment carries contraction and matched anchors whenever any late segment of the recording does.
+2. Draw recordings class-balanced and seeded, one late segment each, up to `caps.attribution_strata_segments` ($72$ by default).
+3. Per stratum, choose up to `ANCHORS_PER_SEGMENT` anchors per segment, one horizon apart, in a seeded random order inside the stratum.
+4. Attribute each anchor's `kld` and `pred_gap` with integrated gradients under both baselines, and with Grad-CAM in the three views of section 13.2.
+
+The source lag profile is read under `source_null`. The target lag profile and the source share $\sum|a_{\mathrm{src}}| / (\sum|a_{\mathrm{src}}| + \sum|a_{\mathrm{tgt}}|)$ are read under `all_zero`, because `source_null` holds the target streams at the input and its target attribution is exactly zero. Each row also carries the collection pass's $K_t$, forecast gain and contraction age at the same anchor (`anchor_kld_per_t`, `anchor_gain`, `anchor_contraction_age_s`).
+
+**Cost.** Each segment is attributed five times, once per stratum, with two baselines. That is about seven cohort segments per segment, so the default cap takes about $40$ minutes on the laptop GPU of section 13.1. This is an estimate from the cohort pass's measured rate, not a timed run.
+
+### 14.3 How the strata are compared
+
+One recording is one unit. The anchors of each recording are averaged per stratum. A contrast (`kl`: `kl_high` $-$ `kl_low`; `ua`: `ua_contraction` $-$ `ua_quiet`) is the paired difference over the recordings that hold both strata.
+
+- **Within a class:** the mean paired difference with a $95\%$ percentile bootstrap interval, and a Wilcoxon signed-rank test. Holm adjusts within one contrast, one class, and one method and readout.
+- **Across classes:** Kruskal–Wallis on the paired differences, Holm-adjusted within one contrast and one method and readout. A small $p$ says that the effect of the stratum differs between classes.
+
+- **At matched coupling:** the `kl_matched` stratum goes through the cohort's own class tests (section 13.3): Kruskal–Wallis across classes, Holm within one method and readout, then Mann–Whitney $U$ and Cliff's $\delta$ per pair. Its `anchor:kld_per_t` row checks the match and should **not** differ. Each `anchor:` metric is its own Holm family, so no readout moves the check's $p$. A large $p$ is not proof of equal levels, so `strata_matched_pairwise.csv` gives the class difference of $K_t$ with its bootstrap interval, to read against `width_nats`. The summary records the band, its width, the drawn recordings per class in it, and the check's $p$ under `strata.rule.matched`, and it warns when the band collapses to one value.
+
+**Results built in by the tiers are checks, not findings.** In the `kl` contrast, `anchor:kld_per_t` and the IG totals of `kld` separate the tiers by construction. `strata_stats.csv` flags them `by_construction`, and the summary's `significant` list leaves them out.
+
+`strata_stats.csv` holds both kinds of paired row (`test` = `wilcoxon` or `kruskal-wallis`, `class` = `across_classes` for the second). `strata_matched_stats.csv` and `strata_matched_pairwise.csv` hold the matched tests. `strata_recordings.csv` holds the per-recording, per-stratum means every test reads.
+
+### 14.4 The forward-only summary
+
+`late_behaviour.pdf` uses no gradient and every scored anchor of the late window. It plots $K_t$ and the forecast gain against minutes before delivery and against seconds since contraction onset. It also plots the paired high-minus-low difference of the attention and of the normalised $K_t$ lag map. It reads the per-anchor table and its lag-map sidecar, so it is cheap, and it covers every recording, not only the drawn ones.
+
+### 14.5 Files and figures
+
+| File | Content |
+| --- | --- |
+| `strata_rows.csv`, `strata_vectors.npz` | IG rows with `stratum` and the joined anchor values; the source and target lag profiles |
+| `strata_gradcam_rows.csv`, `strata_gradcam_vectors.npz` | Grad-CAM rows with `stratum`; the three view profiles |
+| `strata_recordings.csv` | One row per recording and stratum |
+| `strata_stats.csv` | The paired and across-class tests |
+| `strata_matched_stats.csv`, `strata_matched_pairwise.csv` | The class tests at matched $K_t$ |
+| `late_behaviour.pdf` | Section 14.4 |
+| `strata_kl_ig.pdf`, `strata_ua_ig.pdf` | IG profiles per class and stratum, and the paired difference by class |
+| `strata_kl_gradcam.pdf`, `strata_ua_gradcam.pdf` | The same for Grad-CAM |
+| `strata_paired.pdf` | Per-recording A-to-B lines on six scalar metrics, with the tests |
+| `strata_matched.pdf` | The classes at one pooled $K_t$ band: IG and Grad-CAM shares, and the scalar tests |
+| `strata_onset_locked.pdf` | Attribution shares re-indexed on the most recent contraction onset, per class, against an onset-shuffle null |
+
+**Onset-locked attribution.** A contraction can sit anywhere in the lag window, so the lag profile of a mean over anchors blurs it. `strata_onset_locked.pdf` re-indexes each anchor's profile on its own most recent onset. With $a$ = `anchor_contraction_age_s` and lag $\ell$, the source step sits $x = a - 4\ell$ seconds after the onset. The age runs from the anchor's causal endpoint and the lag counts stored steps back from the anchor, so both are on the stored timeline. The null shuffles the ages among one class's anchors, which keeps the profile shapes and breaks only their link to the onset. A peak above the null at $x \approx 0$ is attribution locked to the contraction.
+
+[FIGURE_GUIDE.md](FIGURE_GUIDE.md) explains how to read each figure. The summary block carries the rule, the selection, the plan, the cost and the significant results under `attribution.strata`.
+
+### 14.6 Reading the strata
+
+- **The KL contrast is partly circular.** The strata are cut on $K_t$, so any readout that grows with $K_t$ separates them. Read the shares and centroids, which are scale-free, before totals. The $K_t$ column of `strata_paired.pdf` is a manipulation check, not a finding.
+- **Ask class questions of the matched stratum.** The tier figures print each class's median $K_t$ per tier in their column titles, so the level gap stays visible, but a class difference read at a tier still carries it. Read `strata_matched.pdf`, and check its $K_t$ violin first: if $K_t$ differs there, the match failed for this cohort.
+- **The classes are still out of distribution.** As in section 13.4, a class difference describes the fitted model's response, not a mechanism.
