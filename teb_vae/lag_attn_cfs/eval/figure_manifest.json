@@ -20,7 +20,15 @@
       "attribution_null.pdf",
       "attribution_time_profile.pdf",
       "attribution_time_to_delivery.pdf",
-      "gradcam_classes.pdf"
+      "gradcam_classes.pdf",
+      "late_behaviour.pdf",
+      "strata_kl_gradcam.pdf",
+      "strata_kl_ig.pdf",
+      "strata_matched.pdf",
+      "strata_onset_locked.pdf",
+      "strata_paired.pdf",
+      "strata_ua_gradcam.pdf",
+      "strata_ua_ig.pdf"
     ],
     "calibration": [
       "logvar_distribution.pdf",
