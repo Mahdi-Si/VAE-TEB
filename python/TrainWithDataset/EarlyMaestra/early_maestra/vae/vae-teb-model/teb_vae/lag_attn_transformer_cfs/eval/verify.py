@@ -85,6 +85,9 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         "causal_align_reference",
         "causal_target_forecast_clock",
         "causal_phase_operator",
+        # The two event mechanisms (2026-10-13), shipped on; each ablation arm moves one of these.
+        "posterior_event_gate",
+        "event_weight_floor",
     )
 )
 

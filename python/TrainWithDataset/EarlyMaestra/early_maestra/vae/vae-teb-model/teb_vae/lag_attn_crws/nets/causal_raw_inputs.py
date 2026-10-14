@@ -398,6 +398,8 @@ class CausalRawInputs(CausalWarmupInputs):
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         r"""Compute the seven-term objective over the raw future, at the decoded anchors.
 
@@ -440,6 +442,10 @@ class CausalRawInputs(CausalWarmupInputs):
             lambda_deriv: Weight on the derivative Huber shape term, same contract.
             lambda_boundary: Weight on the boundary-continuity shape term, same contract. Refused
                 outright by the shared objective when an anchor set is present.
+            lambda_event_gate: Weight on the posterior event gate's sparsity term; see the shared
+                implementation. ``0.0`` adds nothing.
+            full_anchor_weight: Optional dense $(B, T)$ weight on the full branch's reconstruction
+                alone; see the shared implementation. ``None`` is the unweighted objective, bitwise.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` is the shared objective's key set
@@ -477,6 +483,8 @@ class CausalRawInputs(CausalWarmupInputs):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
             # The decaying horizon weighting, ``None`` unless a halflife was configured. It is the
             # one half of horizon-aware decoding this raw-target cell takes: the weight reads the
             # forecast's own $\tau$ axis, which a raw block has exactly as a feature block does,

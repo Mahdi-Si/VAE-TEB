@@ -109,6 +109,9 @@ def _row(epoch: int) -> Dict[str, Any]:
         row[f"{stage}/logvar_prior_floor_frac"] = 0.01
         row[f"{stage}/source_lag_warmth_frac_st"] = 0.4
         row[f"{stage}/source_lag_warmth_frac_ph"] = 0.02
+        # The two event mechanisms at their exact off-state: the stated arm sets neither key.
+        row[f"{stage}/event_anchor_frac"] = 1.0
+        row[f"{stage}/event_gate_mean"] = 1.0
     # The tiling: a training step's value is the batch mean over per-segment phases, so it sits
     # strictly inside the band, while both evaluation stages decode every valid anchor.
     row["train/anchors_per_sample"] = 4.6
@@ -293,6 +296,7 @@ def test_a_clean_run_passes_every_derivable_criterion(tmp_path, capsys):
         4: PASS,
         5: NOT_EVALUATED,
         6: PASS,
+        7: PASS,
     }
 
 
@@ -312,6 +316,9 @@ def test_a_clean_run_passes_every_derivable_criterion(tmp_path, capsys):
         # The two channel-axis splits stopped decomposing the same quantity.
         (4, "train/pred_gap_warm_mid", 0.6),
         (4, "val/pred_gap_ph", 0.35),
+        # An event column moved on a run whose configuration sets neither mechanism.
+        (7, "train/event_anchor_frac", 0.5),
+        (7, "val/event_gate_mean", 0.9),
     ],
 )
 def test_each_tier_one_criterion_catches_its_own_planted_failure(
@@ -327,6 +334,60 @@ def test_each_tier_one_criterion_catches_its_own_planted_failure(
     assert code == 1
     assert found[number] == FAIL, f"{column} did not trip criterion {number}"
     assert [key for key, status in found.items() if status == FAIL] == [number]
+
+
+#: The event mechanisms switched on, as Architecture B's shipped configuration states them.
+EVENT_ARM_ON: Dict[str, Any] = {"event_weight_floor": 0.0, "posterior_event_gate": True}
+
+
+def _event_rows(*, frac: float = 0.45, gate_first: float = 0.88) -> List[Dict[str, Any]]:
+    """A passing history for a run with both event mechanisms on: a detector that calls a steady
+    share of anchors active, and a gate that closes a little every epoch from its open seed."""
+    rows = [_row(epoch) for epoch in range(ROWS)]
+    for epoch, row in enumerate(rows):
+        for stage in ("train", "val"):
+            row[f"{stage}/event_anchor_frac"] = frac
+            row[f"{stage}/event_gate_mean"] = gate_first - 0.01 * epoch
+    return rows
+
+
+def test_a_run_with_both_event_mechanisms_on_passes_inside_the_bands(tmp_path, capsys):
+    """The on-state of criterion 7: an active share inside the band and a gate mean strictly inside
+    the unit interval, both read against the configuration rather than against a fixed arm."""
+    write_run(tmp_path, rows=_event_rows(), geometry=EVENT_ARM_ON)
+
+    code = check_run.main(run_dir=str(tmp_path))
+
+    printed = capsys.readouterr().out
+    assert code == 0
+    assert "[PASS] 7." in printed
+    assert "weighting on, gate on" in printed
+    # The gate's tier-2 reading carries its seed and its direction, not the endpoint alone.
+    assert "val/event_gate_mean: final" in printed and "first 0.88" in printed
+
+
+@pytest.mark.parametrize(
+    "column, value, reason",
+    [
+        ("train/event_anchor_frac", 0.0, "the detector found no contraction"),
+        ("val/event_anchor_frac", 1.0, "the weight is inert"),
+        ("train/event_gate_mean", 1.0, "a gate that is not there"),
+    ],
+)
+def test_an_event_column_outside_its_on_band_fails_criterion_seven_alone(
+    tmp_path, capsys, column, value, reason
+):
+    """One cell of one row, on a run with both mechanisms on. Criterion 7 fails and no other does,
+    so the failure is attributed to the mechanism rather than to the geometry."""
+    rows = _event_rows()
+    rows[5][column] = value
+    write_run(tmp_path, rows=rows, geometry=EVENT_ARM_ON)
+
+    code = check_run.main(run_dir=str(tmp_path))
+
+    found = statuses(capsys)
+    assert code == 1, reason
+    assert [key for key, status in found.items() if status == FAIL] == [7]
 
 
 @pytest.mark.parametrize("absent", sorted(STATED_ARM))
@@ -580,6 +641,8 @@ def test_every_tier_two_number_is_printed_beside_its_name(tmp_path, capsys):
         "val/shuffle_penalty",
         "val/source_lag_warmth_frac_st",
         "val/source_lag_warmth_frac_ph",
+        "val/event_anchor_frac",
+        "val/event_gate_mean",
         "val/pred_gap_warm spread",
     ):
         assert name in printed, name

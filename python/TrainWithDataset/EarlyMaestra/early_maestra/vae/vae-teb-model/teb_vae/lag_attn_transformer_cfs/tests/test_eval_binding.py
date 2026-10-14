@@ -90,8 +90,9 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
         "source_attention_window",
     }
 
-    # Plus the one density key only this cell's final revision (2026-09-23) configures.
-    final_revision_keys = {"forecast_ar_residual"}
+    # Plus the one density key only this cell's final revision (2026-09-23) configures, and the
+    # posterior event gate (2026-10-13), which this cell's config alone declares.
+    final_revision_keys = {"forecast_ar_residual", "posterior_event_gate"}
 
     assert set(GEOMETRY_KEYS) == (
         (set(CFS_GEOMETRY_KEYS) - {"causal_norm"}) | encoder_keys | final_revision_keys
