@@ -26,6 +26,9 @@ _STAGE_METRICS = {
     # on and small, and a column that appeared only in some arms could not be read across runs.
     "aux_multiscale", "aux_derivative", "aux_boundary",
     "lambda_ms", "lambda_deriv", "lambda_boundary",
+    # The event mechanisms' four columns, present on every stage whether or not an arm uses them,
+    # for the same reason the shape pairs are.
+    "nll_full_event_block", "event_anchor_frac", "event_gate_mean", "lambda_event_gate",
     "anchor_coverage_frac",
     "mean_logvar_full", "mean_logvar_base",
     "logvar_full_floor_frac", "logvar_full_ceil_frac",

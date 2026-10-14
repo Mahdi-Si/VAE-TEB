@@ -412,6 +412,11 @@ class LagAttnRwsPlotCallback(Callback):
                 lambda_ms=float(pl_module.hparams.get("lambda_ms", 0.0)),
                 lambda_deriv=float(pl_module.hparams.get("lambda_deriv", 0.0)),
                 lambda_boundary=float(pl_module.hparams.get("lambda_boundary", 0.0)),
+                # The two event mechanisms, as the training step passes them: the gate's weight
+                # from the hparams and the contraction weight from this batch's raw UP, so the
+                # figure's total is the step's total.
+                lambda_event_gate=float(pl_module.hparams.get("lambda_event_gate", 0.0)),
+                full_anchor_weight=pl_module._event_anchor_weight(batch, weight),
             )["metrics"]
             kld_per_dim = model.kld_tensor(
                 mu_prior=outs["mu_prior"],

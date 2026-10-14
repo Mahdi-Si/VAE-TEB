@@ -338,6 +338,45 @@ def masked_raw_block_per_anchor(
     return block_per_anchor, contributing
 
 
+def _reduce_block(
+    block_per_anchor: torch.Tensor,
+    contributing: torch.Tensor,
+    target: torch.Tensor,
+    cell_mask: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Average a per-anchor block score over the contributing anchors, and per scored element.
+
+    The reduction :func:`masked_raw_likelihood` performs, factored out so the objective can score
+    the full branch's block once and reduce it both unweighted (this) and event-weighted
+    (:func:`_event_weighted_full_block`) from the same tensor.
+
+    Args:
+        block_per_anchor: Each anchor's summed block score $(B, A)$.
+        contributing: The $0/1$ contributing indicator $(B, A)$.
+        target: The forecast target, read for the block's $H \cdot X$ element count.
+        cell_mask: The optional $(H, C)$ scored-cell mask, whose count replaces $H \cdot X$.
+
+    Returns:
+        ``(d_block, d_sample)`` exactly as :func:`masked_raw_likelihood` defines them.
+    """
+    # Average over the anchors that contribute at all: a fully masked anchor (warm-up, gap,
+    # coverage floor) leaves numerator AND denominator, so the per-anchor scale does not drift
+    # with the mask density.
+    n_anchors = contributing.sum().clamp_min(1.0)
+
+    d_block = block_per_anchor.sum() / n_anchors
+    # Per scored element: the block's own H * X under no cell mask, the scored count under one.
+    # The count stays a device tensor rather than being read back to the host: it is an integer,
+    # exact in the block's dtype, so the division is the same bits either way and costs no sync.
+    elements = (
+        float(target.shape[-2] * target.shape[-1])
+        if cell_mask is None
+        else cell_mask.sum().to(d_block.dtype).clamp_min(1.0)
+    )
+    d_sample = d_block / elements
+    return d_block, d_sample
+
+
 def masked_raw_likelihood(
     mu: torch.Tensor,
     target: torch.Tensor,
@@ -389,23 +428,7 @@ def masked_raw_likelihood(
         cell_mask=cell_mask,
         ar_coef=ar_coef,
     )
-
-    # Average over the anchors that contribute at all: a fully masked anchor (warm-up, gap,
-    # coverage floor) leaves numerator AND denominator, so the per-anchor scale does not drift
-    # with the mask density.
-    n_anchors = contributing.sum().clamp_min(1.0)
-
-    d_block = block_per_anchor.sum() / n_anchors
-    # Per scored element: the block's own H * X under no cell mask, the scored count under one.
-    # The count stays a device tensor rather than being read back to the host: it is an integer,
-    # exact in the block's dtype, so the division is the same bits either way and costs no sync.
-    elements = (
-        float(target.shape[-2] * target.shape[-1])
-        if cell_mask is None
-        else cell_mask.sum().to(d_block.dtype).clamp_min(1.0)
-    )
-    d_sample = d_block / elements
-    return d_block, d_sample
+    return _reduce_block(block_per_anchor, contributing, target, cell_mask)
 
 
 def masked_source_kl(
@@ -736,6 +759,86 @@ def masked_boundary_gap(
     return (gap * valid * contributing[:, 1:]).sum() / n_anchors
 
 
+#: Floor on the weight sum that normalises the event-weighted full branch: a batch whose every
+#: scored anchor sits at an event floor of $0$ divides by this rather than by zero, and scores an
+#: exact zero -- the full branch learns nothing from a batch with no contraction in it, which is
+#: what a floor of $0$ asks for.
+_EVENT_WEIGHT_EPS = 1e-12
+
+
+def _anchor_weight_at(
+    anchor_weight: torch.Tensor, anchors: Optional[torch.Tensor], n_decoded: int
+) -> torch.Tensor:
+    r"""Read a dense $(B, T)$ per-step weight at the decoded anchors, as $(B, A)$.
+
+    Args:
+        anchor_weight: The dense weight $(B, T)$ on the decimated grid.
+        anchors: The decoded anchor set $(B, A)$, or ``None`` for the contiguous prefix.
+        n_decoded: $A$, the number of decoded anchors, read off the forecast tensors.
+
+    Returns:
+        The weight at each decoded anchor, $(B, A)$.
+
+    Raises:
+        ValueError: If the weight is not two-dimensional, or does not cover the anchors.
+    """
+    if anchor_weight.dim() != 2:
+        raise ValueError(
+            f"full_anchor_weight must be (B, T), got shape {tuple(anchor_weight.shape)}"
+        )
+    if anchors is None:
+        if anchor_weight.shape[1] < n_decoded:
+            raise ValueError(
+                f"full_anchor_weight covers {anchor_weight.shape[1]} steps but {n_decoded} anchors "
+                f"were decoded"
+            )
+        return anchor_weight[:, :n_decoded]
+    if anchors.shape[0] != anchor_weight.shape[0]:
+        raise ValueError(
+            f"full_anchor_weight has batch {anchor_weight.shape[0]} against anchor_index batch "
+            f"{anchors.shape[0]}"
+        )
+    return anchor_weight.gather(1, anchors.to(torch.long))
+
+
+def _event_weighted_full_block(
+    block_per_anchor: torch.Tensor,
+    contributing: torch.Tensor,
+    anchor_weight: torch.Tensor,
+    *,
+    anchors: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""The full branch's block NLL as a weighted mean over anchors, plus the active-anchor share.
+
+    $$D_1^{w} = \frac{\sum_{b,a} w_{b,a}\, c_{b,a}\, d_{b,a}}{\sum_{b,a} w_{b,a}\, c_{b,a}},$$
+
+    with $d$ the per-anchor block score, $c$ the contributing indicator and $w$ the supplied
+    weight read at the decoded anchors. A uniform $w$ gives the unweighted mean exactly, so a batch
+    with no event anywhere in it is scored as it always was. The block is the one the unweighted
+    term was reduced from, so the two terms cannot be scored on different tensors.
+
+    Args:
+        block_per_anchor: The full branch's per-anchor block score $(B, A)$, from
+            :func:`masked_raw_block_per_anchor`.
+        contributing: Its $0/1$ contributing indicator $(B, A)$.
+        anchor_weight: The dense $(B, T)$ per-step weight.
+        anchors: The decoded anchor set $(B, A)$ or ``None``.
+
+    Returns:
+        ``(nll_full_event_block, event_anchor_frac)``: the weighted mean in nats per anchor, and
+        the fraction of contributing anchors whose weight is $1$.
+    """
+    at_anchors = _anchor_weight_at(anchor_weight, anchors, block_per_anchor.shape[1]).to(
+        block_per_anchor.dtype
+    )
+    weights = at_anchors * contributing
+    nll = (block_per_anchor * weights).sum() / weights.sum().clamp_min(_EVENT_WEIGHT_EPS)
+    with torch.no_grad():
+        active = ((at_anchors >= 1.0 - 1e-6).to(block_per_anchor.dtype) * contributing).sum()
+        frac = active / contributing.sum().clamp_min(1.0)
+    return nll, frac
+
+
 def compute_loss(
     forward_outputs: Dict[str, torch.Tensor],
     target: torch.Tensor,
@@ -758,16 +861,21 @@ def compute_loss(
     horizon_weight: Optional[torch.Tensor] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    lambda_event_gate: float = 0.0,
+    full_anchor_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     r"""Compute the seven-term objective, per anchor.
 
-    $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
+    $$\mathcal{L} = \lambda_{\mathrm{full}} D_1^{w} + \lambda_{\mathrm{base}} D_0
     + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p
     + \lambda_{\mathrm{ms}} \mathcal{L}_{\mathrm{ms}}
     + \lambda_{\Delta} \mathcal{L}_{\Delta}
-    + \lambda_{\mathrm{boundary}} \mathcal{L}_{\mathrm{boundary}}$$
+    + \lambda_{\mathrm{boundary}} \mathcal{L}_{\mathrm{boundary}}
+    + \lambda_g\,\beta\,\bar g$$
 
-    The first four terms are in nats per anchor; the three shape terms are $L_1$/Huber
+    $D_1^{w}$ is the full branch's block under the optional event weight ($D_1$ itself without one)
+    and $\bar g$ the posterior event gate's masked mean ($1$ on a model without the gate, with
+    $\lambda_g = 0$ enforced). The first four terms and the last are in nats per anchor; the three shape terms are $L_1$/Huber
     quantities over the forecast mean, so a total carrying them is a **mixed-unit** criterion.
     It is still the quantity being minimised and still the right thing to watch, but the
     ``nll_*`` metrics -- not ``total_loss`` -- are the pure-nats readouts.
@@ -871,19 +979,40 @@ def compute_loss(
         ar_coef: Optional $(C,)$ AR(1) residual coefficient, reaching both reconstruction terms;
             see :func:`raw_sample_score`. Both branches are scored under the same $\phi$, so
             ``pred_gap`` remains a difference of two joint log-densities of one family.
+        lambda_event_gate: Weight $\lambda_g$ on the posterior's **event gate** sparsity term,
+            $\lambda_g \, \beta \, \mathbb E_t[g_t]$ over the KL's anchor support, read off
+            ``forward_outputs['event_gate']``. It rides $\beta$'s schedule for the same reason
+            $\beta$ has one: the zero-initialised residual must find where the source helps before
+            it is charged for listening. ``0.0`` -- the default -- adds nothing; a non-zero value
+            on a forward that carries no gate is refused, since the knob would reach nothing. The
+            gate's masked mean is reported as ``event_gate_mean`` ($1.0$ when no gate exists, which
+            is literally the ungated model) beside the echoed ``lambda_event_gate``.
+        full_anchor_weight: Optional dense $(B, T)$ per-step weight on the **full** branch's
+            reconstruction alone, read at the decoded anchors and applied as a weighted mean over
+            contributing anchors; see :mod:`teb_vae.lag_attn_rws.event_weight` for the contraction
+            weighting that produces it. ``nll_full_block`` and ``pred_gap`` stay the *unweighted*
+            quantities; what enters ``total_loss`` in the former's place is reported as
+            ``nll_full_event_block`` (the same tensor when no weight is given), beside
+            ``event_anchor_frac``, the share of contributing anchors at weight $1$ ($1.0$ when no
+            weight is given). The base branch and the KL are never weighted: between events the
+            source pathway then has its cost and no reward.
 
     Returns:
         ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
         seven terms, ``total_loss``, the block/sample reconstruction pairs, ``pred_gap``, both KL
         readouts, ``kld_active_frac``, ``kld_beta``, ``beta_prior``, ``prior_rate``, the three
-        ``aux_*`` shape terms with their echoed weights, ``anchor_coverage_frac`` and the
-        log-variance diagnostics -- and is safe to splat into a metric logger. The likelihood
-        name string is deliberately outside it.
+        ``aux_*`` shape terms with their echoed weights, ``anchor_coverage_frac``, the
+        log-variance diagnostics, and the event pair ``nll_full_event_block`` /
+        ``event_anchor_frac`` beside the gate pair ``event_gate_mean`` / ``lambda_event_gate`` --
+        and is safe to splat into a metric logger. The likelihood name string is deliberately
+        outside it.
 
     Raises:
         ValueError: On an unknown ``likelihood``, a ``weight`` that does not match the trimmed
             grid, a forecast block too short for the coarsest pooling rate when ``lambda_ms``
-            is nonzero, or a nonzero ``lambda_boundary`` on a gathered anchor set.
+            is nonzero, a nonzero ``lambda_boundary`` on a gathered anchor set, a nonzero
+            ``lambda_event_gate`` on a forward that carries no ``event_gate``, or a
+            ``full_anchor_weight`` that is not $(B, T)$ or does not cover the decoded anchors.
     """
     validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
     device, dtype = target.device, target.dtype
@@ -911,7 +1040,9 @@ def compute_loss(
         mask, geometry, anchors=anchors, anchor_valid=anchor_valid, validate=False
     )
 
-    nll_full_block, nll_full_sample = masked_raw_likelihood(
+    # The full branch's block is scored once and reduced twice below -- unweighted here, and
+    # event-weighted when a weight is supplied -- so the two reductions read one tensor.
+    full_block_per_anchor, full_contributing = masked_raw_block_per_anchor(
         forward_outputs["mu_full"],
         target,
         mask,
@@ -921,6 +1052,9 @@ def compute_loss(
         horizon_weight=horizon_weight,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+    )
+    nll_full_block, nll_full_sample = _reduce_block(
+        full_block_per_anchor, full_contributing, target, cell_mask
     )
     nll_base_block, nll_base_sample = masked_raw_likelihood(
         forward_outputs["mu_base"],
@@ -934,6 +1068,18 @@ def compute_loss(
         ar_coef=ar_coef,
     )
 
+    # The event weighting of the FULL branch alone. ``nll_full_block`` above stays the unweighted
+    # log-density -- it is what ``pred_gap`` and every reported metric read -- and this is the
+    # weighted mean over the same contributing anchors that enters the total in its place. With no
+    # weight it IS that tensor, so the off-state is bitwise.
+    if full_anchor_weight is None:
+        nll_full_event_block = nll_full_block
+        event_anchor_frac = torch.ones((), device=device, dtype=dtype)
+    else:
+        nll_full_event_block, event_anchor_frac = _event_weighted_full_block(
+            full_block_per_anchor, full_contributing, full_anchor_weight, anchors=anchors
+        )
+
     kld_btd = kld_tensor(
         mu_prior=forward_outputs["mu_prior"],
         logvar_prior=forward_outputs["logvar_prior"],
@@ -945,6 +1091,22 @@ def compute_loss(
     # On the KL's own anchor support, and in the graph: weighted, this is an objective term.
     # Computed unconditionally so a run that never opted in still reports its prior's rate.
     prior_rate = masked_prior_rate(forward_outputs["logvar_prior"], kl_support)
+
+    # The event gate's sparsity term, over the KL's own anchor support so the two are in the same
+    # per-anchor units. Absent gate: the model is the ungated one, whose gate is identically 1, and
+    # a weight on it would be a knob that reaches nothing -- refused rather than ignored.
+    event_gate = forward_outputs.get("event_gate")
+    if event_gate is None:
+        if lambda_event_gate != 0.0:
+            raise ValueError(
+                f"lambda_event_gate={lambda_event_gate} but the forward carries no 'event_gate': "
+                f"build the model with posterior_event_gate=True, or set lambda_event_gate to 0.0"
+            )
+        event_gate_mean = torch.ones((), device=device, dtype=dtype)
+    else:
+        event_gate_mean = (
+            event_gate.squeeze(-1) * kl_support
+        ).sum() / kl_support.sum().clamp_min(1.0)
 
     # The shape terms, each over both branches and each computed only when it is weighted; see
     # the zeros-when-off paragraph above for why an unweighted term reports 0.0 rather than its
@@ -972,13 +1134,14 @@ def compute_loss(
         aux_boundary = torch.zeros((), device=device, dtype=dtype)
 
     total_loss = (
-        lambda_full * nll_full_block
+        lambda_full * nll_full_event_block
         + lambda_base * nll_base_block
         + beta * kl_terms["source_conditioned_kl_train"]
         + beta_prior * prior_rate
         + lambda_ms * aux_multiscale
         + lambda_deriv * aux_derivative
         + lambda_boundary * aux_boundary
+        + lambda_event_gate * beta * event_gate_mean
     )
 
     # Diagnostics over the same masked supports the losses use, so each stays inside its own
@@ -1082,6 +1245,16 @@ def compute_loss(
         "lambda_ms": torch.full((), float(lambda_ms), device=device, dtype=dtype),
         "lambda_deriv": torch.full((), float(lambda_deriv), device=device, dtype=dtype),
         "lambda_boundary": torch.full((), float(lambda_boundary), device=device, dtype=dtype),
+        # The event mechanisms. ``nll_full_event_block`` is what entered the total for the full
+        # branch -- the unweighted ``nll_full_block`` itself when no weight was given -- and
+        # ``event_anchor_frac`` the share of scored anchors at weight 1 (1.0 unweighted).
+        # ``event_gate_mean`` is the gate's masked mean, 1.0 on a model without the gate.
+        "nll_full_event_block": nll_full_event_block,
+        "event_anchor_frac": event_anchor_frac,
+        "event_gate_mean": event_gate_mean,
+        "lambda_event_gate": torch.full(
+            (), float(lambda_event_gate), device=device, dtype=dtype
+        ),
         "anchor_coverage_frac": anchor_coverage_frac,
         "mean_logvar_full": mean_logvar_full,
         "mean_logvar_base": mean_logvar_base,

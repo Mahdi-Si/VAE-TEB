@@ -79,6 +79,14 @@ model_config:
     lag_kv_source: conv_stem
     source_dropout: null
     forecast_ar_residual: false
+    # The two event mechanisms (2026-10-13) are pinned OFF here like every other switch above: this
+    # fixture asks whether the lag machinery recovers a planted delay, and a gate or a contraction
+    # weight on the full branch would be a second mechanism in the same measurement. The planted
+    # UP does carry detector-visible events (about 90 to 100 percent of anchors stay active at the
+    # shipped reach), so the pin is for attribution, not feasibility.
+    posterior_event_gate: false
+    lambda_event_gate: 0.0
+    event_weight_floor: null
     target_phase_fast_cutoff_hz: null
     target_phase_fast_horizon: null
     beta_schedule:

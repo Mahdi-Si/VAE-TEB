@@ -1,0 +1,42 @@
+# Ablation of the contraction weighting: the default with the full branch scored at every anchor.
+#
+# The default ships the full branch's reconstruction weighted by contraction proximity -- weight 1
+# within `event_weight_reach_steps` after a detected onset, `event_weight_floor: 0.0` elsewhere --
+# so that between contractions the source pathway has its KL cost and no reward. WHY the default
+# needs it: the diagnosed failure is the full branch memorising recording-specific structure, worth
+# tens of nats per anchor in-sample against a KL cost of a few nats, and neither a sparsity weight
+# of the order of the real coupling nor any beta short of the one that erases the signal can price
+# that out. Removing the reward where the physiology says there is none is the one lever that acts
+# on the leak alone.
+#
+# This arm keeps the posterior event gate and removes the weighting (`event_weight_floor: null`), so
+# a difference against the default is attributable to the weighting alone: does the gate on its own
+# close between contractions, or does it need the weighting to take the reward away first? The
+# arithmetic says the latter -- the in-sample reward at quiet anchors dwarfs lambda_g -- and this arm
+# is the measurement of that claim.
+#
+# WHAT TO READ. `event_anchor_frac` is 1.0 here by construction against the default's active share;
+# `event_gate_mean` and `source_conditioned_kl_raw` between contractions, which should stay high
+# here if the arithmetic is right; and `pred_gap` on validation against training, where this arm
+# should reproduce the diagnosed sign reversal and the default should not. The `nll_*` columns stay
+# unweighted log-densities on both arms and compare directly.
+#
+# `event_weight_reach_steps` is left at the default's 55: it is read only when a floor is set.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_no_event_weight.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    event_weight_floor: null
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_no_event_weight
+      tags:
+        variant: lag_attn_trf_cfs_no_event_weight
