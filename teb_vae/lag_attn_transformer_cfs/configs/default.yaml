@@ -156,6 +156,20 @@ model_config:
     # is a laundering subsidy the raw sibling measured (KL filled whether or not it is source-driven),
     # and with the zero-KL start plus the beta warm-up, collapse is guarded structurally.
     free_bits: 0.0
+    # Weight of the posterior EVENT GATE's sparsity term lambda_g * beta * E_t[g_t], read only when
+    # `posterior_event_gate` below is true (refused otherwise: a weight on a gate the model did not
+    # build reaches nothing). It rides the beta schedule by construction, for the same reason beta
+    # has one: the zero-initialised residual must find where the source helps before it is charged
+    # for listening.
+    #
+    # 0.05 SINCE 2026-10-13, half the ~0.1 nats the published UA->FHR coupling measures, so a real
+    # signal keeps its gate open. The exact value matters little by construction: with the
+    # contraction weighting below at floor 0 the quiet anchors carry NO full-branch reward, so any
+    # positive push closes their gates, while at the active anchors the in-sample reward is tens of
+    # nats per anchor and no small lambda_g can close them. The gate's job is to make the silence
+    # between contractions exact (KL identically 0 there) and to read out WHEN the model listens.
+    # `sweep_no_event_gate.yaml` is the ablation (gate off, lambda 0).
+    lambda_event_gate: 0.05
     # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
     # conditional prior's log-variance off its clamp floor: nothing else in the objective penalises
     # a NARROW prior, and the first production run of this family pinned 99.2% of prior coordinates
@@ -269,6 +283,24 @@ model_config:
     # this is the one seam that regularises it without touching the target pathway.
     # `sweep_source_dropout_03.yaml` is the next point on the axis.
     source_dropout: 0.2
+    # The posterior EVENT GATE: one scalar g_t in (0, 1) per step, read off the attended source
+    # summary, multiplying both bounded posterior residuals so that at g_t = 0 the posterior IS the
+    # prior (KL exactly 0 at that step). WHY: the coupling is sparse in time -- a contraction can move
+    # the FHR, and between contractions the source has nothing the target's past lacks -- and one beta
+    # at every anchor either leaks recording-specific structure between contractions or erases the
+    # ~0.1-nat signal at them. With `lambda_event_gate` the model pays for WHEN it listens.
+    #
+    # ON SINCE 2026-10-13, as the structural complement of the contraction weighting below: that
+    # weighting removes the full branch's reward where the physiology says there is none, and the
+    # gate turns the resulting silence into an exact zero KL rather than a small learned residual --
+    # which is what keeps `source_conditioned_kl_raw` a coupling readout instead of a leak readout.
+    # false = the pre-key model, bitwise. The gate is returned as `event_gate` and tracked as
+    # `event_gate_mean`; a warm start from a checkpoint without the gate needs the gate's two tensors
+    # seeded into the checkpoint first (the strict loader refuses missing keys):
+    #   python -m teb_vae.lag_attn_rws.seed_event_gate_checkpoint --checkpoint <old.ckpt>
+    # writes `<old>.event_gate.ckpt`, which `core_model_checkpoint` then points at.
+    # `sweep_no_event_gate.yaml` is the ablation.
+    posterior_event_gate: true
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256
@@ -726,6 +758,34 @@ model_config:
     # L = max_lag + 1 lags of UP history at 4 s/step (worked example: 37 -> 38 lags, 148 s). Down
     # from 90 on 2026-09-23 in this cell only; the conv-LSTM cell and both planted twins keep 90.
     max_lag: 37
+    # Contraction weighting of the FULL branch's reconstruction (task-level, a loss weight the model
+    # never sees). Anchors within `event_weight_reach_steps` after a contraction onset -- detected on
+    # the batch's raw `up` by the evaluation's own detector -- weigh 1; every other anchor weighs
+    # `event_weight_floor`. The base branch and the KL stay unweighted, so between contractions the
+    # source pathway has its cost and no reward. `nll_full_block` and `pred_gap` stay unweighted
+    # either way and `nll_full_event_block` is what entered the total; `event_anchor_frac` is the
+    # share of scored anchors at weight 1.
+    #
+    # ON SINCE 2026-10-13, at floor 0. WHY ZERO AND NOT A SMALL FLOOR: the diagnosed failure is the
+    # full branch memorising recording-specific structure, worth tens of nats per anchor IN-SAMPLE
+    # (train pred_gap +56 against validation -42, DIAGNOSIS.md 4.3). Any positive floor leaves that
+    # reward standing at quiet anchors, scaled by the floor relative to the active ones (the term is
+    # a weighted mean, so in a batch that mixes active and quiet anchors -- every production batch
+    # of 128 segments -- the quiet anchors keep floor/1 of their pull), and it still outweighs the
+    # ~4-nat KL cost there; only a zero floor removes it. A detector miss at a real contraction then costs a few
+    # training anchors of one shared map, which is a sampling loss and not a bias, while a positive
+    # floor would keep the bias. A batch with no detected contraction scores the full branch as
+    # zero and trains it on nothing that step; the base branch, the KL and the prior rate still train.
+    # Both mechanisms enter `val/total_loss`, the primary checkpoint monitor, on every stage; the
+    # secondary monitor `val/nll_full_block` stays the unweighted log-density.
+    #
+    # REACH 55 STEPS (220 s), not `max_lag`'s 37: a contraction lasts 45-120 s and the FHR recovers
+    # over about 90 s after its peak, so the response can run to ~210 s after onset, and an anchor
+    # up to there still holds the response inside its 120-s horizon. 55 rounds that up. A null
+    # floor is OFF (the unweighted objective, bitwise); a null reach resolves to `max_lag`.
+    # `sweep_no_event_weight.yaml` is the ablation.
+    event_weight_floor: 0.0
+    event_weight_reach_steps: 55
     num_heads: 4
     d_head: 32
     use_entmax: true       # exact zeros in the lag distribution, not merely small weights

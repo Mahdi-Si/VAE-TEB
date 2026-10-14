@@ -13,17 +13,20 @@ module is that reading, executed.
 
 From an IDE's Run button, with no command line: fill in ``RUN_ARGS`` near the bottom of this file.
 
-**Why a module and not an eye.** Three of the six tier-1 criteria are statements about *every
+**Why a module and not an eye.** Four of the seven tier-1 criteria are statements about *every
 logged row* -- one of them a $10^{-6}$ relative recomposition of two channel-axis splits against
 each other -- and a multi-thousand-row CSV cannot honestly be checked by inspection. The ones that
-could be read off a chart are here anyway, because a checker that covered five criteria would leave
+could be read off a chart are here anyway, because a checker that covered six criteria would leave
 the reader to remember which one it did not.
 
 **Every tier-1 criterion is a geometry or provenance statement, not a quality one.**
 ``target_warm_frac`` is a stamped provenance column that must read exactly $1.0$;
 ``anchors_per_sample`` must sit at the value this run's own resolved geometry implies; the loss must
 be finite and the spike breaker must never have latched; the two channel-axis splits of the forecast
-gap must recompose to each other; and the run's own artifacts must state which **arm** it trained. A
+gap must recompose to each other; the run's own artifacts must state which **arm** it trained; and
+the two event mechanisms' columns must read as the configured arm implies -- a contraction weight
+whose active share sits at $0$ is a detector that found nothing on these shards, and a gate whose
+mean reads $1.0$ on a run that built one is a gate that is not there. A
 value outside any of them means the run measured something other than what its configuration says,
 or cannot be attributed to a configuration at all, so no tier-2 number from it is worth reading --
 which is why the exit code follows tier 1 alone and never a tier-2 value.
@@ -121,7 +124,29 @@ TIER_TWO_METRICS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("shuffle_penalty", ("val",)),
     ("source_lag_warmth_frac_st", STAGES),
     ("source_lag_warmth_frac_ph", STAGES),
+    # The two event mechanisms' readouts (2026-10-13). Their *bands* are criterion 7; what they
+    # read inside the band -- how much of the timeline the detector calls active, and how far the
+    # gate has closed from its open seed -- is a reading rather than a gate.
+    ("event_anchor_frac", STAGES),
+    ("event_gate_mean", STAGES),
 )
+
+#: The band ``event_anchor_frac`` must sit in on every row of a run whose configuration sets
+#: ``event_weight_floor``. Below the floor of the band the contraction detector found (almost) no
+#: contraction on these shards, so the full branch is being trained on (almost) nothing and the
+#: run should be stopped and the UP traces inspected; above its ceiling the detector called
+#: (almost) every anchor active and the weight is inert. On the committed causal fixture the
+#: shipped reach gives $0.41$ to $0.95$ per segment; a production batch of 128 segments averages
+#: well inside. Not a tier-2 reading: a value outside this band means the mechanism the
+#: configuration states is not the one that trained.
+EVENT_ACTIVE_BAND: Tuple[float, float] = (0.05, 0.95)
+
+#: Where the two event mechanisms are configured, as dotted paths under the resolved config. Both
+#: are read for presence AND value: a key absent from a run's configuration -- the conv-LSTM
+#: cell's, or a run predating the keys -- is the mechanism off, and its column must then read the
+#: off-state exactly.
+EVENT_WEIGHT_FLOOR_PATH = "model_config.VAE_model.event_weight_floor"
+EVENT_GATE_PATH = "model_config.VAE_model.posterior_event_gate"
 
 #: The two checkpoint criteria, by the metric each selects on. The composite optimum and the best
 #: conditioned forecast are different epochs -- $336$ against $278$ on the diagnosed run -- so a run
@@ -581,6 +606,88 @@ def check_arm_is_stated(config: Optional[Dict[str, Any]]) -> Verdict:
     return Verdict(6, title, PASS, f"{named[0]}; {', '.join(stated)}")
 
 
+def check_event_mechanisms(
+    rows: Sequence[Dict[str, str]], config: Optional[Dict[str, Any]]
+) -> Verdict:
+    r"""Criterion 7: the two event mechanisms' columns read as the configured arm implies.
+
+    Two columns, each with an off-state that is exact and an on-state that is a band:
+
+    * ``event_anchor_frac`` -- the share of scored anchors the contraction weight put at $1$. With
+      ``event_weight_floor`` unset it is exactly $1.0$ (the unweighted objective); with it set it
+      must sit inside :data:`EVENT_ACTIVE_BAND` on every row, because a share at $0$ is a detector
+      that found no contraction on these shards and a share at $1$ is a weight that does nothing.
+    * ``event_gate_mean`` -- the posterior event gate's masked mean. With ``posterior_event_gate``
+      off it is exactly $1.0$ (the ungated model); with it on it is strictly inside $(0, 1)$, since
+      the gate is a sigmoid and a row reading exactly $1.0$ is a gate that is not there.
+
+    Every row, like the other geometry criteria: a detector that stops finding contractions in
+    epoch 40 voids the run from there, and an aggregate would hide it.
+
+    Args:
+        rows: The parsed rows.
+        config: The resolved run configuration, or ``None`` when none was found.
+
+    Returns:
+        The verdict.
+    """
+    title = "the event mechanisms' columns match the configured arm"
+    if config is None:
+        return Verdict(7, title, FAIL,
+                       "no resolved configuration was found, so which event mechanisms this run "
+                       "trained with is not recoverable from its artifacts; pass --config")
+
+    found_floor, floor = _lookup(config, EVENT_WEIGHT_FLOOR_PATH)
+    weight_on = found_floor and floor is not None
+    found_gate, gate = _lookup(config, EVENT_GATE_PATH)
+    gate_on = bool(found_gate and gate)
+
+    problems: List[str] = []
+    readings: List[str] = []
+    low, high = EVENT_ACTIVE_BAND
+    for stage in STAGES:
+        frac = _floats(rows, f"{stage}/event_anchor_frac")
+        mean = _floats(rows, f"{stage}/event_gate_mean")
+        if not frac or not mean:
+            problems.append(f"{stage}: an event column is absent")
+            continue
+        if weight_on:
+            bad = [value for value in frac if not low <= value <= high]
+            if bad:
+                problems.append(
+                    f"{stage}/event_anchor_frac outside [{low}, {high}] on {len(bad)} rows "
+                    f"(e.g. {bad[:3]}); at the floor the detector found no contraction, at the "
+                    f"ceiling the weight is inert"
+                )
+            readings.append(f"{stage} active share in [{min(frac):.3g}, {max(frac):.3g}]")
+        else:
+            bad = [value for value in frac if value != 1.0]
+            if bad:
+                problems.append(
+                    f"{stage}/event_anchor_frac is not 1.0 on {len(bad)} rows although no "
+                    f"event_weight_floor is configured (e.g. {bad[:3]})"
+                )
+        if gate_on:
+            bad = [value for value in mean if not 0.0 < value < 1.0]
+            if bad:
+                problems.append(
+                    f"{stage}/event_gate_mean outside (0, 1) on {len(bad)} rows although "
+                    f"posterior_event_gate is on (e.g. {bad[:3]})"
+                )
+            readings.append(f"{stage} gate mean {mean[0]:.3g} -> {mean[-1]:.3g}")
+        else:
+            bad = [value for value in mean if value != 1.0]
+            if bad:
+                problems.append(
+                    f"{stage}/event_gate_mean is not 1.0 on {len(bad)} rows although "
+                    f"posterior_event_gate is off (e.g. {bad[:3]})"
+                )
+    if problems:
+        return Verdict(7, title, FAIL, "; ".join(problems))
+    arm = (f"weighting {'on' if weight_on else 'off'}, gate {'on' if gate_on else 'off'}")
+    return Verdict(7, title, PASS, "; ".join([arm, *readings]) if readings else arm)
+
+
 # =================================================================================================
 # Tier 2: reported and interpreted, never gated
 # =================================================================================================
@@ -623,6 +730,10 @@ def tier_two_readings(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
                 readings.append((f"{stage}/{suffix}", "absent"))
                 continue
             reading = f"final {values[-1]:.6g}"
+            if suffix == "event_gate_mean":
+                # From the open seed (sigma(2) = 0.881) downwards is the gate closing where the
+                # source earns nothing; flat at the seed is a gate that never learned to.
+                reading += f"; first {values[0]:.6g}; {_tail_direction(values)}"
             if suffix == "source_conditioned_kl_raw":
                 # The trajectory, not only the endpoint: criterion 6 asks whether the coupling
                 # readout is still rising at the end, which an endpoint alone cannot answer.
@@ -765,6 +876,7 @@ def main(
         check_gap_recomposition(rows),
         check_two_evaluations(rows, second_rows),
         check_arm_is_stated(resolved),
+        check_event_mechanisms(rows, resolved),
     ]
 
     print(f"run directory: {root}")

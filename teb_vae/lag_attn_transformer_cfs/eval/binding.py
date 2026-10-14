@@ -113,6 +113,11 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     # not fail -- it would report the residual model's numbers under the residual-free model's
     # stated architecture.
     "persistence_residual",
+    # Here because it changes **what the posterior is**: with it on, both residuals are multiplied
+    # by a per-step gate the objective charges for, so the KL at a closed step is exactly zero by
+    # construction rather than by what the data said. Declared by this cell's config alone (the
+    # conv-LSTM cell's does not carry the key), so only this binding reconciles it.
+    "posterior_event_gate",
     # Here because it is part of the **density**: every evaluated readout scores each cell on its
     # AR(1) innovation when it is on, so a config disagreeing about it would report one likelihood's
     # numbers under another's name. ``target_scored_horizon``, the other density term, is a resolved

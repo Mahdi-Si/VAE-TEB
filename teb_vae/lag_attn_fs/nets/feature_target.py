@@ -360,6 +360,8 @@ class FeatureForecastTarget:
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         r"""Compute the seven-term objective, per anchor.
 
@@ -405,6 +407,10 @@ class FeatureForecastTarget:
                 above.
             lambda_deriv: Weight on the derivative Huber shape term. Shipped ``0.0`` here.
             lambda_boundary: Weight on the boundary-continuity shape term. Shipped ``0.0`` here.
+            lambda_event_gate: Weight on the posterior event gate's sparsity term; see the shared
+                implementation. ``0.0`` adds nothing.
+            full_anchor_weight: Optional dense $(B, T)$ weight on the full branch's reconstruction
+                alone; see the shared implementation. ``None`` is the unweighted objective, bitwise.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` is the raw model's key set plus
@@ -441,6 +447,8 @@ class FeatureForecastTarget:
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
             # ``None`` on every cell but the causal pair, where it is the renormalised per-block
             # weight. It reaches the two reconstruction terms and therefore ``pred_gap``; the gap
             # splits below apply the same vector, so each stays a partial sum of it.

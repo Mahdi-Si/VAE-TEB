@@ -842,6 +842,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         r"""The parent's seven-term objective, scored under the forecast clock's pooled validity.
 
@@ -871,6 +873,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
         )
 
     def _anchor_target_values(
