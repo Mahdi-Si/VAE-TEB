@@ -63,6 +63,21 @@ CFS_DELTA = {
     f"{_VAE}.source_validity": "finite",
     # 2026-10-04, after the first production run closed the source path (RESULTS.md).
     f"{_VAE}.forecast_ar_residual": False,
+    # 2026-10-11: the CFS default names the 42 source channels whose warm-up fits its anchor floor;
+    # this cell has no such key.
+    f"{_VAE}.causal_source_channels": _ABSENT,
+    # 2026-10-13: the event mechanisms (posterior event gate, its sparsity weight, and the
+    # contraction weighting of the full branch) exist in the CFS config, shipped on there, and
+    # not here, so each reads as absent on this side rather than as a value that differs.
+    **{
+        f"{_VAE}.{key}": _ABSENT
+        for key in (
+            "posterior_event_gate",
+            "lambda_event_gate",
+            "event_weight_floor",
+            "event_weight_reach_steps",
+        )
+    },
     f"{_VAE}.lag_kv_source": "encoder",
     f"{_VAE}.source_dropout": None,
     f"{_VAE}.free_bits": 0.02,

@@ -1,0 +1,35 @@
+# Ablation of the posterior EVENT GATE: the default with the gate off and its sparsity weight at 0.
+#
+# The default ships the gate ON (`posterior_event_gate: true`, `lambda_event_gate: 0.05`) beside
+# the contraction weighting of the full branch. The two are complements: the weighting removes the
+# full branch's reward where no recent contraction could inform it, and the gate turns the silence
+# that leaves behind into an exact zero KL at those steps rather than a small learned residual. This
+# arm keeps the weighting and removes the gate, so a difference against the default is attributable
+# to the gate alone: whether the exact silence buys a cleaner `source_conditioned_kl_raw` and a
+# better held-out `pred_gap` than the weighting's approximate silence does.
+#
+# WHAT TO READ. `event_gate_mean` is 1.0 here by construction (no gate) against the default's
+# learned value; `source_conditioned_kl_raw` between contractions, which the default should hold at
+# zero and this arm should not; and `pred_gap` on validation, which the gate must not reduce. The
+# `nll_*` columns stay unweighted log-densities on both arms and compare directly.
+#
+# Off here means bitwise the pre-gate posterior head: no gate parameter is built.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_no_event_gate.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    posterior_event_gate: false
+    lambda_event_gate: 0.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_no_event_gate
+      tags:
+        variant: lag_attn_trf_cfs_no_event_gate

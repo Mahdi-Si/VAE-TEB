@@ -150,6 +150,7 @@ class SeqVaeLagAttnRws(nn.Module):
         delta_logvar_scale: float = 2.0,
         posterior_logvar_mode: str = "residual",
         source_dropout: Optional[float] = None,
+        posterior_event_gate: bool = False,
         lag_kv_source: str = "encoder",
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
@@ -258,6 +259,15 @@ class SeqVaeLagAttnRws(nn.Module):
                 $D_1$ drags the prior's scale down alongside its own -- the second of the two
                 paths driving the prior-variance collapse, and the one that survives turning
                 off the base branch's noise. See :class:`PosteriorHead` for what it costs.
+            posterior_event_gate: Build the posterior's **event gate**: one scalar
+                $g_t \in (0, 1)$ per step, read off the attended source summary, that multiplies
+                both bounded residuals so that at $g_t = 0$ the posterior is the prior exactly. With
+                the objective's ``lambda_event_gate`` sparsity term the model is charged for *when*
+                it listens to the source rather than only for how much, which is what a coupling
+                present at a minority of anchors needs: one $\beta$ at every anchor either leaks
+                between contractions or erases the signal at them. The gate is returned as
+                ``event_gate`` ``(B, T, 1)``. ``False`` -- the default -- builds no gate and is
+                bitwise the model before the keyword existed. See :class:`PosteriorHead`.
             lag_kv_source: Which source representation the lag attention's keys **and** values are
                 built from. ``'encoder'`` (the default) is the deep history state $H^u$ -- the
                 model this family has always been -- and is bitwise what was built before the
@@ -416,6 +426,7 @@ class SeqVaeLagAttnRws(nn.Module):
         # Setting the key moves both together, which is the intent: one source-pathway rate.
         self.source_dropout = float(dropout if source_dropout is None else source_dropout)
         self.posterior_source_dropout = 0.0 if source_dropout is None else float(source_dropout)
+        self.posterior_event_gate = bool(posterior_event_gate)
         self.logvar_clamp = (float(logvar_clamp[0]), float(logvar_clamp[1]))
         self.coverage_floor = float(coverage_floor)
         self.base_decode = validate_choice(base_decode, BASE_DECODE_CHOICES, "base_decode")
@@ -610,6 +621,7 @@ class SeqVaeLagAttnRws(nn.Module):
             # The posterior-fusion resolution, not the pathway one: see __init__ for why an
             # unset key means 0.0 here and `dropout` at the pathway sites.
             source_dropout=self.posterior_source_dropout,
+            event_gate=self.posterior_event_gate,
         )
         self.te_analysis = TEAnalysisHead()
 
@@ -685,6 +697,10 @@ class SeqVaeLagAttnRws(nn.Module):
         # non-zero availability term into the prior at step 0 and end the exact zero-KL start. A
         # no-op on a head built without a clock path.
         self.prior_head.zero_init_clock()
+        # And the posterior's event gate, for the same reason: the generic pass xavier-fills its
+        # linear and would hand the gate a random, input-dependent opening at step 0 where the
+        # design seeds it open and input-independent. A no-op on a head built without the gate.
+        self.posterior_head.zero_init_event_gate()
         # The same undoing hits the per-block FiLM generators: the core zero-inits them for an
         # identity-at-init, and `initialization` xavier-refills them. Re-zeroing here is what makes
         # the identity actually true -- at step 0 the per-block-FiLM decoder is bitwise the
@@ -1200,6 +1216,8 @@ class SeqVaeLagAttnRws(nn.Module):
               attention probabilities carry no dropout. Named for what it is -- a
               source-conditioned KL -- not for the transfer entropy it is not yet.
             * ``mu_prior_sat_frac``, ``delta_mu_sat_frac`` -- scalar saturation diagnostics.
+            * ``event_gate`` -- the posterior event gate ``(B, T, 1)``, **only** under
+              ``posterior_event_gate``; the objective charges it and the readouts plot it.
         """
         # Concatenate at the declared widths, then gate: the surviving-channel indices are
         # positional into the full stream, and the delay is applied before the adapters so the
@@ -1226,8 +1244,12 @@ class SeqVaeLagAttnRws(nn.Module):
             self.query_proj(query), h_u, self.build_lag_mask(h_u.shape[1], h_u.device)
         )
 
+        # The event gate, computed from the attended summary and threaded into the head rather
+        # than computed inside it, so it can be returned below and charged by the objective.
+        # ``None`` on a model built without it, where the head's residual is ungated.
+        event_gate = self.posterior_head.event_gate_values(attended_heads)
         mu_post, logvar_post = self.posterior_head(
-            h_y, attended_heads, mu_prior, raw_logvar_prior
+            h_y, attended_heads, mu_prior, raw_logvar_prior, gate=event_gate
         )
         z_prior, z_post = self._reparameterize_shared(
             mu_prior, logvar_prior, mu_post, logvar_post
@@ -1261,7 +1283,7 @@ class SeqVaeLagAttnRws(nn.Module):
             kld_btd, alpha, head_structured=True
         )
 
-        return {
+        outputs = {
             "mu_prior": mu_prior,
             "logvar_prior": logvar_prior,
             "raw_logvar_prior": raw_logvar_prior,
@@ -1283,6 +1305,11 @@ class SeqVaeLagAttnRws(nn.Module):
             "mu_prior_sat_frac": mu_prior_sat_frac,
             "delta_mu_sat_frac": delta_mu_sat_frac,
         }
+        if event_gate is not None:
+            # Present only under the flag, like every other key whose mechanism a model may not
+            # have built: the objective charges it and the readouts plot it.
+            outputs["event_gate"] = event_gate
+        return outputs
 
     def kld_tensor(
         self,
@@ -1325,6 +1352,8 @@ class SeqVaeLagAttnRws(nn.Module):
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         r"""Compute the seven-term objective, per anchor.
 
@@ -1380,6 +1409,10 @@ class SeqVaeLagAttnRws(nn.Module):
                 an exact zero.
             lambda_deriv: Weight on the derivative Huber shape term, same contract.
             lambda_boundary: Weight on the boundary-continuity shape term, same contract.
+            lambda_event_gate: Weight on the posterior event gate's sparsity term; see the shared
+                implementation. ``0.0`` adds nothing.
+            full_anchor_weight: Optional dense $(B, T)$ weight on the full branch's reconstruction
+                alone; see the shared implementation. ``None`` is the unweighted objective, bitwise.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar
@@ -1411,6 +1444,8 @@ class SeqVaeLagAttnRws(nn.Module):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
             # ``None`` on a model built without a halflife, where the buffer does not exist at all
             # and the score is bitwise the horizon-uniform one. A ``getattr`` rather than an
             # attribute read for the reason ``target_channel_weight`` is one: the name is a buffer

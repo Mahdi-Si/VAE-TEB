@@ -418,6 +418,7 @@ _SWITCHES_OFF = dict(
     persistence_residual=False,
     horizon_weight_halflife_steps=None,
     alibi_slope_scale=1.0,
+    posterior_event_gate=False,
 )
 
 

@@ -86,6 +86,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         delta_logvar_scale: float = 2.0,
         posterior_logvar_mode: str = "residual",
         source_dropout: Optional[float] = None,
+        posterior_event_gate: bool = False,
         lag_kv_source: str = "encoder",
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,

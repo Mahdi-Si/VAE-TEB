@@ -847,6 +847,8 @@ class CausalWarmupInputs:
             * ``persistence`` -- the anchor's own target vector $(B, A_{\max}, C_{\mathrm{keep}})$,
               **only** under ``persistence_residual``. Present so a control re-decoding this
               forward's latents carries the same target-only tensor the forward decoded with.
+            * ``event_gate`` -- the posterior event gate $(B, T, 1)$, **only** under
+              ``posterior_event_gate``; the objective charges it and the readouts plot it.
         """
         anchor_index, anchor_valid = self._build_anchor_index(
             batch=int(y_st.shape[0]),
@@ -910,8 +912,11 @@ class CausalWarmupInputs:
             self.query_proj(query), h_u, self.build_lag_mask(h_u.shape[1], h_u.device)
         )
 
+        # The event gate, when the model built one: computed from the attended summary and
+        # threaded into the head so it can be returned and charged. ``None`` otherwise.
+        event_gate = self.posterior_head.event_gate_values(attended_heads)
         mu_post, logvar_post = self.posterior_head(
-            h_y, attended_heads, mu_prior, raw_logvar_prior
+            h_y, attended_heads, mu_prior, raw_logvar_prior, gate=event_gate
         )
         z_prior, z_post = self._reparameterize_shared(
             mu_prior, logvar_prior, mu_post, logvar_post
@@ -980,6 +985,9 @@ class CausalWarmupInputs:
             # reason that has nothing to do with the source. Present only under the flag, like every
             # other key whose mechanism a model may not have built.
             outputs["persistence"] = persistence
+        if event_gate is not None:
+            # Present only under ``posterior_event_gate``, for the reason ``persistence`` is.
+            outputs["event_gate"] = event_gate
         return outputs
 
 

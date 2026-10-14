@@ -48,6 +48,7 @@ import torch.distributed as dist
 from loguru import logger
 from torch import nn
 
+from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 from train.pl_model_base import LightningModelBase, MetricDict
@@ -96,6 +97,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        event_weight_floor: Optional[float] = None,
+        event_weight_reach_steps: Optional[int] = None,
         compile_model: bool = False,
     ) -> None:
         r"""Initialize the task.
@@ -134,6 +138,18 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lambda_deriv: Weight $\lambda_{\Delta}$ of the derivative Huber shape term.
             lambda_boundary: Weight $\lambda_{\mathrm{boundary}}$ of the boundary-continuity
                 shape term.
+            lambda_event_gate: Weight $\lambda_g$ of the posterior event gate's sparsity term,
+                $\lambda_g \, \beta \, \mathbb E_t[g_t]$; requires a net built with
+                ``posterior_event_gate`` and is refused by the objective otherwise. ``0.0`` --
+                the default -- adds nothing. Rides the $\beta$ schedule by construction.
+            event_weight_floor: $w_{\min} \in [0, 1)$, the weight the **full** branch's
+                reconstruction carries at anchors no recent contraction informs; anchors within
+                ``event_weight_reach_steps`` after a contraction onset weigh $1$. ``None`` -- the
+                default -- builds no weight and is the unweighted objective, bitwise. Needs
+                ``'up'`` in ``load_fields``; see :mod:`teb_vae.lag_attn_rws.event_weight`.
+            event_weight_reach_steps: $\ell$, the reach of a contraction in decimated steps.
+                ``None`` -- the default -- resolves to the net's ``max_lag``, the lag window the
+                attention can read. Read only when ``event_weight_floor`` is set.
             compile_model: Wrap the net in ``torch.compile``. Defaults to ``False``, which is
                 the only correct value **for this net**: its LSTM encoders defeat TorchInductor
                 on their own, and a checkpointed attention region defeats it again whenever
@@ -168,10 +184,18 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             "lambda_ms",
             "lambda_deriv",
             "lambda_boundary",
+            "lambda_event_gate",
+            "event_weight_floor",
+            "event_weight_reach_steps",
         )
         self._model_kwargs: Dict[str, Any] = dict(model_kwargs or {})
         self._perm_generator: Optional[torch.Generator] = None
         self._peak_memory_logged = False
+        # Contraction onsets per segment, keyed on (guid, epoch): a dataset constant, detected once
+        # per segment per process and read back on every later step. Plain state, not a buffer and
+        # not an hparam -- it is derivable from the shards and must not reach a checkpoint.
+        # ponytail: unbounded per-rank cache (~300 B per segment); bound it if host memory binds.
+        self._event_onset_cache: Dict[Any, Any] = {}
 
     def setup(self, stage: str) -> None:
         """Seed the derangement generator, once the module knows its rank.
@@ -618,6 +642,56 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         return {}
 
+    def _event_anchor_weight(
+        self, batch: Any, weight: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        r"""The full branch's $(B, T)$ contraction weight for this batch, or ``None`` when off.
+
+        Built from the batch's raw ``up`` trace and the decimated validity by
+        :func:`~teb_vae.lag_attn_rws.event_weight.contraction_anchor_weight`, at the net's own
+        decimation and, unless configured, its own ``max_lag`` as the reach, with the per-segment
+        onsets cached on this module under ``(guid, epoch)``. A loss weight and nothing else: the
+        net never sees it, the evaluation never applies it.
+
+        Args:
+            batch: A batch from the data module.
+            weight: Decimated validity signal $(B, T)$.
+
+        Returns:
+            The weight, or ``None`` when ``event_weight_floor`` is unset.
+
+        Raises:
+            RuntimeError: If the floor is set and the batch carries no ``up`` field.
+        """
+        floor = self.hparams.get("event_weight_floor")
+        if floor is None:
+            return None
+        up = getattr(batch, "up", None)
+        if up is None:
+            raise RuntimeError(
+                "event_weight_floor is set but the batch has no `up` field; the contraction weight "
+                "is detected on the raw UP trace. Add 'up' to dataset_kwargs.load_fields."
+            )
+        reach = self.hparams.get("event_weight_reach_steps")
+        model = self.orig_model
+        # The segment keys the onsets are cached under. Both fields are load-bearing in every
+        # causal config (the tile phase is keyed on the same pair); a batch without them simply runs
+        # the detector every step.
+        guids, epochs = getattr(batch, "guid", None), getattr(batch, "epoch", None)
+        keys = None
+        if guids is not None and epochs is not None:
+            epoch_values = epochs.tolist() if isinstance(epochs, torch.Tensor) else list(epochs)
+            keys = [(str(guid), float(epoch)) for guid, epoch in zip(guids, epoch_values)]
+        return contraction_anchor_weight(
+            up,
+            weight,
+            decimation=int(model.geometry.decimation),
+            reach_steps=int(model.max_lag) if reach is None else int(reach),
+            floor=float(floor),
+            keys=keys,
+            cache=self._event_onset_cache,
+        )
+
     # ------------------------------------------------------------------
     # Loss + metrics
     # ------------------------------------------------------------------
@@ -638,6 +712,11 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         inputs = self._build_forward_inputs(batch)
         fhr_raw, weight = self._build_raw_target(batch)
+        # Before the forward, so the one device-to-host copy the contraction detector needs -- for
+        # segments the onset cache does not hold yet -- waits on the batch transfer alone and not
+        # on the forward's kernels. ``None`` unless an event floor is configured: the objective is
+        # then bitwise unweighted.
+        full_anchor_weight = self._event_anchor_weight(batch, weight)
 
         forward_outputs = self.model(*inputs)
 
@@ -650,6 +729,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_ms = float(self.hparams.get("lambda_ms", 0.0))
         lambda_deriv = float(self.hparams.get("lambda_deriv", 0.0))
         lambda_boundary = float(self.hparams.get("lambda_boundary", 0.0))
+        lambda_event_gate = float(self.hparams.get("lambda_event_gate", 0.0))
 
         loss_metrics = self.orig_model.compute_loss(
             forward_outputs,
@@ -664,6 +744,8 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
         )["metrics"]
         main_loss = loss_metrics["total_loss"]
 

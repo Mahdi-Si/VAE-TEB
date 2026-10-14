@@ -65,6 +65,11 @@ TASK_LEVEL_KEYS = (
     "lambda_ms",
     "lambda_deriv",
     "lambda_boundary",
+    # The event mechanisms' task-level keys: the gate's sparsity weight and the two contraction
+    # weighting keys, all read by the task and none naming a constructor argument.
+    "lambda_event_gate",
+    "event_weight_floor",
+    "event_weight_reach_steps",
     "causal_warmup_budget_steps",
     # All three alignment keys are resolved against the SHARDS by the trainer and reach the
     # constructor only as the shift tuples, so none of them names a constructor argument.
@@ -132,6 +137,16 @@ FINAL_REVISION_KEYS = (
     "forecast_ar_residual",
     "target_phase_fast_cutoff_hz",
     "target_phase_fast_horizon",
+)
+
+#: The keys the 2026-10-13 event mechanisms added, present in this config and in neither sibling's:
+#: the posterior event gate and its sparsity weight, and the two contraction-weighting keys of the
+#: full branch. Shipped ON here; the two `sweep_no_event_*.yaml` arms are the ablations.
+EVENT_KEYS = (
+    "posterior_event_gate",
+    "lambda_event_gate",
+    "event_weight_floor",
+    "event_weight_reach_steps",
 )
 
 #: The ENCODER edge: what may differ from the conv-LSTM causal cell, and why. Anything not here must
@@ -393,6 +408,7 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         "general_config.lr_warmup_steps",
         *(f"{_VAE}.{key}" for key in ENCODER_KEYS),
         *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
+        *(f"{_VAE}.{key}" for key in EVENT_KEYS),
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -465,6 +481,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         "advanced_config.callbacks.model_checkpoint.secondary_monitor",
         # The final revision's likelihood keys, which no sibling carries.
         *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
+        # The event mechanisms' keys, likewise carried here alone (shipped on; the arms turn them off).
+        *(f"{_VAE}.{key}" for key in EVENT_KEYS),
     }
     assert set(theirs) - set(mine) == set()
 

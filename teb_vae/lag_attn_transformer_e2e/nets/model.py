@@ -1068,6 +1068,8 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         r"""Compute the seven-term objective, per anchor.
 
@@ -1104,6 +1106,10 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
                 an exact zero.
             lambda_deriv: Weight on the derivative Huber shape term, same contract.
             lambda_boundary: Weight on the boundary-continuity shape term, same contract.
+            lambda_event_gate: Weight on the posterior event gate's sparsity term; see the shared
+                implementation. ``0.0`` adds nothing.
+            full_anchor_weight: Optional dense $(B, T)$ weight on the full branch's reconstruction
+                alone; see the shared implementation. ``None`` is the unweighted objective, bitwise.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``; see the shared implementation for the metric
@@ -1131,4 +1137,6 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
         )

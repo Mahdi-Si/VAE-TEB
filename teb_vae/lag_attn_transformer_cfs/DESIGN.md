@@ -1178,3 +1178,85 @@ clock's own floor of 48 at stride 13 (137 dense anchors, 10 to 11 tiles) rather 
 clock's 134. The key is equal on the encoder edge and declared on the target edge, where the
 two-sided stream has no warm-up to fit. The legacy-width configs (`smoke_hie.yaml`, `planted.yaml`,
 `sweep_legacy_dualref_physclock.yaml`) restate the list in the 36 + 15 layout or pin `null`.
+
+## Amendment (2026-10-13): the coupling is sparse in time, and two mechanisms let the objective say so
+
+Both live in the shared parents -- the posterior head in `teb_vae/lag_attn/nets/heads.py`, the
+objective in `teb_vae/lag_attn_rws/nets/losses.py`, the task in `teb_vae/lag_attn_rws/task.py` --
+so every cell whose objective is the shared one takes the same keys (the lag-slot cell has its
+own objective and is untouched). Their constructor and loss defaults are **off**,
+and the off-state is bitwise the model and the objective before the keys existed
+(`tests/test_construct.py` pins `posterior_event_gate=False` beside the other switches, and
+`tests/test_event_mechanisms.py` pins the loss equality). **This cell's `default.yaml` ships both
+on**: the weighting at floor $0$ and reach $55$ steps, the gate at $\lambda_g = 0.05$; the
+`sweep_no_event_gate.yaml` and `sweep_no_event_weight.yaml` arms are the ablations. Within this
+cell every config that inherits the default -- `tiny.yaml`, `smoke_hie.yaml`, `ua_s0_only.yaml` and
+the non-ablation arms -- carries both on, and `planted.yaml` pins both off beside its other
+switches. Every other cell leaves both off.
+
+**The premise.** A contraction can move the FHR; between contractions the source has nothing the
+target's own past lacks. The published UA-to-FHR transfer entropy is about $0.1$ nats, significant
+in $35$ to $44\%$ of $20$-minute epochs. One $\beta$ at every anchor therefore either leaks
+recording-specific structure on the quiet majority of anchors (the measured overfit: train
+`pred_gap` $+56$ against validation $-42$, `DIAGNOSIS.md` §4.3) or erases the signal at the active
+minority. The zero-initialised residual makes collapse a fixed point: its only gradient is the
+full-branch reconstruction averaged over all anchors, mostly noise, against a KL pull that is
+consistent.
+
+**Measure first.** `teb_vae/lag_attn_cfs/eval/coupling_sparsity.py` bins the per-anchor KL and the
+per-anchor gaps of a finished evaluation by `seconds_since_contraction`, with recording-level
+bootstrap intervals and the share of KL mass per bin, and bins the recording-demeaned base NLL by
+hours since labour onset. A KL flat in time while the gap concentrates near contractions is the
+leak; both concentrating is a model that has learned the sparsity on its own.
+
+**Why the weighting is the lever and the gate its complement, by the arithmetic.** The leak is
+worth tens of nats per anchor in-sample against a KL cost of a few nats, so no sparsity weight of
+the order of the real coupling ($0.1$ nats) can close a gate on it, and no $\beta$ short of the one
+that erases the signal can price it out. The weighting removes that reward outright where the
+physiology says there is none, at a floor of $0$; what remains at a quiet anchor is the KL's pull
+on the residual and the gate's small push to close, and both now point the same way. The gate then
+makes the silence exact -- $K_t = 0$ at a closed step rather than a small learned residual -- which
+is what keeps `source_conditioned_kl_raw` a coupling readout rather than a leak readout, and gives
+`event_gate_mean` as the readout of *when* the model listens. At the active anchors the in-sample
+reward dwarfs $\lambda_g$, so the gate stays open there whatever its weight.
+
+**The posterior event gate** (`posterior_event_gate`, constructor; `lambda_event_gate`, task). One
+scalar $g_t = \sigma(w^\top \tilde a_t + b)$ per step, read off the attended source summary before
+its dropout, multiplies both bounded residuals -- so at $g_t = 0$ the posterior *is* the prior and
+$K_t = 0$ exactly, in both `posterior_logvar_mode`s (under `independent` the posterior's raw
+log-variance is interpolated towards the prior's **detached** raw value, so that mode's severed
+gradient path stays severed). The objective adds $\lambda_g \, \beta \, \mathbb E_t[g_t]$ over the
+KL's anchor support, riding the $\beta$ ramp so the residual can find where the source helps before
+it is charged for listening; the gate is seeded open ($b = 2$, $g \approx 0.88$) for the same
+reason. $\beta$ can then sit at the ELBO's $1$: the sparsity term, not $\beta$, handles the quiet
+stretches. The gate is returned as `event_gate` $(B, T, 1)$, tracked as `event_gate_mean` ($1.0$
+on a model without it). The shipped $\lambda_g = 0.05$ is half the published coupling, so a real
+signal keeps its gate open; `sweep_no_event_gate.yaml` is the ablation. A weight on a gate the
+model did not build is refused by name. A checkpoint trained without the gate cannot warm-start a
+gated model as it is, because the strict loader refuses missing keys;
+`teb_vae/lag_attn_rws/seed_event_gate_checkpoint.py` writes a copy with the two gate tensors at
+their constructor seed and `posterior_event_gate: True` in its `model_kwargs`, which the loader
+then accepts.
+
+**The contraction weighting of the full branch** (`event_weight_floor`,
+`event_weight_reach_steps`, task). `teb_vae/lag_attn_rws/event_weight.py` runs the evaluation's own
+contraction detector on the batch's raw UP, mean-pooled to the $4$-s grid, and weights the **full**
+branch's per-anchor block NLL at $1$ within the reach after an onset and at the floor elsewhere, as
+a weighted mean over contributing anchors. The base branch and the KL are untouched, so between
+contractions the source pathway has its cost and no reward. `nll_full_block` and `pred_gap` stay
+the unweighted log-densities; `nll_full_event_block` is what entered the total and
+`event_anchor_frac` the share of scored anchors at weight $1$. The estimand becomes the coupling
+conditional on a contraction. Shipped at floor $0$, because any positive floor leaves the
+in-sample memorisation reward standing at quiet anchors scaled by the floor, where it still
+outweighs the KL; and at a reach of $55$ steps ($220$ s), because a contraction lasts $45$ to
+$120$ s and the FHR recovers over about $90$ s after its peak, so the response can run to about
+$210$ s after onset and an anchor up to there still holds it inside its $120$-s horizon
+(`max_lag`'s $37$ steps would drop the recovery). `sweep_no_event_weight.yaml` is the ablation. The
+evaluation applies neither mechanism's weight, so its nats remain log-densities of the unweighted
+block.
+
+**Where the keys are declared.** This cell's parity tests declare the four keys as its own on
+both edges (`EVENT_KEYS` in `tests/test_config_load.py`); this cell's eval binding carries
+`posterior_event_gate` in `GEOMETRY_KEYS` because it changes what the posterior is, and the
+conv-LSTM cell's binding does not, because its config does not declare the key; and the
+`lag_attn_transformer_patch` cell's delta against this default lists the four as absent there.

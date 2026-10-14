@@ -435,6 +435,20 @@ def reassembled_metrics(
     )
     expected["prior_rate"] = masked_prior_rate(forward_outputs["logvar_prior"], kl_support)
 
+    # The event mechanisms, from their primitives. This harness supplies no anchor weight, so the
+    # full-branch term that enters the total IS the unweighted block and every anchor is active;
+    # the gate's masked mean is the objective's own reduction over the KL support, or the ungated
+    # model's 1.0 when the forward carries no gate.
+    ones = torch.ones((), device=target.device, dtype=dtype)
+    expected["nll_full_event_block"] = expected["nll_full_block"]
+    expected["event_anchor_frac"] = ones
+    gate = forward_outputs.get("event_gate")
+    expected["event_gate_mean"] = (
+        ones.clone()
+        if gate is None
+        else (gate.squeeze(-1) * kl_support).sum() / kl_support.sum().clamp_min(1.0)
+    )
+
     # The shape terms, each over both branches in the objective's own order, and each an exact
     # zero when its weight is zero -- the objective does not compute an unweighted term at all,
     # so its metric is a real zero rather than the value it would have taken.
@@ -464,11 +478,12 @@ def reassembled_metrics(
         + _weight_of("lambda_ms") * expected["aux_multiscale"]
         + _weight_of("lambda_deriv") * expected["aux_derivative"]
         + _weight_of("lambda_boundary") * expected["aux_boundary"]
+        + _weight_of("lambda_event_gate") * _weight_of("beta") * expected["event_gate_mean"]
     )
     expected["pred_gap"] = expected["nll_base_block"] - expected["nll_full_block"]
     expected["kld_beta"] = torch.tensor(_weight_of("beta"), dtype=dtype)
     expected["beta_prior"] = torch.tensor(_weight_of("beta_prior"), dtype=dtype)
-    for name in ("lambda_ms", "lambda_deriv", "lambda_boundary"):
+    for name in ("lambda_ms", "lambda_deriv", "lambda_boundary", "lambda_event_gate"):
         expected[name] = torch.tensor(_weight_of(name), dtype=dtype)
     expected["anchor_coverage_frac"] = coverage_frac[:, geometry.warmup :].mean()
 
