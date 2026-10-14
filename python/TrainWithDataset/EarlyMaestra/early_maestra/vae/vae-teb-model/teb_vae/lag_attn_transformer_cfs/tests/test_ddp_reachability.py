@@ -113,6 +113,10 @@ def test_under_mse_the_starved_set_is_exactly_the_decoder_logvar_head(
 #: final revision. ``forecast_ar_residual`` is the fourth parameter-building switch: its AR(1) logit
 #: is a loose parameter seeded at exactly zero -- the state in which a dropped multiply is
 #: invisible -- and it reaches the loss only through the reconstruction terms.
+#: ``posterior_event_gate`` (shipped on since 2026-10-13) is the fifth: its linear is seeded with a
+#: zero weight, so at step 0 the gate is input-independent and the only path to its weight is the
+#: residual it multiplies, which is itself zero-seeded -- two zeros in series, each one a state in
+#: which an unreached parameter looks like a quiet one.
 _SHIPPED_SWITCHES = dict(
     lag_kv_source="adapter",
     prior_availability_input=True,
@@ -121,6 +125,7 @@ _SHIPPED_SWITCHES = dict(
     lag_bias_init="alibi_decay",
     persistence_residual=True,
     forecast_ar_residual=True,
+    posterior_event_gate=True,
 )
 
 
@@ -132,6 +137,8 @@ _EXPECTED_NEW_PARAMETERS = (
     "decoder.persistence_weight",
     "lag_attn.lag_score_bias",
     "target_ar_logit",
+    "posterior_head.event_gate_head.weight",
+    "posterior_head.event_gate_head.bias",
 )
 
 

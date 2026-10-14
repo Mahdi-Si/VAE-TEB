@@ -89,6 +89,11 @@ _METRIC_SUFFIXES = (
     # nll_* columns are the pure-nats readouts.
     "aux_multiscale", "aux_derivative", "aux_boundary",
     "lambda_ms", "lambda_deriv", "lambda_boundary",
+    # The two event mechanisms. ``nll_full_event_block`` is the full-branch term that entered the
+    # total (the unweighted ``nll_full_block`` itself when no contraction weight is configured) and
+    # ``event_anchor_frac`` the share of scored anchors at weight 1; ``event_gate_mean`` is the
+    # posterior event gate's masked mean (1.0 on a model without the gate) beside its echoed weight.
+    "nll_full_event_block", "event_anchor_frac", "event_gate_mean", "lambda_event_gate",
     "anchor_coverage_frac",
     # The decoder-output variances (mean_logvar_full/base) do NOT detect a prior variance
     # pinned on its clamp; mean_logvar_prior and logvar_prior_floor_frac are the watch for the
@@ -371,6 +376,9 @@ class LagAttnRwsTrainer(GraphModelBase):
             lambda_ms=vae_config.get("lambda_ms", 0.0),
             lambda_deriv=vae_config.get("lambda_deriv", 0.0),
             lambda_boundary=vae_config.get("lambda_boundary", 0.0),
+            lambda_event_gate=vae_config.get("lambda_event_gate", 0.0),
+            event_weight_floor=vae_config.get("event_weight_floor"),
+            event_weight_reach_steps=vae_config.get("event_weight_reach_steps"),
             compile_model=self.compile_model_requested(),
         )
         # Re-forces the config's values onto hparams, so a checkpoint-restored run follows the
