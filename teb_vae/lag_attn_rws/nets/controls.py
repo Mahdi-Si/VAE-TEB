@@ -74,6 +74,11 @@ __all__ = [
 #:
 #: So the set is named here, beside the function that decides it, and a consumer that needs a
 #: shuffled quantity not on this list recomputes it from these keys rather than reading it.
+#:
+#: On a model built with the posterior event gate, ``event_gate`` is recomputed too, by every arm:
+#: it is read off the substituted source summary exactly as the posterior it multiplies is. It is
+#: absent from this tuple and the two below because a model without the gate has no such key to
+#: replace, and these tuples describe what is replaced on every model.
 RECOMPUTED_KEYS: Tuple[str, ...] = (
     "mu_post",
     "logvar_post",
@@ -121,7 +126,10 @@ def _attend_and_pose(
       :class:`LagCrossAttention` would build by default, so a model restricting which lags it may
       read cannot have that restriction bypassed by a control alone.
     * The posterior head is handed the matched forward's target state and prior, so the only thing
-      that moved between the matched call and this one is the attended source.
+      that moved between the matched call and this one is the attended source -- and, on a model
+      with the posterior event gate, the gate is recomputed from the substituted summary too, so
+      a stranger's source is also judged by the gate it would have opened, and the recomputed gate
+      is returned beside the posterior so each arm can carry it under ``event_gate``.
 
     Args:
         model: The model whose modules are re-run.
@@ -130,8 +138,9 @@ def _attend_and_pose(
         h_u: The source state to attend over, ``(B, T, d_model)``.
 
     Returns:
-        ``(alpha, mu_post, logvar_post)``: the attention weights and the posterior's two
-        distribution parameters under that source state.
+        ``(alpha, mu_post, logvar_post, gate)``: the attention weights, the posterior's two
+        distribution parameters under that source state, and the event gate recomputed from it --
+        ``None`` on a model built without the gate.
     """
     mu_prior = forward_outputs["mu_prior"]
     query = (
@@ -144,13 +153,15 @@ def _attend_and_pose(
         h_u,
         model.build_lag_mask(h_u.shape[1], h_u.device),
     )
+    gate = model.posterior_head.event_gate_values(attended_heads)
     mu_post, logvar_post = model.posterior_head(
         forward_outputs["target_state"],
         attended_heads,
         mu_prior,
         forward_outputs["raw_logvar_prior"],
+        gate=gate,
     )
-    return alpha, mu_post, logvar_post
+    return alpha, mu_post, logvar_post, gate
 
 
 @torch.no_grad()
@@ -245,7 +256,7 @@ def perm_forward_outputs(
     # The query, the attention under the model's own lag mask, and the posterior head: the tail
     # this arm shares with the source-null one, which is why it is one function rather than two
     # copies. What makes this arm a *permutation* is the single index below and nothing else.
-    alpha_perm, mu_post_perm, logvar_post_perm = _attend_and_pose(
+    alpha_perm, mu_post_perm, logvar_post_perm, gate_perm = _attend_and_pose(
         model, forward_outputs, h_u[perm_index]
     )
     z_post_perm = mu_post_perm + torch.randn_like(mu_post_perm) * torch.exp(
@@ -276,6 +287,8 @@ def perm_forward_outputs(
         logvar_full=logvar_full_perm,
         perm_index=perm_index,
     )
+    if gate_perm is not None:
+        permuted["event_gate"] = gate_perm
     return permuted
 
 
@@ -361,7 +374,7 @@ def source_null_forward_outputs(
     # model built -- not the attention.
     h_u_null = encoded.expand(u_stream.shape[0], -1, -1)
 
-    alpha_null, mu_post_null, logvar_post_null = _attend_and_pose(
+    alpha_null, mu_post_null, logvar_post_null, gate_null = _attend_and_pose(
         model, forward_outputs, h_u_null
     )
 
@@ -371,6 +384,8 @@ def source_null_forward_outputs(
         logvar_post=logvar_post_null,
         attn_weights=alpha_null,
     )
+    if gate_null is not None:
+        nulled["event_gate"] = gate_null
     return nulled
 
 
@@ -469,7 +484,7 @@ def occluded_forward_outputs(
         occluded = source * (keep[:, :, None] if keep.dim() == 2 else keep[None, :, None])
 
     h_u = model.encode_source_kv(occluded)
-    alpha, mu_post, logvar_post = _attend_and_pose(model, forward_outputs, h_u)
+    alpha, mu_post, logvar_post, gate = _attend_and_pose(model, forward_outputs, h_u)
 
     # Drawn rather than reused from the matched forward: the posterior moved, so its own
     # reparameterisation has to be re-run against the moved parameters. What is held fixed across
@@ -505,6 +520,8 @@ def occluded_forward_outputs(
         logvar_full=logvar_full,
         source_state=h_u,
     )
+    if gate is not None:
+        occluded_outputs["event_gate"] = gate
     return occluded_outputs
 
 

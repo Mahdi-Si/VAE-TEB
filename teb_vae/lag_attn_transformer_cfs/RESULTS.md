@@ -110,6 +110,7 @@ a fixed threshold on any of them would be a guess dressed as a gate.
 | 4 | `pred_gap_warm_lo + _mid + _hi`, `pred_gap_novel_lo + _mid + _hi` and `pred_gap_st + pred_gap_ph` agree with each other on every logged row, to `1e-6` relative | `metrics_history.csv` | | |
 | 5 | Two evaluations of the final checkpoint produce an identical metric row set | two run directories | | |
 | 6 | The resolved configuration states every architecture switch and both alignment references, and the run's identity keys name the arm | `resolved_config.yaml` | | |
+| 7 | The event mechanisms' columns match the configured arm: `event_anchor_frac` in `[0.05, 0.95]` on every row when `event_weight_floor` is set and exactly `1.0` otherwise; `event_gate_mean` strictly inside `(0, 1)` on every row when `posterior_event_gate` is on and exactly `1.0` otherwise | `metrics_history.csv` with `resolved_config.yaml` | | |
 
 Criterion 1 is a **stamped provenance column**, not a runtime measurement: it is resolved at
 construction and the constructor already refuses a violating budget-and-floor pairing, so a value
@@ -128,6 +129,14 @@ history saying so — which is how a finished evaluation of this cell once came 
 aligned arm when the run had trained unaligned. Presence rather than value is what is asserted: each
 of the seven keys has a comparison arm on the other side of it, so no single value is the right one.
 The parent's `check_run.py` scores it off a run directory of either cell.
+
+Criterion 7 (2026-10-13) is the one geometry criterion of the two event mechanisms. Both columns
+have an exact off-state, so a run whose configuration leaves a mechanism off and whose column moves
+anyway trained something other than its configuration states; and the weighting's on-state is a
+band because its two edges are two different failures -- a share at $0$ is a contraction detector
+that found nothing on these shards (stop the run and inspect the UP traces), a share at $1$ is a
+weight that does nothing. The gate's on-state is the open interval a sigmoid lives in. What either
+column reads *inside* its band is tier 2.
 
 ### Tier 2 — reported and interpreted
 
@@ -424,6 +433,8 @@ name from the seven `_PACKAGES` tuples. Nothing outside it imports it.
 | `train/spike_skipped` sustained above zero | | stop; the margin is mis-tuned for this objective |
 | `target_warm_frac` other than `1.0` | any row | stop; the geometry broke, and every nat on the page is over the wrong block |
 | `anchors_per_sample` outside its band | any row | stop; the tiling is not the one the configuration states |
+| `train/event_anchor_frac` below `0.05` with `event_weight_floor` set | any row | stop; the contraction detector found no contraction on these shards, so the full branch trains on nothing -- inspect the UP traces before anything else |
+| `train/event_gate_mean` exactly `1.0` with `posterior_event_gate` on, or off `1.0` with it off | any row | stop; the gate the configuration states is not the one that trained |
 | `lr` flat at its base value from step 0 | | investigate; the step-granular ramp did not engage |
 | `train/grad_clip_frac` near 1 | | investigate; the clip is binding on ordinary steps rather than on blow-ups |
 

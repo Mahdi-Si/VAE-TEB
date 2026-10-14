@@ -151,12 +151,13 @@ def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(d
     all: the driver resolves it against the configured shards into the four tuples the network
     takes, and those are what land in every checkpoint. The widths are the committed
     integer-operator fixture's survivors: the budget takes target channels off, and on the promoted
-    unaligned default every source channel survives."""
+    unaligned default `causal_source_channels` (2026-10-11) keeps 42 of the 46 source channels --
+    the four slowest `up_st` channels, whose warm-up outlasts the anchor floor, are named out."""
     kwargs = driver._build_model_kwargs()
 
     assert "causal_warmup_budget_steps" not in kwargs
     assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 76
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 46
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 42
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 

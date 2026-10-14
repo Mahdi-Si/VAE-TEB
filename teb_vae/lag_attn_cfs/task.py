@@ -459,9 +459,12 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             anchor_valid = forward_outputs.get("anchor_valid")
             # The forecast clock's pooled validity, so this mask is the one the objective scored
             # under -- the identity object on the stored clock. The index is the forward's own and
-            # the objective already validated it this step, so neither build validates again.
+            # the objective already validated it this step, so neither build validates again. A
+            # raw-target cell composing this task (the crws pair) has no forecast clock and so no
+            # pooling to apply: its validity is the loader's own.
+            scored_weight = getattr(model, "scored_weight", None)
             forecast, _coverage = forecast_mask(
-                model.scored_weight(weight),
+                weight if scored_weight is None else scored_weight(weight),
                 model.geometry,
                 coverage_floor=model.coverage_floor,
                 anchors=anchors,

@@ -35,6 +35,13 @@ from teb_vae.lag_attn.nets.blocks import (
 #: tensor. ``'independent'`` gives the posterior its own head and severs that path.
 POSTERIOR_LOGVAR_MODES = ("residual", "independent")
 
+#: Bias the posterior's event gate is seeded at, so the gate starts **open** ($\sigma(2) \approx
+#: 0.88$) and the sparsity term closes it where the source earns nothing. Seeded closed, the gate
+#: would multiply the zero-initialised residual's only gradient by a small number before that
+#: residual had found anything -- the collapse the gate exists to prevent.
+# ponytail: a constant; promote to a constructor keyword when an arm needs to sweep it.
+EVENT_GATE_BIAS_INIT = 2.0
+
 
 class PriorHead(nn.Module):
     r"""Target-only prior $p(z_t \mid Y_{\le t})$ and the decoder conditioning state.
@@ -172,6 +179,7 @@ class PosteriorHead(nn.Module):
         delta_logvar_scale: float = 2.0,
         posterior_logvar_mode: str = "residual",
         source_dropout: float = 0.0,
+        event_gate: bool = False,
     ) -> None:
         r"""Initialize the posterior head.
 
@@ -216,6 +224,16 @@ class PosteriorHead(nn.Module):
                 structural. It is recovered exactly under ``head_init_calibration``, which pins
                 the prior's raw log-variance to a constant that the model's init also writes into
                 this head; without that flag the KL starts small but nonzero.
+            event_gate: Build the **event gate**: one scalar $g_t = \sigma(w^\top \tilde a_t + b)$
+                per step, read off the same normalised attended source summary the fusion
+                consumes, that multiplies both bounded deltas. At $g_t = 0$ the posterior *is* the
+                prior at step $t$ -- $K_t = 0$ exactly, in both modes -- so a sparsity cost on
+                $\mathbb E_t[g_t]$ (``lambda_event_gate`` in the objective) charges the model for
+                *when* it listens to the source rather than only for how much, which is what lets
+                $\beta$ sit at the ELBO's $1$ on a coupling that is present at a minority of the
+                anchors. ``False`` -- the default -- builds no gate and is bitwise the head before
+                the keyword existed. The gate reads the summary *before* ``source_dropout``: a gate
+                that opened and closed with a dropout mask would be noise, not a decision.
 
         Raises:
             ValueError: If either scale is not positive, or if ``head_structured`` is set and
@@ -311,12 +329,58 @@ class PosteriorHead(nn.Module):
             logvar_head if self.posterior_logvar_mode == "independent" else None
         )
 
+        # The event gate, when asked for: one linear readout over every head's normalised summary
+        # (or the flat one), seeded open. ``None`` otherwise, so ``event_gate_values`` has nothing
+        # to compute and the forward's gate argument stays ``None`` -- the bitwise off-state.
+        self.event_gate_head: Optional[nn.Linear] = None
+        if event_gate:
+            gate_in = self.num_heads * self.d_head if self.head_structured else d_model
+            self.event_gate_head = nn.Linear(gate_in, 1)
+            self.zero_init_event_gate()
+
+    def zero_init_event_gate(self) -> None:
+        r"""Seed the event gate open: zero weight, bias :data:`EVENT_GATE_BIAS_INIT`.
+
+        Called by the constructor and **again** by the model after its generic initialisation pass,
+        which xavier-fills every ``nn.Linear`` and would otherwise hand the gate a random,
+        input-dependent opening at step $0$. A no-op on a head built without the gate.
+        """
+        if self.event_gate_head is None:
+            return
+        nn.init.zeros_(self.event_gate_head.weight)
+        nn.init.constant_(self.event_gate_head.bias, EVENT_GATE_BIAS_INIT)
+
+    def event_gate_values(self, a: torch.Tensor) -> Optional[torch.Tensor]:
+        r"""The event gate $g_t \in (0, 1)$ at every step, or ``None`` on a head without one.
+
+        Computed from the attended summary alone -- the same tensor the fusion reads, normalised
+        the same way, without the source dropout -- so a control that substitutes the source
+        recomputes the gate from the substituted summary by calling this on it.
+
+        Args:
+            a: Attended source summary -- ``(B, T, d_model)`` flat, or
+                ``(B, T, num_heads, d_head)`` head-structured.
+
+        Returns:
+            The gate ``(B, T, 1)``, or ``None`` when no gate was built.
+        """
+        if self.event_gate_head is None:
+            return None
+        if self.head_structured:
+            summary = torch.cat(
+                [self.a_head_norm(a[:, :, index, :]) for index in range(self.num_heads)], dim=-1
+            )
+        else:
+            summary = self.a_norm(a)
+        return torch.sigmoid(self.event_gate_head(summary))
+
     def forward(
         self,
         h_y: torch.Tensor,
         a: torch.Tensor,
         mu_prior: torch.Tensor,
         raw_logvar_prior: Optional[torch.Tensor] = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Produce the posterior as a bounded residual around the prior.
 
@@ -327,6 +391,9 @@ class PosteriorHead(nn.Module):
             mu_prior: Prior mean ``(B, T, d_z)``, the base of the mean residual.
             raw_logvar_prior: Prior pre-bound raw log-variance ``(B, T, d_z)``, the base of the
                 log-variance residual.
+            gate: The event gate ``(B, T, 1)`` from :meth:`event_gate_values`, or ``None`` for the
+                ungated residual. Threaded by the caller rather than computed here so the model
+                can return it and the objective can charge for it.
 
         Returns:
             ``(mu_post, logvar_post)``, both ``(B, T, d_z)``.
@@ -368,6 +435,9 @@ class PosteriorHead(nn.Module):
         # tanh(0) = 0, so with the delta heads zero-initialised both deltas are identically 0
         # at init and the posterior collapses onto the prior exactly.
         delta_mu = self.delta_mu_scale * torch.tanh(raw_delta / self.delta_mu_scale)
+        if gate is not None:
+            # After the bound, so |delta| <= s still holds and g = 0 closes the residual exactly.
+            delta_mu = delta_mu * gate
         mu_post = mu_prior + delta_mu
 
         raw_logvar_post = self._run_logvar_head(fused_heads, fused_flat)
@@ -375,12 +445,19 @@ class PosteriorHead(nn.Module):
             delta_logvar = (
                 self.delta_logvar_scale * torch.tanh(raw_logvar_post / self.delta_logvar_scale)
             )
+            if gate is not None:
+                delta_logvar = delta_logvar * gate
             # Bound the summed raw value: smooth_bound is not idempotent, so bounding the prior
             # and then adding would leave logvar_post != logvar_prior at init.
             logvar_post = smooth_bound(raw_logvar_prior + delta_logvar, *self.logvar_clamp)
         else:
-            # `raw_logvar_prior` is not read here, which is the whole point of the mode: no
-            # gradient from the full branch's reconstruction reaches the prior's log-variance
+            if gate is not None:
+                # Interpolate in the pre-bound space towards the prior's DETACHED raw value: at
+                # g = 0 the posterior's scale is the prior's, so a closed gate is q = p in both
+                # moments, and the detach keeps this mode's severed path severed.
+                raw_logvar_post = gate * raw_logvar_post + (1.0 - gate) * raw_logvar_prior.detach()
+            # `raw_logvar_prior` is otherwise not read here, which is the whole point of the mode:
+            # no gradient from the full branch's reconstruction reaches the prior's log-variance
             # through this head.
             logvar_post = smooth_bound(raw_logvar_post, *self.logvar_clamp)
 

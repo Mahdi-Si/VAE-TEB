@@ -93,6 +93,8 @@ class PatchSummaryTarget:
         lambda_ms: float = 0.0,
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
+        lambda_event_gate: float = 0.0,
+        full_anchor_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """The shared objective on the summaries of tokens ``a + 1 .. a + H`` per decoded anchor.
 
@@ -127,6 +129,8 @@ class PatchSummaryTarget:
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            lambda_event_gate=lambda_event_gate,
+            full_anchor_weight=full_anchor_weight,
             horizon_weight=getattr(self, "horizon_weight", None),
             **self.forecast_likelihood_kwargs(),
         )
