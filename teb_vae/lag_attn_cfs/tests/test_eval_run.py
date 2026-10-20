@@ -473,8 +473,9 @@ def test_the_summary_records_both_values_of_every_override(collected_run) -> Non
     for path, record in entries.items():
         assert "run_value" in record and "eval_value" in record, path
     assert "dataset_config.vae_test_datasets" in entries
-    assert "dataset_config.stat_path" in entries, (
-        "this cell repoints the statistics too, which the raw cells' delta does not"
+    assert "dataset_config.stat_path" not in entries, (
+        "the evaluation normalises with the run's own statistics file, so the delta must not "
+        "override it"
     )
 
 

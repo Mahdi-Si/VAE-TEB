@@ -448,7 +448,7 @@ def trf_cohort_run(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="session")
 def trf_cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
-    """**This package's** committed evaluation delta with its two placeholder leaves repointed.
+    """**This package's** committed evaluation delta with its placeholder leaf repointed.
 
     Exactly the edit an operator makes to that file before a real run, rather than a bespoke
     overrides file: a delta carrying only the shard paths would **replace** the committed one, and
@@ -461,13 +461,16 @@ def trf_cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
 
     Session-scoped and written once; treat as read-only.
 
-    Three leaves are repointed rather than two, and the third is not a placeholder. The occlusion
+    Two leaves are repointed rather than one, and the second is not a placeholder. The occlusion
     bands are stated in **production lag indices** and the schema refuses a band reaching past the
     model's own ``max_lag`` -- correctly, because a band whose top the attention cannot read would
     score nothing there while its name claimed otherwise. The tiny geometry these fixtures run at
     shrinks that window, so the bands are rescaled to it rather than the refusal being loosened.
     Rescaled through the causal cell's own helper, because the two cells' deltas are asserted equal
     key for key and a second rescaling rule here could make them disagree.
+
+    ``stat_path`` is not set: the evaluation inherits the run's own statistics file, which the
+    cohort run trained with.
     """
     import yaml
 
@@ -478,7 +481,6 @@ def trf_cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
 
     overrides = load_eval_overrides(TRF_CFS_BINDING.overrides_path)
     overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
-    overrides["dataset_config"]["stat_path"] = cohort_stats
     tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_transformer_cfs" / "configs" / "tiny.yaml"
     overrides["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
         int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])

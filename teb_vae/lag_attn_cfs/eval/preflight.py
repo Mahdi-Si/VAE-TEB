@@ -1596,9 +1596,9 @@ GUARD_RECOVERY: Dict[str, Dict[str, str]] = {
     "check_repointed": {
         "cause": "a shard path or stat_path still carries the REPOINT_ME placeholder",
         "recovery": (
-            "edit dataset_config.vae_test_datasets and dataset_config.stat_path in "
-            "eval/configs/eval_overrides.yaml to name the causal holdout split and its statistics "
-            "file"
+            "edit dataset_config.vae_test_datasets in eval/configs/eval_overrides.yaml to name the "
+            "causal holdout split; stat_path is inherited from the checkpoint's resolved config "
+            "and must name the statistics file the run trained with"
         ),
     },
     "check_test_shards_exist": {
@@ -1612,8 +1612,8 @@ GUARD_RECOVERY: Dict[str, Dict[str, str]] = {
     "check_stat_path": {
         "cause": "dataset_config.stat_path is unset or names a file that is not there",
         "recovery": (
-            "regenerate it with hdf5_dataset/calculate_dataset_stats.py from the configured causal "
-            "shards at trim_minutes=1.0, and set dataset_config.stat_path to the result"
+            "make the statistics file the run trained with reachable at the path its resolved "
+            "config names; the evaluation inherits it and must not normalise with another file"
         ),
     },
     "check_trim_minutes": {

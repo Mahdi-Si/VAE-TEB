@@ -397,13 +397,13 @@ def test_the_command_reports_both_halves_against_a_real_checkpoint(
 
     from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
 
-    # The committed delta with its two placeholder leaves repointed -- which is exactly the edit an
+    # The committed delta with its placeholder leaf repointed -- which is exactly the edit an
     # operator makes to that file -- rather than a bespoke overrides file. A delta carrying only the
     # shard paths would REPLACE the committed one, and with it the clinical `load_fields` the
-    # population pass requires: the loader skips a field it was not asked for, silently.
+    # population pass requires: the loader skips a field it was not asked for, silently. The
+    # statistics file is the run's own, inherited from its resolved config.
     overrides: Dict[str, Any] = load_eval_overrides()
     overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
-    overrides["dataset_config"]["stat_path"] = cohort_stats
     overrides_path = tmp_path / "overrides.yaml"
     overrides_path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
     checkpoint = sorted((cohort_run / "model_checkpoints").glob("*.ckpt"))[0]

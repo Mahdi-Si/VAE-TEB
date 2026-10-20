@@ -779,10 +779,11 @@ model_config:
     # Both mechanisms enter `val/total_loss`, the primary checkpoint monitor, on every stage; the
     # secondary monitor `val/nll_full_block` stays the unweighted log-density.
     #
-    # REACH 55 STEPS (220 s), not `max_lag`'s 37: a contraction lasts 45-120 s and the FHR recovers
-    # over about 90 s after its peak, so the response can run to ~210 s after onset, and an anchor
-    # up to there still holds the response inside its 120-s horizon. 55 rounds that up. A null
-    # floor is OFF (the unweighted objective, bitwise); a null reach resolves to `max_lag`.
+    # REACH 55 STEPS (220 s), not `max_lag`'s 37: a contraction lasts 45-90 s (the figure the paper
+    # cites) and the FHR recovers over about 90 s after its peak, so the response can run to about
+    # 180 s after onset; 220 s covers that with 40 s to spare for a long contraction, and an anchor
+    # inside it still holds the response in its 120-s horizon. A null floor is OFF (the unweighted
+    # objective, bitwise); a null reach resolves to `max_lag`.
     # `sweep_no_event_weight.yaml` is the ablation.
     event_weight_floor: 0.0
     event_weight_reach_steps: 55

@@ -18,7 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from teb_vae.lag_attn_cfs.eval.config_schema import DEFAULTS, VALID_KEYS, validate_eval_config
+from teb_vae.lag_attn_cfs.eval.config_schema import (
+    DEFAULTS,
+    FALLBACK_EVENT_LAG_WINDOW_S,
+    SECONDS_PER_STEP,
+    VALID_KEYS,
+    validate_eval_config,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,7 +50,9 @@ def test_an_unknown_key_raises_and_names_the_valid_set() -> None:
 def test_absent_keys_are_filled_from_the_defaults() -> None:
     resolved = validate_eval_config({})
     assert set(resolved) == set(VALID_KEYS)
-    assert resolved == DEFAULTS
+    # The one default that is resolved rather than copied: an unset event window with no training
+    # contraction reach to derive it from is the fallback window.
+    assert resolved == {**DEFAULTS, "event_lag_window_s": FALLBACK_EVENT_LAG_WINDOW_S}
 
     partial = validate_eval_config(_config(seed=7))
     assert partial["seed"] == 7
@@ -79,6 +87,16 @@ def test_the_horizon_floor_is_one_trajectory_bin() -> None:
     from teb_vae.lag_attn_cfs.eval.config_schema import _MIN_HORIZON_HOURS
 
     assert _MIN_HORIZON_HOURS == TRAJECTORY_BIN_HOURS
+
+
+def test_the_step_length_and_the_fallback_window_match_the_modules_they_restate() -> None:
+    """The event window derivation restates the step length rather than importing ``lag_report``,
+    which imports ``torch``; and its fallback is the window the strata pass uses on its own."""
+    from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP as REPORT_SECONDS_PER_STEP
+    from teb_vae.lag_attn_cfs.eval.attribution_strata import DEFAULT_CONTRACTION_WINDOW_S
+
+    assert SECONDS_PER_STEP == REPORT_SECONDS_PER_STEP
+    assert FALLBACK_EVENT_LAG_WINDOW_S == DEFAULT_CONTRACTION_WINDOW_S
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +178,77 @@ def test_an_operator_typed_format_is_normalised(given: str, expected: str) -> No
     resolved = validate_eval_config({"eval_config": {"figure_format": given}})
 
     assert resolved["figure_format"] == expected
+
+
+# ---------------------------------------------------------------------------
+# The event window and the training contraction reach
+# ---------------------------------------------------------------------------
+def _with_reach(window, **vae) -> dict:
+    return {"eval_config": {"event_lag_window_s": window}, "model_config": {"VAE_model": vae}}
+
+
+@pytest.mark.parametrize(
+    "vae, expected",
+    [
+        # The shipped conv-Transformer cell: R = 55 steps at 16 raw samples per 4 s step.
+        ({"event_weight_floor": 0.0, "event_weight_reach_steps": 55, "raw_per_step": 16}, 223.875),
+        # The no-weighting ablation keeps the reach, so it is evaluated on the same event anchors.
+        ({"event_weight_floor": None, "event_weight_reach_steps": 55, "raw_per_step": 16}, 223.875),
+        # Training's own fallback: a null reach under a set floor is the lag window.
+        ({"event_weight_floor": 0.0, "event_weight_reach_steps": None, "max_lag": 37,
+          "raw_per_step": 16}, 151.875),
+        # No contraction weighting configured at all.
+        ({"max_lag": 90, "raw_per_step": 16}, FALLBACK_EVENT_LAG_WINDOW_S),
+    ],
+    ids=["shipped", "ablation", "null-reach", "no-weighting"],
+)
+def test_an_unset_event_window_is_derived_from_the_training_reach(vae: dict, expected: float) -> None:
+    assert validate_eval_config(_with_reach(None, **vae))["event_lag_window_s"] == expected
+
+
+def test_a_set_event_window_is_kept_and_warned_about_when_it_disagrees() -> None:
+    """An explicit window is the operator's choice and stays, but a window that splits anchors
+    differently from the objective says so in the log."""
+    from loguru import logger
+
+    messages: list = []
+    sink_id = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        vae = {"event_weight_floor": 0.0, "event_weight_reach_steps": 55, "raw_per_step": 16}
+        assert validate_eval_config(_with_reach(120.0, **vae))["event_lag_window_s"] == 120.0
+        assert any("splits anchors differently" in str(message) for message in messages)
+        messages.clear()
+        # Within half a raw sample of the derived 223.875 s: the same anchors, so no warning.
+        assert validate_eval_config(_with_reach(223.9, **vae))["event_lag_window_s"] == 223.9
+        assert not messages
+    finally:
+        logger.remove(sink_id)
+
+
+def test_the_derived_window_selects_exactly_the_anchors_training_weighted() -> None:
+    """The identity the derivation rests on, checked on the two grids the code actually uses.
+
+    Training floors each raw onset onto the decimated grid and weights anchors $[o, o + R]$
+    (``contraction_anchor_weight``); the collection pass measures the age from the raw onset to the
+    anchor's last raw sample (``Collector._contraction_ages``). The derived window must split the
+    second exactly where the first ends, under both the inclusive and the strict comparison the
+    analyses use, for every onset phase inside a step.
+    """
+    from teb_vae.lag_attn_cfs.eval.events import FS_RAW
+
+    raw_per_step, reach = 16, 55
+    assert FS_RAW == raw_per_step / SECONDS_PER_STEP
+    window = validate_eval_config(
+        _with_reach(None, event_weight_floor=0.0, event_weight_reach_steps=reach,
+                    raw_per_step=raw_per_step)
+    )["event_lag_window_s"]
+    for onset_raw in range(10 * raw_per_step, 11 * raw_per_step):
+        onset_step = onset_raw // raw_per_step
+        for anchor in range(onset_step, onset_step + reach + 10):
+            age = (raw_per_step * (anchor + 1) - 1 - onset_raw) / FS_RAW
+            trained = anchor - onset_step <= reach
+            assert (age <= window) == trained, (onset_raw, anchor, age)
+            assert (age < window) == trained, (onset_raw, anchor, age)
 
 
 # ---------------------------------------------------------------------------
