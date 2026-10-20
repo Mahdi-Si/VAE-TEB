@@ -13,7 +13,8 @@ pass asks two paired questions instead, inside one late window:
    trace (:func:`~teb_vae.lag_attn_cfs.eval.events.detect_contractions`) and writes
    ``seconds_since_contraction`` per anchor. An anchor with $0 \le a < w$ seconds since the last
    onset is ``ua_contraction``; an anchor with $a \ge w$, or with no onset behind it, is
-   ``ua_quiet``. $w$ is ``eval_config.event_lag_window_s`` ($120$ s by default). Only segments
+   ``ua_quiet``. $w$ is ``eval_config.event_lag_window_s``, derived from the checkpoint's training
+   contraction reach when unset ($120$ s for a run trained with none). Only segments
    with at least one contraction anchor give UA strata, so a flat UP trace is not read as "between
    contractions".
 

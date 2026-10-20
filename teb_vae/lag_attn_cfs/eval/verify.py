@@ -21,8 +21,9 @@ different outcome from the criterion being met and is **never counted as a pass*
 inconclusive rows says so, so a partially-verified run cannot be mistaken for a fully verified one.
 
 ``eval_config.clock_margin_min_nats`` is the standing example. The schema default is unset,
-which makes ``coupling_exceeds_availability_clock`` INCONCLUSIVE; the committed override delta sets
-it from measured data. Either way the measurement reaches the arm tables through the
+which makes ``coupling_exceeds_availability_clock`` INCONCLUSIVE, and the committed override deltas
+leave it unset until a run of the current configuration has measured it. Either way the
+measurement reaches the arm tables through the
 ``coupling_minus_clock_nats`` headline scalar, which is what makes setting the threshold from data
 possible at all.
 
