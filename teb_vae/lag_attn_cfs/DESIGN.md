@@ -1400,11 +1400,16 @@ What it **closed**, each having been a standing gap in this section:
   the same console block as the delay and carried in `summary.json` with the *configured*, *built*
   and *resolved* readings separated — so a config naming one arm while the checkpoint carries
   another is visible rather than merged away.
-- **`clock_margin_min_nats` is set**, at $0.15$ nats, so `coupling_exceeds_availability_clock` is a
-  real gate and the acceptance set is ten criteria rather than nine. The provenance is stated beside
-  the value in both cfs cells' `eval_overrides.yaml`: the diagnosed unaligned run's observed
-  $\Delta_{\mathrm{clock}} = 0.160$ with interval $[0.157, 0.164]$. The margin's provenance is the
-  unaligned arm; the gated quantity is right on both arms.
+- **`clock_margin_min_nats` is unset**, so `coupling_exceeds_availability_clock` is INCONCLUSIVE
+  with $\Delta_{\mathrm{clock}}$ still emitted. It was set at $0.15$ nats from the diagnosed H = 15
+  unaligned run ($\Delta_{\mathrm{clock}} = 0.160$, interval $[0.157, 0.164]$); neither cfs cell
+  trains that configuration now, so both cells' `eval_overrides.yaml` carry `null` until a run of
+  the current configuration has measured it. The gated quantity is right on every alignment arm.
+- **`event_lag_window_s` is derived from the checkpoint** when unset, which is how both cells ship
+  it: $w = 4(R + 1) - 0.125$ s from the run's own `event_weight_reach_steps` $R$, so the event and
+  control anchors are exactly the anchors the training contraction weighting scored at $1$ and at
+  the floor. A run trained with no reach, which is this cell's shipped configuration, resolves to
+  $120$ s.
 
 What it deliberately does **not** do, so each is a known absence rather than an oversight:
 

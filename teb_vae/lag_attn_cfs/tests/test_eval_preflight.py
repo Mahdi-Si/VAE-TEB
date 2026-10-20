@@ -940,7 +940,6 @@ def test_a_real_run_preflights_against_the_shards_it_was_trained_on(
         load_config(str(cohort_run / "model_checkpoints" / RESOLVED_CONFIG_FILENAME))
     )
     merged["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
-    merged["dataset_config"]["stat_path"] = cohort_stats
 
     blob = probe.read_checkpoint(checkpoint)
     task = probe.load_task(checkpoint, torch.device("cpu"), blob=blob)

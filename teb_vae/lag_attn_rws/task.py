@@ -41,13 +41,14 @@ exists to check.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from loguru import logger
 from torch import nn
 
+from teb_vae.lag_attn_rws.eval import events as rws_events
 from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
@@ -642,6 +643,20 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         return {}
 
+    def _event_detector(self) -> Callable[..., Dict[str, Any]]:
+        r"""The contraction detector the contraction weight runs: this cell's own evaluation's.
+
+        A hook, because the two evaluation packages carry two copies of ``detect_contractions`` that
+        differ in one rule (the causal-feature copy drops a peak whose onset walk finds no rising
+        edge), and a training weight must name the same events as the per-anchor table its cell's
+        collection pass writes. The raw-signal cells' detector here; the causal-feature task
+        overrides it with its own evaluation's.
+
+        Returns:
+            The detector callable, with the evaluation module's signature.
+        """
+        return rws_events.detect_contractions
+
     def _event_anchor_weight(
         self, batch: Any, weight: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -690,6 +705,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             floor=float(floor),
             keys=keys,
             cache=self._event_onset_cache,
+            detector=self._event_detector(),
         )
 
     # ------------------------------------------------------------------

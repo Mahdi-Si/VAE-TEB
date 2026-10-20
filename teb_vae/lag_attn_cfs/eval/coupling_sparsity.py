@@ -41,7 +41,8 @@ import pandas as pd
 
 #: Upper edges of the event-age bins in seconds; the last open bin and the "no contraction behind
 #: this anchor" bin are added by :func:`event_age_bins`. $30$ s is the shortest published
-#: UA-to-FHR delay, $120$ s the longest contraction, $300$ s a typical inter-contraction interval.
+#: UA-to-FHR delay, $120$ s outlasts the longest contraction ($45$ to $90$ s), $300$ s is a typical
+#: inter-contraction interval.
 EVENT_AGE_EDGES_S: Sequence[float] = (30.0, 60.0, 120.0, 180.0, 300.0)
 
 #: Upper edges of the hours-since-onset bins; negative is before onset, NaN is unknown.

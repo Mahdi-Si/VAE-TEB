@@ -613,7 +613,7 @@ Each anchor of a late segment can fall in up to three strata:
 | --- | --- |
 | `kl_high` | $K_t$ at or above the $0.7$ quantile of its own segment's $K_t$ |
 | `kl_low` | $K_t$ at or below the $0.3$ quantile of its own segment's $K_t$ |
-| `ua_contraction` | $0 \le a < w$, with $a$ = `seconds_since_contraction` and $w$ = `event_lag_window_s` ($120$ s by default) |
+| `ua_contraction` | $0 \le a < w$, with $a$ = `seconds_since_contraction` and $w$ = `event_lag_window_s` (derived from the checkpoint's training contraction reach, $223.875$ s at the conv-Transformer cell's $R = 55$; $120$ s for a run trained with none) |
 | `ua_quiet` | $a \ge w$, or no onset behind the anchor, in a segment that holds at least one `ua_contraction` anchor |
 | `kl_matched` | $K_t$ inside one band of the **pooled** late-window $K_t$ distribution: the same nats for every class |
 
