@@ -93,7 +93,9 @@ def test_every_override_lands_in_the_merged_config(merged, overrides) -> None:
     assert merged["dataset_config"]["vae_test_datasets"] == (
         overrides["dataset_config"]["vae_test_datasets"]
     )
-    assert merged["dataset_config"]["stat_path"] == overrides["dataset_config"]["stat_path"]
+    # The statistics file is the one leaf of the dataset block the delta must NOT carry: the run's
+    # own file is inherited, so the network sees inputs and targets on its training scale.
+    assert "stat_path" not in overrides["dataset_config"]
     for key, value in _dataset_kwargs(overrides).items():
         assert _dataset_kwargs(merged)[key] == value, key
     assert merged["eval_config"] == overrides["eval_config"]
@@ -145,7 +147,8 @@ def test_the_merge_mutates_neither_input(resolved) -> None:
 def test_the_provenance_carries_both_values_of_every_overridden_leaf(resolved) -> None:
     """The record is what makes the divergence from the trained contract legible. Without it a
     reader of ``summary.json`` cannot tell that the shard list was repointed at the holdout
-    split, that the statistics file moved with it, or that something else was overridden too.
+    split, or that something else was overridden too. The statistics file is the run's own, so it
+    is inherited and has no record.
     """
     merged, provenance = merge_eval_overrides_with_provenance(resolved)
     by_path = {record["path"]: record for record in provenance}
@@ -160,10 +163,8 @@ def test_the_provenance_carries_both_values_of_every_overridden_leaf(resolved) -
     assert shards["run_value"] == resolved["dataset_config"]["vae_test_datasets"]
     assert shards["eval_value"] == merged["dataset_config"]["vae_test_datasets"]
 
-    stats = by_path["dataset_config.stat_path"]
-    assert stats["run_value"] == resolved["dataset_config"]["stat_path"]
-    assert stats["eval_value"] == merged["dataset_config"]["stat_path"]
-    assert stats["run_value"] != stats["eval_value"]
+    assert "dataset_config.stat_path" not in by_path
+    assert merged["dataset_config"]["stat_path"] == resolved["dataset_config"]["stat_path"]
 
 
 def test_the_provenance_walks_to_the_leaves_rather_than_recording_whole_blocks(

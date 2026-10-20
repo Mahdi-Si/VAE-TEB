@@ -248,3 +248,11 @@ def test_the_task_builds_the_weight_from_the_batch_only_when_a_floor_is_set(task
     weight = on._event_anchor_weight(stub_batch, stub_batch.weight)
     assert weight is not None and weight.shape == (stub_batch.weight.shape[0], TINY_SEQ_LEN)
     assert off._event_anchor_weight(stub_batch, stub_batch.weight) is None
+
+    # The weight runs THIS cell's evaluation detector, not the raw-signal cells' copy, so a training
+    # anchor and a per-anchor table bin name one event.
+    from teb_vae.lag_attn_cfs.eval import events as cfs_events
+    from teb_vae.lag_attn_rws.eval import events as rws_events
+
+    assert on._event_detector() is cfs_events.detect_contractions
+    assert on._event_detector() is not rws_events.detect_contractions
