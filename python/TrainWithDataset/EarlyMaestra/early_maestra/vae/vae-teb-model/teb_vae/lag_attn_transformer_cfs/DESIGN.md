@@ -784,7 +784,7 @@ per-epoch scalars, the availability-clock control no permutation control can see
 geometry as a FAIL-able verdict, feature-space trivial predictors, the measured lag support, the
 band-resolved skill readout, the input-level occlusion analysis, the near edge read as censoring
 rather than as inertness, the per-head profiles on the page, the run's arm on the page, and the
-availability-clock margin now set at $0.15$ nats so its verdict decides. `eval/EVAL.md` here is
+availability-clock margin, unset until a run of the current configuration measures it. `eval/EVAL.md` here is
 short by design and defers to
 `teb_vae/lag_attn_cfs/eval/EVAL.md` for all of it. The deliberate absences are that document's too —
 no phase-domain analysis, no deceleration skill or triggered response, no clinical unit, no
@@ -809,12 +809,21 @@ Two things are this cell's own:
   $30$. The cross-cell table carries the first edge only. The target edge's single remaining
   divergence is $C_{\mathrm{keep}}$, which is what the warm-up budget decides.
 
-**`clock_margin_min_nats` is set, at $0.15$ nats**, so `coupling_exceeds_availability_clock` is a
-real gate and the acceptance set is ten criteria rather than nine. Both cfs cells' override files
-carry the same value and the same provenance comment — the diagnosed unaligned run's observed
-$\Delta_{\mathrm{clock}} = 0.160$, interval $[0.157, 0.164]$ — because a margin set independently
-per cell would gate two architectures the two cfs cells exist to compare against two different bars.
-The margin's provenance is the unaligned arm; the gated quantity is right on both arms.
+**`clock_margin_min_nats` is unset**, so `coupling_exceeds_availability_clock` is INCONCLUSIVE
+with $\Delta_{\mathrm{clock}}$ still emitted. It was set at $0.15$ nats from the diagnosed H = 15
+unaligned run ($\Delta_{\mathrm{clock}} = 0.160$, interval $[0.157, 0.164]$), but this cell now trains
+at $H = 30$ with the adapter memory, `max_lag` $37$ and the posterior event gate, which makes the KL
+exactly zero at every closed step. A threshold carried across that change would decide a verdict on
+exactly the run that has to measure it. Both cfs cells' override files carry the same `null`,
+because a margin set independently per cell would gate the two architectures against two different
+bars. Set it from the first converged run of the current configuration.
+
+**`event_lag_window_s` is unset, and unset is derived.** The evaluation resolves it from the
+checkpoint's own `event_weight_reach_steps` $R$ as $w = 4(R + 1) - 0.125$ s, which is $223.875$ s
+at the shipped $R = 55$. The event and control anchors of every contraction-conditioned readout are
+then exactly the anchors the training contraction weighting scored at $1$ and at the floor. The
+earlier literal $120$ s counted the anchors $120$ to $224$ s after an onset as controls, although
+training weighted them as event anchors.
 
 ## 15. Deviation record
 
@@ -1239,8 +1248,10 @@ their constructor seed and `posterior_event_gate: True` in its `model_kwargs`, w
 then accepts.
 
 **The contraction weighting of the full branch** (`event_weight_floor`,
-`event_weight_reach_steps`, task). `teb_vae/lag_attn_rws/event_weight.py` runs the evaluation's own
-contraction detector on the batch's raw UP, mean-pooled to the $4$-s grid, and weights the **full**
+`event_weight_reach_steps`, task). `teb_vae/lag_attn_rws/event_weight.py` runs the cell's own
+evaluation detector -- the task names it, because the two evaluation packages carry two copies that
+differ in one rule -- on the batch's raw UP at the raw rate, under the raw validity the decimated
+weight expands to, floors its onsets onto the decimated grid, and weights the **full**
 branch's per-anchor block NLL at $1$ within the reach after an onset and at the floor elsewhere, as
 a weighted mean over contributing anchors. The base branch and the KL are untouched, so between
 contractions the source pathway has its cost and no reward. `nll_full_block` and `pred_gap` stay
@@ -1249,9 +1260,10 @@ the unweighted log-densities; `nll_full_event_block` is what entered the total a
 conditional on a contraction. Shipped at floor $0$, because any positive floor leaves the
 in-sample memorisation reward standing at quiet anchors scaled by the floor, where it still
 outweighs the KL; and at a reach of $55$ steps ($220$ s), because a contraction lasts $45$ to
-$120$ s and the FHR recovers over about $90$ s after its peak, so the response can run to about
-$210$ s after onset and an anchor up to there still holds it inside its $120$-s horizon
-(`max_lag`'s $37$ steps would drop the recovery). `sweep_no_event_weight.yaml` is the ablation. The
+$90$ s (the figure the paper cites) and the FHR recovers over about $90$ s after its peak, so the
+response can run to about $180$ s after onset; $220$ s covers that with $40$ s to spare for a long
+contraction, and an anchor inside it still holds the response in its $120$-s horizon (`max_lag`'s
+$37$ steps would drop the recovery). `sweep_no_event_weight.yaml` is the ablation. The
 evaluation applies neither mechanism's weight, so its nats remain log-densities of the unweighted
 block.
 

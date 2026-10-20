@@ -58,6 +58,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import torch
 
 from teb_vae.lag_attn_cfs.causal_warmup import WarmupBudget
+from teb_vae.lag_attn_cfs.eval import events as cfs_events
 from teb_vae.lag_attn_fs.task import SeqVaeLagAttnFsTask
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
@@ -573,6 +574,19 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             lambda_boundary=0.0,
         )["metrics"]
         return scored["pred_gap"]
+
+    def _event_detector(self) -> Callable[..., Dict[str, Any]]:
+        r"""This cell's evaluation detector, so the contraction weight names the table's events.
+
+        The causal-feature collection pass writes ``seconds_since_contraction`` with
+        :func:`teb_vae.lag_attn_cfs.eval.events.detect_contractions`, which drops a peak whose onset
+        walk finds no rising edge; the raw-signal copy the parent returns keeps such peaks, so under
+        it a training anchor could be weighted active beside a table bin that reads "none".
+
+        Returns:
+            The causal-feature evaluation's detector.
+        """
+        return cfs_events.detect_contractions
 
     # ------------------------------------------------------------------
     # Loss + metrics

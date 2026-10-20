@@ -18,16 +18,18 @@ steps. The objective applies it to the **full** branch's reconstruction alone
 pathway has its KL cost and no reward, and its residual is pushed to zero there, while at active
 anchors the reward is undiluted.
 
-**The detector is the evaluation's, run exactly as the evaluation runs it.** Onsets come from
-:func:`~teb_vae.lag_attn_rws.eval.events.detect_contractions` on the **raw** trace at
-:data:`~teb_vae.lag_attn_rws.eval.events.FS_RAW`, under the raw validity
-:func:`~teb_vae.lag_attn_rws.eval.events.raw_validity` expands from the decimated weight -- the
-same call the collection pass makes to write ``seconds_since_contraction`` on its per-anchor table
--- and are then floored onto the decimated grid. A weight here and a bin there therefore name one
-event by construction. (A pooled $4$-second trace fed to the same detector was measured to disagree
-on about one event in six: at that rate the detector's smoothing window collapses and the
-$\sigma$-relative prominence rule selects a different peak set.) The stored UP timeline is read as
-it is stored.
+**The detector is the cell's own evaluation detector, run exactly as that evaluation runs it.**
+The caller supplies it: each task hands over the ``detect_contractions`` its own collection pass
+calls to write ``seconds_since_contraction`` on the per-anchor table (the raw-signal cells'
+:mod:`teb_vae.lag_attn_rws.eval.events`; the causal-feature cells'
+:mod:`teb_vae.lag_attn_cfs.eval.events`, which additionally drops a peak whose onset walk finds no
+rising edge). It runs on the **raw** trace at :data:`~teb_vae.lag_attn_rws.eval.events.FS_RAW`,
+under the raw validity :func:`~teb_vae.lag_attn_rws.eval.events.raw_validity` expands from the
+decimated weight, and its onsets are floored onto the decimated grid. A weight here and a bin on
+that cell's table therefore name one event by construction. (A pooled $4$-second trace fed to the
+same detector was measured to disagree on about one event in six: at that rate the detector's
+smoothing window collapses and the $\sigma$-relative prominence rule selects a different peak set.)
+The stored UP timeline is read as it is stored.
 
 **Onsets are a dataset constant per segment**, so a caller may pass a per-row key and a cache:
 the detector then runs once per segment per process and later steps pay a lookup. The weight is a
@@ -36,7 +38,7 @@ every ``nll_*`` the evaluation reports remains a log-density of the unweighted b
 """
 from __future__ import annotations
 
-from typing import Hashable, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Dict, Hashable, MutableMapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -47,7 +49,11 @@ __all__ = ["contraction_anchor_weight", "contraction_onset_steps"]
 
 
 def contraction_onset_steps(
-    up_raw: np.ndarray, weight: np.ndarray, *, decimation: int
+    up_raw: np.ndarray,
+    weight: np.ndarray,
+    *,
+    decimation: int,
+    detector: Callable[..., Dict[str, Any]] = detect_contractions,
 ) -> np.ndarray:
     r"""Contraction onsets of one segment on the decimated grid, from its raw UP trace.
 
@@ -58,6 +64,9 @@ def contraction_onset_steps(
             raw grid exactly as the evaluation expands them, so an event overlapping a gap is
             dropped as the evaluation drops it.
         decimation: Raw samples per decimated step $D$.
+        detector: The ``detect_contractions`` to run -- the one the calling cell's evaluation uses,
+            so a training weight and an evaluation bin name one event. Defaults to the raw-signal
+            cells' detector.
 
     Returns:
         The onsets as ``int16`` decimated-step indices, ascending, possibly empty.
@@ -81,7 +90,7 @@ def contraction_onset_steps(
             "an upstream change rather than a row to score at the floor"
         )
     valid = raw_validity(weight, decimation=int(decimation), raw_len=raw_len)
-    onsets = detect_contractions(trace, fs=FS_RAW, valid=valid)["onset_raw"]
+    onsets = detector(trace, fs=FS_RAW, valid=valid)["onset_raw"]
     return np.sort(np.asarray(onsets, dtype=np.int64) // int(decimation)).astype(np.int16)
 
 
@@ -94,6 +103,7 @@ def contraction_anchor_weight(
     floor: float,
     keys: Optional[Sequence[Hashable]] = None,
     cache: Optional[MutableMapping[Hashable, np.ndarray]] = None,
+    detector: Callable[..., Dict[str, Any]] = detect_contractions,
 ) -> torch.Tensor:
     r"""Build the $(B, T)$ full-branch anchor weight from the raw UP trace.
 
@@ -108,7 +118,9 @@ def contraction_anchor_weight(
         keys: One hashable key per row -- the segment's ``(guid, epoch)`` -- or ``None``. With a
             ``cache``, a row whose key is present skips the detector and reads its onsets back.
         cache: A mapping the onsets are read from and written to, keyed by ``keys``. ``None``
-            runs the detector on every row.
+            runs the detector on every row. A cache must be fed one detector only; the tasks keep
+            one per module.
+        detector: The ``detect_contractions`` to run; see :func:`contraction_onset_steps`.
 
     Returns:
         The weight $(B, T)$ on ``weight``'s device and dtype, every entry $w_{\min}$ or $1$.
@@ -151,7 +163,7 @@ def contraction_anchor_weight(
         )
         for position, index in enumerate(missing):
             onsets = contraction_onset_steps(
-                up_np[position], weight_np[position], decimation=decimation
+                up_np[position], weight_np[position], decimation=decimation, detector=detector
             )
             onsets_per_row[index] = onsets
             if cache is not None and keys is not None and keys[index] is not None:
