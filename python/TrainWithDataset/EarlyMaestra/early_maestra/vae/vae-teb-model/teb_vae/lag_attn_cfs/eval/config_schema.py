@@ -8,9 +8,10 @@ the shards.
 **The override delta, not a second config.** A training run writes its fully resolved
 configuration beside its checkpoints, and that file -- not a committed YAML -- is the record of
 what the model was trained on. But an evaluation genuinely needs a handful of different values:
-the held-out k-fold causal shards rather than the healthy-only pretraining split, the statistics
-file accumulated from those same shards, four extra ``load_fields`` the clinical questions are
-asked in, and an ``eval_config`` block. Those arrive as a small committed delta deep-merged
+the held-out k-fold causal shards rather than the healthy-only pretraining split, the extra
+``load_fields`` the clinical questions are asked in, and an ``eval_config`` block. The statistics
+file is deliberately not among them: the run's own file is inherited, so the network sees inputs
+and targets on the scale it was trained on. Those arrive as a small committed delta deep-merged
 **over** the run's own resolved config, so the run's
 contract stays authoritative and the divergence is a reviewable file rather than a pile of
 command-line flags.
@@ -34,9 +35,11 @@ analysis retains.
 
 **Forked from** ``teb_vae/lag_attn_rws/eval/config_schema.py``, and the divergence is the
 cfs-only keys: ``clock_margin_min_nats``, ``occlusion_bands``, ``figure_format`` and
-``max_hours_before_delivery`` (see :data:`DEFAULTS`). Everything else -- the merge, the provenance walk, the forced
-single-process loader, the closed key set and each refusal's wording -- is the sibling's, because
-this half of a run's configuration surface says nothing about the target domain.
+``max_hours_before_delivery`` (see :data:`DEFAULTS`). ``event_lag_window_s`` is the sibling's key
+with one difference: here it is nullable, and an unset window resolves from the run's own training
+contraction reach (:func:`resolve_event_lag_window_s`). Everything else -- the merge, the provenance
+walk, the forced single-process loader, the closed key set and each refusal's wording -- is the
+sibling's, because this half of a run's configuration surface says nothing about the target domain.
 """
 from __future__ import annotations
 
@@ -118,7 +121,10 @@ DEFAULTS: Dict[str, Any] = {
     "caps": {},
     "prior_shuffle_min_nats": 1.0,
     "min_active_dims": 2,
-    "event_lag_window_s": 120.0,
+    # Nullable, and unset means DERIVED rather than "no window": the run's own training contraction
+    # reach decides it, or :data:`FALLBACK_EVENT_LAG_WINDOW_S` when the run trained with none. See
+    # :func:`resolve_event_lag_window_s`.
+    "event_lag_window_s": None,
     "bootstrap_resamples": 2000,
     "clock_margin_min_nats": None,
     # An empty mapping rather than ``None``, matching ``caps``: a partial override should be able
@@ -149,6 +155,15 @@ _MIN_BOOTSTRAP_RESAMPLES = 100
 #: arrived at more slowly. An operator who has no defensible number leaves the key ``null`` and
 #: gets an explicit INCONCLUSIVE with the measurement beside it.
 _MIN_CLOCK_MARGIN_NATS = 1e-3
+
+#: Seconds per decimated step. Restated rather than imported from
+#: :mod:`teb_vae.lag_attn.nets.lag_report`, which imports ``torch``: this module must stay a cheap
+#: parse.
+SECONDS_PER_STEP = 4.0
+
+#: The event window, in seconds, for a run whose config carries no training contraction reach: the
+#: interval over which a contraction could still influence what is being predicted.
+FALLBACK_EVENT_LAG_WINDOW_S = 120.0
 
 #: The one reserved name inside ``eval_config.occlusion_bands``. Its value is an integer width
 #: rather than a ``[lo, hi]`` pair, and it is resolved against the model's own lag window into a
@@ -288,6 +303,66 @@ def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, T
             )
         validated[str(name)] = (low, high)
     return validated
+
+
+def resolve_event_lag_window_s(window: Any, vae: Mapping[str, Any]) -> float:
+    r"""Return the event window, derived from the run's training contraction reach when unset.
+
+    Training weights the full branch at $1$ on the anchors $t \in [o, o + R]$ after each contraction
+    onset step $o$, with $R$ = ``event_weight_reach_steps``, or ``max_lag`` when the reach is
+    ``null`` and ``event_weight_floor`` is set. The evaluation splits anchors by
+    ``seconds_since_contraction`` instead: the age $a$ from the raw onset sample to the anchor's last
+    raw sample. An anchor $j = t - o$ steps after its onset step therefore has
+    $a \in [\Delta j,\ \Delta (j + 1) - \delta]$, with $\Delta$ the step length and $\delta$ one raw
+    sample. The derived window
+
+    $$w = \Delta (R + 1) - \delta / 2$$
+
+    sits halfway between the oldest age inside the reach and the youngest age outside it. So the
+    inclusive split ($a \le w$, ``events`` and ``lag_high_kl``) and the strict one ($a < w$,
+    ``attribution_strata``) both select exactly the anchors training weighted at $1$, and their
+    controls are exactly the anchors it weighted at the floor. At $R = 55$, $\Delta = 4$ s and
+    $\delta = 0.25$ s, $w = 223.875$ s.
+
+    The reach is read even when ``event_weight_floor`` is ``null``, so the no-weighting ablation arm
+    is evaluated on the same event anchors as the arm it ablates.
+
+    Args:
+        window: The configured ``event_lag_window_s``. ``None`` derives it; a number is validated
+            and kept, with a warning when it splits anchors differently from the training reach.
+        vae: The merged run config's ``model_config.VAE_model`` block, empty when the config
+            carries none.
+
+    Returns:
+        The window in seconds.
+
+    Raises:
+        ValueError: If a set window is not a finite number of at least $1$ s, or if the derivation
+            meets a reach or ``raw_per_step`` that is not a valid integer.
+    """
+    reach = vae.get("event_weight_reach_steps")
+    if reach is None and vae.get("event_weight_floor") is not None:
+        # Training's own fallback: a null reach resolves to the lag window.
+        reach = vae.get("max_lag")
+    derived, half_sample = None, 0.0
+    if reach is not None:
+        reach = _require_int(reach, "event_weight_reach_steps", minimum=0)
+        raw_per_step = _require_int(vae.get("raw_per_step"), "raw_per_step", minimum=1)
+        half_sample = 0.5 * SECONDS_PER_STEP / raw_per_step
+        derived = SECONDS_PER_STEP * (reach + 1) - half_sample
+    if window is None:
+        return FALLBACK_EVENT_LAG_WINDOW_S if derived is None else derived
+    # Zero would restrict the event-conditioned readouts to anchors exactly on a contraction.
+    window = _require_positive_float(window, "event_lag_window_s", minimum=1.0)
+    # Any window within half a raw sample of the derived one selects the same anchors.
+    if derived is not None and abs(window - derived) >= half_sample:
+        logger.warning(
+            f"eval_config.event_lag_window_s = {window:g} s splits anchors differently from the "
+            f"training contraction reach of {reach} steps (derived window {derived:g} s): the "
+            f"event readouts then compare a different anchor set from the one the objective "
+            f"weighted. Set it to null to derive it."
+        )
+    return window
 
 
 # =============================================================================
@@ -593,9 +668,13 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     resolved["min_active_dims"] = _require_int(
         resolved["min_active_dims"], "min_active_dims", minimum=1
     )
-    # Zero would restrict the event-conditioned readouts to anchors exactly on a contraction.
-    resolved["event_lag_window_s"] = _require_positive_float(
-        resolved["event_lag_window_s"], "event_lag_window_s", minimum=1.0
+    # The run's own model block, which the event window and the occlusion bands are both checked
+    # against. Empty in the offline-merge case where the model block was never carried.
+    _vae = (config.get("model_config") or {}).get("VAE_model") or {}
+    # Resolved from the run's own training contraction reach when unset, so the event and control
+    # anchors are the ones the objective weighted at 1 and at the floor.
+    resolved["event_lag_window_s"] = resolve_event_lag_window_s(
+        resolved["event_lag_window_s"], _vae
     )
     resolved["bootstrap_resamples"] = _require_int(
         resolved["bootstrap_resamples"], "bootstrap_resamples", minimum=_MIN_BOOTSTRAP_RESAMPLES
@@ -618,7 +697,6 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     # geometry, and a validator with a literal here would admit a band that measures nothing on
     # exactly the configuration a fixture runs at. Absent geometry skips the upper bound, which is
     # the offline-merge case where the model block was never carried.
-    _vae = (config.get("model_config") or {}).get("VAE_model") or {}
     resolved["occlusion_bands"] = _validate_occlusion_bands(
         resolved["occlusion_bands"],
         None
