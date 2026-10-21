@@ -38,9 +38,10 @@ from loguru import logger
 
 from teb_vae.classifier import figstyle
 from teb_vae.classifier.metrics import (
-    TYPES, _read_json, _sel, _wquantile, classifier_cfg, fold_weights_of, guid_timeline, infer_stride, pool_rows,
-    primary_alpha, unique_cohort,
+    TYPES, _read_json, _sel, _wquantile, axis_bin, classifier_cfg, fold_weights_of, guid_timeline, infer_stride,
+    pool_rows, primary_alpha, unique_cohort,
 )
+from teb_vae.classifier.thresholds import NORM_AXIS
 
 COHORT_OVERVIEW = "cohort/cohort_overview"
 COHORT_SUBGROUPS = "cohort/cohort_subgroups"
@@ -756,8 +757,11 @@ RATES = (("sens", "sensitivity", figstyle.RATE_COLORS["sens"], "o"), ("spec", "s
 TYPE_LABEL = {"instantaneous": "Instantaneous", "committed_cumulative": "Committed\ncumulative",
               "committed_overall": "Committed\noverall"}
 AXIS_LABEL = {"to_delivery": "hours before delivery", "from_onset": "hours since labour onset",
-              "rel_second_stage": "hours from second-stage onset", "position": "segment index",
-              "elapsed": "hours since first segment"}
+              "rel_second_stage": "hours from second-stage onset",
+              NORM_AXIS: "labour progress (−1 onset · 0 second stage · +1 delivery)",
+              "position": "segment index", "elapsed": "hours since first segment"}
+#: The axes whose 0 is second-stage onset: their figures draw the dotted onset line.
+SS_AXES = ("rel_second_stage", NORM_AXIS)
 ROC_KIND = {"committed_cumulative": "Committed cumulative", "committed_overall": "Committed overall",
             "snapshot": "Snapshot"}
 #: Under-power marker of the time-resolved figures: a hollow marker is a bin with fewer GUIDs of a class than needed.
@@ -809,9 +813,10 @@ def _wrap(n: int, ncols: int = 2) -> tuple:
 
 
 def _time_lines(ax: Any, axis: str, pol: Optional[Dict[str, Any]] = None) -> None:
-    """The dashed grey basis time point of ``pol`` (on its own axis) and the dotted second-stage onset."""
+    """The dashed grey basis time point of ``pol`` (on its own axis) and the dotted second-stage onset (on both second-stage
+    axes, :data:`SS_AXES`)."""
     fs = _seam()
-    if axis == "rel_second_stage":
+    if axis in SS_AXES:
         ax.axvline(0.0, ls=":", color=fs.INK, lw=fs.LINE_REGULAR, label="second-stage onset", zorder=1)
     if pol and pol.get("at", "end") != "end" and pol.get("axis", "to_delivery") == axis:
         ax.axvline(float(pol["at"]), ls=(0, (4, 2)), color=fs.MUTED, lw=fs.LINE_REGULAR,
@@ -822,7 +827,7 @@ def _xlim(axes: Any, t: pd.Series, axis: str, pol: Optional[Dict[str, Any]] = No
     """Fix the shared time range up front (autoscaling many shared axes per artist is most of a page's build): the
     data, the onset and basis lines, half a bin of margin; delivery on the right."""
     ts = np.unique(t.astype(float).dropna().to_numpy())
-    xs = [*ts, *([0.0] if axis == "rel_second_stage" else []),
+    xs = [*ts, *([0.0] if axis in SS_AXES else []),
           *([float(pol["at"])] if pol and pol.get("at", "end") != "end" and pol.get("axis", "to_delivery") == axis else [])]
     step = float(np.diff(ts).min()) if ts.size > 1 else 0.0
     pad = 0.6 * step if step else 0.5
@@ -1526,8 +1531,9 @@ def _time_resolved_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 
 
 def _alarms_md(T: Dict[str, Any]) -> List[str]:
-    """§10 part (A1-A5): event sensitivity, lead time, false alarms, burden and alarms per detection per policy."""
-    d = _sel(T["tr"], level="alarm", point="end", split="test", fold="pooled")
+    """§10 part (A1-A5): event sensitivity, lead time, false alarms, burden and alarms per detection per policy (the
+    ``alarm_rule`` rows; A6's per-member rows are :func:`_first_detection_md`'s)."""
+    d = _sel(T["tr"], level="alarm", point="end", split="test", fold="pooled", subgroup="alarm_rule")
     rows = []
     for (m, sd, rule, pid), g in d.groupby(["model_id", "seed", "subgroup_value", "policy_id"], sort=False):
         v, q = g.set_index("metric"), g.set_index("metric")["value"].astype(float)
@@ -1674,6 +1680,7 @@ def _highlights_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
     return ["## 10. Highlights: subgroups, alarms, fold heterogeneity, errors", "",
             "### Subgroup forest (S3) and restricted pairs (S5)", "", *_s_highlights_md(T, c),
             *_alarms_md(T),
+            *_first_detection_md(T, c),
             *_heterogeneity_md(T, c),
             *_errors_md(T, c)]
 
@@ -3353,7 +3360,8 @@ def _merge_windows(d: pd.DataFrame, width: float, axis: str, most: int = R13_MAX
 def _score_windows(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: str = "test",
                    fold: Optional[str] = None) -> Any:
     """R13: ``windowed_comparison_figure`` of the calibrated snapshot probability by clinical class per window of
-    ``axis`` (``eval.bin_h``; 1 segment on position), pooled test, one readout per model that is not a baseline: the
+    ``axis`` (:func:`metrics.axis_bin`: ``eval.bin_h``, 1 segment on position, ``eval.norm_bin`` on the landmark axis),
+    pooled test, one readout per model that is not a baseline: the
     violins, the Kruskal-Wallis + Holm strip and Cliff's delta of the surviving pairs (``stats.windowed_group_
     comparisons``; a cell below ``MIN_GROUP_SIZE`` GUIDs is drawn but left out of the test)."""
     from teb_vae.lag_attn.eval import stats
@@ -3364,7 +3372,7 @@ def _score_windows(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: st
     models = [x for x in _models(d) if x[0] not in BASELINES] or _models(d)  # ponytail: baselines only when alone
     if not models:
         return _all_empty()
-    d, width = _merge_windows(d, 1.0 if axis == "position" else c["eval"]["bin_h"], axis)
+    d, width = _merge_windows(d, axis_bin(axis, c["eval"]), axis)
     order = _order(d["clinical_class"].astype(str).unique(), "clinical_class")
     readouts = []
     for m, sd in models:
@@ -3450,6 +3458,203 @@ EXPECTED_WHEN[CALIBRATION_PER_CLASS] = lambda c: (c.get("labels") or {}).get("ta
 EXPECTED_WHEN[SEED_SPREAD] = lambda c: len((c.get("run") or {}).get("seeds") or []) > 1
 CORE_EXTRA.append(CALIBRATION_GUID)
 EXTRA_TABLES.extend(["decision_curve", "snapshots"])
+
+# ---- block A6 (first detection per subgroup and fold) ----
+# ``alarms/first_detection_<axis>`` from ``first_detection.parquet`` (:func:`metrics.run_A6`): per member of the A6
+# families, when the primary model first alarms under the primary policy, per fold and over the folds. Every panel
+# reads the same per-GUID clocks, so the curves, the boxes and the forest describe one population; the numbers with
+# bootstrap CIs and I² are the A6 metrics rows (summary.md, :func:`_first_detection_md`).
+from teb_vae.classifier.metrics import FD_AXES, FD_FAMILIES, axis_edges, kish_wilson  # noqa: E402
+
+FIRST_DETECTION = "alarms/first_detection_{axis}"
+#: Members the figure leaves out: ``unhealthy`` is acidosis and HIE together, and each of those has its own row.
+FD_SKIP = ("unhealthy",)
+#: The quantiles of a first-detection box: whiskers, box and median.
+FD_BOX = (0.10, 0.25, 0.50, 0.75, 0.90)
+FD_NOTE = ("Line: all folds, each GUID once (a shared test GUID: mean of its K folds' decisions); band and thin lines: "
+           "per-fold test rates; dashed grey: share monitored by c*, the ceiling of detection. Boxes: 10th-90th, "
+           "25th-75th percentile and median first-detection time of the detected GUIDs. Hollow: under {n} GUIDs")
+
+
+def _fd_display(axis: str, c: Any) -> np.ndarray:
+    """Clocks in display units: hours before delivery (positive) on ``to_delivery``, the clock elsewhere."""
+    c = np.asarray(c, np.float64)
+    return -c + 0.0 if axis == "to_delivery" else c
+
+
+def fd_curve(g: pd.DataFrame, cstar: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    r"""``(detected, monitored, n)`` of the A6 rows ``g`` at the evaluation points ``cstar`` (clock units): the
+    weighted shares $\sum_g w_g\,1[a_g \le c^*] / \sum_g w_g$ of first-alarm clocks $a_g$ (NaN: never) and of entry
+    clocks (the first segment), and $n = \sum_g w_g$. ``detected <= monitored`` at every point, since a GUID alarms
+    only once it is monitored."""
+    w = g["w"].to_numpy(np.float64)
+    n = float(w.sum())
+    if not n:
+        return np.full(cstar.size, np.nan), np.full(cstar.size, np.nan), 0.0
+    share = [(g[col].to_numpy(np.float64)[:, None] <= cstar[None, :]).astype(np.float64).T @ w / n
+             for col in ("first_alarm_c", "entry_c")]
+    return share[0], share[1], n
+
+
+def _fd_rows(T: Dict[str, Any], c: Dict[str, Any], axis: str) -> pd.DataFrame:
+    """The primary model's per-fold A6 rows of ``axis`` (``fold != pooled``), primary policy."""
+    d = T.get("first_detection")
+    if d is None or d.empty:
+        return pd.DataFrame()
+    d = _sel(d, axis=axis, split="test", policy_id=c["eval"]["primary_policy"])
+    d = d[d["fold"].astype(str) != "pooled"]
+    return _s_primary(d.astype({"fold": str, "subgroup": str, "subgroup_value": str}))
+
+
+def _fd_members(d: pd.DataFrame) -> List[Tuple[str, str]]:
+    """``(family, member)`` rows of an A6 page: :data:`FD_FAMILIES` order, members worst first, without
+    :data:`FD_SKIP`."""
+    return [(f, m) for f in FD_FAMILIES
+            for m in member_order(d.loc[d["subgroup"] == f, "subgroup_value"].unique()) if m not in FD_SKIP]
+
+
+def _first_detection(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, **_: Any) -> Any:
+    """A6: when the primary model first alarms, per member of :data:`FD_FAMILIES` (rows: HIE, acidosis, healthy, and
+    healthy BG+ / BG-) under the primary policy, pooled test over the folds. Columns:
+
+    1. Detected by c*: each fold's share of the member's GUIDs alarmed by c* (thin), their min-max band, the all-fold
+       share (each GUID once; a shared test GUID as the mean of its K folds' decisions) and, dashed grey, the share
+       already monitored by c*, the ceiling no detection curve can pass (:func:`fd_curve`). On the healthy rows the
+       detected share is the false-alarm share.
+    2. First detection per fold: the 10th-90th percentile (whiskers), 25th-75th (box) and median of the first-detection
+       time of the detected GUIDs, per fold and over all folds (weighted, :func:`metrics._wquantile`).
+    3. Detected by the end per fold: the share alarmed by the last segment with its Kish-Wilson 95 % CI; on the healthy
+       rows the primary policy's α (dashed), so a fold's FPR overshoot reads directly.
+
+    Columns 1 and 2 share the time axis (hours before delivery inverted). A member under ``eval.min_subgroup_n`` GUIDs
+    over the folds is drawn hollow."""
+    from matplotlib.lines import Line2D
+
+    fs, ev, key = _seam(), c["eval"], _Once()
+    d = _fd_rows(T, c, axis)
+    cells = _fd_members(d) if len(d) else []
+    if not cells:
+        return _all_empty(1, 3)
+    fig, grid, _ = _facets(len(cells), 3, row_h=1.9, width=fs.WINDOWS_FIGURE_WIDTH, sharex=False)
+    clocks = d[["entry_c", "exit_c", "first_alarm_c"]].to_numpy(np.float64).ravel()
+    cstar = axis_edges(clocks, axis, ev)
+    t = _fd_display(axis, cstar)
+    folds = sorted(d["fold"].unique(), key=lambda f: int(f) if f.isdigit() else 0)
+    ypos = {**{f: float(i) for i, f in enumerate(folds)}, "all": len(folds) + 0.4}
+    pol, mn = _policy(c, ev["primary_policy"]), ev["min_subgroup_n"]
+    for row, (fam, mem) in zip(grid, cells):
+        g = d[(d["subgroup"] == fam) & (d["subgroup_value"] == mem)]
+        color = _member_style(fam, mem, [m for _, m in cells])[0]
+        healthy = bool(len(g)) and (g["y"].astype(int) == 0).all()
+        curve, box, forest = row
+        for ax, other in ((curve, grid[0, 0]), (box, grid[0, 0]), (forest, grid[0, 2])):
+            if ax is not other:
+                ax.sharex(other)
+        forest.sharey(box)
+        per = {f: fd_curve(x, cstar) for f, x in g.groupby("fold")}
+        det, mon, n = fd_curve(g, cstar)
+        for fd, _mon, _n in per.values():
+            curve.plot(t, fd, color=color, lw=fs.LINE_THIN * 0.8, alpha=0.3, zorder=2)
+        if len(per) > 1 and ev.get("fold_band") != "none":
+            stack = np.vstack([v[0] for v in per.values()])
+            curve.fill_between(t, np.nanmin(stack, 0), np.nanmax(stack, 0), color=color, alpha=0.12, lw=0, zorder=1)
+        curve.plot(t, mon, ls=(0, (3, 2)), color=fs.MUTED, lw=fs.LINE_REGULAR, zorder=2, label="monitored by c*")
+        _estimate_line(curve, t, det, det, np.full(t.size, n < mn), color=color, ls="-", lw=fs.LINE_EMPHASIS * 1.7,
+                       marker="o", ms=fs.MARKER_SMALL, label=None)
+        _time_lines(curve, axis)
+        _unit_y(curve)
+        fs.style_axes(curve)
+        curve.set_ylabel("false-alarm share" if healthy else "detected share")
+        for f, x in [*((f, g[g["fold"] == f]) for f in folds), ("all", g)]:
+            x = x[x["detected"].astype(bool)]
+            if not len(x):
+                continue
+            q = np.atleast_1d(_wquantile(_fd_display(axis, x["first_alarm_c"]), np.asarray(FD_BOX),
+                                         x["w"].to_numpy(np.float64)))
+            y, main = ypos[f], f == "all"
+            box.hlines(y, q[0], q[4], color=color, lw=fs.LINE_THIN * (1.6 if main else 1.0))
+            box.hlines(y, q[1], q[3], color=color, lw=fs.LINE_HEAVY * (1.8 if main else 1.3), alpha=0.6)
+            box.plot(q[2], y, "o", ms=fs.MARKER_SMALL + (1.4 if main else 0.6), color=color if n >= mn else "white",
+                     mec=figstyle.EDGE if n >= mn else color, mew=fs.MARKER_EDGE if n >= mn else 0.9, zorder=3)
+        _time_lines(box, axis)
+        fs.style_axes(box, grid="x")
+        for f in [*folds, "all"]:
+            x = g if f == "all" else g[g["fold"] == f]
+            if not len(x):
+                continue
+            w = x["w"].to_numpy(np.float64)
+            hit = x["detected"].astype(bool).to_numpy()
+            p = float(w[hit].sum() / w.sum())
+            lo, hi = (float(v[0]) for v in kish_wilson(hit[None], np.ones((1, hit.size), bool), w))
+            forest.hlines(ypos[f], lo, hi, color=color, lw=fs.LINE_REGULAR * (1.6 if f == "all" else 1.2))
+            forest.plot(p, ypos[f], "D" if f == "all" else "o", ms=fs.MARKER_SMALL + (1.2 if f == "all" else 0.6),
+                        color=color if n >= mn else "white", mec=figstyle.EDGE if n >= mn else color,
+                        mew=fs.MARKER_EDGE if n >= mn else 0.9, zorder=3)
+        if healthy and pol.get("alpha"):
+            forest.axvline(pol["alpha"], ls=(0, (3, 2)), color=RATES[2][2], lw=fs.LINE_HAIRLINE,
+                           label=f"α = {pol['alpha']:g}")
+        forest.set_xlim(-0.03, 1.03)
+        forest.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1])
+        forest.tick_params(labelleft=False)
+        fs.style_axes(forest, grid="x")
+        box.set_yticks([ypos[f] for f in [*folds, "all"]], [*(f"fold {f}" for f in folds), "all"],
+                       fontsize=fs.FONT_SMALL)
+        box.set_ylim(ypos["all"] + 0.7, -0.7)
+        _row_label(forest, mem.replace("_", " "))
+        key(curve)
+        if healthy:
+            _key(forest)
+    _xlim(grid[:, :2], pd.Series(t), axis)
+    grid[0, 0].set_title("Detected by c*")
+    grid[0, 1].set_title("First detection per fold")
+    grid[0, 2].set_title("Detected by the end")
+    for ax in grid[-1, :2]:
+        _x_time(ax, axis)
+    for ax in grid[:-1].flat:
+        ax.tick_params(labelbottom=False)
+    grid[-1, 2].set_xlabel("share alarmed by the last segment")
+    fs.add_key(fig, [Line2D([], [], color=fs.MUTED, lw=fs.LINE_EMPHASIS * 1.7, marker="o", ms=fs.MARKER_SMALL,
+                            mec=figstyle.EDGE, mew=fs.MARKER_EDGE),
+                     Line2D([], [], color=fs.MUTED, lw=fs.LINE_THIN * 0.8, alpha=0.5)], ["all folds", "one fold"])
+    pm = primary_model(_models(d))
+    _tag(fig, f"First detection · {_who(*pm)} · policy {ev['primary_policy']}")
+    fs.caveat_note(fig, text=FD_NOTE.format(n=mn) + ".")
+    return fig
+
+
+def _first_detection_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
+    """§10 part (A6): per axis and member, pooled test: the detected share with its CI, the median first-detection
+    time with its CI and IQR, the range of the per-fold detected shares, and Cochran's Q p-value and I² across folds."""
+    d = _sel(T["tr"], level="alarm", point="end", split="test", policy_id=c["eval"]["primary_policy"])
+    d = _s_primary(d[d["subgroup"].isin(FD_FAMILIES) & d["metric"].astype(str).str.startswith("fd_")])
+    if d.empty:
+        return []
+    rows = []
+    for (axis, fam, mem), g in d.groupby(["axis", "subgroup", "subgroup_value"], sort=False, observed=True):
+        pooled, per = g[g["fold"].astype(str) == "pooled"], g[g["fold"].astype(str) != "pooled"]
+        v, q = pooled.set_index("metric"), pooled.set_index("metric")["value"].astype(float)
+        f = per.loc[per["metric"] == "fd_detected_frac", "value"].astype(float)
+        unit = "" if axis == NORM_AXIS else " h"
+        rows.append({"axis": axis, "family": fam, "member": mem, "detected [CI]": _vci(v, "fd_detected_frac"),
+                     "median [CI]": _vci(v, "fd_median") + unit,
+                     "IQR": f"{_cell(q.get('fd_q25'))}-{_cell(q.get('fd_q75'))}{unit}",
+                     "fold range": f"{_cell(f.min())}-{_cell(f.max())}" if len(f) else "-",
+                     "Q p": _cell(q.get("fd_detected_frac_q_p")), "I²": _cell(q.get("fd_detected_frac_i2")),
+                     "n": f"{float(pooled['n_pos'].iloc[0]) + float(pooled['n_neg'].iloc[0]):.0f}" if len(pooled) else "-"})
+    return ["### First detection (A6, pooled test)", "",
+            f"Primary model and policy `{c['eval']['primary_policy']}`, rule `{c['eval']['alarm_rule']['kind']}`. Detected: "
+            "the share of the member's GUIDs alarmed by their last segment (healthy: false alarms). Median and IQR: the "
+            "first-detection time of the detected GUIDs, in hours before delivery (`to_delivery`), hours from "
+            "second-stage onset, or labour progress (−1 onset, 0 second stage, +1 delivery). Q p and I²: Cochran's Q "
+            "of the per-fold detected shares; the healthy folds share their augmented test GUIDs, so I² understates "
+            "their heterogeneity. Figures: `alarms/first_detection_<axis>`.", "",
+            _md(pd.DataFrame(rows)), ""]
+
+
+for _a in FD_AXES:
+    _BUILDERS[FIRST_DETECTION.format(axis=_a)] = partial(_first_detection, axis=_a)
+    EXPECTED_WHEN[FIRST_DETECTION.format(axis=_a)] = lambda c, a=_a: a in (c.get("eval") or {}).get("time_axes", [])
+EXTRA_TABLES.append("first_detection")
 
 # ---- block X (confusion and 3-class: X1-X9) ----
 from typing import Tuple  # noqa: E402
@@ -3695,7 +3900,7 @@ def _confusion_evolution(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, spl
             ax.tick_params(which="both", length=0)
             for spine in ax.spines.values():
                 spine.set_visible(False)
-            ax.set_title("end" if not np.isfinite(t) else f"{t:g}" + ("" if axis == "position" else " h"),
+            ax.set_title("end" if not np.isfinite(t) else f"{t:g}" + ("" if axis in ("position", NORM_AXIS) else " h"),
                          fontsize=fs.FONT_SMALL)
         if not pick:
             _empty(row[0])

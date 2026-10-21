@@ -49,6 +49,11 @@ _UNDIGESTED_RUN_KEYS = ("device", "devices", "num_workers", "report_workers")
 #: ``(block, key, default)`` of keys added after runs were made: left out of the digest at their default, which is the
 #: behaviour before the key existed, so those run dirs keep their digest (resume, evaluate, report).
 _LATER_DEFAULTS = (("labels", "time_matched", False),)
+#: Evaluation-only settings that no prediction, calibration or threshold reads: left out of the digest whatever their
+#: value, so adding or changing them never orphans a run dir (resume, evaluate, report). The landmark axis cannot be a
+#: threshold basis (:class:`ThresholdCfg`), and ``eval.norm_bin`` is its bin width (§11.5).
+_EVAL_ONLY_AXES = ("rel_second_stage_norm",)
+_EVAL_ONLY_KEYS = ("norm_bin",)
 #: Run-dir schema version, hashed into :func:`digest`, so a run dir written under an older schema is refused on
 #: resume. Bump it whenever a run-dir schema changes (cohort/prediction columns, context width, file layout).
 SCHEMA_VERSION = 6  # 3: raw covariate columns in cohort/segments.parquet, covariate_availability.parquet (P5);
@@ -335,7 +340,7 @@ class BaselinesCfg(_Block):
 
 
 # ---- eval --------------------------------------------------------------------------------------
-TimeAxis = Literal["to_delivery", "from_onset", "rel_second_stage", "position", "elapsed"]
+TimeAxis = Literal["to_delivery", "from_onset", "rel_second_stage", "rel_second_stage_norm", "position", "elapsed"]
 
 
 class ThresholdCfg(_Block):
@@ -362,6 +367,9 @@ class ThresholdCfg(_Block):
         if self.basis == "segment" and self.method not in (None, "empirical"):
             raise ValueError(f"threshold policy {self.id!r}: basis segment allows only method empirical (segments "
                              f"are correlated, so NP guarantees are void, SPEC §11.3)")
+        if self.axis == "rel_second_stage_norm":
+            raise ValueError(f"threshold policy {self.id!r}: axis rel_second_stage_norm is evaluation only (its clock "
+                             f"needs both stage durations, known only after delivery, SPEC §11.5)")
         return self
 
 
@@ -389,6 +397,10 @@ class EvalCfg(_Block):
     snapshot_max_staleness_h: PositiveFloat
     time_axes: List[TimeAxis]
     bin_h: PositiveFloat
+    # §11.5: bin width of the landmark axis rel_second_stage_norm (-1 labour onset, 0 second-stage onset, +1
+    # delivery); 1 / norm_bin must be an integer, so 0 and both landmarks are bin edges. Defaulted, so an older
+    # run's resolved config still loads
+    norm_bin: PositiveFloat = 0.25
     min_bin_class_n: NonNegativeInt
     subgroup_families: List[str]
     restricted_pairs: List[Tuple[str, str]]
@@ -413,6 +425,10 @@ class EvalCfg(_Block):
         ids = [policy.id for policy in self.thresholds]
         if len(set(ids)) != len(ids) or self.primary_policy not in ids:
             raise ValueError(f"threshold ids must be unique and contain primary_policy; got {ids}")
+        n = 1.0 / self.norm_bin
+        if self.norm_bin > 1.0 or abs(n - round(n)) > 1e-9:
+            raise ValueError(f"eval.norm_bin must divide 1 (0.5, 0.25, 0.2, 0.1, ...), so second-stage onset and both "
+                             f"landmarks are bin edges; got {self.norm_bin}")
         return self
 
 
@@ -547,13 +563,18 @@ def load(path: Any = DEFAULT_CONFIG,
 
 
 def digest(cfg: Config) -> str:
-    """SHA-256 of the canonical JSON of ``cfg``, minus the execution-only ``run`` knobs, plus :data:`SCHEMA_VERSION`."""
+    """SHA-256 of the canonical JSON of ``cfg``, minus the execution-only ``run`` knobs and the evaluation-only settings
+    (:data:`_EVAL_ONLY_AXES`, :data:`_EVAL_ONLY_KEYS`), plus :data:`SCHEMA_VERSION`."""
     payload = cfg.model_dump(mode="json") | {"schema_version": SCHEMA_VERSION}
     for key in _UNDIGESTED_RUN_KEYS:
         payload["classifier"]["run"].pop(key)
     for block, key, default in _LATER_DEFAULTS:
         if payload["classifier"][block].get(key) == default:
             payload["classifier"][block].pop(key)
+    ev = payload["classifier"]["eval"]
+    ev["time_axes"] = [a for a in ev["time_axes"] if a not in _EVAL_ONLY_AXES]
+    for key in _EVAL_ONLY_KEYS:
+        ev.pop(key, None)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

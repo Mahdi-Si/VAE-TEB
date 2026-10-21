@@ -1447,8 +1447,8 @@ def run_C(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 # committed types, where each is evaluated).
 
 from teb_vae.classifier.thresholds import (  # noqa: E402
-    AXIS_REASON, OVR_SEGMENT_SCORES, _online, clock, fpr_threshold, latch_state, ovr_view, policy_threshold,
-    snapshot_window,
+    AXIS_REASON, NORM_AXIS, NORM_BIN, OVR_SEGMENT_SCORES, _online, clock, fpr_threshold, latch_state, ovr_view,
+    policy_threshold, snapshot_window,
 )
 
 TYPES = ("instantaneous", "committed_cumulative", "committed_overall")
@@ -1564,17 +1564,34 @@ def _tr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Optional[li
     return groups
 
 
-def _grids(groups: list, axes: Sequence[str], bin_h: float) -> Dict[str, np.ndarray]:
-    """Bin edges per axis, shared by every group of a model/seed/split: width ``bin_h`` aligned on 0,
-    bins ``(lo, hi]``. ``position`` uses width 1 centred on each index (bin_h is in hours)."""
-    out = {}
-    for axis in axes:
-        c = np.concatenate([_clock(U, axis) for f, U in groups if f != "pooled"])
-        c = c[np.isfinite(c)]
-        w, off = (1.0, 0.5) if axis == "position" else (float(bin_h), 0.0)
-        out[axis] = (off + w * np.arange(np.ceil((c.min() - off) / w) - 1, np.ceil((c.max() - off) / w) + 1)
-                     if c.size else np.zeros(0))
-    return out
+def axis_bin(axis: str, ev: Mapping[str, Any]) -> float:
+    """Bin width of ``axis`` in its own units: 1 segment on ``position``, ``eval.norm_bin`` on :data:`NORM_AXIS`
+    (:data:`NORM_BIN` for a config that predates it), ``eval.bin_h`` hours on every other axis."""
+    if axis == "position":
+        return 1.0
+    return float(ev.get("norm_bin") or NORM_BIN) if axis == NORM_AXIS else float(ev["bin_h"])
+
+
+def axis_edges(c: np.ndarray, axis: str, ev: Mapping[str, Any]) -> np.ndarray:
+    """Bin edges of ``axis`` over the clocks ``c`` (bins ``(lo, hi]``; empty without a finite clock): width
+    :func:`axis_bin` aligned on 0, ``position`` centred on each index. :data:`NORM_AXIS` has the fixed edges
+    $-1, -1 + w, \\dots, +1$ (``eval.norm_bin`` $w$ divides 1, so second-stage onset is an edge): a segment that ends
+    before labour onset ($u < -1$) is in no bin and enters the committed types only, through the running max."""
+    c = c[np.isfinite(c)]
+    if not c.size:
+        return np.zeros(0)
+    w = axis_bin(axis, ev)
+    if axis == NORM_AXIS:
+        return np.linspace(-1.0, 1.0, 2 * int(round(1.0 / w)) + 1)
+    off = 0.5 if axis == "position" else 0.0
+    return off + w * np.arange(np.ceil((c.min() - off) / w) - 1, np.ceil((c.max() - off) / w) + 1)
+
+
+def _grids(groups: list, axes: Sequence[str], ev: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+    """Bin edges per axis (:func:`axis_edges`), shared by every group of a model/seed/split: the per-fold groups'
+    clocks set the range."""
+    return {axis: axis_edges(np.concatenate([_clock(U, axis) for f, U in groups if f != "pooled"]), axis, ev)
+            for axis in axes}
 
 
 def _points(axis: str, edges: np.ndarray, ev: Mapping[str, Any]) -> pd.DataFrame:
@@ -1853,6 +1870,22 @@ def _split_by(b: np.ndarray, idx: np.ndarray) -> Tuple[np.ndarray, list]:
     return vals, np.split(idx[o], starts[1:])
 
 
+def _stage_reasons(U: SimpleNamespace, out: set, sentinel: set, axis: str) -> Dict[str, int]:
+    """L14 reasons of the GUIDs ``out`` that a second-stage axis excludes: ``ss_sentinel`` (an onset recorded at
+    delivery, read as unknown, L7) and ``ss_nan`` (an unknown onset); on :data:`NORM_AXIS` also ``no_tlo`` (onset
+    known, labour onset unknown) and ``landmark_order`` (both known, but a stage of zero or negative length)."""
+    if axis == "rel_second_stage":
+        return {"ss_nan": len(out - sentinel), "ss_sentinel": len(out & sentinel)}
+
+    def missing(c: np.ndarray) -> set:
+        return set(U.guid[~np.logical_and.reduceat(np.isfinite(c), U.first)])
+
+    no_ss = out & (missing(_clock(U, "rel_second_stage")) | sentinel)
+    rest, no_tlo = out - no_ss, missing(U.o["tlo_end_h"].to_numpy(np.float64))
+    return {"ss_nan": len(no_ss - sentinel), "ss_sentinel": len(no_ss & sentinel), "no_tlo": len(rest & no_tlo),
+            "landmark_order": len(rest - no_tlo)}
+
+
 def _verdict(n: int, bad: list, what: str) -> Dict[str, Any]:
     """A sanity check over ``n`` items: fail if any is ``bad``; a check that covered nothing is inconclusive, never a
     pass."""
@@ -1885,7 +1918,7 @@ def run_M(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
             groups = _tr_groups(ctx, m, sd, split)
             if groups is None:
                 continue
-            grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+            grids = _grids(groups, ev["time_axes"], ev)
             has_seg = any(U.o["logit_seg_cal"].notna().any() for _, U in groups)
             for fold, U in groups:
                 keys = _keys(ctx, m, sd, split=split, fold=fold, level="online")
@@ -1894,9 +1927,8 @@ def run_M(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
                     V = _view(U, axis, pts)
                     n_el = int(V.elig.sum()) if V else 0
                     reasons = {AXIS_REASON.get(axis, "missing_clock"): U.first.size - n_el} if n_el < U.first.size else {}
-                    if axis == "rel_second_stage" and reasons:
-                        out = set(U.guid[~V.elig]) if V else set(U.guid)
-                        reasons = {"ss_nan": len(out - sentinel), "ss_sentinel": len(out & sentinel)}
+                    if axis in ("rel_second_stage", NORM_AXIS) and reasons:
+                        reasons = _stage_reasons(U, set(U.guid[~V.elig]) if V else set(U.guid), sentinel, axis)
                     _incl(ctx, "axis_eligibility", m, sd, split, fold, axis, n_el, U.first.size - n_el, reasons)
                     if V is None:
                         continue
@@ -1952,7 +1984,8 @@ def run_M(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     return {"frame": frame, "sanity": sanity, **_meta(ctx), "n_rows": 0 if frame is None else int(len(frame)), "plan": {
         "levels": {"online": "GUID online score s_g(n), running max r_g(n)", "segment": "M6, logit_seg_cal"},
         "metric_types": list(TYPES), "axes": list(ev["time_axes"]), "checkpoints_h": list(ev["checkpoints_h"]),
-        "bin_h": ev["bin_h"], "position_bin": 1, "staleness_h": ev["snapshot_max_staleness_h"],
+        "bin_h": ev["bin_h"], "position_bin": 1, "norm_bin": axis_bin(NORM_AXIS, ev),
+        "staleness_h": ev["snapshot_max_staleness_h"],
         "exclude_last_min": ev["exclude_last_min"], "min_bin_class_n": ev["min_bin_class_n"],
         "alarm_rule": ev["alarm_rule"], "stages": list(STAGE_CODES),
         "t": "display units: to_delivery hours before delivery; bins: centre (instantaneous), right edge (committed)",
@@ -2023,7 +2056,7 @@ def run_A(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
             groups = _tr_groups(ctx, m, sd, split)
             if groups is None:
                 continue
-            edges = _grids(groups, ["to_delivery"], ev["bin_h"])["to_delivery"]
+            edges = _grids(groups, ["to_delivery"], ev)["to_delivery"]
             cs = np.r_[edges[1:], -np.asarray(ev["checkpoints_h"], np.float64)]
             kinds = ["bin"] * (edges.size - 1 if edges.size else 0) + ["checkpoint"] * len(ev["checkpoints_h"])
             for fold, U in groups:
@@ -3000,7 +3033,7 @@ def run_S2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
         groups = _tr_groups(ctx, *pm, split)
         if not groups or pid not in groups[0][1].pids:
             continue
-        grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+        grids = _grids(groups, ev["time_axes"], ev)
         for fold, U in groups:
             which = "val" if split != "test" else "pooled" if fold == "pooled" else "fold"
             Mm = _member_matrix(ctx, U.o["fold"].to_numpy()[U.first], U.guid) & rows[which][:, None]
@@ -3285,7 +3318,7 @@ def run_X10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pa
         groups = _ovr_groups(ctx, *pm, "test", k)
         if not groups:
             continue
-        grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+        grids = _grids(groups, ev["time_axes"], ev)
         mask = cells["class_mask"].to_numpy(np.int64)
         has_pos, has_neg = (mask >> k) & 1 == 1, (mask & ~(1 << k)) != 0
         U = groups[-1][1]
@@ -3560,7 +3593,7 @@ def run_R12(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pa
         groups = _tr_groups(ctx, m, sd, "test")
         if groups is None:
             continue
-        grids, U = _grids(groups, ev["time_axes"], ev["bin_h"]), dict(groups)["pooled"]
+        grids, U = _grids(groups, ev["time_axes"], ev), dict(groups)["pooled"]
         fold, cls = U.o["fold"].to_numpy()[U.first], U.o["clinical_class"].astype(str).to_numpy()[U.first]
         for axis in ev["time_axes"]:
             pts = _points(axis, grids[axis], ev)
@@ -3598,7 +3631,7 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             groups = _tr_groups(ctx, m, sd, split)
             if groups is None:
                 continue
-            grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+            grids = _grids(groups, ev["time_axes"], ev)
             for fold, U in groups:
                 P3 = (U.o[p3].to_numpy(np.float64) if set(p3) <= set(U.o) and U.o[p3].notna().all(axis=None) else None)
                 cls = U.o["class_code"].to_numpy(np.int64)[U.first] - 1
@@ -3649,6 +3682,154 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 
 P2_TABLES += ("decision_curve", "snapshots")  # always non-empty: every model has test GUIDs and time-resolved rows
 ANALYSES.update({"K": run_K, "H": run_H, "R10": run_R10, "R12": run_R12, "K7": run_K7})
+
+# ---- block A6 (first detection per subgroup and fold) ----
+#
+# §11.12 A6: when each test GUID is first alarmed, per member of FD_FAMILIES, per fold and pooled, on the clinically
+# anchored axes. It reads the M engine's groups (:func:`_tr_groups`, fold weights included) and their latched state
+# ``U.la`` (``eval.alarm_rule``), primary model and policy. First detection is a time-to-event outcome: a GUID enters
+# observation at its first segment (monitoring often starts late in labour) and leaves at its last (delivery ends it),
+# so the fraction detected by c* can never exceed the fraction monitored by c*. ``first_detection.parquet`` keeps each
+# GUID's entry, exit and first-alarm clocks, from which the figure draws both curves; ``metrics.parquet`` gets the
+# summary rows. "How many" (the detected fraction) and "how early" (the time among the detected) are kept apart: a more
+# sensitive fold also detects the harder labours, later, so its median first detection can move towards delivery.
+
+#: A6 axes (those in ``eval.time_axes``): delivery and second-stage onset, in hours and landmark-registered.
+FD_AXES = ("to_delivery", "rel_second_stage", NORM_AXIS)
+#: A6 families: the clinical classes, and the healthy blood-gas split (train/val healthy GUIDs are about 85 % BG+, the
+#: augmented test ones about 80 % BG-, §11.6.1 healthy_comparator), the healthy shift most likely to move false alarms.
+FD_FAMILIES = ("class", "healthy_x_bg")
+#: A6 quantiles (in time order: q10 is the earliest tenth) of the first-detection time among the detected GUIDs.
+FD_QUANTILES = (0.10, 0.25, 0.75, 0.90)
+FD_COLUMNS = ["model_id", "seed", "split", "fold", "policy_id", "rule", "axis", "subgroup", "subgroup_value", "guid",
+              "y", "w", "entry_c", "exit_c", "first_alarm_c", "detected"]
+
+
+def first_alarm_rows(U: SimpleNamespace, p: int) -> Tuple[np.ndarray, np.ndarray]:
+    """``(alarmed, row)`` per GUID of a prepared group ``U`` (:func:`_prep`) under its ``p``-th policy and
+    ``eval.alarm_rule`` (``U.la``, a latched state, so on for a suffix of each GUID's rows): whether the GUID is ever
+    alarmed, and the row of its first alarm (its last row where it never alarms)."""
+    n_g = np.diff(np.r_[U.first, U.gi.size])
+    n_on = np.add.reduceat(U.la[p].astype(np.int64), U.first)
+    return n_on > 0, U.first + n_g - np.maximum(n_on, 1)
+
+
+def _display(axis: str, c: np.ndarray) -> np.ndarray:
+    """Clocks in the display units of the metrics rows' ``t``: hours before delivery (positive) on ``to_delivery``,
+    the clock itself elsewhere."""
+    return -c + 0.0 if axis == "to_delivery" else c
+
+
+def _fd_rows(U: SimpleNamespace, sel: np.ndarray, alarmed: np.ndarray, fa: np.ndarray, cells: pd.DataFrame,
+             axis: str, boot: Mapping[str, Any], **keys: Any) -> Tuple[list, Dict[int, Tuple[float, float, float]]]:
+    """A6 summary rows of one group on one axis, per cell (rows of ``sel``, (C, G) over ``U``'s GUIDs in the
+    population): ``fd_detected_frac``, the share alarmed by the GUID's last segment (:func:`rate_ci`); over the
+    detected GUIDs, the first-detection median ``fd_median`` (:func:`_stat_ci`, the patient-cluster bootstrap) and the
+    :data:`FD_QUANTILES` ``fd_q<p>`` (:func:`_wquantile`), all in the display units of ``t`` (:func:`_display`).
+    ``n_pos``/``n_neg``: the cell's class counts. A per-fold test group weighs its GUIDs (``U.w``, §11.7). Also returns
+    ``{cell: (fraction, ci_lo, ci_hi)}`` for the fold heterogeneity of :func:`run_A6`."""
+    rows, fracs, flip = [], {}, axis == "to_delivery"
+    for k in np.flatnonzero(sel.any(1)):
+        s = sel[k]
+        det, ws = s & alarmed, None if U.w is None else U.w[s]
+        lo, hi, nu = rate_ci(det[None], s[None], U.y, U.pat, w=U.w, **boot)
+        frac = float(_gsum(det, U.w, 0) / _gsum(s, U.w, 0))
+        x, wx = fa[det], None if U.w is None else U.w[det]
+        med = _stat_ci(x, np.median, boot, units=None if U.pat is None else U.pat[det], w=wx)
+        med = (-med[0] + 0.0, -med[2] + 0.0, -med[1] + 0.0) if flip else med
+        vals = {"fd_detected_frac": frac, "fd_median": med[0],
+                **{f"fd_q{round(100 * q)}": float(_display(axis, np.asarray(_wquantile(x, q, wx)))) if x.size else NAN
+                   for q in FD_QUANTILES}}
+        ci = {"fd_detected_frac": {"ci_lo": float(lo[0]), "ci_hi": float(hi[0]), "n_undefined": float(nu[0])},
+              "fd_median": {"ci_lo": med[1], "ci_hi": med[2]}}
+        rows += metric_rows(vals, ci, subgroup=cells["subgroup"].iat[k], subgroup_value=cells["subgroup_value"].iat[k],
+                            **_class_counts(U.y[s], ws), **keys)
+        fracs[int(k)] = (frac, float(lo[0]), float(hi[0]))
+    return rows, fracs
+
+
+def run_A6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
+    """A6: first detection per subgroup and fold, on each :data:`FD_AXES` axis in ``eval.time_axes``, for the primary
+    model and policy under ``eval.alarm_rule``, pooled test and each fold's test group (weighted, §11.7).
+
+    Writes ``first_detection.parquet`` (:data:`FD_COLUMNS`: one row per fold or ``pooled``, axis, member of
+    :data:`FD_FAMILIES` and GUID eligible on the axis; ``entry_c``, ``exit_c`` and ``first_alarm_c`` are the clocks of
+    the GUID's first segment, last segment and first alarm (NaN: never alarmed), increasing with real time, so
+    ``to_delivery`` is negative hours) and ``level='alarm'`` rows (:func:`_fd_rows`; ``subgroup`` = the family). Per
+    axis and member, ``fold='pooled'`` also gets Cochran's Q p-value and Higgins' I² of the per-fold detected fractions
+    (:func:`i_squared`, SE from each fold's 95 % CI): ``fd_detected_frac_q_p`` and ``fd_detected_frac_i2``. The
+    healthy folds share the augmented test GUIDs (§2.5), so their estimates are positively correlated and I²
+    understates their heterogeneity.
+
+    Sanity ``a6_first_alarm_matches_latch``: on every axis, group and evaluation point, "first-alarm clock <= c*"
+    equals M's committed decision (the latched state at the last segment with clock <= c*, :func:`_view`), so the two
+    code paths agree."""
+    ev, pid, boot = eval_config, eval_config["primary_policy"], _boot(eval_config)
+    axes, pm, cells = [a for a in FD_AXES if a in ev["time_axes"]], primary_model(_s_models(ctx)), _cells(ctx)
+    keep = cells["subgroup"].isin(FD_FAMILIES).to_numpy()
+    fd_cells = cells[keep].reset_index(drop=True)
+    groups = _tr_groups(ctx, *pm, "test") if pm and axes and keep.any() else None
+    tables, rows, bad, n_chk, per_fold = [], [], [], 0, {}
+    if groups and pid in groups[0][1].pids:
+        p, grids = groups[0][1].pids.index(pid), _grids(groups, axes, ev)
+        for fold, U in groups:
+            alarmed, first_row = first_alarm_rows(U, p)
+            last = np.r_[U.first[1:], U.gi.size] - 1
+            live = np.ones(U.first.size, bool) if U.w is None else U.w > 0  # the (weighted) fold population
+            Mm = _member_matrix(ctx, U.o["fold"].to_numpy()[U.first], U.guid)[keep]
+            keys = _keys(ctx, *pm, split="test", fold=fold, level="alarm", metric_type="alarm", denominator="all",
+                         point="end", t=NAN, policy_id=pid, policy_basis=U.basis[pid],
+                         threshold=U.T[0, p] if fold != "pooled" else NAN)
+            for axis in axes:
+                pts = _points(axis, grids[axis], ev)
+                V = _view(U, axis, pts)
+                if V is None:
+                    continue
+                c = _clock(U, axis)
+                fa = np.where(alarmed, c[first_row], NAN)
+                n_chk += 1
+                hi = pts["hi"].to_numpy(np.float64)[None, :]
+                by = (fa[:, None] <= hi) & V.elig[:, None]
+                # _view places clocks by a GUID-offset key (gi * W + c), so a first alarm within float noise of c* may
+                # land on either side there; as M7c, a 1e-9 tie is not a disagreement
+                off = (by != (U.la[p][V.row] & V.avail & V.elig[:, None])) & ~(np.abs(fa[:, None] - hi) <= 1e-9)
+                if off.any():
+                    bad.append(f"{pm[0]}|{pm[1]}|test|{fold}|{axis}|{pid}")
+                sel = Mm & (V.elig & live)[None, :]
+                ci, gi = np.nonzero(sel)
+                tables.append(pd.DataFrame({
+                    "model_id": pm[0], "seed": pm[1], "split": "test", "fold": fold, "policy_id": pid,
+                    "rule": ev["alarm_rule"]["kind"], "axis": axis, "subgroup": fd_cells["subgroup"].to_numpy()[ci],
+                    "subgroup_value": fd_cells["subgroup_value"].to_numpy()[ci], "guid": U.guid[gi],
+                    "y": U.y[gi].astype(np.int64), "w": 1.0 if U.w is None else U.w[gi], "entry_c": c[U.first][gi],
+                    "exit_c": c[last][gi], "first_alarm_c": fa[gi], "detected": alarmed[gi]}))
+                r, fracs = _fd_rows(U, sel, alarmed, fa, fd_cells, axis, boot, **(keys | {"axis": axis}))
+                rows += r
+                if fold != "pooled":
+                    for k, v in fracs.items():
+                        per_fold.setdefault((axis, k), []).append(v)
+        z = ndtri(0.975)
+        for (axis, k), v in per_fold.items():
+            theta, lo, hi = np.asarray(v, np.float64).T
+            rec = i_squared(theta, (hi - lo) / (2 * z))
+            rows += metric_rows({"fd_detected_frac_q_p": rec["q_p"], "fd_detected_frac_i2": rec["i2"]}, None,
+                                **_keys(ctx, *pm, split="test", fold="pooled", level="alarm", metric_type="alarm",
+                                        denominator="all", point="end", t=NAN, policy_id=pid, axis=axis,
+                                        subgroup=fd_cells["subgroup"].iat[k],
+                                        subgroup_value=fd_cells["subgroup_value"].iat[k]))
+    table = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame(columns=FD_COLUMNS)
+    table.astype({"fold": str}).to_parquet(out_dir / "tables" / "first_detection.parquet", index=False)
+    return {"rows": rows, **_meta(ctx), "n_rows": int(len(table)),
+            "sanity": {"a6_first_alarm_matches_latch": _verdict(n_chk, bad, "first-alarm vs latched-state grids")},
+            "plan": {"model": pm and list(pm), "policy": pid, "rule": ev["alarm_rule"], "axes": axes,
+                     "families": [f for f in FD_FAMILIES if f in set(cells["subgroup"])], "split": "test",
+                     "first_detection": "clock of the first segment at which eval.alarm_rule's latched state is on",
+                     "units": "table: clocks increasing with real time; rows: display units of t (to_delivery: hours "
+                              "before delivery)",
+                     "heterogeneity": "Cochran's Q / I² of the per-fold detected fractions (healthy folds correlated)"}}
+
+
+ANALYSES.update({"A6": run_A6})
 
 # ---- block X (confusion and 3-class: X1-X9) ----
 #
@@ -3810,7 +3991,7 @@ def _ovr_frames(ctx: SimpleNamespace, m: str, sd: str, split: str, ev: Mapping[s
         groups = _tr_groups(sub, m, sd, split)
         if groups is None:
             continue
-        grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+        grids = _grids(groups, ev["time_axes"], ev)
         for fold, U in groups:
             for axis in ev["time_axes"]:
                 pts = _points(axis, grids[axis], ev)
@@ -3843,7 +4024,7 @@ def run_X(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
                     U.o[cols].isna().any(axis=None) for _, U in groups):
                 skipped.append(f"{m}|{sd}|{split}")
                 continue
-            grids = _grids(groups, ev["time_axes"], ev["bin_h"])
+            grids = _grids(groups, ev["time_axes"], ev)
             for fold, U in groups:
                 P = U.o[cols].to_numpy(np.float64)
                 keys = _keys(ctx, m, sd, split=split, fold=fold, level="online", metric_type="instantaneous",
