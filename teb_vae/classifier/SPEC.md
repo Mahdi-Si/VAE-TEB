@@ -1393,6 +1393,7 @@ A search failure raises. There is never a silent fallback.
 | `to_delivery` | hours before delivery; evaluation only |
 | `from_onset` | `tlo_end`; GUIDs without TLO are excluded and counted |
 | `rel_second_stage` | `ss_rel + 1260` in h; GUIDs with unknown second stage are excluded and counted |
+| `rel_second_stage_norm` | `rel_second_stage` registered on three landmarks, each stage scaled by its own duration: $u = c_\mathrm{ss}/D_1$ for $c_\mathrm{ss} \le 0$, $u = c_\mathrm{ss}/D_2$ after, so labour onset is at $-1$, second-stage onset at $0$ and delivery at $+1$ for every labour. $D_1$ (onset to second-stage onset) $= c_\mathrm{lo} - c_\mathrm{ss}$ and $D_2$ (second-stage onset to delivery) $= c_\mathrm{ss} - t$, from one segment's end $t$ (h rel. delivery), `tlo_end_h` $c_\mathrm{lo}$ and $c_\mathrm{ss}$ (`thresholds.stage_durations`). **Evaluation only**: the clock needs both durations, known only after delivery, so no threshold policy may take it (`config.ThresholdCfg` refuses it). GUIDs without TLO or a known second-stage onset, or with a stage of length $\le 0$, are excluded and counted (`ss_nan`, `ss_sentinel`, `no_tlo`, `landmark_order`). A segment ending before labour onset has $u < -1$ |
 | `position` | `seg_pos`, 1..N |
 | `elapsed` | hours since the first segment |
 
@@ -1401,7 +1402,7 @@ A search failure raises. There is never a silent fallback.
 These carry over the previous pipeline's instantaneous / committed-cumulative / committed-overall analysis. The definitions are corrected for its defects (A1, A5, A8, A15) and generalised to every axis.
 
 **Notation**
-- Each axis defines a clock c that increases with real time: `to_delivery` → `t_end` in hours, negative; `from_onset` → `tlo_end`; `rel_second_stage` → `(ss_rel + 1260)/3600`; `position` → `seg_pos`; `elapsed` → hours since the first segment.
+- Each axis defines a clock c that increases with real time: `to_delivery` → `t_end` in hours, negative; `from_onset` → `tlo_end`; `rel_second_stage` → `(ss_rel + 1260)/3600`; `rel_second_stage_norm` → its landmark registration $u$ (table above); `position` → `seg_pos`; `elapsed` → hours since the first segment.
 - c_g(n) is the clock of GUID g's segment n. An evaluation point is c*. A bin is b = (c_lo, c_hi].
 - s_g(n) is the online score after segment n (for segment scope: the segment score s_n, or the running aggregator; see below).
 - r_g(n) = max_{m ≤ n} s_g(m) is the running max.
@@ -1445,6 +1446,7 @@ These carry over the previous pipeline's instantaneous / committed-cumulative / 
   - Committed types use the bin's right edge c_hi.
   - The **position** axis gives "metrics vs segment index".
   - The **rel_second_stage** axis gives the second-stage analysis that the old SSO module produced, without its silent cohort filter. GUIDs with unknown second stage are excluded **and counted** (L14).
+  - The **rel_second_stage_norm** axis has fixed bins of width `eval.norm_bin` (default 0.25, the quartiles of each stage; it must divide 1, so $-1$, $0$ and $+1$ are edges) from $-1$ to $+1$. It gives every second-stage figure a twin on which labours of different length share bins: in hours, a bin far from onset holds only the long labours. Normalisation adds no segments. A second stage of $D_2$ hours in 4 bins gives bins of $D_2/4$ h, so where $D_2/4$ is shorter than the segment stride (11–20 min) a GUID has no snapshot in some second-stage bins, and the instantaneous population there can be thinner than on the hours axis. The committed types carry the state forward and are not affected. Compare the two n strips on a real run before reading a bin. A segment ending before labour onset ($u < -1$) is in no bin and enters the committed types only.
 - **Segment-level AUROC per bin**, time-matched (§6.6).
 - **Bin reporting rules:**
   - Every bin and checkpoint reports n_pos and n_neg and a bootstrap CI.
@@ -1613,7 +1615,7 @@ The complete list of figures is in the analysis catalogue (§11.12). The rules h
 - Every time-resolved plot follows the old pipeline's orientation: the hours-before-delivery axis is **inverted**, so delivery is on the right.
 - It carries:
   - a dashed grey vertical line at each **threshold-basis time point** (`at`, e.g. "decision 1 h");
-  - a dotted zero line on the `rel_second_stage` axis (label "second-stage onset");
+  - a dotted zero line on the `rel_second_stage` and `rel_second_stage_norm` axes (label "second-stage onset");
   - an **n strip** under the axis (GUIDs per class per bin);
   - one short **note** line under it saying what a hollow marker or a gap means (`Hollow: n < <min_bin_class_n> per class`). The exclusion counts by reason (e.g. "41 GUIDs with unknown second stage") are in `evaluation/tables/inclusion.csv` (L14) and `summary.md`, not on the figure.
 - **Figure text budget.** A figure carries one title (what it shows, then a model or policy, then `validation` / `fold k` off the pooled test set), short noun-phrase panel titles, the model as `model · seed 42` (`model · ensemble`, or the bare name of a seedless baseline), axis labels with units, one key and at most one note line. Keys shared by several panels are drawn once, under the panels; an entry that belongs to one panel only (an AUC, a mean) stays inside that panel. Legend keys carry no `N = …`; the counts, slopes, intercepts, ECE, ICI and CIs are in the tables and `summary.md`, and the definitions of each figure (population, bands, line styles) are in this document.
@@ -1727,6 +1729,7 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
 | M1 | Metric types vs time | Three stacked rows (instantaneous, committed cumulative, committed overall): sensitivity, specificity and FPR lines with CIs, α line, basis-time line, n strip, × axes × policies (figures for the primary policy and every `*_1h` basis policy; tables for all) | fig `metric_types_<axis>_<policy>` | 5 variants × 3 types, per fold and aggregated |
 | M2 | Checkpoint table | policy × metric type × checkpoint: sens, spec, FPR, PPV, NPV, n, CIs | table + summary §8 | `decision_point_metrics` |
 | M3 | Second-stage axis mirror | M1 on `rel_second_stage`, with the zero line (the exclusion counts by reason are in `inclusion.csv`) | fig `metric_types_rel_second_stage_<policy>` | SSO mirror (without its cohort filter) |
+| M3n | Normalised second-stage axis | Every per-axis analysis and figure (M1, M6, R7, R13, K7, S2, S5, X3, X5–X7, X10) on `rel_second_stage_norm` (§11.5): the same stems with the axis name, the zero line at second-stage onset, x = labour progress | figs `*_rel_second_stage_norm*` | new |
 | M4 | Labour-onset axis | M1 on `from_onset` | fig `metric_types_from_onset_<policy>` | new (TLO was never used) |
 | M5 | Position axis | M1 on `position` (metrics vs segment index) | fig `metric_types_position_<policy>` | new |
 | M6 | Segment-level instantaneous | Every segment in a bin, segment score, GUID-cluster CI | fig `segment_instantaneous_<axis>` | old row-level instantaneous |
@@ -1781,6 +1784,7 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
 | A3 | False-alarm curve | Fraction of healthy GUIDs alarmed by τ (the committed-overall FPR curve), and time-to-first-false-alarm distribution | fig `false_alarms` | new |
 | A4 | Alarm burden | Healthy: fraction of monitored segments in alarm; alarms per detection (FP/TP GUIDs) | table | new |
 | A5 | Alarm rule comparison | latch vs k_of_n (when configured) on A1–A4 | table | new |
+| A6 | First detection per subgroup and fold | Primary model and policy under `eval.alarm_rule`, pooled test and each fold's test group (weighted, §11.7), on `to_delivery`, `rel_second_stage` and `rel_second_stage_norm` (those in `eval.time_axes`), per member of `class` and `healthy_x_bg` (`metrics.FD_FAMILIES`). First detection is a time-to-event outcome: a GUID enters at its first segment and leaves at its last, so the detected share by c* is capped by the share monitored by c*. Table: each GUID's entry, exit and first-alarm clocks. Rows (`level=alarm`, `subgroup` = family): `fd_detected_frac` (share alarmed by the last segment, `rate_ci`), `fd_median` (patient-cluster bootstrap) and `fd_q10/25/75/90` of the first-detection time among the detected GUIDs (display units of `t`); on `fold=pooled` also Cochran's Q p and I² of the per-fold detected shares (the healthy folds share their augmented test GUIDs, so I² understates theirs). Sanity `a6_first_alarm_matches_latch`: "first-alarm clock ≤ c*" equals M's committed decision at every point. Figure: rows = members (`unhealthy` left out), columns = detected by c* (fold lines, min–max band, all-fold line, dashed monitored ceiling), first-detection boxes per fold (10–90, 25–75, median), detected share by the end per fold with Kish–Wilson CI and the policy's α on the healthy rows | `evaluation/tables/first_detection.parquet`; figs `first_detection_<axis>`; summary §10 | new (A2 has no subgroups, folds or second-stage axes) |
 
 #### Block H — Heterogeneity and stability
 
@@ -1827,7 +1831,8 @@ Every table goes into `evaluation/tables/metrics.parquet` (long format, §11.9) 
   eval.log  resolved_config.yaml  provenance.json
   tables/
     metrics.parquet  thresholds.parquet  roc_points.parquet  subgroups.parquet  subgroup_tests.parquet
-    subgroup_cutpoints.json  errors.parquet  alarms.parquet  inclusion.csv  attribution.parquet (E6, when enabled)
+    subgroup_cutpoints.json  errors.parquet  alarms.parquet  first_detection.parquet (A6)  inclusion.csv
+    attribution.parquet (E6, when enabled)
   figures/                # pooled full set (stems from §11.12), one file per format
     cohort/  roc/  thresholds/  metric_types/  subgroups/  calibration/  confusion/  multiclass/
     alarms/  heterogeneity/  errors/  baselines/
@@ -2074,8 +2079,9 @@ classifier:
     alarm_rule: {kind: latch}       # latch | k_of_n {k, n}
     checkpoints_h: [6, 4, 3, 2, 1, 0.5]
     snapshot_max_staleness_h: 1.0
-    time_axes: [to_delivery, from_onset, rel_second_stage, position, elapsed]
+    time_axes: [to_delivery, from_onset, rel_second_stage, rel_second_stage_norm, position, elapsed]
     bin_h: 0.5
+    norm_bin: 0.25                  # rel_second_stage_norm bin width: the quartiles of each stage (must divide 1)
     min_bin_class_n: 5
     subgroup_families: [class, source_file, class_x_cs, healthy_x_bg, healthy_bg_x_cs, cs, bg, healthy_comparator,
                         stage_last, reached_second_stage, has_tlo, admission_tlo_tertile, labour_duration_tertile,
@@ -2533,6 +2539,8 @@ Full discussion is in [`RESEARCH.md`](RESEARCH.md). The references that ground d
 ---
 
 ## CHANGELOG
+
+- 2026-10-21 — **Landmark-registered second-stage axis (§11.5, M3n)** and **first detection per subgroup and fold (A6).** `rel_second_stage_norm` scales each stage by its own duration ($-1$ labour onset, $0$ second-stage onset, $+1$ delivery; `thresholds.clock`, `stage_durations`), so every per-axis figure gets a twin on which labours of different length share bins; fixed bins of `eval.norm_bin` (0.25), evaluation only (threshold policies refuse it), exclusions counted by reason (`ss_nan`, `ss_sentinel`, `no_tlo`, `landmark_order`). `metrics.axis_bin` / `axis_edges` hold every axis's bin width and edges (R13 used `bin_h` on every axis). A6 writes `first_detection.parquet`, `fd_*` rows with CIs and I², and the sanity identity against M's latched state; the figure `alarms/first_detection_<axis>` draws, per member, the detected share by c* under its monitored ceiling, the per-fold first-detection boxes and the per-fold detected share. `_alarms_md` reads the `alarm_rule` rows only, so A6's rows never enter the A1–A5 table.
 
 - 2026-10-08 (later) — **Fold weighting of per-fold test rows (§11.7)** and **fold bands for the subgroup time figures (block S).** Every per-fold test metric is computed on the weighted fold population (`metrics.fold_weights_of`: a shared test GUID weighs 1/K in each of its K folds; pooled and val rows bit-identical), through `w=` on the metric primitives (`threshold_free`, `thresholded`, `multiclass`, `net_benefit`, `roc_points`, `bootstrap_rank`, `bootstrap_auroc`, `rate_ci` with `kish_wilson`, `three_class_ci`, `_stat_ci`) and a `w` column on the per-fold populations; `summary.json` records `results.fold_weighting: inverse_k`; `alarms.parquet` gains `w`. In run 2026-10-07--17-52 the fold-mean test AUROC moves from 0.698 to 0.654 (= pooled) and the pooled line leaves the fold envelope in 0.5 % of the specificity/FPR cells instead of 47.7 %. The report weights the per-fold curves it computes itself (PR, OvR, reliability) and labels per-fold values in figure notes and `summary.md`. S2 writes per-fold test rows for every family but `fold`, and S2, S5 and S8 each get a `_folds` twin (pooled line over the per-fold min–max; thin fold lines on S5 and S8). `healthy_bg_x_cs` draws its cs− cells as the lighter shade of their bg colour. `config.digest` leaves a key added later out at its default (`_LATER_DEFAULTS`: `labels.time_matched: false`), so run dirs made before the key keep their digest. Tests `tests/test_fold_band.py`, `tests/test_fold_weights.py`, `tests/test_metrics.py` (weighted primitives).
 
