@@ -100,3 +100,30 @@ def test_basis_committed_and_instantaneous_known_answers():
     assert _by_class(*T.basis_scores(seg, guids, "instantaneous")) == ([0.1, 0.4, 0.9], [0.6])
     assert _by_class(*T.basis_scores(seg, guids, "guid_final")) == ([0.1, 0.4, 0.9], [0.6])
     assert _by_class(*T.basis_scores(seg, guids, "segment")) == ([0.3, 0.4, 0.9], [])
+
+
+# --- the landmark-registered second-stage axis (§11.5) ------------------------------------------
+def _labour(guid: str, ends_h, onset_h: float, ss_h: float) -> pd.DataFrame:
+    """Segments of one GUID ending at ``ends_h`` (h rel. delivery), with labour onset at ``onset_h`` and second-stage
+    onset at ``ss_h`` (NaN: unknown), in the cohort's columns (``ss_rel_h`` at the segment start, ``tlo_end_h`` at
+    its end)."""
+    t_end = np.asarray(ends_h, np.float64) * 3600.0
+    return pd.DataFrame({"guid": guid, "t_end_s": t_end, "epoch_s": t_end - 1260.0,
+                         "tlo_end_h": t_end / 3600.0 - onset_h, "ss_rel_h": (t_end - 1260.0) / 3600.0 - ss_h})
+
+
+def test_landmark_clock_known_answers():
+    """Onset -10 h, second-stage onset -2 h, delivery 0: D1 = 8 h and D2 = 2 h, so segment ends at -11, -10, -6, -2,
+    -1 and 0 h sit at u = -1.125 (before onset), -1, -0.5, 0, +0.5 and +1. A GUID without TLO, one without a known
+    second-stage onset and one whose second stage starts before labour onset have no clock on the axis."""
+    seg = pd.concat([_labour("a", [-11, -10, -6, -2, -1, 0], -10.0, -2.0), _labour("no_tlo", [-3, -1], np.nan, -2.0),
+                     _labour("no_ss", [-3, -1], -10.0, np.nan), _labour("order", [-3, -1], -2.0, -3.0)],
+                    ignore_index=True)
+    u = T.clock(seg, T.NORM_AXIS)
+    a = seg["guid"] == "a"
+    np.testing.assert_allclose(u[a], [-1.125, -1.0, -0.5, 0.0, 0.5, 1.0], atol=1e-12)
+    assert u[~a].isna().all()
+    d1, d2 = T.stage_durations(seg)
+    np.testing.assert_allclose(np.c_[d1[a], d2[a]], np.tile([8.0, 2.0], (6, 1)), atol=1e-12)
+    with pytest.raises(ValueError, match="evaluation-only"):
+        T.snapshot_window(T.NORM_AXIS, bin_h=0.5, staleness_h=1.0)

@@ -38,3 +38,17 @@ def test_a_run_dir_of_another_schema_version_is_refused(tmp_path, monkeypatch):
 
         logger.remove()
         logger.add(sys.stderr)
+
+
+def test_landmark_axis_is_evaluation_only_and_left_out_of_the_digest():
+    """``rel_second_stage_norm`` (§11.5) is no threshold basis; ``eval.norm_bin`` must divide 1; neither enters the
+    digest, so a run dir made before the axis existed still resumes and re-evaluates."""
+    with pytest.raises(ValueError, match="evaluation only"):
+        config.load(DEFAULT, ["classifier.eval.thresholds=[{id: np30, policy: fpr_cap, alpha: 0.3, method: empirical, "
+                              "basis: committed_overall, axis: rel_second_stage_norm, at: 0.5}]"])
+    with pytest.raises(ValueError, match="norm_bin must divide 1"):
+        config.load(DEFAULT, ["classifier.eval.norm_bin=0.3"])
+    assert config.load(DEFAULT, ["classifier.eval.norm_bin=0.2"]).classifier.eval.norm_bin == 0.2
+    assert config.digest(config.load(DEFAULT)) == config.digest(config.load(DEFAULT, [
+        "classifier.eval.norm_bin=0.5",
+        "classifier.eval.time_axes=[to_delivery, from_onset, rel_second_stage, position, elapsed]"]))
