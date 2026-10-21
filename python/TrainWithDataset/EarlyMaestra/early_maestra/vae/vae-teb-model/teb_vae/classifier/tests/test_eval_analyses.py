@@ -26,12 +26,15 @@ def _split_of(i: int, fold: int) -> str:
 
 
 def make_run(root: Path, *, folds: Sequence[int] = (1, 2, 3), n_guids: int = 100, resamples: int = 20,
-             overrides: Sequence[str] = (), seed: int = 0) -> Tuple[Path, Any]:
+             overrides: Sequence[str] = (), seed: int = 0, second_stage: bool = False) -> Tuple[Path, Any]:
     """A run dir with ``config.resolved.yaml``, ``manifest.json``, ``cohort/*`` and ``predictions/*``.
 
     GUID ``i`` is healthy for even i, acidosis for i % 4 == 1, HIE otherwise; 8-12 segments on a
     660-s grid ending in the last 20 min. Positives' segment logits are shifted up (more so in the
     last hour), so AUROC is high; the shortcut baseline scores GUID length with a weak signal.
+    Labour onset is 6 h before delivery for i % 3 > 0 (TLO), unknown otherwise. ``second_stage``: GUIDs with
+    i % 7 > 0 also get a second-stage onset 1 h before delivery (so some have one without a TLO); without it every
+    onset is unknown.
     """
     from teb_vae.classifier.config import digest, load
     from teb_vae.classifier.thresholds import select_thresholds
@@ -49,11 +52,13 @@ def make_run(root: Path, *, folds: Sequence[int] = (1, 2, 3), n_guids: int = 100
         n, last = 8 + i % 5, -rng.uniform(60, 1200)
         t_end = last - 660.0 * np.arange(n)[::-1]
         y = int(code > 1)
+        has_ss = i % 7 > 0 if second_stage else False
         segs.append(pd.DataFrame({
             "guid": f"g{i:03d}", "seg_pos": np.arange(n), "slot": np.arange(n), "t_end_s": t_end,
             "epoch_s": t_end - 1260.0, "class_code": code, "clinical_class": name, "source_file": sub, "subgroup": sub,
-            "y": y, "cs": sub.endswith("_cs") and "no_cs" not in sub, "bg": True, "has_tlo": i % 3 > 0, "has_ss": i % 2 == 0,
-            "tlo_end_s": np.where(i % 3 > 0, t_end + 6 * 3600.0, np.nan), "ss_rel_s": np.nan, "stage": "unknown",
+            "y": y, "cs": sub.endswith("_cs") and "no_cs" not in sub, "bg": True, "has_tlo": i % 3 > 0,
+            "has_ss": has_ss if second_stage else i % 2 == 0, "tlo_end_s": np.where(i % 3 > 0, t_end + 6 * 3600.0, np.nan),
+            "ss_rel_s": t_end - 1260.0 + 3600.0 if has_ss else np.nan, "stage": "unknown",
             "valid_frac": 1.0, "n_valid_steps": 300,
             "base": rng.normal(0, 1, n) + rng.normal(0, 0.7) + 1.5 * y * (1 + (t_end > -3600)) / 1.25,
         }))
@@ -76,7 +81,7 @@ def make_run(root: Path, *, folds: Sequence[int] = (1, 2, 3), n_guids: int = 100
             else:
                 p["logit_seg"] = p["logit_online"] = np.nan
             p["logit_seg_cal"], p["logit_online_cal"] = p["logit_seg"], p["logit_online"]
-            p["tlo_end_h"], p["ss_rel_h"] = p["tlo_end_s"] / 3600, np.nan
+            p["tlo_end_h"], p["ss_rel_h"] = p["tlo_end_s"] / 3600, p["ss_rel_s"] / 3600
             g = p.groupby(["split", "guid"], as_index=False).agg(
                 **{c: (c, "first") for c in ("run_id", "model_id", "seed", "fold", "class_code", "y", "cs", "bg",
                                              "clinical_class", "subgroup", "has_tlo", "has_ss", "shared_test")},
@@ -163,3 +168,37 @@ def test_provenance_digest_mismatch_refuses(tmp_path):
     (run / "predictions" / "provenance.json").write_text(json.dumps(prov | {"config_digest": "0" * 64}))
     with pytest.raises(ValueError, match="config digest"):
         M.evaluate(run, cfg)
+
+
+def test_first_detection_and_landmark_axis(tmp_path):
+    """A6 and the landmark axis (§11.5, §11.12 A6) on a run with second-stage onsets (labour onset at -6 h, second-stage
+    onset at -1 h, so u = c_ss / 5 in the first stage and c_ss / 1 in the second): A6's sanity identity (first alarm vs
+    M's latched state) passes on every axis; on to_delivery the pooled detected share of ``unhealthy`` is A's event
+    sensitivity (every adverse GUID, two code paths); the landmark axis evaluates at its fixed bin edges in (-1, 1]
+    and counts its exclusions by reason (no onset; onset without TLO)."""
+    run, cfg = make_run(tmp_path, folds=(1, 2), resamples=5, second_stage=True)
+    assert M.evaluate(run, cfg, only=["M", "A", "A6"]) == 0
+    (part,) = (run / "evaluation").glob("partial_*")
+    summary = json.loads((part / "summary.json").read_text())
+    assert summary["results"]["sanity"]["checks"]["a6_first_alarm_matches_latch"]["verdict"] == "pass"
+    fd = pd.read_parquet(part / "tables" / "first_detection.parquet")
+    assert set(fd["axis"]) == {"to_delivery", "rel_second_stage", "rel_second_stage_norm"}
+    assert {"healthy", "acidosis", "hie", "unhealthy"} <= set(fd["subgroup_value"])
+    assert (fd["first_alarm_c"].isna() == ~fd["detected"]).all() and (fd["entry_c"] <= fd["exit_c"]).all()
+    assert (fd.loc[fd["detected"], "first_alarm_c"] >= fd.loc[fd["detected"], "entry_c"]).all()
+
+    rows, pid = pd.read_parquet(part / "tables" / "metrics.parquet"), cfg.classifier.eval.primary_policy
+    pooled = M._sel(rows, level="alarm", split="test", fold="pooled", policy_id=pid, model_id="probe")
+    fd_sens = M._sel(pooled, axis="to_delivery", subgroup="class", subgroup_value="unhealthy", metric="fd_detected_frac")
+    event = M._sel(pooled, subgroup="alarm_rule", subgroup_value="latch", metric="event_sens")
+    assert fd_sens["value"].iloc[0] == pytest.approx(event["value"].iloc[0])
+
+    norm = M._sel(rows, level="online", axis="rel_second_stage_norm", point="bin", metric_type="committed_overall")
+    edges = np.linspace(-1.0, 1.0, 9)
+    assert len(norm) and np.isin(np.round(norm["t"].astype(float).unique(), 9), np.round(edges[1:], 9)).all()
+    inc = pd.read_csv(part / "tables" / "inclusion.csv", dtype={"fold": str})
+    e = inc[(inc["analysis"] == "axis_eligibility") & (inc["axis"] == "rel_second_stage_norm") & (inc["split"] == "test")
+            & (inc["fold"] == "pooled") & (inc["model_id"] == "probe")].iloc[0]
+    reasons = json.loads(e["reasons"])
+    assert reasons["ss_nan"] > 0 and reasons["no_tlo"] > 0 and reasons["landmark_order"] == 0
+    assert sum(reasons.values()) == e["n_excluded"]

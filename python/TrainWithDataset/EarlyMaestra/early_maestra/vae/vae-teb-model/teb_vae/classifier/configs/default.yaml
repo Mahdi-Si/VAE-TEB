@@ -157,8 +157,11 @@ classifier:
     alarm_rule: {kind: latch}       # latch | k_of_n {k, n}
     checkpoints_h: [6, 4, 3, 2, 1, 0.5]
     snapshot_max_staleness_h: 1.0
-    time_axes: [to_delivery, from_onset, rel_second_stage, position, elapsed]
+    # rel_second_stage_norm: rel_second_stage with each stage scaled by its own duration (-1 labour onset, 0 second-stage
+    # onset, +1 delivery; GUIDs need TLO and a known second-stage onset), so labours of different length share bins
+    time_axes: [to_delivery, from_onset, rel_second_stage, rel_second_stage_norm, position, elapsed]
     bin_h: 0.5
+    norm_bin: 0.25                  # rel_second_stage_norm bin width: the quartiles of each stage (must divide 1)
     min_bin_class_n: 5
     subgroup_families: [class, source_file, class_x_cs, healthy_x_bg, healthy_bg_x_cs, cs, bg, healthy_comparator,
                         stage_last, reached_second_stage, has_tlo, admission_tlo_tertile, labour_duration_tertile,

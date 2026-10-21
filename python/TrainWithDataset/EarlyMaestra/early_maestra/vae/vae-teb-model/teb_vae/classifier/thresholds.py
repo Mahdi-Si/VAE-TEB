@@ -143,17 +143,48 @@ def apply_threshold(score: Any, thr: float) -> np.ndarray:
 
 
 #: Evaluation time axes (SPEC §11.5; CONTRACT "Evaluation time axes"), and why a GUID drops off one.
-AXES = ("to_delivery", "from_onset", "rel_second_stage", "position", "elapsed")
-AXIS_REASON = {"from_onset": "no_tlo", "rel_second_stage": "unknown_second_stage"}
+AXES = ("to_delivery", "from_onset", "rel_second_stage", "rel_second_stage_norm", "position", "elapsed")
+AXIS_REASON = {"from_onset": "no_tlo", "rel_second_stage": "unknown_second_stage",
+               "rel_second_stage_norm": "no_landmarks"}
+#: The landmark-registered second-stage axis (SPEC §11.5): labour onset at -1, second-stage onset at 0, delivery at +1.
+#: Evaluation only: its clock needs both stage durations, which are known only after delivery, so it is never a
+#: threshold basis (``config.ThresholdCfg`` refuses it).
+NORM_AXIS = "rel_second_stage_norm"
+#: Default bin width of :data:`NORM_AXIS` (``eval.norm_bin``): the quartiles of each stage, 8 bins over [-1, +1].
+NORM_BIN = 0.25
+
+
+def stage_durations(segments: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    r"""First- and second-stage durations $(D_1, D_2)$ in hours of each segment's GUID, one value per row.
+
+    A segment carries the three landmarks of its labour implicitly. With its end $t$ (h relative to delivery,
+    ``t_end_s / 3600``), its ``rel_second_stage`` clock $c_\mathrm{ss}$ and its ``tlo_end_h`` $c_\mathrm{lo}$, the
+    second-stage onset is at $t - c_\mathrm{ss}$ and the labour onset at $t - c_\mathrm{lo}$. So
+    $D_1 = c_\mathrm{lo} - c_\mathrm{ss}$ (labour onset to second-stage onset) and $D_2 = c_\mathrm{ss} - t$ (second-stage
+    onset to delivery). Example: onset at -10 h and second-stage onset at -2 h give $D_1 = 8$ and $D_2 = 2$ on every
+    segment. Both are constant within a GUID; the GUID median absorbs float noise. NaN without a TLO or a known
+    second-stage onset.
+    """
+    ss = clock(segments, "rel_second_stage")
+    by = segments["guid"]
+    d1 = (segments["tlo_end_h"] - ss).groupby(by).transform("median")
+    d2 = (ss - segments["t_end_s"] / 3600.0).groupby(by).transform("median")
+    return d1.astype(np.float64), d2.astype(np.float64)
 
 
 def clock(segments: pd.DataFrame, axis: str) -> pd.Series:
-    """Clock of each segment on ``axis`` (increasing with real time; NaN = the GUID is ineligible).
+    r"""Clock of each segment on ``axis`` (increasing with real time; NaN = the GUID is ineligible).
 
     ``to_delivery`` ``t_end_s/3600`` (h, negative); ``from_onset`` ``tlo_end_h``; ``rel_second_stage``
     ``ss_rel_h`` (at segment start) plus the segment's duration; ``position`` ``seg_pos + 1``;
     ``elapsed`` hours since the GUID's first retained segment end. Threshold selection and every
     time-resolved metric read this one function, so they cannot disagree.
+
+    ``rel_second_stage_norm`` (:data:`NORM_AXIS`) is the piecewise-linear landmark registration of
+    ``rel_second_stage``: each stage is scaled by its own duration (:func:`stage_durations`),
+    $u = c_\mathrm{ss} / D_1$ for $c_\mathrm{ss} \le 0$ and $u = c_\mathrm{ss} / D_2$ after, so labour onset is at
+    $-1$, second-stage onset at $0$ and delivery at $+1$ for every labour. A segment that ends before labour onset
+    has $u < -1$. NaN for the whole GUID without both landmarks, or with a stage of zero or negative length.
     """
     s = segments
     if axis == "to_delivery":
@@ -162,6 +193,9 @@ def clock(segments: pd.DataFrame, axis: str) -> pd.Series:
         c = s["tlo_end_h"]
     elif axis == "rel_second_stage":
         c = s["ss_rel_h"] + (s["t_end_s"] - s["epoch_s"]) / 3600.0
+    elif axis == NORM_AXIS:
+        ss, (d1, d2) = clock(s, "rel_second_stage"), stage_durations(s)
+        c = (ss / d1.where(ss <= 0.0, d2)).where((d1 > 0.0) & (d2 > 0.0))
     elif axis == "position":
         c = s["seg_pos"] + 1.0
     elif axis == "elapsed":
@@ -176,7 +210,14 @@ def snapshot_window(axis: str, *, bin_h: float, staleness_h: Optional[float]) ->
     last segment with clock <= c*, kept iff its clock > c* - w. On ``to_delivery`` a point is a checkpoint, so w is
     ``eval.snapshot_max_staleness_h``; the other axes are read on the bin grid, w = ``bin_h`` (``position``: 1).
     Threshold selection (:func:`basis_frame`) and the evaluation's checkpoints (``metrics._points``) both take w here,
-    so an instantaneous threshold is chosen on the population it is reported on."""
+    so an instantaneous threshold is chosen on the population it is reported on.
+
+    Raises:
+        ValueError: On :data:`NORM_AXIS`, which is evaluation only (no threshold basis reads it), or on
+            ``to_delivery`` without ``staleness_h``.
+    """
+    if axis == NORM_AXIS:
+        raise ValueError(f"{NORM_AXIS} is an evaluation-only axis: no threshold basis or snapshot window reads it")
     if axis == "position":
         return 1.0
     if axis != "to_delivery":
