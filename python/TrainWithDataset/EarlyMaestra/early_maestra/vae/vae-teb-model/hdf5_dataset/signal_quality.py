@@ -4,8 +4,8 @@ The dataset builder reads every record through the MIMO adaptor and cuts it into
 $N = 5280$ samples at $f_s = 4$ Hz. This module takes one segment's **pre-fill** signals -- the
 signals before ``MimoSequence.interpolate_input`` has replaced anything -- and does three things:
 
-1. It gives every sample a ``uint8`` quality code for UA (:class:`UaBit`) and for FHR
-   (:class:`FhrBit`). A sample can carry several bits.
+1. It gives every sample a quality code: ``uint16`` for UA (:class:`UaBit`) and ``uint8`` for
+   FHR (:class:`FhrBit`). A sample can carry several bits.
 2. It bridges every invalid span with a one-interval monotone cubic (PCHIP), so a span edge does
    not excite every wavelet channel with a broadband step.
 3. It measures how much of each stored coefficient is built from invalid samples. For a causal
@@ -42,7 +42,16 @@ short runs between the toggles pass every rule. They are not a signal the bridge
 so a short valid run in a mostly invalid neighbourhood is an ``ISLAND``
 (:attr:`QualityConfig.island_max_s`).
 
-**Causality.** Most rules read only past samples. Eight read ahead, and each read is bounded by
+**Oscillations.** Maternal breathing can add a regular wave of $5$--$20$ s period to the UA, on
+the rest and on every contraction. Its sharp edges pass the jump test and its crests pass the
+spike test, so the version 2 rules masked whole segments of real contractions. A train of at
+least :attr:`QualityConfig.osc_min_peaks` regularly spaced peaks (or dips) is an
+``OSCILLATION``: the jump and spike rules ignore it, and its samples stay valid. An artifact burst
+is not regular, so it is still marked. A sensor that toggles to the ceiling can be regular, so a
+wave swings at most :attr:`QualityConfig.osc_max_units`, and a jump to or from a ceiling value is
+marked inside a wave too.
+
+**Causality.** Most rules read only past samples. Nine read ahead, and each read is bounded by
 :attr:`QualityConfig.lookahead_s`:
 
 * a box is closed by its opposite jump within :attr:`QualityConfig.box_max_s`;
@@ -58,11 +67,15 @@ so a short valid run in a mostly invalid neighbourhood is an ``ISLAND``
 * a floor run is marked when an invalid code follows it within
   :attr:`QualityConfig.floor_near_s`;
 * an island is judged by the :attr:`QualityConfig.island_context_s` after it;
+* an oscillation starts once the next :attr:`QualityConfig.osc_min_peaks` peaks of its train
+  are seen, within :attr:`QualityConfig.osc_min_peaks` $\times$
+  :attr:`QualityConfig.osc_period_max_s`;
 * the bridge uses the first valid sample after a span. Every sample it writes is invalid, so a
   model that honours the mask never reads the bridge before that sample.
 
-The module is pure NumPy (plus ``scipy.signal`` for the FFT convolution). It does not import the
-scattering code; :func:`magnitude_kernels` takes the bank's arrays as arguments.
+The module is pure NumPy, plus ``scipy.signal`` for the peaks and the FFT convolution and
+``scipy.io`` to read the raw FHR channel. It does not import the scattering code;
+:func:`magnitude_kernels` takes the bank's arrays as arguments.
 """
 from __future__ import annotations
 
@@ -74,7 +87,7 @@ import numpy as np
 
 #: Version of the rules and of the stored fields. A builder writes it as a file attribute, and a
 #: file with another version is not complete for a build of this one.
-QUALITY_VERSION = 2
+QUALITY_VERSION = 3
 
 
 class UaBit(enum.IntFlag):
@@ -92,6 +105,9 @@ class UaBit(enum.IntFlag):
         HOLD: A constant hold that a repair or a frozen sensor produced.
         FLOOR: A floor (loss of contact) next to an invalid code, or an exact-zero run.
         ISLAND: A short run that passed every other rule inside a mostly invalid region.
+        OSCILLATION: Inside a regular train of peaks or dips (maternal breathing). Valid: the
+            bit only records that the jump and spike rules were not applied here. It is the
+            ninth bit, so the UA bits are ``uint16``.
     """
 
     MISSING = 1
@@ -102,6 +118,7 @@ class UaBit(enum.IntFlag):
     HOLD = 32
     FLOOR = 64
     ISLAND = 128
+    OSCILLATION = 256
 
 
 class FhrBit(enum.IntFlag):
@@ -123,7 +140,9 @@ class FhrBit(enum.IntFlag):
     LINEAR = 64
 
 
-#: The UA bits that make a sample invalid. A ``CENSORED`` sample stays valid.
+#: Storage type of the UA bits: :class:`UaBit` has nine bits.
+UA_DTYPE = np.uint16
+#: The UA bits that make a sample invalid. ``CENSORED`` and ``OSCILLATION`` samples stay valid.
 UA_INVALID = int(
     UaBit.MISSING | UaBit.CODE | UaBit.TRANSIENT | UaBit.STEP | UaBit.HOLD | UaBit.FLOOR
     | UaBit.ISLAND
@@ -196,6 +215,16 @@ class QualityConfig:
         island_share: A run is an island when at least this share of each of its two context
             windows is invalid. A run between two isolated spikes has mostly valid context and
             stays valid.
+        osc_units: Smallest prominence of a peak (or dip) of an oscillation, measured within
+            :attr:`osc_period_max_s` on each side. The rest of a quiet uterus varies by about
+            $2$ units.
+        osc_max_units: Largest prominence of a peak of an oscillation. Breathing swings the TOCO
+            by about $10$--$20$ units; a toggle between a rest and the ceiling swings further.
+        osc_period_min_s: Shortest spacing of two peaks of an oscillation.
+        osc_period_max_s: Longest spacing of two peaks of an oscillation. Maternal breathing has
+            a period of about $3$--$20$ s; contractions are at least $1$ minute apart.
+        osc_min_peaks: Fewest peaks of a train. A random burst of $5$ spikes is rarely regular.
+        osc_ratio: Largest ratio of two consecutive spacings in a train.
         fhr_hold_min_s: Shortest exactly constant FHR run that is a hold. Natural integer runs
             reach about $11$ s.
         fhr_linear_min_s: Shortest monotone FHR ramp that can be a linear repair.
@@ -239,6 +268,12 @@ class QualityConfig:
     island_max_s: float = 20.0
     island_context_s: float = 20.0
     island_share: float = 0.5
+    osc_units: float = 6.0
+    osc_max_units: float = 30.0
+    osc_period_min_s: float = 5.0
+    osc_period_max_s: float = 20.0
+    osc_min_peaks: int = 5
+    osc_ratio: float = 1.5
     fhr_hold_min_s: float = 15.0
     fhr_linear_min_s: float = 15.0
     fhr_linear_tol_bpm: float = 0.75
@@ -258,7 +293,8 @@ class QualityConfig:
                          self.step_confirm_s + self.jump_lag_s,
                          self.censored_max_s + 2.0 * self.jump_lag_s, self.settle_window_s,
                          self.spike_side_s, self.hold_long_s + 2.0 * self.pre_level_s,
-                         2.0 * self.floor_near_s, self.island_max_s + self.island_context_s))
+                         2.0 * self.floor_near_s, self.island_max_s + self.island_context_s,
+                         self.osc_min_peaks * self.osc_period_max_s))
 
     def as_attrs(self) -> Dict[str, Any]:
         """Return the thresholds as flat HDF5-attribute values, prefixed ``quality_``."""
@@ -452,20 +488,23 @@ def ua_quality(
         cfg: The thresholds.
 
     Returns:
-        ``(bits, steps)``: ``uint8`` bits ``(N,)``, and the ``STEP`` events in order.
+        ``(bits, steps)``: ``uint16`` bits ``(N,)``, and the ``STEP`` events in order.
     """
     x = np.asarray(up, dtype=np.float64)
     present = np.asarray(present, dtype=bool)
     n = x.size
-    q = np.zeros(n, dtype=np.uint8)
-    q[~present] |= np.uint8(UaBit.MISSING)
+    q = np.zeros(n, dtype=UA_DTYPE)
+    q[~present] |= UA_DTYPE(UaBit.MISSING)
     code = present & ((x > cfg.code_threshold) | (x < 0.0))
-    q[code] |= np.uint8(UaBit.CODE)
+    q[code] |= UA_DTYPE(UaBit.CODE)
     data = present & ~code
     ceiling = data & np.isin(x, np.asarray(cfg.ceiling_values, dtype=np.float64))
 
-    steps = _mark_transients(x, data, ceiling, q, cfg)
-    _mark_spikes(x, data, q, cfg)
+    # First, because the jump and spike rules must not read a breathing wave as artifacts.
+    regular = _oscillations(x, data, cfg)
+    q[regular] |= UA_DTYPE(UaBit.OSCILLATION)
+    steps = _mark_transients(x, data, ceiling, q, regular, cfg)
+    _mark_spikes(x, data, q, regular & ~ceiling, cfg)
     _mark_censored(ceiling, q, cfg)
     _mark_holds(x, data & ~ceiling, q, fhr_hold, cfg)
     _mark_floors(x, data, q, cfg)
@@ -476,8 +515,8 @@ def ua_quality(
     for step in steps:
         if step.start > 0 and held[step.start - 1]:
             span = slice(step.start, step.settle)
-            q[span] &= np.uint8(0xFF ^ int(UaBit.STEP))
-            q[span] |= np.uint8(UaBit.TRANSIENT)
+            q[span] &= UA_DTYPE(0xFFFF ^ int(UaBit.STEP))
+            q[span] |= UA_DTYPE(UaBit.TRANSIENT)
         else:
             kept.append(step)
     # Last, because an island is judged by every other invalid bit around it.
@@ -578,7 +617,7 @@ def _step_after(
     the third.
     """
     pre = slice(max(0, start - cfg.samples(cfg.pre_level_s)), start)
-    clean = data[pre] & ~ceiling[pre] & ((q[pre] & np.uint8(UaBit.TRANSIENT | UaBit.STEP)) == 0)
+    clean = data[pre] & ~ceiling[pre] & ((q[pre] & UA_DTYPE(UaBit.TRANSIENT | UaBit.STEP)) == 0)
     if clean.size < cfg.samples(cfg.pre_level_s) // 2 or not clean.all():
         return None
     before = x[pre]
@@ -594,16 +633,18 @@ def _step_after(
 
 
 def _mark_transients(
-    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig
+    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, q: np.ndarray, regular: np.ndarray,
+    cfg: QualityConfig,
 ) -> List[StepEvent]:
     """Mark jumps, boxes, baseline steps and the settling after gaps.
 
     Two triggers open an event. The first is a jump of at least :attr:`QualityConfig.jump_units`
-    within :attr:`QualityConfig.jump_lag_s` between two usable samples. It marks a box up to its
-    opposite jump (:func:`_box_end`), a ``STEP`` up to its settled window (:func:`_step_after`),
-    or else only the discontinuity and one stored step on each side. The second is the end of a
-    gap whose next value lies at least :attr:`QualityConfig.gap_level_units` from the level before
-    the gap; it marks until :func:`_settle` closes it.
+    within :attr:`QualityConfig.jump_lag_s` between two usable samples, outside an oscillation
+    (``regular``) unless it lands on or leaves a ceiling value. It marks a box up to its opposite jump (:func:`_box_end`), a ``STEP`` up to
+    its settled window (:func:`_step_after`), or else only the discontinuity and one stored step
+    on each side. The second is the end of a gap whose next value lies at least
+    :attr:`QualityConfig.gap_level_units` from the level before the gap; it marks until
+    :func:`_settle` closes it.
     """
     n = x.size
     lag = cfg.samples(cfg.jump_lag_s)
@@ -612,6 +653,10 @@ def _mark_transients(
     gap_end[1:] = data[1:] & ~data[:-1]
     jump = np.zeros(n, dtype=bool)
     jump[lag:] = data[lag:] & data[:-lag] & (np.abs(x[lag:] - x[:-lag]) >= cfg.jump_units)
+    # An edge of a breathing wave is not a discontinuity; a jump to or from the ceiling still is.
+    touch = ceiling.copy()
+    touch[lag:] |= ceiling[:-lag]
+    jump &= ~regular | touch
 
     # Only the candidate samples are visited; an event's end skips every candidate inside it.
     resume = 0
@@ -626,7 +671,7 @@ def _mark_transients(
             level = _level_before(x, data, stop, cfg)
             if level is not None and abs(x[i] - level) >= cfg.gap_level_units:
                 end = _settle(x, data, ceiling, i, level, cfg)
-                q[i:end] |= np.uint8(UaBit.TRANSIENT)
+                q[i:end] |= UA_DTYPE(UaBit.TRANSIENT)
                 resume = max(end, i + 1)
                 continue
         if jump[i]:
@@ -637,31 +682,34 @@ def _mark_transients(
             sign = float(np.sign(x[i] - x[i - lag]))
             end = _box_end(x, data, jump, i, sign, level, cfg)
             if end is not None:
-                q[start:end] |= np.uint8(UaBit.TRANSIENT)
+                q[start:end] |= UA_DTYPE(UaBit.TRANSIENT)
                 resume = end
                 continue
             step = _step_after(x, data, ceiling, q, start, i, sign, level, cfg)
             if step is not None:
                 settle, settled = step
-                q[start:settle] |= np.uint8(UaBit.STEP)
+                q[start:settle] |= UA_DTYPE(UaBit.STEP)
                 steps.append(StepEvent(start=start, settle=settle, delta=settled - level))
                 resume = max(settle, i + lag)
                 continue
-            q[max(0, start - lag):min(n, i + 1 + lag)] |= np.uint8(UaBit.TRANSIENT)
+            q[max(0, start - lag):min(n, i + 1 + lag)] |= UA_DTYPE(UaBit.TRANSIENT)
             # One stored step shows as a jump at `lag` consecutive samples: skip the rest of it.
             resume = i + lag
     return steps
 
 
-def _mark_spikes(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
-    r"""Mark pulses and dips shorter than any contraction.
+def _mark_spikes(
+    x: np.ndarray, data: np.ndarray, q: np.ndarray, regular: np.ndarray, cfg: QualityConfig
+) -> None:
+    r"""Mark pulses and dips shorter than any contraction, outside an oscillation.
 
     For each usable sample $n$ with side windows $L_n = x[n-s, n)$ and $R_n = x(n, n+s]$ of
     :attr:`QualityConfig.spike_side_s`, the prominence is $x_n - \max(\min L_n, \min R_n)$. A
     run with prominence at least :attr:`QualityConfig.spike_units` is a spike; its samples above
     half its height, and one stored step on each side, are ``TRANSIENT``. The same test on $-x$
     finds dips. A contraction crest is too broad to pass: it falls only a few units within
-    $s$ on either side.
+    $s$ on either side. A spike whose top lies in an oscillation and off the ceiling
+    (``regular``) is a crest of the wave and is not marked.
     """
     n = x.size
     side = cfg.samples(cfg.spike_side_s)
@@ -679,13 +727,103 @@ def _mark_spikes(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityCon
         peak = data & np.isfinite(base) & (sign * x - base >= cfg.spike_units)
         for start, stop in runs(peak):
             top = start + int(np.argmax(sign * x[start:stop]))
+            if regular[top]:
+                continue
             half = base[top] + 0.5 * (sign * x[top] - base[top])
             lo, hi = top, top + 1
             while lo > 0 and data[lo - 1] and sign * x[lo - 1] >= half:
                 lo -= 1
             while hi < n and data[hi] and sign * x[hi] >= half:
                 hi += 1
-            q[max(0, lo - lag):min(n, hi + lag)] |= np.uint8(UaBit.TRANSIENT)
+            q[max(0, lo - lag):min(n, hi + lag)] |= UA_DTYPE(UaBit.TRANSIENT)
+
+
+def _oscillations(x: np.ndarray, data: np.ndarray, cfg: QualityConfig) -> np.ndarray:
+    r"""Return the samples inside a regular train of peaks, or of dips.
+
+    In each run of usable samples, a peak is a local maximum whose prominence within
+    :attr:`QualityConfig.osc_period_max_s` on each side lies between
+    :attr:`QualityConfig.osc_units` and :attr:`QualityConfig.osc_max_units`; a dip is a peak of
+    $-x$. A train is a maximal sequence of
+    peaks whose spacings lie in [:attr:`QualityConfig.osc_period_min_s`,
+    :attr:`QualityConfig.osc_period_max_s`] and whose consecutive spacings differ by at most the
+    factor :attr:`QualityConfig.osc_ratio`. A train of at least
+    :attr:`QualityConfig.osc_min_peaks` peaks covers its first to its last peak, plus half its
+    median spacing on each side, so the edges before the first crest and after the last one are
+    inside it.
+
+    Args:
+        x: UA in TOCO units.
+        data: Usable samples: present and not a code.
+        cfg: The thresholds.
+
+    Returns:
+        Boolean ``(N,)``, ``True`` inside an oscillation.
+    """
+    import warnings
+
+    from scipy.signal import find_peaks
+
+    n = x.size
+    region = np.zeros(n, dtype=bool)
+    shortest = cfg.samples(cfg.osc_period_min_s)
+    longest = cfg.samples(cfg.osc_period_max_s)
+    need = int(cfg.osc_min_peaks)
+    for start, stop in runs(data):
+        if stop - start < (need - 1) * shortest:
+            continue
+        for sign in (1.0, -1.0):
+            # A flat top can have a prominence of 0 inside the window. The prominence floor
+            # drops such a peak, so SciPy's warning about it carries nothing.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
+                peaks, _ = find_peaks(sign * x[start:stop],
+                                      prominence=(cfg.osc_units, cfg.osc_max_units),
+                                      wlen=2 * longest + 1)
+            for first, last, spacing in _regular_trains(peaks, shortest, longest, need,
+                                                        cfg.osc_ratio):
+                pad = spacing // 2
+                lo = start + max(0, int(peaks[first]) - pad)
+                hi = start + min(stop - start, int(peaks[last]) + pad + 1)
+                region[lo:hi] = True
+    return region
+
+
+def _regular_trains(
+    peaks: np.ndarray, shortest: int, longest: int, need: int, ratio: float
+) -> List[Tuple[int, int, int]]:
+    """Return the maximal trains of regularly spaced peaks.
+
+    Args:
+        peaks: Peak positions in ascending order.
+        shortest: Shortest spacing in samples.
+        longest: Longest spacing in samples.
+        need: Fewest peaks of a train.
+        ratio: Largest ratio of two consecutive spacings.
+
+    Returns:
+        ``[(first, last, spacing), ...]``: indices into ``peaks`` of the first and the last peak
+        of each train, and its median spacing in samples.
+    """
+    trains: List[Tuple[int, int, int]] = []
+    first, previous = 0, 0
+    for k in range(1, len(peaks) + 1):
+        fits, gap = False, 0
+        if k < len(peaks):
+            gap = int(peaks[k] - peaks[k - 1])
+            fits = shortest <= gap <= longest
+            steady = k - first < 2 or max(gap, previous) <= ratio * min(gap, previous)
+            if fits and steady:
+                previous = gap
+                continue
+        # The train peaks[first:k] ends here.
+        if k - first >= need:
+            trains.append((first, k - 1, int(np.median(np.diff(peaks[first:k])))))
+        if k < len(peaks):
+            # A spacing that fits but breaks the rhythm starts a new train at its first peak.
+            first = k - 1 if fits else k
+            previous = gap
+    return trains
 
 
 def _mark_censored(ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
@@ -700,9 +838,9 @@ def _mark_censored(ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> No
     artifact = (q & (UaBit.TRANSIENT | UaBit.STEP)) != 0
     for start, stop in runs(ceiling):
         if stop - start > limit or artifact[start:stop].any():
-            q[start:stop] |= np.uint8(UaBit.TRANSIENT)
+            q[start:stop] |= UA_DTYPE(UaBit.TRANSIENT)
         else:
-            q[start:stop] |= np.uint8(UaBit.CENSORED)
+            q[start:stop] |= UA_DTYPE(UaBit.CENSORED)
 
 
 def _mark_holds(
@@ -750,16 +888,16 @@ def _mark_holds(
             head = slice(start, min(stop, start + first))
             joint = float(np.mean(fhr_hold[head])) >= cfg.hold_fhr_share
         if edge or joint:
-            q[start:stop] |= np.uint8(UaBit.HOLD)
+            q[start:stop] |= UA_DTYPE(UaBit.HOLD)
             continue
         past = slice(max(0, start - context), start)
         prior = x[past][usable[past]]
         if prior.size == 0 or x[start] <= prior.min() + cfg.rest_units:
             cut = min(stop, start + rest_max)
-            q[start:cut] |= np.uint8(UaBit.CENSORED)
-            q[cut:stop] |= np.uint8(UaBit.HOLD)
+            q[start:cut] |= UA_DTYPE(UaBit.CENSORED)
+            q[cut:stop] |= UA_DTYPE(UaBit.HOLD)
         elif long_run:
-            q[start:stop] |= np.uint8(UaBit.HOLD)
+            q[start:stop] |= UA_DTYPE(UaBit.HOLD)
 
 
 def _mark_floors(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
@@ -779,10 +917,10 @@ def _mark_floors(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityCon
         if stop - start < cfg.samples(cfg.floor_min_s):
             continue
         if np.all(x[start:stop] == 0.0) or since[start] <= near:
-            q[start:stop] |= np.uint8(UaBit.FLOOR)
+            q[start:stop] |= UA_DTYPE(UaBit.FLOOR)
         elif until[stop - 1] <= near:
             span = np.arange(start, stop)
-            q[span[until[start:stop] <= 2 * near]] |= np.uint8(UaBit.FLOOR)
+            q[span[until[start:stop] <= 2 * near]] |= UA_DTYPE(UaBit.FLOOR)
 
 
 def _mark_islands(q: np.ndarray, cfg: QualityConfig) -> None:
@@ -800,7 +938,7 @@ def _mark_islands(q: np.ndarray, cfg: QualityConfig) -> None:
         q: UA bits, changed in place.
         cfg: The thresholds.
     """
-    invalid = (q & np.uint8(UA_INVALID)) != 0
+    invalid = (q & UA_DTYPE(UA_INVALID)) != 0
     n = q.size
     longest = cfg.samples(cfg.island_max_s)
     context = cfg.samples(cfg.island_context_s)
@@ -810,7 +948,7 @@ def _mark_islands(q: np.ndarray, cfg: QualityConfig) -> None:
         before = float(np.mean(invalid[max(0, start - context):start]))
         after = float(np.mean(invalid[stop:stop + context]))
         if min(before, after) >= cfg.island_share:
-            q[start:stop] |= np.uint8(UaBit.ISLAND)
+            q[start:stop] |= UA_DTYPE(UaBit.ISLAND)
 
 
 # =================================================================================================
@@ -891,7 +1029,7 @@ class CleanResult:
     """One segment's codes and cleaned signals.
 
     Attributes:
-        up_bits: UA quality bits, ``uint8 (N,)``.
+        up_bits: UA quality bits, ``uint16 (N,)``.
         fhr_bits: FHR quality bits, ``uint8 (N,)``.
         up_clean: Bridged UA. Its level is not corrected after a step.
         fhr_clean: Bridged FHR.
@@ -945,7 +1083,7 @@ def clean_segment(
     up_clean = bridge(np.asarray(up, dtype=np.float64), up_invalid, cfg)
     fhr_invalid_bits = FHR_INVALID if repaired is None else FHR_INVALID_EXACT
     fhr_clean = bridge(fhr, (fhr_bits & fhr_invalid_bits) != 0, cfg)
-    return CleanResult(up_bits=up_bits.astype(np.uint8), fhr_bits=fhr_bits,
+    return CleanResult(up_bits=up_bits.astype(UA_DTYPE), fhr_bits=fhr_bits,
                        up_clean=up_clean, fhr_clean=fhr_clean, steps=tuple(steps),
                        fhr_invalid_bits=fhr_invalid_bits)
 
@@ -1075,13 +1213,109 @@ def contamination(
 
 
 # =================================================================================================
+# The raw FHR channel
+# =================================================================================================
+def _series(segdat: Any) -> Tuple[int, np.ndarray]:
+    """Lay one ``segdat`` channel on an absolute 4 Hz index grid.
+
+    Args:
+        segdat: A channel's ``segdat`` struct from ``efmStruct``.
+
+    Returns:
+        ``(first_index, values)``: the grid index of ``values[0]``, and the values with $-1$
+        where the channel has no sample.
+    """
+    incr = float(segdat.domainIncr)
+    starts = np.atleast_1d(np.asarray(segdat.domainStart, dtype=np.float64))
+    onsets = np.atleast_1d(np.asarray(segdat.parameterSet.onsetPointer, dtype=np.int64)) - 1
+    lengths = np.atleast_1d(np.asarray(segdat.parameterSet.segLength, dtype=np.int64))
+    data = np.asarray(segdat.dataSet, dtype=np.float64).ravel()
+    first = np.round(starts / incr).astype(np.int64)
+    origin = int(first.min())
+    values = np.full(int((first + lengths).max() - origin), -1.0)
+    for g, onset, length in zip(first, onsets, lengths):
+        values[g - origin:g - origin + length] = data[onset:onset + length]
+    return origin, values
+
+
+def _lookup(origin: int, values: np.ndarray, index: np.ndarray) -> np.ndarray:
+    """Read ``values`` at absolute grid indices, $-1$ outside the channel."""
+    local = index - origin
+    out = np.full(index.shape, -1.0)
+    inside = (local >= 0) & (local < values.size)
+    out[inside] = values[local[inside]]
+    return out
+
+
+def raw_fhr_repaired(record_path: str, domain_start: np.ndarray, fhr_pre: np.ndarray,
+                     present: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    r"""Mark the FHR samples that the upstream repair wrote, from the raw channel of the record.
+
+    The adaptor reads the last of ``Repaired HR1``, ``Repaired HR2`` and ``Repaired external
+    FECG`` present. The raw channel is the same name without ``Repaired``. Each segment is first
+    placed on the repaired channel's grid (the offset with the most exact matches, within
+    $\pm 4$ samples), then the raw channel is read at one record-wide offset within $\pm 1$
+    sample. A present sample is repaired if the raw value there is absent, 0, 255, or different.
+
+    Args:
+        record_path: The ``.mat`` file.
+        domain_start: Segment start times in seconds, ``(n,)``.
+        fhr_pre: Pre-fill FHR ``(n, N)``.
+        present: Present samples ``(n, N)``.
+
+    Returns:
+        ``(repaired, info)``: a boolean ``(n, N)`` array, or ``None`` when the record has no raw
+        channel; and the channel name, the offsets and the match rates.
+    """
+    from scipy.io import loadmat
+
+    mat = loadmat(record_path, squeeze_me=True, struct_as_record=False)["efmStruct"]
+    signals = {sig.measure: sig for sig in np.atleast_1d(mat.signals)}
+    chosen = [k for k in ("Repaired HR1", "Repaired HR2", "Repaired external FECG") if k in signals]
+    if not chosen:
+        return None, {"raw_fhr": "no repaired channel"}
+    raw_key = chosen[-1].replace("Repaired ", "")
+    if raw_key not in signals:
+        return None, {"raw_fhr": f"no {raw_key!r} channel"}
+    rep_origin, rep_values = _series(signals[chosen[-1]].segdat)
+    raw_origin, raw_values = _series(signals[raw_key].segdat)
+
+    n_seg, n = fhr_pre.shape
+    grids = []
+    placed = 0
+    for i in range(n_seg):
+        base = int(np.floor(domain_start[i] / 0.25)) + np.arange(n)
+        best, best_hits = 0, -1
+        for offset in range(-4, 5):
+            hits = int(np.sum(_lookup(rep_origin, rep_values, base + offset)[present[i]]
+                              == fhr_pre[i][present[i]]))
+            if hits > best_hits:
+                best, best_hits = offset, hits
+        grids.append(base + best)
+        placed += best_hits
+    raw_offset, raw_hits = 0, -1
+    for offset in (-1, 0, 1):
+        hits = sum(int(np.sum(_lookup(raw_origin, raw_values, grids[i] + offset)[present[i]]
+                              == fhr_pre[i][present[i]])) for i in range(n_seg))
+        if hits > raw_hits:
+            raw_offset, raw_hits = offset, hits
+    repaired = np.zeros((n_seg, n), dtype=bool)
+    for i in range(n_seg):
+        raw = _lookup(raw_origin, raw_values, grids[i] + raw_offset)
+        repaired[i] = present[i] & ((raw <= 0) | (raw >= 255) | (raw != fhr_pre[i]))
+    total = max(int(present.sum()), 1)
+    return repaired, {"raw_fhr": raw_key, "raw_offset": raw_offset,
+                      "repaired_grid_match": placed / total, "raw_match": raw_hits / total}
+
+
+# =================================================================================================
 # Summaries
 # =================================================================================================
 def bit_shares(bits: np.ndarray, flags: Any, over: Optional[np.ndarray] = None) -> Dict[str, float]:
     """Share of samples carrying each bit.
 
     Args:
-        bits: ``uint8`` quality bits.
+        bits: Quality bits.
         flags: :class:`UaBit` or :class:`FhrBit`.
         over: Samples to average over; ``None`` uses all.
 
