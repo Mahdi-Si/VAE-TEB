@@ -31,6 +31,35 @@ To run:
 2. Check `output_dir` and `screening_csv_path` in `RUN_ARGS`.
 3. Set `workers` to the number of free CPU cores.
 4. Press Run.
-5. Run it a second time with `eligible_only` set to `False` and a new `output_dir`.
+
+A second run with `eligible_only` set to `False` is not needed: the folds fix the record pool of the
+fold build.
 
 The outputs hold clinical traces. Keep them on the production box.
+
+## 2026-10-25, later: quality rules version 2
+
+The first production profile (`tmp/new-k-fold-docs/signal_quality/` here) found three rule defects.
+`QUALITY_VERSION` is now 2: no UA level correction, a stricter step test, ceiling runs decided as a
+whole, and a new `ISLAND` bit (bit 7, which was `SHIFTED`). The design note, section 2.7, has the
+evidence.
+
+**`mimo/` (untracked): no change.**
+
+| File | State in git here | Needed on the production box |
+|---|---|---|
+| `hdf5_dataset/signal_quality.py` | tracked, modified and staged (not committed) | yes: replace the copy there |
+| `hdf5_dataset/new_pipeline/profile_signal_quality.py` | tracked, modified and staged (not committed) | yes: replace the copy there |
+| `research_notes/UA_QUALITY_MASK_DESIGN.md` | tracked, modified and staged (not committed) | no |
+| `research_notes/PROD_SYNC_RECORD.md` | tracked, modified and staged (not committed) | no |
+
+To run the second profile:
+
+1. Copy the two code files to the same paths on the production box.
+2. Open `profile_signal_quality.py` and set `output_dir` in `RUN_ARGS` to a new, empty folder.
+3. Keep every other `RUN_ARGS` value of the first run, so the record draw is the same.
+4. Press Run.
+5. Check that `run_config.json` in the new folder says `"quality_version": 2`.
+
+A new folder is necessary because the script does not delete old example pages. The new `island`
+category also changes the page numbers, so old and new pages would mix.
