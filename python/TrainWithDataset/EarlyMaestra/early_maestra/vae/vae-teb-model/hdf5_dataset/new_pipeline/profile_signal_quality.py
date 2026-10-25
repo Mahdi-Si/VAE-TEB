@@ -3,8 +3,8 @@ r"""Profile the raw CTG signals and show what the quality step changes. Read onl
 The script reads a sample of records the way ``create_new_pipeline.py`` reads them, twice: once
 as the builder does today (with ``MimoSequence.interpolate_input`` and ``_sanitize_signals``),
 and once with the MIMO fill turned off, which gives the **pre-fill** signals. On the pre-fill
-signals it runs :mod:`hdf5_dataset.signal_quality`: the per-sample codes, the level correction,
-the bridge, and the contamination $\rho_c[k]$ of every stored coefficient. It writes no dataset.
+signals it runs :mod:`hdf5_dataset.signal_quality`: the per-sample codes, the bridge, and the
+contamination $\rho_c[k]$ of every stored coefficient. It writes no dataset.
 
 The MIMO fill is turned off by patching the method on its class for the duration of one read.
 Nothing in the ``mimo`` packages changes on disk.
@@ -78,6 +78,7 @@ EXAMPLE_CATEGORIES = {
     "transient": ("UA transient", "ua_transient"),
     "hold": ("UA hold", "ua_hold"),
     "floor": ("UA floor", "ua_floor"),
+    "island": ("UA island in an artifact region", "ua_island"),
     "mimo_overwrite": ("MIMO fill overwrote valid samples", "fill_overwritten_valid"),
     "fhr_repaired": ("FHR repair", "fhr_invalid_share"),
     "clean": ("Clean UA with contractions (control)", "n_contr_clean"),
@@ -1117,7 +1118,8 @@ def write_report(out: Path, seg: pd.DataFrame, runs_df: pd.DataFrame, records: p
         lines += [
             "The records were drawn from the eligible records only. The prescreen uses the same flat",
             "gates, so it has already dropped records whose flats the MIMO fill made: the gate table",
-            "below undercounts the effect. Run once with `eligible_only` off to see all of it.",
+            "below undercounts the effect. The fold build does not need the full count: the folds",
+            "fix its record pool.",
             "",
         ]
     lines += [
@@ -1126,7 +1128,8 @@ def write_report(out: Path, seg: pd.DataFrame, runs_df: pd.DataFrame, records: p
         "1. The MIMO fill (`MimoSequence.interpolate_input`) is turned off during the read. Its",
         "   effect on today's data is in figure 03 and in the `fill_*` columns of `segments.csv`.",
         "2. Every sample gets UA and FHR quality bits (`hdf5_dataset/signal_quality.py`).",
-        "3. The UA level is corrected after each baseline step (`SHIFTED` bit).",
+        "3. A UA baseline step is masked but not corrected; a ceiling run is decided as a whole;",
+        "   a short valid run in a mostly invalid region is invalid (`ISLAND` bit).",
         "4. Every invalid span is bridged by a monotone cubic between its valid neighbours.",
         "5. Each stored coefficient gets its contamination $\\rho$ from the causal kernel of its channel.",
         "",
