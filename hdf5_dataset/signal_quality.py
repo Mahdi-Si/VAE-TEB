@@ -2,15 +2,13 @@ r"""Per-sample quality codes, cleaning and coefficient contamination for the CTG
 
 The dataset builder reads every record through the MIMO adaptor and cuts it into segments of
 $N = 5280$ samples at $f_s = 4$ Hz. This module takes one segment's **pre-fill** signals -- the
-signals before ``MimoSequence.interpolate_input`` has replaced anything -- and does four things:
+signals before ``MimoSequence.interpolate_input`` has replaced anything -- and does three things:
 
 1. It gives every sample a ``uint8`` quality code for UA (:class:`UaBit`) and for FHR
    (:class:`FhrBit`). A sample can carry several bits.
-2. It corrects the UA level after a detected baseline step, so the level difference of a sensor
-   repositioning does not stay in the signal.
-3. It bridges every invalid span with a one-interval monotone cubic (PCHIP), so a span edge does
+2. It bridges every invalid span with a one-interval monotone cubic (PCHIP), so a span edge does
    not excite every wavelet channel with a broadband step.
-4. It measures how much of each stored coefficient is built from invalid samples. For a causal
+3. It measures how much of each stored coefficient is built from invalid samples. For a causal
    channel with magnitude kernel $w_c$ and the invalid indicator $b_n$, the contamination at step
    $k$ is
 
@@ -23,8 +21,9 @@ signals before ``MimoSequence.interpolate_input`` has replaced anything -- and d
 shards every such run starts with a jump of 30 units or more, most of them from a value of 5 or
 less. A run at exactly 100 (or 127, the top of a 0--127 monitor range) entered smoothly is a
 contraction crest that the device or the export clamped: it is *censored* -- the timing is right
-and the true value is at least the stored one -- and it stays valid. A ceiling run entered by a
-jump, or longer than :attr:`QualityConfig.censored_max_s`, is an artifact.
+and the true value is at least the stored one -- and it stays valid. A ceiling run that a jump
+enters or leaves, or that is longer than :attr:`QualityConfig.censored_max_s`, is an artifact as
+a whole.
 
 **Jumps are local.** A jump of :attr:`QualityConfig.jump_units` within one stored step marks only
 the discontinuity, because a steep contraction rise can contain one. A wider span is marked only
@@ -32,12 +31,25 @@ when the evidence is specific: a sharp opposite jump back to the old level (a *b
 that is settled before the jump and settled again right after it (a *step*), or a pulse shorter
 than any contraction (a *spike*, :attr:`QualityConfig.spike_side_s`).
 
-**Causality.** Most rules read only past samples. Six read ahead, and each read is bounded by
+**Levels are not corrected.** A step is masked up to its settled window, and the bridge crosses
+it; the level after it stays as recorded. A correction that subtracts each step's level change
+adds up its errors: a contraction plateau or a clamp taken for a step moved whole rests by up to
+$100$ units in the profile. Without a correction, a missed or a false step leaves the signal as
+the device wrote it.
+
+**Islands.** In a region where the sensor toggles between a level and a ceiling or a code, the
+short runs between the toggles pass every rule. They are not a signal the bridge may anchor on,
+so a short valid run in a mostly invalid neighbourhood is an ``ISLAND``
+(:attr:`QualityConfig.island_max_s`).
+
+**Causality.** Most rules read only past samples. Eight read ahead, and each read is bounded by
 :attr:`QualityConfig.lookahead_s`:
 
 * a box is closed by its opposite jump within :attr:`QualityConfig.box_max_s`;
 * a step needs a settled window within :attr:`QualityConfig.step_search_s` and no return to the
   old level within :attr:`QualityConfig.step_confirm_s`;
+* a ceiling run is censored only if it ends within :attr:`QualityConfig.censored_max_s` without
+  a jump;
 * the transient after a gap ends at the start of a settled window of
   :attr:`QualityConfig.settle_window_s`;
 * a spike is measured over :attr:`QualityConfig.spike_side_s` on both sides;
@@ -45,6 +57,7 @@ than any contraction (a *spike*, :attr:`QualityConfig.spike_side_s`).
   edge jump at its end;
 * a floor run is marked when an invalid code follows it within
   :attr:`QualityConfig.floor_near_s`;
+* an island is judged by the :attr:`QualityConfig.island_context_s` after it;
 * the bridge uses the first valid sample after a span. Every sample it writes is invalid, so a
   model that honours the mask never reads the bridge before that sample.
 
@@ -61,7 +74,7 @@ import numpy as np
 
 #: Version of the rules and of the stored fields. A builder writes it as a file attribute, and a
 #: file with another version is not complete for a build of this one.
-QUALITY_VERSION = 1
+QUALITY_VERSION = 2
 
 
 class UaBit(enum.IntFlag):
@@ -78,7 +91,7 @@ class UaBit(enum.IntFlag):
         STEP: A jump from a settled level to a new settled level: a sensor repositioning.
         HOLD: A constant hold that a repair or a frozen sensor produced.
         FLOOR: A floor (loss of contact) next to an invalid code, or an exact-zero run.
-        SHIFTED: Valid, but a level correction after a ``STEP`` changed the value.
+        ISLAND: A short run that passed every other rule inside a mostly invalid region.
     """
 
     MISSING = 1
@@ -88,7 +101,7 @@ class UaBit(enum.IntFlag):
     STEP = 16
     HOLD = 32
     FLOOR = 64
-    SHIFTED = 128
+    ISLAND = 128
 
 
 class FhrBit(enum.IntFlag):
@@ -110,9 +123,10 @@ class FhrBit(enum.IntFlag):
     LINEAR = 64
 
 
-#: The UA bits that make a sample invalid. ``CENSORED`` and ``SHIFTED`` samples stay valid.
+#: The UA bits that make a sample invalid. A ``CENSORED`` sample stays valid.
 UA_INVALID = int(
     UaBit.MISSING | UaBit.CODE | UaBit.TRANSIENT | UaBit.STEP | UaBit.HOLD | UaBit.FLOOR
+    | UaBit.ISLAND
 )
 #: The FHR bits that make a sample invalid when the upstream repair is not known: every FHR bit.
 FHR_INVALID = int(FhrBit.MISSING | FhrBit.REPAIRED | FhrBit.JUMP | FhrBit.HOLD | FhrBit.LINEAR)
@@ -148,12 +162,15 @@ class QualityConfig:
         box_max_s: Longest box: an opposite jump later than this does not close it.
         step_search_s: A step must reach a settled window within this after its jump. A
             contraction keeps rising or falling; a repositioned sensor holds its new level.
-        step_confirm_s: A step must not come back to the old level within this after its jump,
-            so a broad contraction crest is not a step.
+        step_confirm_s: A step must not come back to the old level within this after its jump.
+            A contraction returns to its rest level within about $2$ minutes, so a flat-topped
+            contraction is not a step; at $40$ s, plateaus of $40$--$60$ s passed as steps in
+            the profile.
         spike_units: Smallest height of a spike above the higher of its two sides.
         spike_side_s: Width of each side window of a spike. A contraction crest falls by about
             $4$ units over $3$ s, so $12$ units is $3\times$ that.
-        censored_max_s: A ceiling run is censored for this long, and a transient after it.
+        censored_max_s: A ceiling run longer than this is an artifact as a whole: no
+            contraction crest stays clamped this long.
         gap_level_units: After a gap, a level this far from the level before the gap starts a
             transient that runs until the signal returns or settles.
         hold_min_s: Shortest constant run that can be a hold or a clamped rest.
@@ -173,6 +190,12 @@ class QualityConfig:
         floor_min_s: Shortest floor run.
         floor_near_s: A floor run is invalid when an invalid code or a missing sample lies
             within this distance of it.
+        island_max_s: A valid run shorter than this, with invalid samples on both sides, can be
+            an ``ISLAND``.
+        island_context_s: Width of each window, before and after the run, that judges an island.
+        island_share: A run is an island when at least this share of each of its two context
+            windows is invalid. A run between two isolated spikes has mostly valid context and
+            stays valid.
         fhr_hold_min_s: Shortest exactly constant FHR run that is a hold. Natural integer runs
             reach about $11$ s.
         fhr_linear_min_s: Shortest monotone FHR ramp that can be a linear repair.
@@ -198,7 +221,7 @@ class QualityConfig:
     max_transient_s: float = 150.0
     box_max_s: float = 60.0
     step_search_s: float = 10.0
-    step_confirm_s: float = 40.0
+    step_confirm_s: float = 120.0
     spike_units: float = 12.0
     spike_side_s: float = 3.0
     censored_max_s: float = 120.0
@@ -213,6 +236,9 @@ class QualityConfig:
     floor_units: float = 2.0
     floor_min_s: float = 20.0
     floor_near_s: float = 30.0
+    island_max_s: float = 20.0
+    island_context_s: float = 20.0
+    island_share: float = 0.5
     fhr_hold_min_s: float = 15.0
     fhr_linear_min_s: float = 15.0
     fhr_linear_tol_bpm: float = 0.75
@@ -229,8 +255,10 @@ class QualityConfig:
     def lookahead_s(self) -> float:
         """The longest look into the future of any rule: see the module docstring."""
         return float(max(self.box_max_s + self.pre_level_s, self.step_search_s + self.settle_window_s,
-                         self.step_confirm_s, self.settle_window_s, self.spike_side_s,
-                         self.hold_long_s + 2.0 * self.pre_level_s, 2.0 * self.floor_near_s))
+                         self.step_confirm_s + self.jump_lag_s,
+                         self.censored_max_s + 2.0 * self.jump_lag_s, self.settle_window_s,
+                         self.spike_side_s, self.hold_long_s + 2.0 * self.pre_level_s,
+                         2.0 * self.floor_near_s, self.island_max_s + self.island_context_s))
 
     def as_attrs(self) -> Dict[str, Any]:
         """Return the thresholds as flat HDF5-attribute values, prefixed ``quality_``."""
@@ -395,11 +423,11 @@ def _linear_ramps(y: np.ndarray, present: np.ndarray, cfg: QualityConfig) -> Lis
 # =================================================================================================
 @dataclass(frozen=True)
 class StepEvent:
-    """One detected baseline step.
+    """One detected baseline step. It is recorded and masked; the level is not corrected.
 
     Attributes:
-        start: First sample of the step's transient.
-        settle: First sample of the settled window; the level correction starts here.
+        start: First sample of the step's ``STEP`` span.
+        settle: First sample of the settled window, where the ``STEP`` span ends.
         delta: Settled level minus the level before the jump, in UA units.
     """
 
@@ -452,6 +480,8 @@ def ua_quality(
             q[span] |= np.uint8(UaBit.TRANSIENT)
         else:
             kept.append(step)
+    # Last, because an island is judged by every other invalid bit around it.
+    _mark_islands(q, cfg)
     return q, kept
 
 
@@ -533,22 +563,25 @@ def _box_end(
 
 
 def _step_after(
-    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, start: int, i: int, sign: float,
-    level: float, cfg: QualityConfig,
+    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, q: np.ndarray, start: int, i: int,
+    sign: float, level: float, cfg: QualityConfig,
 ) -> Optional[Tuple[int, float]]:
     """Return ``(settle, settled level)`` if the jump at ``i`` is a step, or ``None``.
 
-    Three tests must pass. The :attr:`QualityConfig.pre_level_s` before the jump is settled. A
-    settled window starts within :attr:`QualityConfig.step_search_s` after the jump, at least
-    :attr:`QualityConfig.step_units` away from ``level`` in the jump's direction. The signal does
-    not come back to within :attr:`QualityConfig.return_units` of ``level`` within
-    :attr:`QualityConfig.step_confirm_s`. A jump inside a contraction rise fails the first test,
-    and one near a broad crest fails the third.
+    Three tests must pass. The :attr:`QualityConfig.pre_level_s` before the jump is settled, and
+    every sample in it is usable, off the ceiling and outside an earlier transient: a level that
+    a clamp or an artifact holds is not a baseline. A settled window starts within
+    :attr:`QualityConfig.step_search_s` after the jump, at least :attr:`QualityConfig.step_units`
+    away from ``level`` in the jump's direction. The signal does not come back to within
+    :attr:`QualityConfig.return_units` of ``level`` within :attr:`QualityConfig.step_confirm_s`.
+    A jump inside a contraction rise fails the first test, and a flat-topped contraction fails
+    the third.
     """
     pre = slice(max(0, start - cfg.samples(cfg.pre_level_s)), start)
-    before = x[pre][data[pre]]
-    if before.size < cfg.samples(cfg.pre_level_s) // 2:
+    clean = data[pre] & ~ceiling[pre] & ((q[pre] & np.uint8(UaBit.TRANSIENT | UaBit.STEP)) == 0)
+    if clean.size < cfg.samples(cfg.pre_level_s) // 2 or not clean.all():
         return None
+    before = x[pre]
     if before.max() - before.min() > cfg.settle_range_units:
         return None
     found = _settled_window(x, data, ceiling, i + 1, i + 1 + cfg.samples(cfg.step_search_s), cfg)
@@ -570,8 +603,7 @@ def _mark_transients(
     opposite jump (:func:`_box_end`), a ``STEP`` up to its settled window (:func:`_step_after`),
     or else only the discontinuity and one stored step on each side. The second is the end of a
     gap whose next value lies at least :attr:`QualityConfig.gap_level_units` from the level before
-    the gap; it marks until :func:`_settle` closes it. A level change across a gap is not
-    corrected.
+    the gap; it marks until :func:`_settle` closes it.
     """
     n = x.size
     lag = cfg.samples(cfg.jump_lag_s)
@@ -608,7 +640,7 @@ def _mark_transients(
                 q[start:end] |= np.uint8(UaBit.TRANSIENT)
                 resume = end
                 continue
-            step = _step_after(x, data, ceiling, start, i, sign, level, cfg)
+            step = _step_after(x, data, ceiling, q, start, i, sign, level, cfg)
             if step is not None:
                 settle, settled = step
                 q[start:settle] |= np.uint8(UaBit.STEP)
@@ -657,15 +689,20 @@ def _mark_spikes(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityCon
 
 
 def _mark_censored(ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
-    """Mark ceiling samples outside a transient as censored, up to the censored limit."""
+    """Decide each ceiling run as a whole: ``CENSORED`` crest or ``TRANSIENT`` artifact.
+
+    A run is an artifact if it is longer than :attr:`QualityConfig.censored_max_s`, or if any of
+    its samples is already a transient or a step: a jump entered or left it, or it lies in a
+    box, a spike or the settling after a gap. Otherwise every sample is censored. A decision per
+    sample would keep the tail of a jump-entered run valid, and the bridge would anchor on it.
+    """
     limit = cfg.samples(cfg.censored_max_s)
     artifact = (q & (UaBit.TRANSIENT | UaBit.STEP)) != 0
     for start, stop in runs(ceiling):
-        cut = min(stop, start + limit)
-        clean = ~artifact[start:cut]
-        q[start:cut][clean] |= np.uint8(UaBit.CENSORED)
-        if stop > cut:
-            q[cut:stop] |= np.uint8(UaBit.TRANSIENT)
+        if stop - start > limit or artifact[start:stop].any():
+            q[start:stop] |= np.uint8(UaBit.TRANSIENT)
+        else:
+            q[start:stop] |= np.uint8(UaBit.CENSORED)
 
 
 def _mark_holds(
@@ -748,33 +785,37 @@ def _mark_floors(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityCon
             q[span[until[start:stop] <= 2 * near]] |= np.uint8(UaBit.FLOOR)
 
 
+def _mark_islands(q: np.ndarray, cfg: QualityConfig) -> None:
+    r"""Mark short valid runs inside mostly invalid regions as ``ISLAND``.
+
+    A valid run shorter than :attr:`QualityConfig.island_max_s`, with an invalid sample on each
+    side, is an island when at least :attr:`QualityConfig.island_share` of the
+    :attr:`QualityConfig.island_context_s` before it is invalid, and also of the same window
+    after it. Both sides must pass: a run next to one long gap is the edge of a valid region,
+    not an island. A run that touches the segment's start or end is never an island. Every
+    decision reads the invalid mask from before this rule, so the result does not depend on the
+    order of the runs.
+
+    Args:
+        q: UA bits, changed in place.
+        cfg: The thresholds.
+    """
+    invalid = (q & np.uint8(UA_INVALID)) != 0
+    n = q.size
+    longest = cfg.samples(cfg.island_max_s)
+    context = cfg.samples(cfg.island_context_s)
+    for start, stop in runs(~invalid):
+        if start == 0 or stop == n or stop - start >= longest:
+            continue
+        before = float(np.mean(invalid[max(0, start - context):start]))
+        after = float(np.mean(invalid[stop:stop + context]))
+        if min(before, after) >= cfg.island_share:
+            q[start:stop] |= np.uint8(UaBit.ISLAND)
+
+
 # =================================================================================================
 # Cleaning
 # =================================================================================================
-def correct_levels(up: np.ndarray, steps: Sequence[StepEvent], valid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Subtract each step's level change from the samples after it settles.
-
-    The TOCO baseline is arbitrary (a monitor resets it on connection), so a level change at a
-    repositioning carries no information. Each correction uses only the settled window after the
-    step, which lies inside the step's masked span or just after it.
-
-    Args:
-        up: The UA signal.
-        steps: Output of :func:`ua_quality`.
-        valid: Valid samples; only these change.
-
-    Returns:
-        ``(corrected, shifted)``: the corrected signal, and the valid samples whose value changed.
-    """
-    out = np.asarray(up, dtype=np.float64).copy()
-    offset = np.zeros(out.size)
-    for step in steps:
-        offset[step.settle:] += step.delta
-    shifted = valid & (offset != 0.0)
-    out[shifted] -= offset[shifted]
-    return out, shifted
-
-
 def bridge(x: np.ndarray, invalid: np.ndarray, cfg: QualityConfig = DEFAULT_CONFIG) -> np.ndarray:
     r"""Replace every invalid span by a one-interval monotone cubic between its valid neighbours.
 
@@ -852,9 +893,9 @@ class CleanResult:
     Attributes:
         up_bits: UA quality bits, ``uint8 (N,)``.
         fhr_bits: FHR quality bits, ``uint8 (N,)``.
-        up_clean: Level-corrected, bridged UA.
+        up_clean: Bridged UA. Its level is not corrected after a step.
         fhr_clean: Bridged FHR.
-        steps: The UA baseline steps.
+        steps: The UA baseline steps, recorded only.
         fhr_invalid_bits: The FHR bits that invalidate a sample: :data:`FHR_INVALID_EXACT`
             when the repair mask was given, else :data:`FHR_INVALID`.
     """
@@ -883,8 +924,6 @@ def clean_segment(
     present: np.ndarray,
     repaired: Optional[np.ndarray] = None,
     cfg: QualityConfig = DEFAULT_CONFIG,
-    *,
-    correct_steps: bool = True,
 ) -> CleanResult:
     """Code and clean one segment.
 
@@ -895,7 +934,6 @@ def clean_segment(
         repaired: FHR samples the upstream repair wrote, or ``None``. When it is given, only
             :data:`FHR_INVALID_EXACT` invalidates an FHR sample.
         cfg: The thresholds.
-        correct_steps: Subtract the level change after each UA baseline step.
 
     Returns:
         The :class:`CleanResult`.
@@ -904,11 +942,7 @@ def clean_segment(
     fhr_hold = (fhr_bits & FhrBit.HOLD) != 0
     up_bits, steps = ua_quality(up, present, fhr_hold, cfg)
     up_invalid = (up_bits & UA_INVALID) != 0
-    up_level = np.asarray(up, dtype=np.float64)
-    if correct_steps and steps:
-        up_level, shifted = correct_levels(up_level, steps, ~up_invalid)
-        up_bits = up_bits | np.where(shifted, np.uint8(UaBit.SHIFTED), np.uint8(0))
-    up_clean = bridge(up_level, up_invalid, cfg)
+    up_clean = bridge(np.asarray(up, dtype=np.float64), up_invalid, cfg)
     fhr_invalid_bits = FHR_INVALID if repaired is None else FHR_INVALID_EXACT
     fhr_clean = bridge(fhr, (fhr_bits & fhr_invalid_bits) != 0, cfg)
     return CleanResult(up_bits=up_bits.astype(np.uint8), fhr_bits=fhr_bits,
