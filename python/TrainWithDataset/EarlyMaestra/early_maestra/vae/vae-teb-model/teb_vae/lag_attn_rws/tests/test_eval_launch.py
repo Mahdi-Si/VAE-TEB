@@ -42,6 +42,8 @@ ENTRY_POINTS: Tuple[str, ...] = (
     # mistyped setting is a gate that measures the wrong thing for hours before saying so.
     "hdf5_dataset.new_pipeline.create_new_pipeline",
     "hdf5_dataset.calculate_dataset_stats",
+    # The fold-folder build, run after the minimization folds exist.
+    "hdf5_dataset.new_pipeline.build_fold_datasets",
     # The latent-class fine-tuning pilot's runner. Same convention, one declared alias below.
     "teb_vae.lag_attn_transformer_cfs.latent_pilot.run",
 )
