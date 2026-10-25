@@ -1,10 +1,12 @@
 # UA quality mask, cleaning and scattering: research and design
 
-Date: 2026-10-25. Status: Phase 0 and Phase 1 are implemented; the builder does not use them yet.
-The rules in `hdf5_dataset/signal_quality.py` and the profile
-`hdf5_dataset/new_pipeline/profile_signal_quality.py` exist. A local run on the two `.mat` records
-changed several rules (section 2.6). The production profile (320 records) then changed three more
-(section 2.7, `QUALITY_VERSION` = 2). Section 4.3 describes the rules as implemented.
+Date: 2026-10-25. Status: Phases 0, 1 and 2 are implemented; the loader does not read the new
+fields yet (Phase 3). The rules in `hdf5_dataset/signal_quality.py` and the profile
+`hdf5_dataset/new_pipeline/profile_signal_quality.py` exist, and the builder writes the quality fields
+when `signal_quality` is on. A local run on the two `.mat` records changed several rules (section 2.6).
+The first production profile (320 records) changed three more (section 2.7, version 2), and the second
+one added the oscillation rule (section 2.8, `QUALITY_VERSION` = 3). Section 4.3 describes the rules as
+implemented.
 
 Scope: the dataset-creation pipeline (`hdf5_dataset/new_pipeline/create_new_pipeline.py`) and the
 fields it writes. The model gate in `teb_vae/lag_attn_transformer_cfs` is a later step; this document
@@ -209,6 +211,25 @@ records held 86% of the code samples. Section 6 lists the check this needs.
 
 The MIMO fill alone dropped 172 of 19,644 segments (7–32 per subgroup) through the flat gates.
 
+### 2.8 What the second production profile changed
+
+The second production profile ran version 2 on the same record draw. On its example pages, the three
+version-2 fixes held.
+
+One new defect appeared. A regular wave of about 8 s period and 16–20 units peak to peak ran through
+a whole `hie_no_cs` segment, on top of real contractions. It is most likely maternal breathing. Version 2
+read each crest as a spike and each flank as a jump, and it kept 0.7% of that segment's UA valid. The
+wave is physiological, so version 3 keeps it valid and marks it with a new `OSCILLATION` bit (section 4.3).
+On synthetic copies of the wave, the valid share rose from 12% to 100% (triangle wave) and from 87% to
+99.8% (sawtooth with a 0.5-s fall). An irregular burst of the same height is still marked, and a regular
+toggle between 80 and 100 is still an artifact, because the rule caps the prominence at 30 units and
+keeps every jump that touches a ceiling run.
+
+Two smaller findings stay open. Short handling plateaus (a few seconds, flat, between jumps) stay valid
+when no rule reaches them. The run also stopped while it drew the example pages, before it wrote
+`REPORT.md`. The profile now writes the report before the pages and again after them, and one failed page
+no longer stops the others.
+
 ---
 
 ## 3. What the literature says
@@ -279,11 +300,12 @@ equals `HR2` at 99.5% of shared samples, so a direct comparison gives an exact F
 
 ### 4.3 Step 1: per-sample quality codes
 
-One `uint8` bit field per signal and per sample. A sample can carry several bits.
+One bit field per signal and per sample: `uint16` for UA (nine bits), `uint8` for FHR. A sample can
+carry several bits.
 
 **UA codes (`up_quality`)**
 
-As implemented (`QUALITY_VERSION` = 2). A "jump" is $\lvert x_n - x_{n-4}\rvert \ge 15$: 15 units
+As implemented (`QUALITY_VERSION` = 3). A "jump" is $\lvert x_n - x_{n-4}\rvert \ge 15$: 15 units
 within one stored 1-s step.
 
 | Bit | Name | Rule (4 Hz, $x$ = UP) | Class | Lookahead |
@@ -296,6 +318,7 @@ within one stored 1-s step.
 | 5 | `HOLD` | a constant run of $\ge 30$ s with a start jump $\ge 10$, an end jump $\ge 10$ that stays 10 s (runs under 60 s), or a joint FHR hold; any other constant run of $\ge 60$ s that is not a clamped rest; a clamped rest past 300 s | invalid | 70 s |
 | 6 | `FLOOR` | $x \le 2$ for $\ge 20$ s that is all exact zeros or starts within 30 s after `CODE`/`MISSING`; the part within 60 s before a `CODE`/`MISSING` that follows within 30 s | invalid | 60 s |
 | 7 | `ISLAND` | a valid run shorter than 20 s, invalid on both sides, with $\ge 50\%$ invalid samples in the 20 s before it and also in the 20 s after it; never at the segment's start or end | invalid | 40 s |
+| 8 | `OSCILLATION` | a train of $\ge 5$ peaks (or troughs) of prominence 6–30 units, spaced 5–20 s apart, with a ratio of $\le 1.5$ between consecutive spacings; from the first to the last peak, plus half the median spacing on each side. Inside it, a jump is a transient only where it touches a ceiling run, and a crest is not a spike | valid | 100 s |
 
 Every invalid sample is bridged (section 4.4), so a separate `BRIDGED` bit is not needed.
 
@@ -310,9 +333,13 @@ Evidence for the thresholds:
   40–60 s plateaus passed the step test in the production profile; the step test now waits 120 s.
 - The 30-s and 60-s hold limits sit above the 24-s natural plateaus seen in the samples. The 300-s rest
   limit is the builder's flat-UA gate.
+- The 5–20 s band holds the 8-s wave of section 2.8 and slow paced breathing in labour (about 6–10
+  breaths per minute). It stays far below a contraction's 30–60 s rise. Five peaks make a train that
+  one contraction with two or three bumps does not form.
 
 The lookahead of the whole rule set is 122 s (70 s in version 1); `QualityConfig.lookahead_s`
-computes it, and `as_attrs()` writes it as `quality_lookahead_s`.
+computes it, and `as_attrs()` writes it as `quality_lookahead_s`. The oscillation rule needs 100 s,
+so the total does not change.
 
 **FHR codes (`fhr_quality`)**
 
@@ -359,7 +386,9 @@ future. Masking repaired FHR in the target loss and the KL support removes this 
    low-pass for contraction detection) stays inside the detector.
 
 Write the cleaned UA to `up`, so that `up` and `up_st` describe the same signal, and keep the original
-in `up_raw` as `uint8`. Do the same for FHR (`fhr`, `fhr_raw`).
+in `up_raw` as `float16`. Do the same for FHR (`fhr`, `fhr_raw`). The pre-fill values are integers
+0–255 in every record checked, and `float16` holds every integer up to 2048 and every quarter step below
+512 exactly. The builder logs a warning if a stored raw value is not exact.
 
 ### 4.5 Step 3: carry the mask to the coefficient grid
 
@@ -407,20 +436,30 @@ the gap and keeps the slow channels valid.
 
 | Field or attribute | Shape and type | Approximate size per sample (raw, before LZF) |
 |---|---|---|
-| `up_quality`, `fhr_quality` | (N, 5280) uint8 | 5.3 KB each; mostly zeros |
-| `up_raw`, `fhr_raw` | (N, 5280) uint8 | 5.3 KB each |
+| `up_quality` | (N, 5280) uint16 | 10.6 KB; mostly zeros |
+| `fhr_quality` | (N, 5280) uint8 | 5.3 KB; mostly zeros |
+| `up_raw`, `fhr_raw` | (N, 5280) float16 | 10.6 KB each |
 | `up_st_rho`, `up_ph_rho` | (N, 36, 330), (N, 10, 330) uint8 | 15 KB together; mostly zeros |
 | `fhr_st_rho`, `fhr_ph_rho` | (N, 36, 330), (N, 44, 330) uint8 | 26 KB together; mostly zeros |
-| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac`, `n_contractions` | (N,) | — |
-| attrs `quality_version`, `quality_lookahead_s`, the thresholds, the kernel digest | file attributes | — |
+| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | (N,) float32 | — |
+| `fhr_repair_exact` | (N,) uint8 | 1 if the raw channel gave the FHR repair mask |
+| attrs `quality_version`, `quality_lookahead_s`, `quality_<threshold>`, `quality_rho_scale` (255), `quality_kernel_digest` | file attributes | — |
+| attrs `bits`, `invalid_bits` on `up_quality`; `bits`, `invalid_bits_exact`, `invalid_bits_rules` on `fhr_quality` | dataset attributes | the bit names as JSON |
 
-`up` and `fhr` keep their shape and become the cleaned signals. Compare with `fhr_st` alone, which is
+The table is as implemented. `n_contractions` from the first draft is not stored: the detector policy
+is still open (section 2.7). `up` and `fhr` keep their shape and become the cleaned signals. Compare with `fhr_st` alone, which is
 47 KB per sample as float32. The masks compress well, because they are mostly zeros inside per-sample
 chunks.
 
 ### 4.8 Integration points
 
-Line numbers are from the review and can drift.
+Line numbers are from the review and can drift. Phase 2 implemented every row down to
+`build_fold_datasets.py`; the last three rows are Phase 3.
+
+As implemented, `signal_quality=True` in `create_new_pipeline.py` or `build_fold_datasets.py` reads each
+record with the MIMO fill off (`mimo_fill`), runs the gates on the pre-fill signals, and then cleans each
+kept segment (`_clean_record`). `build_fold_datasets.py` ends with `quality_report/`
+(`quality_report.py`): a summary per file and example pages read back from the files.
 
 | Where | Change |
 |---|---|
@@ -520,13 +559,14 @@ frames) is an option only if the audit shows misses that the rules cannot catch.
 |---|---|---|
 | 0 | A profile script (read only), run on the production box | numbers that confirm or change section 4.3 |
 | 1 | `hdf5_dataset/signal_quality.py`: pure NumPy codes, bridge, $\rho$ kernels, with unit tests | a tested module |
-| 2 | Builder integration (section 4.8), with `quality_version` = 2 | a new dataset variant |
+| 2 | Builder integration (section 4.8), with `quality_version` = 3 | a new dataset variant |
 | 3 | Loader mask group, masked statistics, sample-page rows | a loadable, visible mask |
 | 4 | Model: key mask in the lag attention, gate prior, contraction weight on cleaned UA | a separate task |
 
-Status: Phases 0 and 1 exist (the unit tests are not written yet). The production profile ran on
-version 1, and version 2 fixes what it found (section 2.7). Phase 2 waits for a second production
-profile on version 2.
+Status: Phases 0, 1 and 2 exist (the unit tests are not written yet). The first production profile
+ran on version 1, and version 2 fixes what it found (section 2.7). The second ran on version 2, and
+version 3 fixes what it found (section 2.8). A local build of the two `.mat` records with the quality
+step kept every valid sample exactly as recorded.
 
 Decisions taken (2026-10-25, the recommended option each time):
 1. Store $\rho$ in the file.
@@ -539,6 +579,6 @@ Decisions taken (2026-10-25, the recommended option each time):
    (section 4.8). In the production profile this keeps 172 of 19,644 segments.
 
 Open:
-8. Confirm the version-2 rules on the second production profile, mainly the island rule and the
-   ceiling runs that change from censored to artifact.
+8. Confirm the version-3 oscillation rule on a third production profile before the full build.
 9. Phase 3: whether the training weight's contraction detector reads the quality mask (section 2.7).
+10. Short handling plateaus between jumps stay valid (section 2.8). Low priority.
