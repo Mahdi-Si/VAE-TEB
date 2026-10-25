@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Repository root: ``hdf5_dataset/new_pipeline/create_new_pipeline.py`` -> up three.
 _REPO_ROOT = os.path.dirname(
@@ -64,15 +64,31 @@ from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering import (
     harmonic_index,
     novelty_curve,
     phase_k_steps_for,
+    resolve_leg_alignment,
     validate_phase_operator,
 )
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch import (
     CausalTorchBank,
     transform_batch_numpy,
 )
+
+# The production box keeps the scripts and their two helper modules in one folder, beside the
+# packages above; the repository keeps them in packages. Each import tries the folder first and
+# falls back only when the module itself is absent, so an error inside it is not hidden.
+try:
+    import signal_quality as sq
+except ModuleNotFoundError as _exc:
+    if _exc.name != "signal_quality":
+        raise
+    from hdf5_dataset import signal_quality as sq
 # Stdlib-only by design, and already imported this way by ``compare_causal_scattering.py``: the
 # dependency direction from a dataset builder to the launch helper is established.
-from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args
+try:
+    from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args
+except ModuleNotFoundError as _exc:
+    if not str(_exc.name).startswith("teb_vae"):
+        raise
+    from launch import missing_required, resolve_launch_args
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -242,6 +258,21 @@ TRANSFORMS = (TWO_SIDED, CAUSAL)
 # provenance to verify channel identity against.
 COEFFICIENT_BLOCKS = ("fhr_st", "fhr_ph", "fhr_up_ph", "up_st", "up_ph")
 CAUSAL_BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
+
+# The optional signal-quality step (``hdf5_dataset/signal_quality.py``, causal builds only). A file
+# built with it stores the bridged signals in ``fhr``/``up`` and adds the datasets below; the root
+# attribute ``quality_version`` says which rules wrote them. A file without that attribute was
+# built without the step.
+#: ``<block>_rho`` stores the contamination $\rho \in [0, 1]$ as $\mathrm{round}(255\,\rho)$.
+QUALITY_RHO_SCALE = 255
+#: Raw samples per stored step, as in ``weight`` and the coefficient blocks.
+QUALITY_DECIMATION = 16
+#: Per-sample datasets ``(n, len_signal)`` and their dtypes. ``*_raw`` is the pre-fill signal;
+#: ``float16`` holds the integer values the monitors write exactly.
+QUALITY_SIGNAL_FIELDS = {"up_quality": "u2", "fhr_quality": "u1", "up_raw": "f2", "fhr_raw": "f2"}
+#: Per-segment datasets ``(n,)`` and their dtypes.
+QUALITY_SEGMENT_FIELDS = {"up_valid_frac": "f4", "up_censored_frac": "f4",
+                          "fhr_valid_frac": "f4", "fhr_repair_exact": "u1"}
 
 # How the test split is formed. ``'augmented'`` puts a test partition in every fold and augments
 # it; ``'holdout'`` fixes one test set across all folds.
@@ -700,6 +731,7 @@ def create_initial_hdf5(
     source_pickle_path: Optional[str] = None,
     source_guid_digest: Optional[str] = None,
     phase_operator: str = PHASE_OPERATOR_LEGACY,
+    signal_quality: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
@@ -767,16 +799,26 @@ def create_initial_hdf5(
             alignment it is also visible in the shape -- but a width is not a
             version, and the attribute is what a consumer checks. Must agree
             with both selections' own ``phase_operator``.
+        signal_quality: Causal only. ``masks["signal_quality"]`` from
+            :func:`attach_signal_quality`; ``None`` creates no quality dataset. When given, the
+            file also holds the datasets of :func:`quality_field_names` and the root attributes
+            ``quality_version``, ``quality_lookahead_s``, every threshold as ``quality_<name>``,
+            ``quality_rho_scale`` and ``quality_kernel_digest``.
 
     Raises:
         ValueError: On an unknown *transform* or *phase_operator*; on a causal
             file with no channel plan, with a cross-phase width, or whose
             widths disagree with the plan; on a selection built under another
             operator than the one being recorded; on the integer operator on a
-            two-sided file.
+            two-sided file; on *signal_quality* for a two-sided file.
     """
     validate_transform(transform)
     validate_phase_operator(phase_operator)
+    if signal_quality is not None and transform != CAUSAL:
+        raise ValueError(
+            "signal_quality on a two-sided file: the contamination of a coefficient is defined "
+            "by a one-sided kernel, so the step exists for the causal variant only"
+        )
     if transform != CAUSAL and phase_operator != PHASE_OPERATOR_LEGACY:
         raise ValueError(
             f"phase_operator={phase_operator!r} on a {transform!r} file: the two-sided variant "
@@ -1008,6 +1050,68 @@ def create_initial_hdf5(
             dtype=str_dt,
             chunks=(chunk_n,),
         )
+        if signal_quality is not None:
+            _create_quality_datasets(
+                h5f, signal_quality, channel_plan, len_signal, len_sequence, chunk_n
+            )
+
+
+def quality_field_names() -> List[str]:
+    """Every dataset the signal-quality step adds to a file, in a fixed order.
+
+    Returns:
+        The per-sample fields, then ``<block>_rho`` for each causal block, then the per-segment
+        fields.
+    """
+    return (list(QUALITY_SIGNAL_FIELDS) + [f"{block}_rho" for block in CAUSAL_BLOCKS]
+            + list(QUALITY_SEGMENT_FIELDS))
+
+
+def _create_quality_datasets(
+    h5f: Any,
+    quality: Mapping[str, Any],
+    channel_plan: Dict[str, CausalChannelPlan],
+    len_signal: int,
+    len_sequence: int,
+    chunk_n: int,
+) -> None:
+    r"""Create the quality datasets and write the quality root attributes.
+
+    Chunked like the other datasets: one sample deep for the per-sample and per-step fields,
+    ``chunk_n`` deep for the per-segment ones. ``up_quality`` and ``fhr_quality`` carry their bit
+    names (``bits``, JSON) and the bits that make a sample invalid, so a reader needs no copy of
+    ``signal_quality.py`` to decode them. For FHR the invalid bits depend on
+    ``fhr_repair_exact``: ``invalid_bits_exact`` where the raw channel gave the repair mask,
+    ``invalid_bits_rules`` where the rules stood in for it.
+
+    Args:
+        h5f: The open file.
+        quality: ``masks["signal_quality"]``.
+        channel_plan: The causal plan; it fixes the width of each ``<block>_rho``.
+        len_signal: Raw signal length.
+        len_sequence: Stored steps per segment.
+        chunk_n: Chunk depth of the per-segment datasets.
+    """
+    for key, value in quality["config"].as_attrs().items():
+        h5f.attrs[key] = value
+    h5f.attrs["quality_rho_scale"] = np.int32(QUALITY_RHO_SCALE)
+    h5f.attrs["quality_kernel_digest"] = quality["kernel_digest"]
+    for name, dtype in QUALITY_SIGNAL_FIELDS.items():
+        h5f.create_dataset(name, shape=(0, len_signal), maxshape=(None, len_signal), dtype=dtype,
+                           chunks=(1, len_signal), compression="lzf")
+    h5f["up_quality"].attrs["bits"] = json.dumps({flag.name: int(flag) for flag in sq.UaBit})
+    h5f["up_quality"].attrs["invalid_bits"] = np.int32(sq.UA_INVALID)
+    h5f["fhr_quality"].attrs["bits"] = json.dumps({flag.name: int(flag) for flag in sq.FhrBit})
+    h5f["fhr_quality"].attrs["invalid_bits_exact"] = np.int32(sq.FHR_INVALID_EXACT)
+    h5f["fhr_quality"].attrs["invalid_bits_rules"] = np.int32(sq.FHR_INVALID)
+    for block in CAUSAL_BLOCKS:
+        width = channel_plan[block].n_channels
+        h5f.create_dataset(f"{block}_rho", shape=(0, width, len_sequence),
+                           maxshape=(None, width, len_sequence), dtype="u1",
+                           chunks=(1, width, len_sequence), compression="lzf")
+    for name, dtype in QUALITY_SEGMENT_FIELDS.items():
+        h5f.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype, chunks=(chunk_n,),
+                           compression="lzf")
 
 
 def create_hdf5_for_masks(
@@ -1057,6 +1161,7 @@ def create_hdf5_for_masks(
         source_pickle_path=source_pickle_path,
         source_guid_digest=guid_set_digest(records_list),
         phase_operator=masks.get("causal_phase_operator", PHASE_OPERATOR_LEGACY),
+        signal_quality=masks.get("signal_quality"),
     )
 
 
@@ -1077,6 +1182,7 @@ def append_samples_batch(
     fhr_up_ph_batch: Optional[np.ndarray] = None,
     up_st_batch: Optional[np.ndarray] = None,
     up_ph_batch: Optional[np.ndarray] = None,
+    quality_batch: Optional[Mapping[str, np.ndarray]] = None,
 ) -> None:
     """Append K samples to an existing HDF5 file in a single open/close.
 
@@ -1086,7 +1192,8 @@ def append_samples_batch(
     — the pattern ``up_st`` and ``up_ph`` use — would silently discard a
     computed block on a two-sided file, which is the failure the geometry guard
     exists to prevent. So a batch without a dataset and a dataset without a
-    batch both raise.
+    batch both raise. The quality datasets are guarded the same way, as one
+    group: a quality batch must name every field of :func:`quality_field_names`.
 
     Args:
         path: Path to existing HDF5 file.
@@ -1109,15 +1216,36 @@ def append_samples_batch(
             the target HDF5 has the ``up_st`` dataset.
         up_ph_batch: Shape ``(K, n_up_phase, len_seq)``. Optional — only written
             if the target HDF5 has the ``up_ph`` dataset.
+        quality_batch: ``{field: (K, ...)}`` for every quality dataset. ``None`` only for a
+            file built without the signal-quality step.
 
     Raises:
-        ValueError: If ``fhr_up_ph`` exists in the file but no batch was given,
-            or a batch was given but the dataset does not exist.
+        ValueError: If ``fhr_up_ph`` or the quality datasets exist in the file but no batch
+            was given, or a batch was given but the datasets do not exist, or a quality batch
+            misses a field or names an unknown one.
     """
     k = fhr_batch.shape[0]
     if k == 0:
         return
     with h5py.File(path, "a", libver="latest") as h5f:
+        has_quality = "up_quality" in h5f
+        if has_quality and quality_batch is None:
+            raise ValueError(
+                f"{path} has the quality datasets but no quality_batch was given; they would be "
+                f"left empty for every sample written"
+            )
+        if quality_batch is not None:
+            if not has_quality:
+                raise ValueError(
+                    f"{path} has no quality datasets but a quality_batch was given; create the "
+                    f"file from masks that carry signal_quality"
+                )
+            expected = set(quality_field_names())
+            if set(quality_batch) != expected:
+                raise ValueError(
+                    f"quality_batch for {path} misses {sorted(expected - set(quality_batch))} "
+                    f"and names unknown fields {sorted(set(quality_batch) - expected)}"
+                )
         has_cross = "fhr_up_ph" in h5f
         if has_cross and fhr_up_ph_batch is None:
             raise ValueError(
@@ -1155,8 +1283,208 @@ def append_samples_batch(
             h5f["time_from_labor_onset"][idx:new_size] = tlo_batch
         if "second_stage_onset" in h5f:
             h5f["second_stage_onset"][idx:new_size] = second_stage_batch
+        for name, values in (quality_batch or {}).items():
+            h5f[name][idx:new_size] = values
         for i, g in enumerate(guid_batch):
             h5f["guid"][idx + i] = g
+
+
+# ============================================================================
+# Signal quality
+# ============================================================================
+@contextmanager
+def mimo_fill(enabled: bool):
+    """Turn ``MimoSequence.interpolate_input`` off for the body of the ``with`` block.
+
+    The MIMO fill writes interpolated values into the gaps of both channels, and in some segments
+    over valid samples too; the quality step needs the signals before it. The patch is on the
+    class, because ``prepare_data`` replaces the instance twice before it calls the method. The
+    original method is restored on exit, also after an exception. Nothing under ``mimo/``
+    changes on disk.
+
+    Args:
+        enabled: Keep the fill (``True``: the body runs unchanged) or replace it with the
+            identity (``False``).
+    """
+    if enabled:
+        yield
+        return
+    cls = sys.modules[EarlyMaestraMimoAdaptor.__module__].MimoSequence
+    original = cls.interpolate_input
+    cls.interpolate_input = lambda self: self
+    try:
+        yield
+    finally:
+        cls.interpolate_input = original
+
+
+def attach_signal_quality(masks: Dict[str, Any], cfg: Optional[Any] = None) -> Dict[str, Any]:
+    r"""Turn the signal-quality step on for a causal build.
+
+    The step reads every record with the MIMO fill off, gives every sample a UA and an FHR
+    quality code, bridges the invalid spans, transforms the bridged signals, and stores with each
+    coefficient its contamination $\rho_c[k]$ (``hdf5_dataset/signal_quality.py``). The
+    contamination kernels come from the bank, the plan and the pairs in *masks*, so the
+    ``<block>_rho`` written beside a block describes that block's channels by construction.
+    Everything is stored as ``masks["signal_quality"]``, and every writer reads it from there:
+    the files of one build agree on it as they agree on the transform.
+
+    Args:
+        masks: Output of :func:`compute_scattering_masks` with ``transform='causal'``; changed
+            in place.
+        cfg: A ``signal_quality.QualityConfig``; ``None`` uses the default thresholds.
+
+    Returns:
+        *masks*.
+
+    Raises:
+        ValueError: On a two-sided build.
+    """
+    if masks.get("transform", TWO_SIDED) != CAUSAL:
+        raise ValueError(
+            "the signal-quality step needs transform='causal': the contamination of a "
+            "coefficient is defined by a one-sided kernel"
+        )
+    cfg = sq.DEFAULT_CONFIG if cfg is None else cfg
+    bank, plan = masks["causal_bank"], masks["channel_plan"]
+    pairs = {"fhr_ph": _selection_pairs(masks["fhr_ph_selection"]),
+             "up_ph": _selection_pairs(masks["up_ph_selection"])}
+    leg_alignment = masks.get("causal_leg_alignment", LEG_ALIGNMENT_MODES[0])
+    resolved = {block: resolve_leg_alignment(bank, pairs[block], leg_alignment) for block in pairs}
+    pair_shift = None
+    if all(value is not None for value in resolved.values()):
+        pair_shift = {block: value[0] for block, value in resolved.items()}
+    kept = {block: np.asarray(plan[block].kept) for block in CAUSAL_BLOCKS}
+    kernels = sq.magnitude_kernels(bank.psi, bank.phi, kept, pairs, pair_shift)
+    digest = hashlib.sha256()
+    for block in CAUSAL_BLOCKS:
+        for kernel in kernels[block]:
+            digest.update(np.ascontiguousarray(kernel, dtype=np.float64).tobytes())
+    masks["signal_quality"] = {"config": cfg, "kernels": kernels,
+                               "kernel_digest": digest.hexdigest()}
+    return masks
+
+
+def _validate_quality_fields(hdf5_path: str, masks: Dict[str, Any]) -> None:
+    """Fail fast if the quality datasets of a file disagree with the build, before any transform.
+
+    A quality build must find every quality dataset, each ``<block>_rho`` as wide as its block,
+    and the version and kernel digest it writes. A build without the step must find no quality
+    dataset: :func:`append_samples_batch` would refuse every batch, but only after the transform.
+
+    Args:
+        hdf5_path: The file about to be filled.
+        masks: The build's masks.
+
+    Raises:
+        ValueError: Naming the dataset or the attribute that disagrees.
+    """
+    quality = masks.get("signal_quality")
+    with h5py.File(hdf5_path, "r") as h5f:
+        found = [name for name in quality_field_names() if name in h5f]
+        if quality is None:
+            if found:
+                raise ValueError(
+                    f"{hdf5_path} has the quality datasets {found} but this build does not write "
+                    f"them; the file was created for a build with the signal-quality step"
+                )
+            return
+        missing = sorted(set(quality_field_names()) - set(found))
+        if missing:
+            raise ValueError(
+                f"{hdf5_path} lacks the quality datasets {missing}; create it with "
+                f"create_hdf5_for_masks from masks that carry signal_quality"
+            )
+        version = h5f.attrs.get("quality_version")
+        if version is None or int(version) != sq.QUALITY_VERSION:
+            raise ValueError(
+                f"{hdf5_path} records quality_version={version} but this build writes "
+                f"{sq.QUALITY_VERSION}"
+            )
+        if h5f.attrs.get("quality_kernel_digest") != quality["kernel_digest"]:
+            raise ValueError(
+                f"{hdf5_path} was created with other contamination kernels than this build's"
+            )
+        widths = resolve_channel_layout(masks)
+        for block in CAUSAL_BLOCKS:
+            n_on_disk = int(h5f[f"{block}_rho"].shape[1])
+            if n_on_disk != widths[block]:
+                raise ValueError(
+                    f"'{block}_rho' in {hdf5_path} is {n_on_disk} channels wide but '{block}' "
+                    f"stores {widths[block]}"
+                )
+
+
+def _clean_record(
+    record: str,
+    fhr: np.ndarray,
+    up: np.ndarray,
+    weight: np.ndarray,
+    domain_starts: List[float],
+    quality: Mapping[str, Any],
+    rho_banks: Mapping[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    r"""Code, bridge and measure the kept segments of one record.
+
+    A sample is present when its weight is positive and its FHR is not 0, as in the profile. The
+    FHR repair mask comes from the raw channel of the record (read again with ``scipy.io``); if
+    that fails, the hold, ramp and jump rules stand in for it and ``fhr_repair_exact`` is 0.
+
+    Args:
+        record: The ``.mat`` file.
+        fhr: Pre-fill FHR of the kept segments, ``(n, N)``; a non-finite sample is already 0.
+        up: Pre-fill UA, same shape.
+        weight: MIMO sample weights, ``(n, N / 16)``.
+        domain_starts: Segment start times in seconds.
+        quality: ``masks["signal_quality"]``.
+        rho_banks: Block name -> ``signal_quality.ContaminationBank``.
+
+    Returns:
+        ``(fhr_clean, up_clean, fields)``: the bridged signals, sanitised as the stored signals
+        always are, and one ``(n, ...)`` array per quality dataset.
+    """
+    cfg = quality["config"]
+    n, length = fhr.shape
+    name = os.path.basename(record)
+    present = np.repeat(np.asarray(weight) > 0, QUALITY_DECIMATION, axis=1)[:, :length] & (fhr != 0)
+    repaired = None
+    try:
+        repaired, info = sq.raw_fhr_repaired(record, np.asarray(domain_starts, dtype=np.float64),
+                                             fhr, present)
+        if repaired is None:
+            logger.warning(f"{name}: {info['raw_fhr']}; the FHR repair mask falls back to the "
+                           f"rules")
+    except Exception as exc:  # noqa: BLE001 -- the rules stand in for the exact mask
+        logger.warning(f"{name}: the raw FHR channel could not be read ({exc!r}); the FHR "
+                       f"repair mask falls back to the rules")
+    results = [sq.clean_segment(fhr[j], up[j], present[j],
+                                None if repaired is None else repaired[j], cfg)
+               for j in range(n)]
+    up_bits = np.stack([r.up_bits for r in results]).astype(np.uint16)
+    up_bad = np.stack([r.up_invalid for r in results])
+    fhr_bad = np.stack([r.fhr_invalid for r in results])
+    fields: Dict[str, np.ndarray] = {
+        "up_quality": up_bits,
+        "fhr_quality": np.stack([r.fhr_bits for r in results]).astype(np.uint8),
+        "up_raw": up.astype(np.float16),
+        "fhr_raw": fhr.astype(np.float16),
+        "up_valid_frac": np.mean(~up_bad, axis=1).astype(np.float32),
+        "up_censored_frac": np.mean((up_bits & int(sq.UaBit.CENSORED)) != 0,
+                                    axis=1).astype(np.float32),
+        "fhr_valid_frac": np.mean(~fhr_bad, axis=1).astype(np.float32),
+        "fhr_repair_exact": np.full(n, repaired is not None, dtype=np.uint8),
+    }
+    for block in CAUSAL_BLOCKS:
+        rho = rho_banks[block](up_bad if block.startswith("up") else fhr_bad)
+        fields[f"{block}_rho"] = np.rint(rho * QUALITY_RHO_SCALE).astype(np.uint8)
+    inexact = int(np.count_nonzero(fields["up_raw"] != up)
+                  + np.count_nonzero(fields["fhr_raw"] != fhr))
+    if inexact:
+        logger.warning(f"{name}: {inexact} raw samples are not exact in float16; up_raw and "
+                       f"fhr_raw hold them rounded")
+    fhr_clean, up_clean = _sanitize_signals(np.stack([r.fhr_clean for r in results]),
+                                            np.stack([r.up_clean for r in results]))
+    return fhr_clean, up_clean, fields
 
 
 # ============================================================================
@@ -2820,6 +3148,12 @@ def create_hdf5_dataset_from_records_list(
         transform: ``'two_sided'`` or ``'causal'``; must match the variant the
             file was created for and the masks were computed for.
 
+    With ``precomputed_masks["signal_quality"]`` (:func:`attach_signal_quality`) the record is
+    read with the MIMO fill off, and the sanitising is replaced: the segment gates read the
+    pre-fill signals (a flat run that the fill wrote no longer drops a segment), each kept
+    segment is coded and bridged (:func:`_clean_record`), the transform reads the bridged
+    signals, and ``fhr``/``up`` store them. The prescreen does not change.
+
     Returns:
         List of record paths that errored.
 
@@ -2885,6 +3219,16 @@ def create_hdf5_dataset_from_records_list(
             n_pairs=len(st_model.i_idx),
         )
 
+    # The quality step, if the masks carry it; both directions are checked against the file.
+    quality = precomputed_masks.get("signal_quality")
+    _validate_quality_fields(hdf5_path, precomputed_masks)
+    rho_banks: Dict[str, Any] = {}
+    if quality is not None:
+        rho_banks = {
+            block: sq.ContaminationBank(quality["kernels"][block], signal_length, QUALITY_DECIMATION)
+            for block in CAUSAL_BLOCKS
+        }
+
     errors_list: List[str] = []
     guid_tracking: Optional[Dict[str, GuidTrackingEntry]] = (
         {} if run_guid_analysis else None
@@ -2909,22 +3253,10 @@ def create_hdf5_dataset_from_records_list(
                 up_shift_secs=-20,
                 default_target_index=default_ti,
             )
-            if verbose:
-                mimo_adaptor.read_single_input(
-                    record, out_dec_factor=16, out_dec_factor_offset=0,
-                    target_is_onehot=True, dtype=np.float32,
-                )
-                mimo_prepared, _ = mimo_adaptor.mimo.prepare_data(
-                    batch_size=1, do_evaluate=True, align_left=True,
-                    do_split=True, do_pad=True, do_reflect=True,
-                    base_length=base_block_size, do_equalize=True,
-                    do_merge=True,
-                    min_domain_start=[MIN_DOMAIN_START_DATASET, MIN_DOMAIN_START_DATASET],
-                    max_domain_start=[np.inf, np.inf],
-                    overlap_percentage=overlap_percentage,
-                )
-            else:
-                with suppress_stdout_stderr():
+            # The quality step needs the signals before the MIMO fill; without it the read is
+            # unchanged.
+            with mimo_fill(quality is None):
+                if verbose:
                     mimo_adaptor.read_single_input(
                         record, out_dec_factor=16, out_dec_factor_offset=0,
                         target_is_onehot=True, dtype=np.float32,
@@ -2938,13 +3270,36 @@ def create_hdf5_dataset_from_records_list(
                         max_domain_start=[np.inf, np.inf],
                         overlap_percentage=overlap_percentage,
                     )
+                else:
+                    with suppress_stdout_stderr():
+                        mimo_adaptor.read_single_input(
+                            record, out_dec_factor=16, out_dec_factor_offset=0,
+                            target_is_onehot=True, dtype=np.float32,
+                        )
+                        mimo_prepared, _ = mimo_adaptor.mimo.prepare_data(
+                            batch_size=1, do_evaluate=True, align_left=True,
+                            do_split=True, do_pad=True, do_reflect=True,
+                            base_length=base_block_size, do_equalize=True,
+                            do_merge=True,
+                            min_domain_start=[MIN_DOMAIN_START_DATASET, MIN_DOMAIN_START_DATASET],
+                            max_domain_start=[np.inf, np.inf],
+                            overlap_percentage=overlap_percentage,
+                        )
 
             fhr = mimo_prepared.block_input[:, :, 1].copy()
             up = mimo_prepared.block_input[:, :, 0].copy()
             domain_starts = list(mimo_prepared.domain_start)
             sample_weights = mimo_prepared.sample_weights
 
-            fhr, up = _sanitize_signals(fhr, up)
+            if quality is None:
+                fhr, up = _sanitize_signals(fhr, up)
+            else:
+                # Pre-fill: the gates below read these, and _clean_record replaces the sanitising.
+                # A non-finite sample is a gap, like a 0.
+                fhr = np.nan_to_num(np.asarray(fhr, dtype=np.float64), nan=0.0, posinf=0.0,
+                                    neginf=0.0)
+                up = np.nan_to_num(np.asarray(up, dtype=np.float64), nan=0.0, posinf=0.0,
+                                   neginf=0.0)
 
             guid_key = os.path.splitext(os.path.basename(record))[0]
             normalized_key = _normalize_guid(guid_key)
@@ -3012,6 +3367,12 @@ def create_hdf5_dataset_from_records_list(
             valid_fhr = fhr[valid_indices]
             valid_up = up[valid_indices]
             n_valid = len(valid_indices)
+            quality_fields: Dict[str, np.ndarray] = {}
+            if quality is not None:
+                valid_fhr, valid_up, quality_fields = _clean_record(
+                    record, valid_fhr, valid_up, sample_weights[valid_indices],
+                    [domain_starts[i] for i in valid_indices], quality, rho_banks,
+                )
             scatter_failed: set = set()
             causal_blocks: List[Optional[Dict[str, np.ndarray]]] = []
 
@@ -3118,6 +3479,7 @@ def create_hdf5_dataset_from_records_list(
             b_target, b_weight = [], []
             b_guid, b_epoch = [], []
             b_cs, b_bg, b_tlo, b_ss = [], [], [], []
+            b_quality: Dict[str, list] = {name: [] for name in quality_fields}
 
             record_name = os.path.splitext(os.path.basename(record))[0]
 
@@ -3156,8 +3518,11 @@ def create_hdf5_dataset_from_records_list(
                 tflo = float(domain_starts[orig_idx]) - labor_onset_sec
                 tss = float(domain_starts[orig_idx]) - ss_sec
 
-                b_fhr.append(fhr[orig_idx, :])
-                b_up.append(up[orig_idx, :])
+                # The signals the transform read: the bridged ones under the quality step.
+                b_fhr.append(valid_fhr[seg_j])
+                b_up.append(valid_up[seg_j])
+                for name, values in quality_fields.items():
+                    b_quality[name].append(values[seg_j])
                 b_fhr_st.append(coefficients["fhr_st"])
                 b_up_st.append(coefficients["up_st"])
                 b_fhr_ph.append(coefficients["fhr_ph"])
@@ -3194,6 +3559,10 @@ def create_hdf5_dataset_from_records_list(
                     second_stage_batch=np.array(b_ss, dtype=np.float32),
                     up_st_batch=np.stack(b_up_st),
                     up_ph_batch=np.stack(b_up_ph),
+                    quality_batch=(
+                        None if quality is None
+                        else {name: np.stack(values) for name, values in b_quality.items()}
+                    ),
                 )
 
         except Exception as e:
@@ -3294,6 +3663,7 @@ def create_new_pipeline(
     leg_alignment: str = LEG_ALIGNMENT_MODES[0],
     device: Optional[str] = None,
     phase_operator: str = PHASE_OPERATOR_LEGACY,
+    signal_quality: bool = False,
 ):
     """Run the complete new dataset creation pipeline.
 
@@ -3350,10 +3720,15 @@ def create_new_pipeline(
             Written into every causal file as ``causal_phase_operator``. Write
             an integer build to a **separate** output path with its own
             statistics: its channel axis is a different one.
+        signal_quality: Causal only. Read the records with the MIMO fill off, code and bridge
+            every kept segment, and store the quality datasets beside the coefficients (see
+            :func:`attach_signal_quality`). ``fhr``/``up`` then hold the bridged signals, so
+            write such a build to a **separate** output path with its own statistics.
 
     Raises:
         ValueError: On an unknown *transform*, *leg_alignment* or
-            *phase_operator*, before anything is created.
+            *phase_operator*, or *signal_quality* on a two-sided build, before anything is
+            created.
     """
     # First statements, before os.makedirs and before the CSV is read: a refusal that arrives
     # later leaves an output directory behind and reports a CSV problem instead of the real one.
@@ -3361,6 +3736,8 @@ def create_new_pipeline(
     validate_leg_alignment(leg_alignment)
     validate_phase_operator(phase_operator)
     validate_test_mode(test_mode)
+    if signal_quality and transform != CAUSAL:
+        raise ValueError("signal_quality=True needs transform='causal'")
 
     setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
@@ -3375,6 +3752,13 @@ def create_new_pipeline(
         SIGNAL_LENGTH, scattering_T=16, device=torch_device, transform=transform,
         leg_alignment=leg_alignment, phase_operator=phase_operator,
     )
+    if signal_quality:
+        attach_signal_quality(masks)
+        logger.info(
+            f"Signal quality: rules version {sq.QUALITY_VERSION}, look-ahead "
+            f"{sq.DEFAULT_CONFIG.lookahead_s:g} s. The MIMO fill is off, and fhr/up store the "
+            f"bridged signals."
+        )
     # Log the resolved layout and the active selection parameters: this is the
     # operator's confirmation that the intended variant is running, and it
     # surfaces c_y / c_u so a stale model config is caught before the run ends.
@@ -3715,6 +4099,10 @@ def build_parser() -> argparse.ArgumentParser:
                              f"2^(3/2) family, branch discontinuity); '{PHASE_OPERATOR_INTEGER}' "
                              "stores integer harmonics k in {2, 4} and applies them exactly "
                              f"(44/10 phase channels). Default: {PHASE_OPERATOR_LEGACY}.")
+    parser.add_argument("--signal-quality", dest="signal_quality",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Causal only: read with the MIMO fill off, store the bridged signals "
+                             "and the quality datasets. Default: off.")
     return parser
 
 
@@ -3732,6 +4120,7 @@ def main(
     leg_alignment: Optional[str] = None,
     device: Optional[str] = None,
     phase_operator: Optional[str] = None,
+    signal_quality: Optional[bool] = None,
 ) -> int:
     """Apply the defaults the parser is not allowed to carry, then run the build.
 
@@ -3753,6 +4142,7 @@ def main(
         leg_alignment: Causal phase-harmonic leg alignment.
         device: Torch device for the transform.
         phase_operator: Causal phase-harmonic operator version.
+        signal_quality: Causal only: the signal-quality step.
 
     Returns:
         The process exit code.
@@ -3773,6 +4163,7 @@ def main(
         leg_alignment=leg_alignment or LEG_ALIGNMENT_MODES[0],
         device=device,
         phase_operator=phase_operator or PHASE_OPERATOR_LEGACY,
+        signal_quality=bool(signal_quality),
     )
     return 0
 
@@ -3871,6 +4262,13 @@ RUN_ARGS: Dict[str, Any] = {
     #                           OWN output path and its own statistics file.
     #   Recorded as the root attribute causal_phase_operator.
     "phase_operator": "integer_harmonic_v1",
+
+    # bool | None -- causal builds only: the signal-quality step.  (None -> False)
+    #   True : read with the MIMO fill off; code, bridge and measure every kept segment; store the
+    #          bridged signals in fhr/up and the quality datasets beside them. Recorded as the root
+    #          attribute quality_version. Needs its OWN output path and statistics file.
+    #   build_fold_datasets.py has the same switch for the minimization-fold build.
+    "signal_quality": False,
 
     # ========================= Everything below has a default =========================
     # str | None -- torch device for the transform, e.g. "cuda:3" to pin one GPU of eight.

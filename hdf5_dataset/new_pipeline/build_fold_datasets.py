@@ -39,7 +39,16 @@ folds hold ``train`` and ``val`` only, as in ``create_new_pipeline.py``.
 
 A rerun with the same inputs skips every file that is already complete. A file is written as
 ``<name>.partial`` and renamed only when it is complete, and a complete file is recognized by its
-``source_guid_digest`` attribute.
+``source_guid_digest`` attribute and its ``quality_version``.
+
+With ``signal_quality`` (causal builds only) every file also carries the quality datasets of
+``create_new_pipeline.attach_signal_quality``, and ``fhr``/``up`` hold the bridged signals. The
+build then ends with ``quality_report/`` beside the datasets: a summary per file and example pages
+read back from the files (``quality_report.py``). The pages hold clinical traces.
+
+On the production box this file, ``create_new_pipeline.py``, ``signal_quality.py``,
+``quality_report.py`` and ``fold_eda_analysis.py`` may sit in one folder; each import tries that
+folder first and falls back to the repository's packages.
 """
 from __future__ import annotations
 
@@ -70,7 +79,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if not __package__ and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
+try:  # Repository layout, and a box with the teb_vae package.
+    from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
+except ModuleNotFoundError as _exc:
+    if not str(_exc.name).startswith("teb_vae"):
+        raise
+    # Production: every file in one folder. Light, like the line above: the launch helper only.
+    from launch import missing_required, resolve_launch_args  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +113,28 @@ def _pipeline() -> Any:
     Returns:
         The ``create_new_pipeline`` module.
     """
-    from hdf5_dataset.new_pipeline import create_new_pipeline
+    return _sibling("create_new_pipeline")
 
-    return create_new_pipeline
+
+def _sibling(name: str) -> Any:
+    """Import a module of this folder: flat first (production), then from the repository package.
+
+    Falls back only when the flat module itself is absent, so an error inside it is not hidden.
+
+    Args:
+        name: Module name, e.g. ``'create_new_pipeline'``.
+
+    Returns:
+        The module.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+    return importlib.import_module(f"hdf5_dataset.new_pipeline.{name}")
 
 
 @dataclass(frozen=True)
@@ -411,6 +445,8 @@ def _prepare_state(device: Optional[str], settings: Mapping[str, Any]) -> None:
         cnp.SIGNAL_LENGTH, scattering_T=16, device=torch.device("cpu"),
         transform=settings["transform"], leg_alignment=settings["leg_alignment"],
         phase_operator=settings["phase_operator"])
+    if settings.get("signal_quality"):
+        cnp.attach_signal_quality(masks)
     labor_onset_map, second_stage_map = cnp.load_csv_metadata(settings["tlo_csv_path"],
                                                               verbose=False)
     _STATE.update(cnp=cnp, masks=masks, settings=dict(settings),
@@ -461,21 +497,26 @@ def _run_job(job: Job) -> Dict[str, Any]:
             "seconds": round(time.time() - start, 1)}
 
 
-def is_complete(path: str, digest: str, source_pickle_path: str) -> bool:
-    """Return whether *path* is a finished file of this GUID set and this pickle.
+def is_complete(path: str, digest: str, source_pickle_path: str,
+                quality_version: Optional[int] = None) -> bool:
+    """Return whether *path* is a finished file of this GUID set, this pickle and these rules.
 
     Args:
         path: The final path of the file.
         digest: ``guid_set_digest`` of the file's records.
         source_pickle_path: The pickle every file of the build records.
+        quality_version: ``signal_quality.QUALITY_VERSION`` for a build with the quality step,
+            ``None`` for one without it. A file of other rules, or of the other kind, is rebuilt.
     """
     if not os.path.exists(path):
         return False
     import h5py
 
     with h5py.File(path, "r") as f:
+        stored = f.attrs.get("quality_version")
         return (f.attrs.get("source_guid_digest") == digest
-                and f.attrs.get("source_pickle_path") == str(source_pickle_path))
+                and f.attrs.get("source_pickle_path") == str(source_pickle_path)
+                and (None if stored is None else int(stored)) == quality_version)
 
 
 def run_jobs(jobs: Sequence[Job], settings: Mapping[str, Any],
@@ -501,7 +542,8 @@ def run_jobs(jobs: Sequence[Job], settings: Mapping[str, Any],
     """
     digest = _pipeline().guid_set_digest
     todo = [j for j in jobs if not is_complete(j.path, digest(list(j.records)),
-                                               settings["source_pickle_path"])]
+                                               settings["source_pickle_path"],
+                                               settings.get("quality_version"))]
     logger.info(f"{len(jobs) - len(todo)} of {len(jobs)} files are complete; "
                 f"{len(todo)} to build")
     todo.sort(key=lambda j: -len(j.records))
@@ -661,7 +703,8 @@ class AssemblyTask:
 
 
 def assemble_file(task: AssemblyTask, source_pickle_path: str,
-                  batch_rows: int = COPY_BATCH_ROWS) -> Dict[str, Any]:
+                  batch_rows: int = COPY_BATCH_ROWS,
+                  quality_version: Optional[int] = None) -> Dict[str, Any]:
     """Write one partition file as the concatenation of its unit files.
 
     The empty file copies the first unit's datasets and attributes, which
@@ -672,6 +715,7 @@ def assemble_file(task: AssemblyTask, source_pickle_path: str,
         task: The partition file to write.
         source_pickle_path: The pickle every file of the build records.
         batch_rows: Rows per read.
+        quality_version: As in :func:`is_complete`.
 
     Returns:
         A summary of the file.
@@ -683,7 +727,7 @@ def assemble_file(task: AssemblyTask, source_pickle_path: str,
     import h5py
 
     dst, sources, digest = task.path, task.sources, task.digest
-    if is_complete(dst, digest, source_pickle_path):
+    if is_complete(dst, digest, source_pickle_path, quality_version):
         return {"path": dst, "skipped": True}
     partial = dst + PARTIAL_SUFFIX
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
@@ -741,19 +785,21 @@ def plan_assembly(output_base_path: str, partitions: pd.DataFrame, members: pd.D
 
 
 def assemble_kfold(tasks: Sequence[AssemblyTask], source_pickle_path: str,
-                   workers: int) -> List[Dict[str, Any]]:
+                   workers: int, quality_version: Optional[int] = None) -> List[Dict[str, Any]]:
     """Write every partition file, in *workers* processes (CPU work: LZF and disk).
 
     Returns:
         One summary per partition file.
     """
     if workers <= 1:
-        return [assemble_file(t, source_pickle_path) for t in tasks]
+        return [assemble_file(t, source_pickle_path, quality_version=quality_version)
+                for t in tasks]
     import multiprocessing as mp
 
     results = []
     with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
-        futures = [pool.submit(assemble_file, t, source_pickle_path) for t in tasks]
+        futures = [pool.submit(assemble_file, t, source_pickle_path, COPY_BATCH_ROWS,
+                               quality_version) for t in tasks]
         for i, future in enumerate(as_completed(futures), 1):
             results.append(future.result())
             if i % 20 == 0 or i == len(futures):
@@ -820,7 +866,8 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
          pretrain_test_fraction: Optional[float] = None,
          pretrain_guids_per_shard: Optional[int] = None, seed: Optional[int] = None,
          assembly_workers: Optional[int] = None, keep_units: Optional[bool] = None,
-         dry_run: Optional[bool] = None) -> int:
+         dry_run: Optional[bool] = None, signal_quality: Optional[bool] = None,
+         quality_examples: Optional[int] = None) -> int:
     """Apply the defaults, plan the build, and run it.
 
     Args:
@@ -844,6 +891,9 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
         assembly_workers: Processes that assemble the partition files. Default: 4.
         keep_units: Keep ``_units/`` after the assembly. Default: off.
         dry_run: Write the pickle, the manifest and the GUID lists, then stop. Default: off.
+        signal_quality: Causal only: the signal-quality step of ``create_new_pipeline.py``, and
+            the report in ``quality_report/`` at the end. Default: off.
+        quality_examples: Example pages per category in the report; 0 draws none. Default: 4.
 
     Returns:
         The process exit code.
@@ -859,6 +909,11 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     cnp.validate_transform(transform)
     cnp.validate_leg_alignment(leg_alignment)
     cnp.validate_phase_operator(phase_operator)
+    signal_quality = bool(signal_quality)
+    if signal_quality and transform != cnp.CAUSAL:
+        raise ValueError("signal_quality=True needs transform='causal'")
+    quality_version = cnp.sq.QUALITY_VERSION if signal_quality else None
+    quality_examples = 4 if quality_examples is None else int(quality_examples)
     eligibility = pretrain_eligibility or PRETRAIN_ELIGIBILITY[0]
     test_fraction = 0.1 if pretrain_test_fraction is None else float(pretrain_test_fraction)
     per_shard = int(pretrain_guids_per_shard or 5000)
@@ -897,7 +952,8 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     settings = {"transform": transform, "leg_alignment": leg_alignment,
                 "phase_operator": phase_operator, "tlo_csv_path": str(tlo_csv_path),
                 "scatter_batch_size": int(scatter_batch_size or 128), "verbose": bool(verbose),
-                "source_pickle_path": str(pickle_path)}
+                "source_pickle_path": str(pickle_path), "signal_quality": signal_quality,
+                "quality_version": quality_version}
     manifest = {
         "fold_dir": str(fold_dir), "fold_partitions_sha256": fold_digest,
         "fold_run_config": run_config, "screening_csv_path": str(screening_csv_path),
@@ -918,14 +974,16 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
 
     # A unit is needed only while a partition file it feeds is incomplete: a rerun after a
     # finished build, whose units are deleted, must not transform them again.
-    pending = [t for t in tasks if not is_complete(t.path, t.digest, str(pickle_path))]
+    pending = [t for t in tasks
+               if not is_complete(t.path, t.digest, str(pickle_path), quality_version)]
     needed = {source for t in pending for source in t.sources}
     jobs = [j for j in jobs if j.kind != "unit" or j.path in needed]
     results = run_jobs(jobs, settings, devices)
     check_files_agree(sorted(j.path for j in jobs))
     assembled: List[Dict[str, Any]] = []
     if "kfold" in steps:
-        assembled = assemble_kfold(pending, str(pickle_path), int(assembly_workers or 4))
+        assembled = assemble_kfold(pending, str(pickle_path), int(assembly_workers or 4),
+                                   quality_version)
         if not keep_units and (out / KFOLD_DIR / UNITS_DIR).exists():
             shutil.rmtree(out / KFOLD_DIR / UNITS_DIR)
         if pending:
@@ -934,8 +992,11 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     finals = [j.path for j in jobs if j.kind == "pretraining"] + (
         [t.path for t in tasks] if "kfold" in steps else [])
     check_files_agree(sorted(finals))
+    report: Dict[str, Any] = {}
+    if signal_quality:
+        report = _run_quality_report(out, finals, quality_examples, seed)
 
-    manifest["results"] = {"transform": results, "assembly": assembled}
+    manifest["results"] = {"transform": results, "assembly": assembled, "quality_report": report}
     with open(out / MANIFEST_NAME, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     logger.info(f"Build finished: {out}")
@@ -945,12 +1006,42 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
 def _run_fold_eda(kfold: Path, test_mode: str) -> None:
     """Run the pipeline's fold EDA on the first fold, as ``create_new_pipeline.py`` does."""
     try:
-        from hdf5_dataset.new_pipeline.fold_eda_analysis import run_fold_eda
-
+        run_fold_eda = _sibling("fold_eda_analysis").run_fold_eda
         test_dir = str(kfold / "test") if test_mode == "holdout" else None
         run_fold_eda(str(kfold / "fold_1"), str(kfold / "fold_1" / "fold_eda"), test_dir=test_dir)
     except Exception as e:  # noqa: BLE001 -- optional report, as in the pipeline
         logger.error(f"Fold EDA failed: {e}")
+
+
+def _run_quality_report(out: Path, finals: Sequence[str], n_examples: int,
+                        seed: int) -> Dict[str, Any]:
+    """Write ``quality_report/`` from the pretraining shards and the files of one fold.
+
+    Each segment of the build is read once: every pool GUID sits in exactly one partition of
+    ``fold_1``, and the holdout test set, if any, in ``k_fold_cross_validation_dataset/test``.
+    A failure is logged and does not fail the build, whose files are complete by then.
+
+    Args:
+        out: The output directory.
+        finals: Every final file of the build.
+        n_examples: Example pages per category.
+        seed: Seed of the row sample and of the random examples.
+
+    Returns:
+        The report's summary, or ``{"error": ...}``.
+    """
+    kfold = out / KFOLD_DIR
+    files = []
+    for path in finals:
+        p = Path(path)
+        if PRETRAIN_DIR in p.parts or "fold_1" in p.parts or p.parent == kfold / "test":
+            files.append((path, p.relative_to(out).as_posix()))
+    try:
+        return _sibling("quality_report").write_quality_report(
+            files, str(out / "quality_report"), n_examples=n_examples, seed=seed)
+    except Exception as e:  # noqa: BLE001 -- a report, written after every file is complete
+        logger.exception("quality report failed")
+        return {"error": repr(e)}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -988,6 +1079,9 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None)
     p.add_argument("--dry-run", dest="dry_run", action=argparse.BooleanOptionalAction,
                    default=None)
+    p.add_argument("--signal-quality", dest="signal_quality",
+                   action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--quality-examples", dest="quality_examples", type=int)
     return p
 
 
@@ -1024,14 +1118,14 @@ RUN_ARGS: Dict[str, Any] = {
     "fold_dir": r"/path/to/minimization_folds_k10",
 
     # str -- guid_screening_results.csv of the pipeline run the pool came from. Required.
-    "screening_csv_path": r"/path/to/output_base_path/guid_screening_results.csv",
+    "screening_csv_path": r"/data/deid/isilon/MS_model/new_ph_dataset/guid_screening_results.csv",
 
     # str -- CSV with the labour-onset and second-stage columns. Required.
     "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
 
     # str -- a NEW directory for the whole build. Required. A rerun into the same directory
     #        with the same fold folder skips every finished file.
-    "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/minimization_folds_causal_int",
+    "output_base_path": r"/data/deid/isilon/MS_model/new_ph_dataset/minimization_folds_quality_v3",
 
     # ============================= The variant to build =============================
     # Same values and meanings as RUN_ARGS in create_new_pipeline.py.
@@ -1041,6 +1135,14 @@ RUN_ARGS: Dict[str, Any] = {
     "leg_alignment": "envelope",
     # "ratio_power_v0" | "integer_harmonic_v1"            (None -> "ratio_power_v0"; causal only)
     "phase_operator": "integer_harmonic_v1",
+    # bool | None -- the signal-quality step (causal only).    (None -> False)
+    #   True : read with the MIMO fill off; store the bridged signals in fhr/up and, beside them,
+    #          up_quality, fhr_quality, up_raw, fhr_raw, <block>_rho and the valid fractions.
+    #          Root attribute quality_version. Ends with quality_report/ (clinical traces: keep it
+    #          on this box). Needs its OWN output_base_path and statistics file.
+    "signal_quality": True,
+    # int | None -- example pages per category in quality_report/; 0 draws none.  (None -> 4)
+    "quality_examples": 4,
 
     # ================================ What to build ================================
     # list[str] | None -- any of "pretraining", "kfold".  (None -> both)

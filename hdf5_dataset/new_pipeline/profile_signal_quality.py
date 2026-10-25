@@ -6,8 +6,12 @@ and once with the MIMO fill turned off, which gives the **pre-fill** signals. On
 signals it runs :mod:`hdf5_dataset.signal_quality`: the per-sample codes, the bridge, and the
 contamination $\rho_c[k]$ of every stored coefficient. It writes no dataset.
 
-The MIMO fill is turned off by patching the method on its class for the duration of one read.
-Nothing in the ``mimo`` packages changes on disk.
+The MIMO fill is turned off by patching the method on its class for the duration of one read
+(``create_new_pipeline.mimo_fill``). Nothing in the ``mimo`` packages changes on disk.
+
+On the production box this file may sit in one folder with ``signal_quality.py``,
+``create_new_pipeline.py``, ``events.py`` and ``launch.py``; each import tries that folder first and
+falls back to the repository's packages.
 
 Outputs in ``output_dir``:
 
@@ -26,7 +30,6 @@ Run it on the production box, where the records and the MIMO adaptor live. Edit
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import logging
 import os
@@ -35,7 +38,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -48,8 +51,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if not __package__ and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from hdf5_dataset import signal_quality as sq  # noqa: E402
-from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
+try:  # Production: every file in one folder.
+    import signal_quality as sq  # noqa: E402
+except ModuleNotFoundError as _exc:  # Repository layout.
+    if _exc.name != "signal_quality":
+        raise
+    from hdf5_dataset import signal_quality as sq  # noqa: E402
+try:  # Repository layout, and a box with the teb_vae package.
+    from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
+except ModuleNotFoundError as _exc:
+    if not str(_exc.name).startswith("teb_vae"):
+        raise
+    # Production: every file in one folder; create_new_pipeline re-exports the two helpers.
+    from create_new_pipeline import missing_required, resolve_launch_args  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +93,7 @@ EXAMPLE_CATEGORIES = {
     "hold": ("UA hold", "ua_hold"),
     "floor": ("UA floor", "ua_floor"),
     "island": ("UA island in an artifact region", "ua_island"),
+    "oscillation": ("UA regular oscillation (kept valid)", "ua_oscillation"),
     "mimo_overwrite": ("MIMO fill overwrote valid samples", "fill_overwritten_valid"),
     "fhr_repaired": ("FHR repair", "fhr_invalid_share"),
     "clean": ("Clean UA with contractions (control)", "n_contr_clean"),
@@ -87,36 +102,31 @@ EXAMPLE_CATEGORIES = {
 
 def _pipeline() -> Any:
     """Import ``create_new_pipeline`` on first use; it needs the production packages."""
-    from hdf5_dataset.new_pipeline import create_new_pipeline
+    try:  # Production: every file in one folder.
+        import create_new_pipeline
+    except ModuleNotFoundError as exc:  # Repository layout.
+        if exc.name != "create_new_pipeline":
+            raise
+        from hdf5_dataset.new_pipeline import create_new_pipeline
 
     return create_new_pipeline
+
+
+def _events() -> Tuple[Any, Any]:
+    """Import the contraction detector of the training weight: ``(detect_contractions, raw_validity)``."""
+    try:  # Production: every file in one folder.
+        from events import detect_contractions, raw_validity
+    except ModuleNotFoundError as exc:  # Repository layout.
+        if exc.name != "events":
+            raise
+        from teb_vae.lag_attn_rws.eval.events import detect_contractions, raw_validity
+
+    return detect_contractions, raw_validity
 
 
 # =================================================================================================
 # Reading
 # =================================================================================================
-@contextlib.contextmanager
-def mimo_fill(enabled: bool) -> Iterator[None]:
-    """Turn ``MimoSequence.interpolate_input`` off for the body of the ``with`` block.
-
-    The patch is on the class, because ``prepare_data`` replaces the instance twice before it
-    calls the method. The original method is restored on exit, also after an exception.
-
-    Args:
-        enabled: Keep the fill (``True``) or replace it with the identity (``False``).
-    """
-    cnp = _pipeline()
-    module = sys.modules[cnp.EarlyMaestraMimoAdaptor.__module__]
-    cls = module.MimoSequence
-    original = cls.interpolate_input
-    if not enabled:
-        cls.interpolate_input = lambda self: self
-    try:
-        yield
-    finally:
-        cls.interpolate_input = original
-
-
 def load_record(record_path: str) -> Dict[str, Any]:
     """Read one record as the builder does, with and without the MIMO fill.
 
@@ -134,10 +144,10 @@ def load_record(record_path: str) -> Dict[str, Any]:
         ValueError: If the two reads disagree on the segment list.
     """
     cnp = _pipeline()
-    with mimo_fill(True):
+    with cnp.mimo_fill(True):
         fhr_now, up_now, ds_now, w_now = cnp._run_mimo_pipeline(
             record_path, cnp.MIN_DOMAIN_START_DATASET, verbose=False)
-    with mimo_fill(False):
+    with cnp.mimo_fill(False):
         fhr_pre, up_pre, ds_pre, w_pre = cnp._run_mimo_pipeline(
             record_path, cnp.MIN_DOMAIN_START_DATASET, verbose=False)
     if list(ds_now) != list(ds_pre) or fhr_now.shape != fhr_pre.shape:
@@ -180,99 +190,6 @@ def _gate(cnp: Any, fhr: np.ndarray, up: np.ndarray, weight: np.ndarray, domain_
             or sum(v for v in fhr_lens if v >= 240) > 1200):
         return "flat"
     return "post_delivery" if domain_start >= 0 else "kept"
-
-
-def _series(segdat: Any) -> Tuple[int, np.ndarray]:
-    """Lay one ``segdat`` channel on an absolute 4 Hz index grid.
-
-    Args:
-        segdat: A channel's ``segdat`` struct from ``efmStruct``.
-
-    Returns:
-        ``(first_index, values)``: the grid index of ``values[0]``, and the values with $-1$
-        where the channel has no sample.
-    """
-    incr = float(segdat.domainIncr)
-    starts = np.atleast_1d(np.asarray(segdat.domainStart, dtype=np.float64))
-    onsets = np.atleast_1d(np.asarray(segdat.parameterSet.onsetPointer, dtype=np.int64)) - 1
-    lengths = np.atleast_1d(np.asarray(segdat.parameterSet.segLength, dtype=np.int64))
-    data = np.asarray(segdat.dataSet, dtype=np.float64).ravel()
-    first = np.round(starts / incr).astype(np.int64)
-    origin = int(first.min())
-    values = np.full(int((first + lengths).max() - origin), -1.0)
-    for g, onset, length in zip(first, onsets, lengths):
-        values[g - origin:g - origin + length] = data[onset:onset + length]
-    return origin, values
-
-
-def _lookup(origin: int, values: np.ndarray, index: np.ndarray) -> np.ndarray:
-    """Read ``values`` at absolute grid indices, $-1$ outside the channel."""
-    local = index - origin
-    out = np.full(index.shape, -1.0)
-    inside = (local >= 0) & (local < values.size)
-    out[inside] = values[local[inside]]
-    return out
-
-
-def raw_fhr_repaired(record_path: str, domain_start: np.ndarray, fhr_pre: np.ndarray,
-                     present: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-    """Mark the FHR samples that the upstream repair wrote, from the raw channel.
-
-    The adaptor reads the last of ``Repaired HR1``, ``Repaired HR2`` and ``Repaired external
-    FECG`` present. The raw channel is the same name without ``Repaired``. Each segment is first
-    placed on the repaired channel's grid (the offset with the most exact matches, within
-    $\\pm 4$ samples), then the raw channel is read at one record-wide offset within $\\pm 1$
-    sample. A present sample is repaired if the raw value there is absent, 0, 255, or different.
-
-    Args:
-        record_path: The ``.mat`` file.
-        domain_start: Segment start times in seconds.
-        fhr_pre: Pre-fill FHR ``(n, N)``.
-        present: Present samples ``(n, N)``.
-
-    Returns:
-        ``(repaired, info)``: a boolean ``(n, N)`` array or ``None`` when the raw channel is
-        missing, and the offsets and match rates for ``records.csv``.
-    """
-    from scipy.io import loadmat
-
-    mat = loadmat(record_path, squeeze_me=True, struct_as_record=False)["efmStruct"]
-    signals = {sig.measure: sig for sig in np.atleast_1d(mat.signals)}
-    chosen = [k for k in ("Repaired HR1", "Repaired HR2", "Repaired external FECG") if k in signals]
-    if not chosen:
-        return None, {"raw_fhr": "no repaired channel"}
-    raw_key = chosen[-1].replace("Repaired ", "")
-    if raw_key not in signals:
-        return None, {"raw_fhr": f"no {raw_key!r} channel"}
-    rep_origin, rep_values = _series(signals[chosen[-1]].segdat)
-    raw_origin, raw_values = _series(signals[raw_key].segdat)
-
-    n_seg, n = fhr_pre.shape
-    grids = []
-    placed = 0
-    for i in range(n_seg):
-        base = int(np.floor(domain_start[i] / 0.25)) + np.arange(n)
-        best, best_hits = 0, -1
-        for offset in range(-4, 5):
-            hits = int(np.sum(_lookup(rep_origin, rep_values, base + offset)[present[i]]
-                              == fhr_pre[i][present[i]]))
-            if hits > best_hits:
-                best, best_hits = offset, hits
-        grids.append(base + best)
-        placed += best_hits
-    raw_offset, raw_hits = 0, -1
-    for offset in (-1, 0, 1):
-        hits = sum(int(np.sum(_lookup(raw_origin, raw_values, grids[i] + offset)[present[i]]
-                              == fhr_pre[i][present[i]])) for i in range(n_seg))
-        if hits > raw_hits:
-            raw_offset, raw_hits = offset, hits
-    repaired = np.zeros((n_seg, n), dtype=bool)
-    for i in range(n_seg):
-        raw = _lookup(raw_origin, raw_values, grids[i] + raw_offset)
-        repaired[i] = present[i] & ((raw <= 0) | (raw >= 255) | (raw != fhr_pre[i]))
-    total = max(int(present.sum()), 1)
-    return repaired, {"raw_fhr": raw_key, "raw_offset": raw_offset,
-                      "repaired_grid_match": placed / total, "raw_match": raw_hits / total}
 
 
 # =================================================================================================
@@ -388,8 +305,7 @@ def profile_record(record_path: str, subgroup: str) -> Dict[str, Any]:
         ``{"record": {...}, "segments": [...], "runs": [...], "channels": {block: (valid, total)}}``
         where ``valid`` and ``total`` are per-channel sums over the record's kept segments.
     """
-    from teb_vae.lag_attn_rws.eval.events import detect_contractions, raw_validity
-
+    detect_contractions, raw_validity = _events()
     guid = Path(record_path).stem
     started = time.time()
     record: Dict[str, Any] = {"guid": guid, "subgroup": subgroup, "record_path": record_path,
@@ -406,7 +322,7 @@ def profile_record(record_path: str, subgroup: str) -> Dict[str, Any]:
     repaired = None
     if _WORKER["read_raw_fhr"] and profiled:
         try:
-            repaired, info = raw_fhr_repaired(record_path, rec["domain_start"], rec["fhr_pre"],
+            repaired, info = sq.raw_fhr_repaired(record_path, rec["domain_start"], rec["fhr_pre"],
                                               rec["present"])
             record.update(info)
         except Exception as exc:  # noqa: BLE001
@@ -1014,7 +930,7 @@ def render_examples(picks: Sequence[Tuple[str, Dict[str, Any]]], kit: Dict[str, 
                 repaired = None
                 if read_raw_fhr:
                     try:
-                        repaired, _ = raw_fhr_repaired(path, rec["domain_start"], rec["fhr_pre"],
+                        repaired, _ = sq.raw_fhr_repaired(path, rec["domain_start"], rec["fhr_pre"],
                                                        rec["present"])
                     except Exception:  # noqa: BLE001 -- the page still draws without it
                         repaired = None
@@ -1034,7 +950,11 @@ def render_examples(picks: Sequence[Tuple[str, Dict[str, Any]]], kit: Dict[str, 
                 logger.warning(f"example {category} {row['guid']}/{i}: transform failed {failures}")
                 continue
             coeffs = {"now": blocks[0], "clean": blocks[1]}
-            fig = plot_example(plt, category, row, rec, r, rho, coeffs, kit, epsilon)
+            try:
+                fig = plot_example(plt, category, row, rec, r, rho, coeffs, kit, epsilon)
+            except Exception:  # noqa: BLE001 -- one bad page must not cost the others
+                logger.exception(f"example {category} {row['guid']}/{i}: the page failed")
+                continue
             name = f"{number:02d}_{category}_{row['guid']}_seg{i}.png"
             fig.savefig(out / name, dpi=110)
             pdf.savefig(fig)
@@ -1129,7 +1049,8 @@ def write_report(out: Path, seg: pd.DataFrame, runs_df: pd.DataFrame, records: p
         "   effect on today's data is in figure 03 and in the `fill_*` columns of `segments.csv`.",
         "2. Every sample gets UA and FHR quality bits (`hdf5_dataset/signal_quality.py`).",
         "3. A UA baseline step is masked but not corrected; a ceiling run is decided as a whole;",
-        "   a short valid run in a mostly invalid region is invalid (`ISLAND` bit).",
+        "   a short valid run in a mostly invalid region is invalid (`ISLAND` bit); a regular",
+        "   wave of 5-20 s period (maternal breathing) stays valid (`OSCILLATION` bit).",
         "4. Every invalid span is bridged by a monotone cubic between its valid neighbours.",
         "5. Each stored coefficient gets its contamination $\\rho$ from the causal kernel of its channel.",
         "",
@@ -1318,6 +1239,9 @@ def main(
     ]
     figures = [f for f in figures if f]
 
+    # Written before the examples, and again after them: the slow page loop must not cost the
+    # report if it stops.
+    write_report(out, seg, runs_df, records, figures, [], cfg, epsilon, run_config)
     examples: List[str] = []
     if n_examples > 0:
         picks = choose_examples(seg, n_examples, seed)
@@ -1392,10 +1316,10 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 RUN_ARGS: Dict[str, Any] = {
     # ================================ FILL IN: the paths ================================
     # str -- a directory for the report. Required. Files in it are overwritten.
-    "output_dir": r"/data1/fetal-heart-tracing/HDF5_Datasets/signal_quality_profile",
+    "output_dir": r"/data/deid/isilon/MS_model/new_ph_dataset/quality_profile_3",
 
     # str | None -- guid_screening_results.csv of a pipeline run; records are drawn from it.
-    "screening_csv_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_int/guid_screening_results.csv",
+    "screening_csv_path": r"/data/deid/isilon/MS_model/new_ph_dataset/guid_screening_results.csv",
 
     # list[str] | None -- explicit .mat paths; used instead of the CSV when set.
     "record_paths": None,
