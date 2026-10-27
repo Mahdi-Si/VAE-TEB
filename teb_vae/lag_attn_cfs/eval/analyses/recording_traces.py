@@ -60,6 +60,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     anchor_support,
     attention_entropy,
     batch_field,
+    forward_kwargs,
     model_inputs,
 )
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors
@@ -325,7 +326,8 @@ def trace_recording(
         moved = task.transfer_batch_to_device(batch, task.device, dataloader_idx=0)
         y_st, y_ph, u_stream, _target_features, weight = model_inputs(task, moved)
         outputs = model(
-            y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride
+            y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride,
+            **forward_kwargs(task, moved, u_stream),
         )
         segment_traces = gather_segment_traces(
             model, outputs, weight, batch_rows,

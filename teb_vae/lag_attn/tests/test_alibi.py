@@ -162,8 +162,8 @@ def test_forward_shapes():
     assert head_out.shape == (_BATCH, _SEQ_LEN, _NUM_HEADS, _D_HEAD)
 
 
-def test_a_batched_mask_is_accepted_and_collapsed():
-    """A ``(B, T, L)`` mask can only depend on ``(t, l)``, so it collapses to the first row."""
+def test_a_batched_mask_of_identical_rows_equals_the_shared_mask():
+    """A ``(B, T, L)`` mask is applied per sample; with every row the shared mask it is that mask."""
     attention = _make().eval()
     h_y, h_u = _states()
     flat = attention.build_lag_mask(_SEQ_LEN)
@@ -174,6 +174,50 @@ def test_a_batched_mask_is_accepted_and_collapsed():
         from_batched = attention(h_y, h_u, batched)[1]
 
     assert torch.equal(from_flat, from_batched)
+
+
+def test_a_per_sample_mask_moves_only_its_own_sample():
+    """A key removed from sample 1 gets zero weight there, and sample 0 attends exactly as before.
+
+    This is how the source-quality mask removes a bad source step: it must not leak into the other
+    samples of the batch, which the earlier collapse to the first row silently did.
+    """
+    attention = _make().eval()
+    h_y, h_u = _states()
+    flat = attention.build_lag_mask(_SEQ_LEN)
+    batched = flat[None].expand(_BATCH, -1, -1).clone()
+    removed_step = _SEQ_LEN // 2
+    for t in range(removed_step, min(_SEQ_LEN, removed_step + _MAX_LAG + 1)):
+        batched[1, t, t - removed_step] = False
+
+    with torch.no_grad():
+        shared = attention(h_y, h_u, flat)[1]
+        masked = attention(h_y, h_u, batched)[1]
+
+    assert torch.equal(masked[0], shared[0])
+    for t in range(removed_step, min(_SEQ_LEN, removed_step + _MAX_LAG + 1)):
+        assert float(masked[1, t, :, t - removed_step].abs().max()) == 0.0
+    assert not torch.equal(masked[1], shared[1])
+
+
+@pytest.mark.parametrize("use_entmax", [True, False])
+def test_a_row_with_no_valid_key_attends_to_nothing_and_stays_finite(use_entmax):
+    """All keys removed: zero weights and a zero summary, finite gradients, under both normalisers.
+
+    ``entmax15`` raises an index error on an all ``-inf`` row, so the attention scores such a row
+    as zeros and zeroes its weights afterwards instead.
+    """
+    attention = _make(use_entmax=use_entmax).train()
+    h_y, h_u = _states()
+    h_u = h_u.clone().requires_grad_(True)
+    mask = attention.build_lag_mask(_SEQ_LEN)[None].expand(_BATCH, -1, -1).clone()
+    mask[0] = False
+
+    _, alpha, heads = attention(h_y, h_u, mask)
+    assert float(alpha[0].abs().max()) == 0.0
+    assert float(heads[0].abs().max()) == 0.0
+    heads.sum().backward()
+    assert torch.isfinite(h_u.grad).all()
 
 
 def test_no_mask_is_identical_to_the_built_mask():

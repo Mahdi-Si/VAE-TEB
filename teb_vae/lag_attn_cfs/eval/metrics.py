@@ -271,6 +271,33 @@ def model_inputs(task: Any, batch: Any) -> Tuple[torch.Tensor, ...]:
     return y_st, y_ph, u_stream, target_features, weight
 
 
+def forward_kwargs(task: Any, batch: Any, u_stream: torch.Tensor) -> Dict[str, Any]:
+    r"""The keyword arguments a direct forward call needs beyond the streams and the geometry.
+
+    Today that is one: the source-validity mask $v \in \{0, 1\}^{B \times T \times c_u}$ of a model
+    built with ``source_quality_mask``, assembled by the task's own ``_build_source_valid`` from
+    the batch's ``up_st_step_valid`` / ``up_ph_step_valid``. The forward requires it under the flag
+    and refuses it without, so a caller splats this dict rather than deciding for itself.
+
+    Kept beside :func:`model_inputs` rather than inside it because that function's five-tuple is
+    unpacked positionally across the grid, and a sixth element present on one flag only would
+    break every one of those readers. The mask is always the **batch's own**: an intervention that
+    edits the source's values (an occlusion, a zero-source baseline) keeps it, because the quality
+    of the recorded UA decides which keys exist, not the values handed to the encoder.
+
+    Args:
+        task: The Lightning task wrapping the loaded net.
+        batch: The batch the streams came from.
+        u_stream: The assembled source stream $(B, T, c_u)$, for the mask's shape check.
+
+    Returns:
+        ``{'source_valid': (B, T, c_u) bool}`` under ``source_quality_mask``, ``{}`` otherwise.
+    """
+    if not bool(getattr(task.orig_model, "source_quality_mask", False)):
+        return {}
+    return {"source_valid": task._build_source_valid(batch, u_stream)}
+
+
 def batch_field(batch: Any, name: str) -> Any:
     """Read one field off a batch, tolerating both mapping and attribute access.
 
@@ -2268,7 +2295,8 @@ def evaluate_batch(
     # silently swap a phase for a stride.
     anchor_phase, anchor_stride = DENSE_ANCHOR_GEOMETRY
     outputs = model(
-        y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride
+        y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride,
+        **forward_kwargs(task, batch, u_stream),
     )
 
     # Read off the forward rather than recomputed, for the reason ``causal_inputs.py`` gives for
