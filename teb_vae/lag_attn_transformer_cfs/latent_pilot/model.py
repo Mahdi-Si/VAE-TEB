@@ -660,7 +660,8 @@ def forward_inputs(task: Any, batch: Any) -> Tuple[Any, ...]:
         batch: A batch from the data module.
 
     Returns:
-        ``(y_st, y_ph, u_stream, anchor_phase, anchor_stride)``.
+        ``(y_st, y_ph, u_stream, anchor_phase, anchor_stride)``, plus ``source_valid`` as a sixth
+        element when the net is built with ``source_quality_mask``.
 
     Raises:
         PilotConfigError: If the resolved geometry is not the dense one.

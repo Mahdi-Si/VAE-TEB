@@ -55,9 +55,10 @@ TIME_POOLING_PROOF = (
 #: is a silent no-op rather than a refusal. ``tests/test_eval_binding.py`` asserts both halves
 #: against the class and against this package's shipped ``configs/default.yaml``.
 #:
-#: The cfs cell's tuple **minus** ``causal_norm`` **plus** this architecture's seven encoder keys and
-#: ``forecast_ar_residual``, the one density key only this cell's final revision configures, with
-#: the shared keys in the cfs cell's order. ``tests/test_eval_binding.py`` asserts that relation
+#: The cfs cell's tuple **minus** ``causal_norm`` **plus** this architecture's seven encoder keys,
+#: ``forecast_ar_residual``, the one density key only this cell's final revision configures, and the
+#: two posterior keys only this cell's config declares (``posterior_event_gate``,
+#: ``source_quality_mask``), with the shared keys in the cfs cell's order. ``tests/test_eval_binding.py`` asserts that relation
 #: rather than a count. ``causal_norm`` is not merely irrelevant here: the constructor does not
 #: accept it, so a config carrying it is already a ``TypeError`` at rebuild and reconciling it could
 #: only ever compare a key against nothing.
@@ -118,6 +119,13 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     # construction rather than by what the data said. Declared by this cell's config alone (the
     # conv-LSTM cell's does not carry the key), so only this binding reconciles it.
     "posterior_event_gate",
+    # Here because it changes **what the posterior is**, as the gate above does: with it on, a UA
+    # step the dataset's ``ua_step_mask`` marks bad leaves the lag keys of every query, and an anchor
+    # with no valid key keeps its gate closed, so $q = p$ and the KL there is exactly zero by
+    # construction. It adds no parameter, so a checkpoint loads under either value and the rebuild
+    # takes the checkpoint's; a config disagreeing about it would report the masked posterior's
+    # coupling under the unmasked model's stated architecture. Declared by this cell's config alone.
+    "source_quality_mask",
     # Here because it is part of the **density**: every evaluated readout scores each cell on its
     # AR(1) innovation when it is on, so a config disagreeing about it would report one likelihood's
     # numbers under another's name. ``target_scored_horizon``, the other density term, is a resolved

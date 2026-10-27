@@ -54,6 +54,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     anchor_support,
     forecast_likelihood_terms,
+    forward_kwargs,
     model_inputs,
 )
 from teb_vae.lag_attn_rws.nets import controls
@@ -154,17 +155,32 @@ def score_pairs(task: Any, own: Any, partner: Any) -> Dict[str, np.ndarray]:
     y_st, y_ph, u_stream, target_features, weight = model_inputs(task, own)
     partner_source = model_inputs(task, partner)[2]
     phase, stride = DENSE_ANCHOR_GEOMETRY
-    outputs = model(y_st, y_ph, u_stream, anchor_phase=phase, anchor_stride=stride)
+    own_kwargs = forward_kwargs(task, own, u_stream)
+    outputs = model(y_st, y_ph, u_stream, anchor_phase=phase, anchor_stride=stride, **own_kwargs)
     anchors = outputs["anchor_index"]
     target = model._build_forecast_target(target_features, anchors)
     mask, _coverage, kl_support = anchor_support(model, weight, outputs)
     density = forecast_likelihood_terms(model)
 
     gated = partner_source if model.source_gate is None else model.source_gate(partner_source)
+    # Under ``source_quality_mask`` the partner's source arrives with the PARTNER's quality mask, as
+    # the permutation control hands a donor's source with the donor's mask: a key is judged by the
+    # recording stretch it was read from. The partner is a whole stored segment substituted step for
+    # step -- step $s$ of the shifted arm is step $s$ of the partner -- so its mask is taken at the
+    # same steps with no offset; nothing inside the stream moves, only which segment fills it.
+    posed = outputs
+    if own_kwargs:
+        partner_valid = forward_kwargs(task, partner, partner_source)["source_valid"]
+        key_mask = model.source_key_mask(
+            partner_valid,
+            model.build_lag_mask(int(partner_source.shape[1]), partner_source.device),
+            partner_source.dtype,
+        )
+        posed = {**outputs, "source_key_mask": key_mask, "source_open": key_mask.any(dim=-1)}
     # A seeded generator only because the helper also decodes one draw, which nothing here reads;
     # it keeps the global stream untouched.
     generator = torch.Generator(device=gated.device).manual_seed(0)
-    shifted = controls.occluded_forward_outputs(model, outputs, gated, anchors=anchors, generator=generator)
+    shifted = controls.occluded_forward_outputs(model, posed, gated, anchors=anchors, generator=generator)
 
     gather = anchors.to(torch.long)[:, :, None].expand(-1, -1, outputs["mu_prior"].shape[-1])
     persistence = outputs.get("persistence")

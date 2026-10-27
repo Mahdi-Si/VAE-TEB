@@ -93,7 +93,9 @@ _METRIC_SUFFIXES = (
     # total (the unweighted ``nll_full_block`` itself when no contraction weight is configured) and
     # ``event_anchor_frac`` the share of scored anchors at weight 1; ``event_gate_mean`` is the
     # posterior event gate's masked mean (1.0 on a model without the gate) beside its echoed weight.
+    # ``source_mask_fraction`` is the share of KL anchors the UA quality mask closed (0.0 off).
     "nll_full_event_block", "event_anchor_frac", "event_gate_mean", "lambda_event_gate",
+    "source_mask_fraction",
     "anchor_coverage_frac",
     # The decoder-output variances (mean_logvar_full/base) do NOT detect a prior variance
     # pinned on its clamp; mean_logvar_prior and logvar_prior_floor_frac are the watch for the

@@ -414,13 +414,16 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         per-sample tile phase and the stride. Everything downstream of this method reads
         ``inputs[0]`` for the batch size and the device rather than a named tensor, so the arity
         change reaches nothing else -- the diagnostic callback star-splats it, and the objective
-        never sees it at all.
+        never sees it at all. A model built with ``source_quality_mask`` gets a sixth, the
+        source-validity mask of :meth:`_build_source_valid`, last so every positional reader of
+        the first five is unchanged.
 
         Args:
             batch: A batch from the data module.
 
         Returns:
-            ``(y_st, y_ph, u_stream, anchor_phase, anchor_stride)``.
+            ``(y_st, y_ph, u_stream, anchor_phase, anchor_stride)``, plus ``source_valid`` under
+            ``source_quality_mask``.
         """
         y_st, y_ph = self._build_target_streams(batch)
         source = self._build_source_stream(batch)
@@ -429,7 +432,50 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         # be the ``self.training`` mistake in another spelling, so the stage travels on the
         # instance for exactly the length of one step; see ``compute_loss_and_metrics``'s caller.
         phase, stride = self.resolve_anchor_geometry(self._stage, batch)
+        if bool(getattr(self.orig_model, "source_quality_mask", False)):
+            return y_st, y_ph, source, phase, stride, self._build_source_valid(batch, source)
         return y_st, y_ph, source, phase, stride
+
+    def _build_source_valid(self, batch: Any, source: torch.Tensor) -> torch.Tensor:
+        r"""Assemble the per-channel source-validity mask in the source stream's channel order.
+
+        The dataset's ``ua_step_mask`` emits ``up_st_step_valid`` and ``up_ph_step_valid``, each
+        ``(B, T, C)`` at its block's width; they are concatenated exactly as
+        :meth:`_build_source_stream` concatenates the blocks, so channel $c$ of the mask describes
+        channel $c$ of the stream.
+
+        Args:
+            batch: A batch from the data module.
+            source: The assembled source stream, for the width check.
+
+        Returns:
+            The boolean mask ``(B, T, c_u)``, ``True`` = usable.
+
+        Raises:
+            RuntimeError: If a block's mask is absent, or the mask is not the stream's shape.
+        """
+        names = (
+            ("up_st", "up_ph")
+            if bool(getattr(self.orig_model, "use_up_st", False))
+            else ("up_ph",)
+        )
+        blocks = []
+        for name in names:
+            mask = getattr(batch, f"{name}_step_valid", None)
+            if mask is None:
+                raise RuntimeError(
+                    f"the model was built with source_quality_mask=True but the batch has no "
+                    f"`{name}_step_valid` field. Set dataset_kwargs.ua_step_mask in the config; "
+                    f"it needs a signal-quality build (root attribute quality_version)."
+                )
+            blocks.append(mask)
+        valid = torch.cat(blocks, dim=-1) if len(blocks) > 1 else blocks[0]
+        if tuple(valid.shape) != tuple(source.shape):
+            raise RuntimeError(
+                f"the source-validity mask has shape {tuple(valid.shape)} but the source stream "
+                f"has {tuple(source.shape)}; the two must come from the same blocks."
+            )
+        return valid.to(device=source.device, dtype=torch.bool)
 
     # ------------------------------------------------------------------
     # Diagnostics
