@@ -60,6 +60,8 @@ model_config:
     source_attention_blocks: 2
     source_attention_window: 8
     likelihood: mse
+    # The fixture shards are not signal-quality builds, so they carry nothing to mask with.
+    source_quality_mask: false
 
 dataset_config:
   # Repo-root-relative: entry points run from the repo root. The fixtures are the family's -- every
@@ -71,6 +73,8 @@ dataset_config:
   stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_int.hdf5
   dataloader_config:
     num_workers: 0       # no worker spawn for 4 samples
+    dataset_kwargs:
+      ua_step_mask: {bits: null, rho_epsilon: null}   # neither rule set = no mask
 
 advanced_config:
   tracking:

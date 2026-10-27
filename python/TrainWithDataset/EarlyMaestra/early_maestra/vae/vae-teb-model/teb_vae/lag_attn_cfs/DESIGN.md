@@ -115,6 +115,15 @@ keyed on the pair; without them every segment of every recording is decoded at o
 with $A_{\max}$ a geometry constant either way, so no shape, no count and no metric would differ.
 `trainer.preflight` refuses it.
 
+**A signal-quality build adds quality fields, and they are opt-in.** On a causal build with
+`signal_quality=True`, `fhr`/`up` hold the bridged signals, and the coefficients come from them. Beside
+them sit `up_quality`, `fhr_quality`, `*_raw`, `<block>_rho` and per-segment shares
+(`hdf5_dataset/dataset_explained_research.md` §8.3, §10.5). The shipped `load_fields` names none of
+them, so the model reads only the fields in the table above, and no quality field is ever normalised.
+Such a build needs a new statistics file, computed over it with the quality mask on, at `stat_path`;
+the loader refuses an older statistics file by its `quality_version`. The model side of the mask (key
+mask, gate prior) is still open (`research_notes/UA_QUALITY_MASK_DESIGN.md` section 8, Phase 4).
+
 **`fhr_up_ph` is absent from the variant and must stay absent from every config.** A coefficient
 mixing both signals would put the source's own signal into the forecast target and destroy the
 target-only / source-conditioned separation the coupling readout rests on. In `load_fields` the
@@ -1759,8 +1768,8 @@ unscaled difference of the references, which is the pair itself; the lag-axis bi
 times it.
 
 **Amendment, 2026-09-05 — the stored timeline is canonical.** Every number in the two paragraphs
-above still subtracted a $20$ s "acquisition shift" ($\tau_{\mathrm{pre}}$) from the identity.
-The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it. The term was removed from `lag_report.physical_lag_seconds`, from
+above still carried a $20$ s correction term in the identity, which is now removed.
+The stored UP/FHR timeline is canonical: treat the stored signals as if they were recorded that way, and use only the feature grid and the filter-delay terms in a lag identity. The term was removed from `lag_report.physical_lag_seconds`, from
 `warmup_budget.py` and from every caption; the canonical figures are: the $20$–$60$ s band at
 lags $-0.1$–$38.9$ under the shipped pair (grazing lag $0$ by $0.1$ at $h = 29$ — whether that
 warrants re-pricing the $288.2672$ s pin is a CFS-12 question) and $-25.0$–$14.0$ under the

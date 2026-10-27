@@ -296,6 +296,7 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         _check_boundary_term_is_off(config)
         _check_phase_key_fields(config)
         _check_source_block_kept(config)
+        _check_source_quality_pairing(config)
         # Last, because it is the expensive one -- it opens every configured shard -- and because
         # its own refusals (a two-sided shard, disagreeing shards, a trim that does not produce the
         # declared window, a reach budget set alongside this one) are the ones a cheap check cannot
@@ -423,6 +424,37 @@ def _check_phase_key_fields(config: Dict[str, Any]) -> None:
             f"The anchor tiling's per-segment phase is a stable hash of the recording identifier, "
             f"the segment's own start time, the epoch and the seed; without both keys every "
             f"segment is decoded at one tile grid forever and nothing about the run says so."
+        )
+
+
+def _check_source_quality_pairing(config: Dict[str, Any]) -> None:
+    """Refuse ``source_quality_mask`` without an active ``ua_step_mask``, and the reverse.
+
+    The model flag makes every forward require the mask the loader's ``ua_step_mask`` emits, so the
+    flag alone fails at the first batch, after the run directory exists. The loader key alone is
+    worse: the mask is built, collated and moved every step, and nothing reads it, so the run trains
+    an unmasked model while its config says otherwise. A ``ua_step_mask`` that names no bit and sets
+    no ``rho_epsilon`` is off, as the loader reads it.
+
+    Args:
+        config: The resolved run config.
+
+    Raises:
+        ValueError: Naming both keys and their values.
+    """
+    vae = (config.get("model_config") or {}).get("VAE_model") or {}
+    flag = bool(vae.get("source_quality_mask", False))
+    dataloader = (config.get("dataset_config") or {}).get("dataloader_config") or {}
+    spec = (dataloader.get("dataset_kwargs") or {}).get("ua_step_mask")
+    active = isinstance(spec, dict) and (
+        bool(spec.get("bits")) or spec.get("rho_epsilon") is not None
+    )
+    if flag != active:
+        raise ValueError(
+            f"model_config.VAE_model.source_quality_mask is {flag} but "
+            f"dataset_config.dataloader_config.dataset_kwargs.ua_step_mask is {spec!r}, which "
+            f"{'sets' if active else 'sets no'} rule. Set both (the flag true and at least one of "
+            f"bits / rho_epsilon) or neither."
         )
 
 

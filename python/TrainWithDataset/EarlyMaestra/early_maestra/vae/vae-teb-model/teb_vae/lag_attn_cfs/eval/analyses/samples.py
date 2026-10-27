@@ -86,6 +86,7 @@ from teb_vae.lag_attn_cfs.eval.dataset_rows import (
 from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     batch_field,
+    forward_kwargs,
     model_inputs,
 )
 from teb_vae.lag_attn_cfs.sample_page import COMPACT_PAGE_ROWS
@@ -488,6 +489,7 @@ def render_pages(
             outs = model(
                 y_st, y_ph, u_stream,
                 anchor_phase=anchor_phase, anchor_stride=anchor_stride,
+                **forward_kwargs(task, moved, u_stream),
             )
             panels = input_stream_rows(
                 model, seams["input_stream_panels"], (y_st, y_ph, u_stream), 0

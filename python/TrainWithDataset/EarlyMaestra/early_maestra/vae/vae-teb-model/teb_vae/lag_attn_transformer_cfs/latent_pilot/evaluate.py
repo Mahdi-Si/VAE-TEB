@@ -387,7 +387,8 @@ def _select_samples(
     where it is per-sample; the stride is scalar and is not.
 
     Args:
-        inputs: The five forward arguments.
+        inputs: The five forward arguments, plus the source-quality mask as a sixth under
+            ``source_quality_mask``.
         target_features: The gathered target stream $(B, T, c_y)$.
         weight: The decimated validity signal $(B, T)$.
         keep: A boolean mask over the batch.
@@ -397,7 +398,7 @@ def _select_samples(
     """
     if bool(keep.all()):
         return inputs, target_features, weight
-    y_st, y_ph, u_stream, phase, stride = inputs
+    y_st, y_ph, u_stream, phase, stride, *source_valid = inputs
     index = torch.as_tensor(np.flatnonzero(keep), dtype=torch.long, device=y_st.device)
     if torch.is_tensor(phase) and phase.dim() > 0:
         phase = phase.index_select(0, index)
@@ -408,6 +409,8 @@ def _select_samples(
             u_stream.index_select(0, index),
             phase,
             stride,
+            # The source-quality mask, present only under ``source_quality_mask``.
+            *(mask.index_select(0, index) for mask in source_valid),
         ),
         target_features.index_select(0, index),
         weight.index_select(0, index),

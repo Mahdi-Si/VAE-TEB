@@ -80,6 +80,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     batch_guids,
     expected_anchors_per_sample,
     forecast_likelihood_terms,
+    forward_kwargs,
     model_inputs,
 )
 from teb_vae.lag_attn_rws.nets.controls import NoCrossGroupPartner, make_derangement
@@ -464,7 +465,8 @@ def cache_target_states(
         moved = task.transfer_batch_to_device(batch, task.device, dataloader_idx=0)
         y_st, y_ph, u_stream, target_features, weight = model_inputs(task, moved)
         outputs = model(
-            y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride
+            y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride,
+            **forward_kwargs(task, moved, u_stream),
         )
         batch_size = int(y_st.shape[0])
         # Detached and on CPU: the probe reads a tensor with no graph behind it, so no optimizer
