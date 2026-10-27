@@ -38,6 +38,9 @@ both geometries side by side rather than choosing one.
 | Transform implementation (two-sided) | `hdf5_dataset/kymatio_phase_scattering.py` |
 | Transform implementation (causal) | `hdf5_dataset/causal_scattering.py`, `hdf5_dataset/causal_scattering_torch.py` |
 | Causal transform mathematics | `documents/docs-md-files/datasets/CAUSAL_SCATTERING_PHASE_HARMONIC_MATH.md` |
+| Signal-quality rules (§8.3) | `hdf5_dataset/signal_quality.py` |
+| Signal-quality report and profile | `hdf5_dataset/new_pipeline/quality_report.py`, `hdf5_dataset/new_pipeline/profile_signal_quality.py` |
+| Signal-quality design | `research_notes/UA_QUALITY_MASK_DESIGN.md` |
 | Normalisation statistics | `hdf5_dataset/calculate_dataset_stats.py` |
 | PyTorch segment dataset | `hdf5_dataset/hdf5_dataset.py` |
 | PyTorch GUID-sequence dataset | `hdf5_dataset/guid_hdf5_dataset.py` |
@@ -314,46 +317,23 @@ Three failure modes worth guarding against:
    ships `1.0` — but the pairing rule still does: build the stats file at the
    same `trim_minutes` the loader will use.
 
-### 3.4. UP Time Shift
+### 3.4. Stored UP/FHR Timeline
 
-The MIMO adaptor is constructed with `up_shift_secs=-20` at **both** call
-sites — the screening adaptor (`create_new_pipeline.py:1787`) and the build
-adaptor (`create_new_pipeline.py:2897`) — and the shift is applied inside
-`read_input_common_2d` (`mimo_adaptor.py:265-285`) as
+**The stored UP/FHR timeline is canonical (binding, 2026-09-05).** The
+builder fixes the alignment of UP and FHR when it writes the shards. Treat the
+stored signals as if they were recorded that way. No loader, statistic, lag
+formula, plot axis, simulation or evaluation record adds a correction to that
+grid. Lag identities use only the feature grid and the filter-delay terms
+(§8.1). A change to the alignment is a dataset-creation question, and it would
+produce a new dataset version.
 
-$$\Delta = \operatorname{round}\!\left(\frac{-20}{\texttt{domain\_incr}}\right)
-\ \text{native samples} \;=\; -80 \ \text{samples on a } 4\ \text{Hz record}$$
+The builder writes the last 80 samples (20 s at 4 Hz) of each record's UP
+channel as zeros; FHR has no such tail.
 
-i.e. **the UP trace is advanced 20 s earlier** relative to FHR, zero-filled at
-the tail. Three details of *how* it is applied:
-
-- It uses the record's **native** `domain_incr`, and it runs before the
-  per-segment resampling to $f_s = 4$ Hz (`mimo_adaptor.py:299-302` and
-  `:318-324`). The displacement is therefore $-20$ s whatever the source rate;
-  $-80$ samples is the 4 Hz instance, not the general case.
-- It rewrites the whole per-record UP channel before any segment is sliced
-  (`:306-308`), so it is not a per-segment operation.
-- Because $\Delta < 0$ the branch taken is
-  `up_shifted[:-abs_shift] = up_signal[abs_shift:]` on an array pre-filled by
-  `np.zeros_like`, so the **last 80 samples of the record's UP channel are
-  zero**. FHR is untouched. If $|\Delta|$ exceeded the record length the whole
-  UP channel would become zeros.
-
-**Downstream convention (binding, 2026-09-05):** The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it. Every
-lag-resolved readout, lag formula, plot axis, simulation and evaluation record is expressed on
-the stored grid as written, with no "raw-file" or "sensor-timeline" correction. The former
-`MECHANICAL_SHIFT_SECONDS`, `lag_original_sensor_seconds` and `eval_config.up_shift_secs`
-consumers were removed for that reason. The source carries an unresolved
-`# TODO: Check with Phil for global UP shift`
-(`mimo/EarlyMaestra/early_maestra/adaptor/mimo_adaptor.py:265`, immediately
-above the shift block); resolving it is a dataset-creation question and
-would produce a new dataset version, never a downstream correction.
-
-The dataset test suite enforces the same rule on itself:
-`hdf5_dataset/tests/test_phase_operator.py:3-4` and
-`test_preprocessing_availability.py:8-11` both state in their module
-docstrings that the shift is part of the signal and is outside their audit,
-which is what stops it re-entering through a test fixture.
+The dataset tests `hdf5_dataset/tests/test_phase_operator.py` and
+`test_preprocessing_availability.py` state the same rule in their module
+docstrings. They keep the stored timeline outside their audit, so no test
+fixture adds a correction back.
 
 ### 3.5. Signal Sanitisation
 
@@ -393,7 +373,8 @@ no NaN reaches `_sanitize_signals`.
 > up to $2L$ against $L$ and essentially never fires — so this document states
 > only that a constant-valued fill is applied to both channels of the affected
 > rows. Establish the behaviour empirically before relying on the contents of a
-> dropout.
+> dropout. A signal-quality build turns this fill off and bridges the gaps
+> itself (§8.3).
 
 ### 3.6. Weight and Target
 
@@ -1760,7 +1741,7 @@ gives three geometries:
 | Field | dtype | Two-sided | Causal, `ratio_power_v0` | Causal, `integer_harmonic_v1` | Description |
 |---|---|---|---|---|---|
 | `fhr` | float32 | $(5280,)$ | $(5280,)$ | $(5280,)$ | Raw FHR (bpm) |
-| `up` | float32 | $(5280,)$ | $(5280,)$ | $(5280,)$ | Raw UP (mmHg), shifted 20 s earlier (§3.4) |
+| `up` | float32 | $(5280,)$ | $(5280,)$ | $(5280,)$ | Raw UP (mmHg), on the stored timeline (§3.4) |
 | `fhr_st` | float32 | $(43, 330)$ | $(36, 330)$ | $(36, 330)$ | FHR scattering, $S_0$ + $S_1$ |
 | `fhr_ph` | float32 | $(66, 330)$ | $(66, 330)$ | $(44, 330)$ | FHR self-phase (+ `sel_*` attrs) |
 | `fhr_up_ph` | float32 | $(79, 330)$ | absent | absent | UP↔FHR cross-phase (§7.4) |
@@ -1951,6 +1932,60 @@ against the block width.
 - A newly built two-sided file is **not** byte-identical to an old one: it
   gains the root attributes above. Every stored *array* is bit-for-bit
   unchanged, and no attribute is renamed, retyped or removed.
+- **The signal-quality step is a sixth refused property** (§8.3). A `paths`
+  list that mixes quality and non-quality files is refused. So is a list whose
+  files differ in `quality_version`, in a root `quality_*` attribute, in the
+  bit-field attributes or in the set of quality datasets.
+
+### 8.3. Signal-Quality Fields
+
+`signal_quality=True` adds an optional step to a **causal** build, in
+`create_new_pipeline.py` and `build_fold_datasets.py`; a two-sided build
+refuses the switch. The result is a *quality build*. The rules are in
+`hdf5_dataset/signal_quality.py` (`QUALITY_VERSION` = 3). The authoritative
+description, with the evidence for every rule, is section 4.7 of
+`research_notes/UA_QUALITY_MASK_DESIGN.md`.
+
+The step changes how the build reads a record. It reads with the MIMO fill of
+§3.5 off (`mimo_fill`) and runs the segment gates of §3.7 on the pre-fill
+signals. Then `_clean_record` codes each kept segment, bridges every invalid
+span, and computes the contamination $\rho \in [0, 1]$ of each coefficient. The
+transform reads the bridged signals. The prescreen of §3.9 does not change, so
+the GUID pool stays the same.
+
+**`fhr` and `up` hold the cleaned (bridged) signals** in a quality build. They
+keep their names, shapes and dtype. The file gains these datasets, per segment:
+
+| Field | dtype | Shape | Description |
+|---|---|---|---|
+| `up_quality` | uint16 | $(5280,)$ | UA bit codes; attributes `bits` (JSON names) and `invalid_bits` |
+| `fhr_quality` | uint8 | $(5280,)$ | FHR bit codes; attributes `bits`, `invalid_bits_exact` and `invalid_bits_rules` |
+| `up_raw`, `fhr_raw` | float16 | $(5280,)$ | The signals before the MIMO fill, in raw units |
+| `<block>_rho` | uint8 | the shape of its block | $\mathrm{round}(255\rho)$, for `fhr_st`, `fhr_ph`, `up_st` and `up_ph` |
+| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | float32 | scalar | Per-segment shares |
+| `fhr_repair_exact` | uint8 | scalar | 1 if the raw FHR channel gave the repair mask |
+
+A sample is invalid where its bit code shares a bit with the invalid-bit
+mask. For FHR, `fhr_repair_exact` picks the mask per segment:
+`invalid_bits_exact` where it is 1, and `invalid_bits_rules` where it is 0.
+
+Root attributes of a quality build:
+
+| Attribute | Meaning |
+|---|---|
+| `quality_version` | The rule version; absent means a build without the step |
+| `quality_lookahead_s` | The lookahead of the whole rule set, in seconds |
+| `quality_<threshold>` | One attribute per rule threshold |
+| `quality_rho_scale` | 255: a stored $\rho$ holds $\mathrm{round}(255\rho)$ |
+| `quality_kernel_digest` | SHA-256 hex digest of the magnitude kernels that compute $\rho$ |
+
+**Compatibility.** A file without `quality_version` is a build without the
+step, and every reader treats it exactly as before. The loader raises on a file
+that stores quality datasets but no `quality_version`. A quality build needs
+its own output path and its own statistics file (§9.5).
+`build_fold_datasets.py` also compares `quality_version` before it counts a
+file as complete, and it ends a quality build with `quality_report/`
+(`quality_report.py`). That folder holds clinical traces.
 
 ---
 
@@ -2065,7 +2100,9 @@ field shapes are taken from the first file alone, so a 36-wide file fed into a
 Written `libver='latest'`. Root attrs: `created_at` (ISO timestamp),
 `trim_minutes` ($-1.0$ = no trim), `transform`, **`causal_leg_alignment`**,
 **`causal_phase_operator`**, `log_epsilon` (a hard literal $10^{-6}$, not the
-instance value), `description`, plus an optional `metadata` group.
+instance value), `description`, plus an optional `metadata` group. A stats
+file of a quality build also carries `quality_version`, `quality_rho_epsilon`
+when the mask was applied, and per-field `quality_excluded` (§9.5).
 
 The three variant attributes are stamped from the **source dataset's** resolved
 layout and are written on **both** variants, defaulting to the legacy values
@@ -2095,6 +2132,12 @@ than stopping it. A stats file that cannot even be opened returns early and is
 left to the recovering load below. A legacy stats file paired with a legacy or
 two-sided dataset resolves to the same values and is silent.
 
+**A fifth check covers the signal-quality step** (§9.5). The stats file's root
+`quality_version` must equal the data's, with an absent attribute read as
+`None` on both sides. The check runs before the variant check, so an old stats
+file beside a quality build is refused with "Recompute the statistics for this
+build."
+
 The per-channel transform assignment lives **in the stats file**, and the
 loader adopts it wholesale, overwriting its own defaults. A field whose stats
 group lacks those attrs silently gets no transform.
@@ -2109,6 +2152,50 @@ group lacks those attrs silently gets no transform.
 to the 5th–95th percentile, through the *same* `normalize_tensor_data` code
 path the loader uses. It recomputes statistics internally, so enabling it
 doubles the pass over the data.
+
+### 9.5. The Quality Mask
+
+On two local records (hie_cs only) with $\varepsilon = 0.1$, the quality mask
+excluded 2.3% of the `fhr_st` steps, 2.2% of `fhr_ph`, 4.7% of `up_st` and 3.3%
+of `up_ph`. These shares come from one subgroup. They show the scale of the
+effect, not a production value.
+
+**On a quality build (§8.3), the statistics skip bridged and contaminated
+values.** Two settings of `calculate_dataset_stats.py` control this, in
+`RUN_ARGS`, on the command line and in `calculate_and_save_dataset_stats`:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `quality_mask` | `True` | Apply the mask when every source file is a quality build; no effect on other files |
+| `quality_rho_epsilon` | 0.1 | The threshold $\varepsilon \in [0, 1)$; a value outside raises |
+
+With the mask on, the sums of a coefficient block run over
+
+$$V_c = \{\, t \ge W_c \ :\ \rho_c(t) \le \varepsilon \,\},$$
+
+where $\rho_c(t)$ is `<block>_rho` divided by `quality_rho_scale`. The sums of
+`fhr` and `up` skip every sample whose bit code carries an invalid bit (§8.3).
+The mask uses the same NaN blanking as the warm-up (§9.3), so the two combine
+as a logical AND of "valid". `plot_histograms` applies the same mask.
+
+**The output records what was done.**
+- The root attribute `quality_version` is written for every quality source,
+  also with the mask off.
+- The root attribute `quality_rho_epsilon` is written only when the mask was
+  applied.
+- Each field group gets `quality_excluded`: the values that the mask removed
+  beyond the warm-up. It is a scalar for `fhr`/`up` and one count per channel
+  for a block.
+
+**Four inputs are refused.** The calculator raises on a file list that mixes
+quality and non-quality files, and on two quality versions. It raises on a
+quality file that lacks a quality dataset or attribute that the mask reads.
+It also raises on a field or channel that the mask leaves without a value,
+because that channel would normalise with `std = 0`.
+
+Files without `quality_version` give exactly the old statistics. Statistics
+computed with `quality_mask=False` on a quality build carry `quality_version`
+and pass the loader's pairing check (§9.4).
 
 ---
 
@@ -2148,7 +2235,7 @@ does **not** stack them, so they exist per segment but vanish at the GUID level.
 Coherence and statistics are resolved at **construction**, in this order
 (`hdf5_dataset.py:1243-1264`): `_resolve_dataset_layout` →`_resolve_validity`
 (rebase, print, dead-channel refusal) → the `emit_validity_mask` guard →
-`_load_normalization_stats` (which calls `_check_stats_pairing` first) →
+`_check_quality_request` (§10.5) → `_load_normalization_stats` (which calls `_check_stats_pairing` first) →
 `_build_index`. All of it happens *before* the index is built, not during it.
 
 Constructor arguments:
@@ -2156,7 +2243,7 @@ Constructor arguments:
 | Arg | Default | Effect |
 |---|---|---|
 | `paths` | required | One path or a list; a flat index is built across files |
-| `load_fields` | `None` | Restrict which datasets are read |
+| `load_fields` | `None` | Restrict which datasets are read. `None` reads every stored field except the signal-quality fields (§10.5) |
 | `allowed_guids` | `None` | GUID whitelist |
 | `cs_label` / `bg_label` | `None` | Vectorised equality filters |
 | `epoch_min` / `epoch_max` | `None` | Inclusive bounds on `epoch` |
@@ -2168,6 +2255,8 @@ Constructor arguments:
 | `normalize_fields` | `None` | Restrict which fields are normalised |
 | `trim_minutes` | `None` | **Must be 1.0** for production (§3.3) — the default performs no trimming |
 | `emit_validity_mask` | `False` | Add a `<block>_valid` boolean field per sample (§10.3). Causal datasets only |
+| `emit_quality_mask` | `False` | Add the boolean `up_valid` and `fhr_valid` per sample (§10.5). Quality builds only |
+| `ua_step_mask` | `None` | Add `up_st_step_valid` / `up_ph_step_valid`, the per-step UA validity the model's source mask reads (§10.5). Quality builds only |
 
 Multiprocessing-safe: `__getstate__` / `__setstate__` drop locks, open HDF5
 handles and the sample cache so each worker reopens lazily. The validity-mask
@@ -2207,6 +2296,10 @@ Caching here is a true LRU, distinct from the inner FIFO.
 `sequence_collate_fn` right-pads to $S_{\max}$ and emits `mask` $(B, S_{\max})$
 bool and `lengths` $(B,)$. Pad values: `target` $\rightarrow -1.0$, `weight`
 $\rightarrow 0.0$, `segment_indices` $\rightarrow -1$, everything else $0.0$.
+The quality fields (§10.5) pad as invalid, because a pad of 0 would read as
+clean data: `<block>_rho` $\rightarrow 1.0$, `up_quality` and `fhr_quality`
+$\rightarrow 1$ (the `MISSING` bit), and `up_valid`/`fhr_valid`
+$\rightarrow$ `False` (`_PAD_VALUES`).
 
 **Factory:** `create_sequence_dataloader(hdf5_files, batch_size=4,
 segment_duration=1200.0, guid_cache_size=128, …)`.
@@ -2341,6 +2434,68 @@ are not normalised. NaN entries are preserved and must be handled downstream.
 > module as the downstream handler. **Neither symbol exists anywhere in the
 > repository**; the claim has been removed rather than re-anchored. A consumer
 > of these fields must handle NaN itself.
+
+### 10.5. Signal-Quality Fields in the Loader
+
+**The quality fields are opt-in.** With `load_fields=None`, a quality build
+(§8.3) gives the same keys as a file without the step: the bridged `fhr`/`up`
+and the coefficients, but no quality field. A quality field loads only when
+`load_fields` names it. Unlike an ordinary field, a named quality field that
+the files lack raises at construction (`_check_quality_request`).
+
+A named quality field comes out as follows. $L$ is the trimmed raw length
+(4800 at `trim_minutes = 1.0`), and $T$, $C$ are the trimmed steps and the
+channels of the block.
+
+| Field | Shape | dtype | Content |
+|---|---|---|---|
+| `up_quality` | $(L,)$ | `int32` (stored uint16) | bit codes, trimmed like `up` |
+| `fhr_quality` | $(L,)$ | `uint8` | bit codes, trimmed like `fhr` |
+| `up_raw`, `fhr_raw` | $(L,)$ | the loader `dtype` | raw units, trimmed like `fhr`/`up` |
+| `<block>_rho` | $(T, C)$ | the loader `dtype` | $\rho \in [0, 1]$ (stored value / `quality_rho_scale`), trimmed and transposed like the block |
+| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | scalar | the loader `dtype` | per segment |
+| `fhr_repair_exact` | scalar | `bool` | per segment |
+
+**No quality field is ever normalised**, whatever `normalize_fields` says.
+`normalize_tensor_data` returns it unchanged, and the stats load skips it.
+
+**Three additions decode the bits.**
+- `emit_quality_mask=True` adds `up_valid` and `fhr_valid`, $(L,)$ bool,
+  `True` where the sample is valid. UA is valid where
+  `up_quality & invalid_bits` $= 0$. FHR uses `invalid_bits_exact` or
+  `invalid_bits_rules` per segment, by `fhr_repair_exact`. The bit fields need
+  not be in `load_fields`.
+- The property `quality_info` returns a `QualityInfo` with the version, the
+  $\rho$ scale, the lookahead, the kernel digest, the bit maps, the invalid-bit
+  masks and every root `quality_*` attribute. It is `None` on a file without
+  the step.
+- The attribute `stats_quality_rho_epsilon` holds the stats file's root
+  `quality_rho_epsilon`, or `None` when that attribute is absent.
+
+**`ua_step_mask` gives the UA validity on the coefficient grid.** It is a
+mapping with three keys, and it adds `up_st_step_valid` and
+`up_ph_step_valid`, $(T, C)$ bool, `True` where the coefficient is usable.
+Only the UA blocks in `load_fields` get a mask.
+
+| Key | Rule |
+|---|---|
+| `bits` | Bit names (any case), or `"invalid"` for the file's `invalid_bits`. Stored step $k$ reads raw sample $16k$, so it is bad when any raw sample $16k-15, \dots, 16k$ carries a named bit. One value for every channel |
+| `rho_epsilon` | A coefficient is bad when its stored $\rho > \varepsilon$, per channel. $\varepsilon \in [0, 1)$ |
+| `hold_steps` | Extend each bad bit-step forward by this many steps. It does not change the $\rho$ rule. Default $0$ |
+
+For example, `{bits: null, rho_epsilon: 0.1, hold_steps: 0}` marks every
+coefficient with more than 10% of its filter mass on bridged samples. The two
+rules are OR-joined. The bit rule runs on the untrimmed grid and is trimmed
+afterwards, so a hold that starts in the trimmed lead-in still reaches the
+served window. `None`, or a mapping that names no bit and sets no
+`rho_epsilon`, is off. The loader refuses an unknown key or bit name, an
+$\varepsilon$ outside $[0, 1)$, a negative hold, a file without the quality
+step, and a $\rho$ rule on a file without `<block>_rho`. A padded GUID-level
+segment pads these fields with `False`.
+
+**Coherence.** The layout check refuses a mixed `paths` list (§8.2), and the
+stats pairing refuses a stats file of another `quality_version` (§9.4). A
+quality build therefore needs a stats file computed over that build (§9.5).
 
 ---
 
@@ -2588,6 +2743,11 @@ mixed-operator file list or a statistics file built under the other operator, ch
 **before** the width so the message names the real cause. The two axes are orthogonal and compose
 freely: four causal builds are reachable, and each is a distinct dataset.
 
+**`signal_quality=True` is likewise a separate dataset** (§8.3). It changes no width, but `fhr`/`up`
+and every coefficient then come from the bridged signals. It needs its own output path and its own
+statistics file, computed with the quality mask on (§9.5). The loader refuses a mixed file list and a
+statistics file of another `quality_version`.
+
 The build logs its resolved layout before any work — variant, leg alignment, per-block widths,
 $c_y$/$c_u$, the dropped channels and the warm-up and delay ranges — and
 `smoke_check_channel_selection.py` prints those same lines for both variants
@@ -2638,7 +2798,8 @@ per-channel novelty, which must read `causal_delay_s` and `causal_novelty_curve`
 | Causal gammatone order / taps / warm-up quantile | 4 / 32768 / 0.95 |
 | Causal warm-up range (untrimmed steps) | `fhr_st` 5–293, `fhr_ph` 8–149, `up_st` 5–293, `up_ph` 56–149 |
 | Causal group delay (uncompensated) | `fhr_st` 13.3–791.0 s, `fhr_ph` 20.5–402.2 s, `up_ph` 150.8–402.2 s |
-| UP time shift | $-20$ s ($-80$ samples at 4 Hz; applied at the record's native rate) |
+| Signal-quality step | causal only, `signal_quality=True`; `quality_version` 3 (§8.3) |
+| Statistics $\rho$ threshold $\varepsilon$ | 0.1 on a quality build (§9.5) |
 | Log epsilon / z-score epsilon | $10^{-6}$ / $10^{-8}$ |
 | Folds | 10, named `fold_1` … `fold_10` |
 | Partitions per fold | 3 (train / val / test) in **augmented** mode; 2 (train / val) in **holdout** mode, plus one shared `test/` built outside the fold loop |

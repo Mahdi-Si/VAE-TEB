@@ -68,7 +68,12 @@ from teb_vae.lag_attn_cfs.eval.dataset_rows import (
     epoch_stamp,
     subset_loader,
 )
-from teb_vae.lag_attn_cfs.eval.metrics import DENSE_ANCHOR_GEOMETRY, batch_field, model_inputs
+from teb_vae.lag_attn_cfs.eval.metrics import (
+    DENSE_ANCHOR_GEOMETRY,
+    batch_field,
+    forward_kwargs,
+    model_inputs,
+)
 
 #: The manifest of traced recordings, and its columns.
 #: The manifest of the example pages -- one anchor per class with every example readout's maps --
@@ -568,7 +573,8 @@ def attribute_example(
     Args:
         task: The loaded task.
         inputs: The batch's ``(y_st, y_ph, u_stream)``, unexpanded.
-        extra: The batch's ``(target_features, weight)``, unexpanded.
+        extra: The batch's ``(target_features, weight)``, plus ``source_valid`` under
+            ``source_quality_mask``, unexpanded.
         cell: The cell binding.
         sample: Which batch element the example is.
         column: The anchor's position on the anchor axis.
@@ -719,8 +725,15 @@ def attribute_batch(
     likelihood = str(task.hparams.get("likelihood", "gaussian_nll"))
     y_st, y_ph, u_stream, target_features, weight = model_inputs(task, batch)
     inputs = (y_st, y_ph, u_stream)
-    extra = (target_features, weight)
-    kwargs: Dict[str, Any] = {"anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1]}
+    # The recording's own source-validity mask rides in ``extra`` under ``source_quality_mask``, as
+    # its third element: every Captum call then expands it with the rows and holds it fixed along
+    # the path, so the zero-source baseline attends under the keys the recorded UA left, not under
+    # a mask recomputed from zeros. See ``core.readout_args``.
+    masked = forward_kwargs(task, batch, u_stream)
+    extra = (target_features, weight, *masked.values())
+    kwargs: Dict[str, Any] = {
+        "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1], **masked,
+    }
     if not cell.dense_latent:
         kwargs["return_proposals"] = True
     with torch.no_grad():

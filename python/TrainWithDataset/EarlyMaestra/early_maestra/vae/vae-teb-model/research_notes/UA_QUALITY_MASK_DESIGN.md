@@ -1,12 +1,13 @@
 # UA quality mask, cleaning and scattering: research and design
 
-Date: 2026-10-25. Status: Phases 0, 1 and 2 are implemented; the loader does not read the new
-fields yet (Phase 3). The rules in `hdf5_dataset/signal_quality.py` and the profile
+Date: 2026-10-25. Status: Phases 0 to 3 are implemented, except the evaluation sample pages. Phase 4
+(the model side) is open. The rules in `hdf5_dataset/signal_quality.py` and the profile
 `hdf5_dataset/new_pipeline/profile_signal_quality.py` exist, and the builder writes the quality fields
-when `signal_quality` is on. A local run on the two `.mat` records changed several rules (section 2.6).
-The first production profile (320 records) changed three more (section 2.7, version 2), and the second
-one added the oscillation rule (section 2.8, `QUALITY_VERSION` = 3). Section 4.3 describes the rules as
-implemented.
+when `signal_quality` is on. The loader, the sequence collate and the statistics read those fields,
+and the dataset viewer draws them (section 4.9). A local run on the two `.mat` records changed several
+rules (section 2.6). The first production profile (320 records) changed three more (section 2.7,
+version 2), and the second one added the oscillation rule (section 2.8, `QUALITY_VERSION` = 3).
+Section 4.3 describes the rules as implemented.
 
 Scope: the dataset-creation pipeline (`hdf5_dataset/new_pipeline/create_new_pipeline.py`) and the
 fields it writes. The model gate in `teb_vae/lag_attn_transformer_cfs` is a later step; this document
@@ -196,7 +197,7 @@ The FHR rules confirmed the exact repair mask. The repaired share was 2.2–3.5%
 
 The drop in detected contractions after cleaning (about 1 per segment) is a detector policy, not a mask
 defect. `drop_events_overlapping_gaps` drops a contraction if any sample from onset to end is invalid.
-Segments with 99–99.9% valid UA still lost 0.59 contractions; fully valid segments lost none. Phase 3
+Segments with 99–99.9% valid UA still lost 0.59 contractions; fully valid segments lost none. Phase 4
 must decide whether the training weight's detector reads the quality mask (section 8).
 
 The invalid UA share depends on the time to delivery and the delivery mode more than on the class:
@@ -453,31 +454,97 @@ chunks.
 
 ### 4.8 Integration points
 
-Line numbers are from the review and can drift. Phase 2 implemented every row down to
-`build_fold_datasets.py`; the last three rows are Phase 3.
+Line numbers are from the review and can drift. The "Status" column says which phase did each row
+and where the code is now. Every row is done except the two evaluation sample pages.
 
 As implemented, `signal_quality=True` in `create_new_pipeline.py` or `build_fold_datasets.py` reads each
 record with the MIMO fill off (`mimo_fill`), runs the gates on the pre-fill signals, and then cleans each
 kept segment (`_clean_record`). `build_fold_datasets.py` ends with `quality_report/`
 (`quality_report.py`): a summary per file and example pages read back from the files.
 
-| Where | Change |
-|---|---|
-| `create_new_pipeline.py:2942-2945` | Patch out the MIMO fill and keep the pre-fill presence mask. |
-| after `:2945`, before `_sanitize_signals` (`:1855-1874`) | Compute the codes; bridge the signals. |
-| `:2968-2971`, `:3012`, `:3115-3174` | Carry the new arrays through dedup, `valid_indices` and the `b_*` lists. |
-| `create_initial_hdf5` (`:687-1010`), `append_samples_batch` (`:1063-1159`) | Create and write the fields. A field that is created but never written stays zero without an error, so test this. |
-| `_validate_geometry` (`:1637-1718`), causal attrs (`:622-684`) | Add the quality attributes, so that the loader's equality check covers them. |
-| segment gates (`:2975-3006`) | Compute the flat gates on the pre-fill signals: the fill writes the flats that the gate rejects (section 2.2). Decide after the production profile, which reports both gate results. Change only the build's per-segment gate. The prescreen (`_quality_filter_segments`, `:1877`) uses the same gates for `estimated_valid_hours_6h` and so for `eligible_2h`/`eligible_3h`; changing it there changes the GUID pool and invalidates the minimization folds. |
-| `build_fold_datasets.py` `is_complete` (`:464-478`) | Also compare `quality_version`; otherwise old files count as complete. |
-| `calculate_dataset_stats.py` | Compute the coefficient statistics over valid steps only ($\rho \le \varepsilon$). Artifacts inflate the variance today. |
-| `hdf5_dataset.py` (`:1792-1855`) | Add a mask group: trim it like the coefficient blocks, read it without the float cast, never normalise it, and give a default when a file lacks it. |
-| `lag_attn_rws/sample_page.py` | Show UP up to 130, mark the codes and add a mask row. |
+| Where | Change | Status |
+|---|---|---|
+| `create_new_pipeline.py:2942-2945` | Patch out the MIMO fill and keep the pre-fill presence mask. | done, Phase 2: `mimo_fill` |
+| after `:2945`, before `_sanitize_signals` (`:1855-1874`) | Compute the codes; bridge the signals. | done, Phase 2: `_clean_record` |
+| `:2968-2971`, `:3012`, `:3115-3174` | Carry the new arrays through dedup, `valid_indices` and the `b_*` lists. | done, Phase 2 |
+| `create_initial_hdf5` (`:687-1010`), `append_samples_batch` (`:1063-1159`) | Create and write the fields. A field that is created but never written stays zero without an error, so test this. | done, Phase 2: `_create_quality_datasets`; a quality batch must name every field of `quality_field_names()` |
+| `_validate_geometry` (`:1637-1718`), causal attrs (`:622-684`) | Add the quality attributes, so that the loader's equality check covers them. | done, Phase 2 |
+| segment gates (`:2975-3006`) | Compute the flat gates on the pre-fill signals: the fill writes the flats that the gate rejects (section 2.2). Decide after the production profile, which reports both gate results. Change only the build's per-segment gate. The prescreen (`_quality_filter_segments`, `:1877`) uses the same gates for `estimated_valid_hours_6h` and so for `eligible_2h`/`eligible_3h`; changing it there changes the GUID pool and invalidates the minimization folds. | done, Phase 2: build gate only; the prescreen is unchanged |
+| `build_fold_datasets.py` `is_complete` (`:464-478`) | Also compare `quality_version`; otherwise old files count as complete. | done, Phase 2 |
+| `calculate_dataset_stats.py` | Compute the coefficient statistics over valid steps only ($\rho \le \varepsilon$). Artifacts inflate the variance today. | done, Phase 3: `quality_mask`, `quality_rho_epsilon` (section 4.9) |
+| `hdf5_dataset.py` (`:1792-1855`) | Add a mask group: trim it like the coefficient blocks, read it without the float cast, never normalise it, and give a default when a file lacks it. | done, Phase 3, with one change: a requested field that the files lack raises, and no default is given (section 4.9) |
+| `guid_hdf5_dataset.py` `_PAD_VALUES` | Pad the quality fields of a padded segment as invalid. | done, Phase 3 |
+| `hdf5_dataset/plot_dataset_samples.py` | Show UP up to 130, mark the codes, draw the raw signals. | done, Phase 3: the `quality` option |
+| `lag_attn_rws/sample_page.py` | Show UP up to 130, mark the codes and add a mask row. | open, Phase 4: the UA axis still stops at 100 |
+| `lag_attn_cfs/eval/traces.py` | Show UP up to 130. | open, Phase 4: the UA axis still stops at 100 |
 
 The model side (later): the lag attention collapses a per-sample mask to `m_lag[0]` and broadcasts it
 over the batch (`lag_attn/nets/attention.py:229, 274`). A per-sample key mask is therefore dropped today
 without an error. Also, if the mask reaches the posterior but not the prior, it repeats the "clock" leak
 of `LAG_READOUT_DIAGNOSIS.md` §5.
+
+### 4.9 Loader and statistics as implemented
+
+**The quality fields are opt-in.** With `load_fields=None`, `CombinedHDF5Dataset`
+(`hdf5_dataset/hdf5_dataset.py`) gives a quality file the same keys as a file without the step. A
+quality field loads only when `load_fields` names it. The loader never normalises a quality field,
+whatever `normalize_fields` says. If `load_fields` names a quality field that the files do not store,
+the constructor raises.
+
+A named quality field comes out as follows. $L$ is the trimmed raw length (4800 at
+`trim_minutes` = 1.0), and $T$, $C$ are the trimmed steps and the channels of the block.
+
+| Field | Shape | dtype | Content |
+|---|---|---|---|
+| `up_quality` | $(L,)$ | `int32` (stored `uint16`) | bit codes, trimmed like `up` |
+| `fhr_quality` | $(L,)$ | `uint8` | bit codes, trimmed like `fhr` |
+| `up_raw`, `fhr_raw` | $(L,)$ | the loader `dtype` | the signal before the MIMO fill, in raw units |
+| `<block>_rho` | $(T, C)$ | the loader `dtype` | $\rho \in [0, 1]$: the stored value divided by `quality_rho_scale`, trimmed like the block |
+| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | scalar | the loader `dtype` | per segment |
+| `fhr_repair_exact` | scalar | `bool` | per segment |
+
+**Three loader additions decode the bits.**
+- `emit_quality_mask=True` adds `up_valid` and `fhr_valid`, $(L,)$ bool, `True` where the sample is
+  valid. A UA sample is valid where `up_quality & invalid_bits` $= 0$. FHR uses `invalid_bits_exact`
+  where `fhr_repair_exact` is 1, and `invalid_bits_rules` otherwise. The bit fields need not be in
+  `load_fields`.
+- The property `quality_info` returns a `QualityInfo`: the version, the $\rho$ scale, the lookahead,
+  the kernel digest, the bit maps, the invalid-bit masks and every root `quality_*` attribute. It is
+  `None` for a file without the step.
+- The attribute `stats_quality_rho_epsilon` holds the statistics file's root `quality_rho_epsilon`, or
+  `None` when that attribute is absent.
+
+**The loader refuses two kinds of mismatch.** First, the layout check refuses a file list that mixes
+quality and non-quality files. It also refuses two `quality_version` values, different root
+`quality_*` attributes, different bit-field attributes or different sets of quality datasets. Second,
+the root `quality_version` of the statistics file must equal the data's; an absent attribute reads as
+`None` on both sides. On a mismatch the error ends with "Recompute the statistics for this build." The
+check compares only the version, so statistics computed with `quality_mask=False` on a quality build
+pass it.
+
+**The sequence collate pads a missing segment as invalid.** In `guid_hdf5_dataset.py`
+(`_PAD_VALUES`), a padded segment gets $\rho = 1.0$ and the bit value 1 (`MISSING`), which both bit
+fields count as invalid. `up_valid` and `fhr_valid` pad to `False`. A pad of 0 would read as clean data.
+
+**The statistics skip invalid values on a quality build.** `calculate_dataset_stats.py` has two
+settings: `quality_mask` (default `True`) and `quality_rho_epsilon` (default 0.1, in $[0, 1)$). With the
+mask on, the sums of a coefficient block run over
+
+$$V_c = \{\, t \ge W_c \ :\ \rho_c(t) \le \varepsilon \,\},$$
+
+so the mask and the causal warm-up $W_c$ combine. The sums of `fhr` and `up` skip every sample that
+carries an invalid bit. The calculator refuses a list that mixes quality and non-quality files or two
+versions, and a channel that the mask leaves empty. Files without `quality_version` give exactly the
+old statistics.
+
+The output records what was done. The root attribute `quality_version` is written for every quality
+source. The root attribute `quality_rho_epsilon` is written only when the mask was applied. Each field
+group gets `quality_excluded`: the values that the mask removed beyond the warm-up, as a scalar for
+`fhr`/`up` and one count per channel for a block.
+
+A local measurement on two records (hie_cs only) gives the size of the effect. With $\varepsilon$ = 0.1,
+the mask excluded 2.3% (`fhr_st`), 2.2% (`fhr_ph`), 4.7% (`up_st`) and 3.3% (`up_ph`) of the
+coefficient steps. These shares come from one subgroup and can differ on the production build.
 
 ---
 
@@ -555,18 +622,38 @@ frames) is an option only if the audit shows misses that the rules cannot catch.
 
 ## 8. Phased plan and open decisions
 
-| Phase | Work | Output |
-|---|---|---|
-| 0 | A profile script (read only), run on the production box | numbers that confirm or change section 4.3 |
-| 1 | `hdf5_dataset/signal_quality.py`: pure NumPy codes, bridge, $\rho$ kernels, with unit tests | a tested module |
-| 2 | Builder integration (section 4.8), with `quality_version` = 3 | a new dataset variant |
-| 3 | Loader mask group, masked statistics, sample-page rows | a loadable, visible mask |
-| 4 | Model: key mask in the lag attention, gate prior, contraction weight on cleaned UA | a separate task |
+| Phase | Work | Output | Status |
+|---|---|---|---|
+| 0 | A profile script (read only), run on the production box | numbers that confirm or change section 4.3 | done |
+| 1 | `hdf5_dataset/signal_quality.py`: pure NumPy codes, bridge, $\rho$ kernels, with unit tests | a tested module | done; the rule unit tests are not written |
+| 2 | Builder integration (section 4.8), with `quality_version` = 3 | a new dataset variant | done |
+| 3 | Loader mask group, masked statistics, sample-page rows | a loadable, visible mask | done, except the evaluation sample pages (section 4.9) |
+| 4 | Model: `load_fields` in the model configs, key mask in the lag attention, gate prior, contraction weight on cleaned UA; the UA axis of the evaluation sample pages; `quality_version` in the classifier cache fingerprint | a separate task | in part: the key mask and the gate are done (section 8.1) |
 
-Status: Phases 0, 1 and 2 exist (the unit tests are not written yet). The first production profile
-ran on version 1, and version 2 fixes what it found (section 2.7). The second ran on version 2, and
-version 3 fixes what it found (section 2.8). A local build of the two `.mat` records with the quality
-step kept every valid sample exactly as recorded.
+Status: Phases 0 to 3 exist. The signal-quality rules still have no unit tests. The loader and the
+statistics have tests in `hdf5_dataset/tests/test_quality_loader.py` and `test_quality_stats.py`. The
+first production profile ran on version 1, and version 2 fixes what it found (section 2.7). The second
+ran on version 2, and version 3 fixes what it found (section 2.8). A local build of the two `.mat`
+records with the quality step kept every valid sample exactly as recorded. On two local records
+(hie_cs only), the masked statistics excluded 2.2–4.7% of the coefficient steps per block (section 4.9).
+
+### 8.1 Phase 4, first part: the source mask (2026-10-25)
+
+The loader key `ua_step_mask` turns the stored bits and $\rho$ into a per-step UA validity
+(`dataset_explained_research.md` §10.5). The model key `source_quality_mask` removes the bad steps
+from the lag keys and closes the posterior gate where no key is left, so $q = p$ there
+(`teb_vae/lag_attn_transformer_cfs/DESIGN.md`, amendment 2026-10-25). The shared lag attention no
+longer collapses a per-sample mask to sample 0; this fixes the defect that section 4.8 records.
+The transformer cfs `default.yaml` ships the rule $\rho > 0.1$ with no bit rule. The contraction
+weight returns to its floor at a closed anchor, so open item 9 is answered for closed anchors
+only: the detector still reads the bridged `up`.
+
+Still open in Phase 4: the prior is not gated (it never reads UA), the evaluation sample pages,
+`quality_version` in the classifier cache fingerprint, and the lag-slot and patch cells.
+
+Without `ua_step_mask`, a model reads a quality build through its current `load_fields`. It therefore gets the
+bridged `fhr`/`up` and the coefficients computed from them, but no quality field. It still needs a
+statistics file computed over the quality build.
 
 Decisions taken (2026-10-25, the recommended option each time):
 1. Store $\rho$ in the file.
@@ -580,5 +667,5 @@ Decisions taken (2026-10-25, the recommended option each time):
 
 Open:
 8. Confirm the version-3 oscillation rule on a third production profile before the full build.
-9. Phase 3: whether the training weight's contraction detector reads the quality mask (section 2.7).
+9. Phase 4: whether the training weight's contraction detector reads the quality mask (section 2.7).
 10. Short handling plateaus between jumps stay valid (section 2.8). Low priority.

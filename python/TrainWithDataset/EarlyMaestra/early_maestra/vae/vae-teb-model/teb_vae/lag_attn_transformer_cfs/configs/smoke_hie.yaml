@@ -80,6 +80,8 @@ model_config:
     # asked to pay for its rate.
     beta_schedule:
       warmup_epochs: 20
+    # This shard predates the signal-quality step, so it carries nothing to mask with.
+    source_quality_mask: false
 
 dataset_config:
   # Repo-root-relative: entry points run from the repo root. Both splits are the same shard; see
@@ -90,6 +92,8 @@ dataset_config:
   dataloader_config:
     num_workers: 2       # a few hundred samples; worker spawn dominates beyond this on Windows
     prefetch_factor: 2
+    dataset_kwargs:
+      ua_step_mask: {bits: null, rho_epsilon: null}   # neither rule set = no mask
 
 advanced_config:
   tracking:

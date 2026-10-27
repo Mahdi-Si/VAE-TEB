@@ -139,12 +139,13 @@ class SeqVaeLagAttnTrfCfs(
         target_forecast_shift: Optional[Sequence[int]] = None,
         target_scored_horizon: Optional[Sequence[int]] = None,
         forecast_ar_residual: bool = False,
+        source_quality_mask: bool = False,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
         Every keyword the architecture parent takes is forwarded unchanged or renamed; only the
-        ten below are
+        eleven below are
         this target domain's. The defaults that differ from the parent's -- ``warmup_period`` $134$,
         ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry rather than a preference,
         and a run that left them at the parent's values would be describing a dataset that does not
@@ -197,6 +198,10 @@ class SeqVaeLagAttnTrfCfs(
             forecast_ar_residual: Score the horizon under a per-channel AR(1) residual with a
                 learnable $\phi_c = \tanh(a_c)$, seeded at $0$. ``False`` builds no parameter and
                 is the factorised score.
+            source_quality_mask: Require ``source_valid`` in every forward and apply it: bad UA
+                steps leave the lag keys, and an anchor with no valid key keeps $q = p$. Paired
+                with the dataset's ``ua_step_mask``. ``False`` builds the model bitwise as before
+                the keyword existed; either value adds no parameter.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -226,6 +231,7 @@ class SeqVaeLagAttnTrfCfs(
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
             target_forecast_shift=target_forecast_shift,
+            source_quality_mask=source_quality_mask,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.

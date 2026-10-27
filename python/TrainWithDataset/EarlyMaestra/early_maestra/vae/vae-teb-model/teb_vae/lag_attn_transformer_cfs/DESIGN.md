@@ -97,6 +97,15 @@ them independently:
   only the root `transform` attribute and the channel counts tell them apart, and the warm-up
   resolver refuses a two-sided shard by name before a run directory exists.
 
+**A signal-quality build adds quality fields, and they are opt-in.** On a causal build with
+`signal_quality=True`, `fhr`/`up` hold the bridged signals, and the coefficients come from them. Beside
+them sit `up_quality`, `fhr_quality`, `*_raw`, `<block>_rho` and per-segment shares
+(`hdf5_dataset/dataset_explained_research.md` §8.3, §10.5). The shipped `load_fields` names none of
+them, and no quality field is ever normalised. Such a build needs a new statistics file, computed over
+it with the quality mask on, at `stat_path`; the loader refuses an older statistics file by its
+`quality_version`. The UA gate and the key mask do not read the quality fields yet
+(`research_notes/UA_QUALITY_MASK_DESIGN.md` section 8, Phase 4).
+
 ## 3. Geometry, tiling and the warm-up
 
 All three are the causal parent's, reached by import: the budget-and-floor pairing $B = 134$,
@@ -1272,3 +1281,78 @@ both edges (`EVENT_KEYS` in `tests/test_config_load.py`); this cell's eval bindi
 `posterior_event_gate` in `GEOMETRY_KEYS` because it changes what the posterior is, and the
 conv-LSTM cell's binding does not, because its config does not declare the key; and the
 `lag_attn_transformer_patch` cell's delta against this default lists the four as absent there.
+
+## Amendment (2026-10-25): the UA quality mask closes the source where the UA is bad
+
+A quality build (`hdf5_dataset/signal_quality.py`) stores per-sample UA quality bits and, per
+coefficient, the share $\rho$ of its filter mass that falls on bridged samples. This amendment lets
+those flags remove UA from the posterior. The model key is `source_quality_mask` (constructor); the
+loader key is `dataset_kwargs.ua_step_mask`. Both default **off**, and the off state is bitwise the
+model before the key existed. **This cell's `default.yaml` ships both on**, with
+`rho_epsilon: 0.1` and no bit rule. `tiny.yaml` and `smoke_hie.yaml` turn both off, because their
+shards predate the quality step. The pre-flight (`_check_source_quality_pairing` in
+`teb_vae/lag_attn_cfs/trainer.py`) refuses one key without the other.
+
+**The loader rule.** `ua_step_mask` takes three keys. `bits` names quality bits (or `"invalid"`,
+the file's full invalid set); stored step $k$ is bad when any raw sample $16k-15, \dots, 16k$
+carries one. `rho_epsilon` marks a coefficient bad when its $\rho > \varepsilon$, per channel.
+`hold_steps` extends a bad bit-step forward by that many steps; it does not touch the $\rho$ rule.
+The two rules are OR-joined, so a step is bad when either rule marks it. The loader emits
+`up_st_step_valid` and `up_ph_step_valid`, $(T, C)$ bool on each block's own grid, and the task
+concatenates them in the order of `u_stream`.
+
+**Why $\rho$ is the shipped rule.** The bits say which raw samples were bad. The model reads
+coefficients, and a coefficient at step $k$ integrates a filter support that reaches well past the
+four seconds the step stores. $\rho$ measures exactly that contamination, per channel. The bits
+cannot express a subset through $\rho$, because $\rho$ is computed against the full invalid set;
+a bit rule is the way to mask on selected codes only.
+
+**The model.** UA reaches the posterior at query $t$ through the lag keys at $t-\ell$. A step is
+usable when every source channel the source gate keeps is valid there; the per-step mask $m_{b,s}$
+is that conjunction. The key mask is
+
+$$K_{b,t,\ell} = \mathrm{lag\_mask}_{t,\ell} \wedge m_{b,\,t-\ell},$$
+
+and the posterior gate closes where no key is left:
+
+$$g^{\mathrm{eff}}_{b,t} = g_{b,t}\,o_{b,t}, \qquad o_{b,t} = \exists\,\ell : K_{b,t,\ell}.$$
+
+Removing the keys alone is not enough. The attended summary is then zero, but the gate reads it
+through a LayerNorm, and the LayerNorm of zero is its bias, so $g_t$ would stay open and $q \ne p$.
+With the gate closed, $q = p$ and $K_t = 0$ exactly at a closed anchor. A model without the learned
+gate (`posterior_event_gate: false`) uses $o_t$ as its gate. The prior is untouched: it never reads
+the source.
+
+**Two fixes in the shared attention** (`teb_vae/lag_attn/nets/attention.py`). The attention
+collapsed a $(B, T, L)$ mask to sample $0$ and applied it to the whole batch, so a per-sample mask
+was dropped without an error. It now applies each sample's own row. Also, `entmax15` fails on an
+all $-\infty$ row; such a row is now scored as zeros, and its weights are zeroed afterwards.
+
+**The objective and the task.** `event_gate_mean` is now the mean over the open anchors only, so
+it stays the readout of when the model listens to a source it can see. The new metric
+`source_mask_fraction` is the share of KL-scored anchors the mask closed ($0.0$ without the mask).
+The contraction weight returns to its floor at a closed anchor, $w'_t = f + (w_t - f)\,o_t$,
+because the full branch there decodes the base latent.
+
+**The controls.** The permutation, source-null and occlusion arms re-attend under a key mask. The
+permutation arm carries the donor's mask with the donor's source; the other two keep the
+recording's own mask.
+
+**The evaluation.** Every direct forward call in `teb_vae/lag_attn_cfs/eval/` passes the mask
+through `metrics.forward_kwargs`, which is empty without the flag. Occlusion, the zero-source
+baseline and integrated gradients keep the recording's own mask, because the quality of the
+recorded UA decides which keys exist, not the values given to the encoder. The time-shift arm
+substitutes a whole partner segment step for step, so it takes the partner's mask at the same
+steps. This cell's eval binding carries `source_quality_mask` in `GEOMETRY_KEYS`, for the reason
+given for `posterior_event_gate`: it changes what the posterior is and adds no parameter, so a
+disagreeing config would otherwise pass without an error.
+
+**What is not covered.** The lag-slot cell has its own forward and objective; the patch cell has
+its own forward wrapper; the two-sided cells have no quality build. None of them takes the key.
+Old checkpoints load unchanged: the key adds no parameter or buffer, and their saved
+`model_kwargs` do not set it.
+
+**Measure first.** Read `source_mask_fraction` in the first epoch of a run. A share far above the
+build report's masked share means the rule is stricter than intended; a share near zero means the
+mask changes almost nothing. Tests: `tests/test_source_quality_mask.py` (model, controls, objective,
+task, pre-flight) and `hdf5_dataset/tests/test_ua_step_mask.py` (the loader rule).

@@ -46,6 +46,8 @@ ENTRY_POINTS: Tuple[str, ...] = (
     "hdf5_dataset.new_pipeline.build_fold_datasets",
     # The signal-quality profile, run before a build that writes the quality fields.
     "hdf5_dataset.new_pipeline.profile_signal_quality",
+    # The dataset sample viewer, which also draws the quality fields of a signal-quality build.
+    "hdf5_dataset.plot_dataset_samples",
     # The latent-class fine-tuning pilot's runner. Same convention, one declared alias below.
     "teb_vae.lag_attn_transformer_cfs.latent_pilot.run",
 )

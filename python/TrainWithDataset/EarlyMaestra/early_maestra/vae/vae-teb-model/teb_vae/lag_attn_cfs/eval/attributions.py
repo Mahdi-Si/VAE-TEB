@@ -571,6 +571,7 @@ class AnchorReadout(nn.Module):
         weight: torch.Tensor,
         columns: torch.Tensor,
         coordinates: torch.Tensor,
+        source_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the model and return the readout at each row's anchor.
 
@@ -584,14 +585,22 @@ class AnchorReadout(nn.Module):
             columns: Each row's anchor as a position on the dense anchor axis, $(B,)$ ``long``.
             coordinates: Each row's latent coordinate for the per-coordinate readouts, $(B,)$
                 ``long``; ignored by the others.
+            source_valid: The recording's own source-validity mask $(B, T, c_u)$ ``bool``, on a
+                model built with ``source_quality_mask`` and ``None`` otherwise. Never attributed
+                and never interpolated: it is the third element of the ``extra`` tuple, so Captum
+                expands it with the rows and every point of a path -- the baseline included --
+                attends under the mask of the UA that was recorded. See :func:`readout_args`.
 
         Returns:
             The readout, $(B,)$.
         """
         model = self.model
         anchors = self.anchor_steps(columns)                            # (B,)
+        kwargs: Dict[str, Any] = {} if self.cell.dense_latent else {"return_proposals": True}
+        if source_valid is not None:
+            kwargs["source_valid"] = source_valid
         with attributed_forward(model, anchors):
-            outputs = model(y_st, y_ph, u_stream, **({} if self.cell.dense_latent else {"return_proposals": True}))
+            outputs = model(y_st, y_ph, u_stream, **kwargs)
         rows = torch.arange(columns.shape[0], device=columns.device)
         anchor_valid = outputs["anchor_valid"][:, 0]                    # (B,)
         name = self.readout
@@ -675,6 +684,30 @@ class AnchorReadout(nn.Module):
 # =============================================================================
 # Inputs, baselines, anchors
 # =============================================================================
+def readout_args(
+    extra: Sequence[torch.Tensor], columns: torch.Tensor, coordinates: torch.Tensor
+) -> Tuple[torch.Tensor, ...]:
+    r"""The arguments :meth:`AnchorReadout.forward` takes after the three attributed streams.
+
+    ``extra`` is ``(target_features, weight)``, plus the recording's source-validity mask as a
+    third element on a model built with ``source_quality_mask``. The mask goes **last**, after
+    ``columns`` and ``coordinates``, so the positional order of the four fixed arguments never
+    depends on the flag. It travels with the fixed arguments rather than with the attributed
+    inputs, so no baseline and no interpolation point $x_0 + \alpha (x - x_0)$ edits it: the
+    quality of the recorded UA decides which keys exist, whatever values the path hands the
+    encoder.
+
+    Args:
+        extra: The row-expanded ``(target_features, weight[, source_valid])``.
+        columns: Per-row anchor-axis positions, $(N,)$.
+        coordinates: Per-row latent coordinate, $(N,)$.
+
+    Returns:
+        ``(target_features, weight, columns, coordinates[, source_valid])``.
+    """
+    return (extra[0], extra[1], columns, coordinates, *extra[2:])
+
+
 def baselines_for(name: str, inputs: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, ...]:
     """Build one named baseline tuple for an input tuple.
 
@@ -1095,7 +1128,8 @@ def expand_rows(
 
     Args:
         inputs: ``(y_st, y_ph, u_stream)``, $(B, \\ldots)$.
-        extra: ``(target_features, weight)``, $(B, \\ldots)$.
+        extra: ``(target_features, weight)``, plus ``source_valid`` under
+            ``source_quality_mask`` (:func:`readout_args`), $(B, \\ldots)$.
         columns_per_sample: One array of anchor-axis positions per sample.
 
     Returns:
@@ -1138,7 +1172,8 @@ def integrated_gradients(
     Args:
         wrapper: The readout module.
         inputs: The row-expanded ``(y_st, y_ph, u_stream)``.
-        extra: The row-expanded ``(target_features, weight)``.
+        extra: The row-expanded ``(target_features, weight[, source_valid])``; see
+            :func:`readout_args`.
         columns: Per-row anchor-axis positions, $(N,)$.
         baseline: One of :data:`BASELINES`.
         coordinates: Per-row latent coordinate, or ``None`` for readouts without one.
@@ -1163,7 +1198,7 @@ def integrated_gradients(
         )
     exact = baselines_for(baseline, inputs)
     start = entry_point(inputs, exact, entry_fraction)
-    forward_args = (extra[0], extra[1], columns, coordinates)
+    forward_args = readout_args(extra, columns, coordinates)
     with torch.no_grad():
         value_input = wrapper(*inputs, *forward_args)
         value_baseline = wrapper(*exact, *forward_args)
@@ -1294,7 +1329,7 @@ def ablate_lag_bands(
         inputs[2].detach(),
         baselines=torch.zeros_like(inputs[2]),
         feature_mask=mask,
-        additional_forward_args=(inputs[0].detach(), inputs[1].detach(), extra[0], extra[1], columns, coordinates),
+        additional_forward_args=(inputs[0].detach(), inputs[1].detach(), *readout_args(extra, columns, coordinates)),
         perturbations_per_eval=int(perturbations_per_eval),
     )
     source = source.detach().cpu().to(torch.float64).numpy()
@@ -1372,7 +1407,7 @@ def layer_attribution(
         return {"per_unit": np.zeros((0, 0)), "total": np.zeros(0)}
     exact = baselines_for(baseline, inputs)
     start = entry_point(inputs, exact, entry_fraction)
-    forward_args = (extra[0], extra[1], columns, coordinates)
+    forward_args = readout_args(extra, columns, coordinates)
     with warnings.catch_warnings():
         # Captum warns that a list of layers must not be a chain; the per-head fusion modules
         # each read the target state and their own head, so the warning does not apply.
