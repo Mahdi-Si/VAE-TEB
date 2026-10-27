@@ -301,6 +301,15 @@ model_config:
     # writes `<old>.event_gate.ckpt`, which `core_model_checkpoint` then points at.
     # `sweep_no_event_gate.yaml` is the ablation.
     posterior_event_gate: true
+    # The UA QUALITY MASK (2026-10-25). The forward takes a sixth input, `source_valid`, built from
+    # `dataset_kwargs.ua_step_mask` below. A UA step it marks bad leaves the lag keys of every query,
+    # and an anchor with no valid key keeps its gate closed, so q = p and the KL is exactly 0 there.
+    # It adds no parameter, so it does not change what a checkpoint holds; the prior never sees it.
+    # `source_mask_fraction` logs the share of KL anchors it closed, and `event_gate_mean` averages
+    # over the anchors it left open. Needs a signal-quality build (root attribute quality_version)
+    # and its own statistics file. The pre-flight refuses this flag without `ua_step_mask`, and the
+    # reverse. false = the pre-key model, bitwise.
+    source_quality_mask: true
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256
@@ -1059,6 +1068,22 @@ dataset_config:
       # warm-fraction readout still reports 1.0 -- which is why the resolver cross-checks this value
       # against `sequence_length` and refuses a mismatch naming both config paths.
       trim_minutes: 1.0
+      # Which UA steps `source_quality_mask` treats as usable; the two rules are OR-joined.
+      #   bits:        UA bit names, OR-joined: MISSING, CODE, CENSORED, TRANSIENT, STEP, HOLD,
+      #                FLOOR, ISLAND, OSCILLATION, or "invalid" (the file's invalid set, every bit
+      #                but CENSORED and OSCILLATION). A step is bad if any raw sample of the 4 s it
+      #                reads carries one. One value for every channel. null = no bit rule.
+      #   rho_epsilon: a coefficient is bad if its stored contamination rho > epsilon. Per channel,
+      #                and it covers each coefficient's whole causal window, but rho was computed
+      #                from the full invalid set only. 0.1 = the statistics file's threshold, so a
+      #                masked value is exactly a value the normalisation excluded. null = off.
+      #   hold_steps:  extend each step the bit rule marks bad forward by this many steps.
+      # A step is usable only if every source channel the model reads is. null = no mask (and
+      # source_quality_mask must then be false).
+      ua_step_mask:
+        bits: null
+        rho_epsilon: 0.1
+        hold_steps: 0
 
 
 # Advanced configs ========================================================

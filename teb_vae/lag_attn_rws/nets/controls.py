@@ -107,7 +107,10 @@ SOURCE_NULL_KEYS: Tuple[str, ...] = ("mu_post", "logvar_post", "attn_weights")
 
 
 def _attend_and_pose(
-    model, forward_outputs: Dict[str, torch.Tensor], h_u: torch.Tensor
+    model,
+    forward_outputs: Dict[str, torch.Tensor],
+    h_u: torch.Tensor,
+    key_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Run the query, the lag attention and the posterior head against a substituted source state.
 
@@ -130,12 +133,18 @@ def _attend_and_pose(
       with the posterior event gate, the gate is recomputed from the substituted summary too, so
       a stranger's source is also judged by the gate it would have opened, and the recomputed gate
       is returned beside the posterior so each arm can carry it under ``event_gate``.
+    * Under ``source_quality_mask`` the matched forward's key mask ``source_key_mask`` replaces
+      the lag mask, and an anchor with no valid key keeps its gate closed, as in the forward. An
+      arm that moves the source between recordings passes the donor's mask as ``key_mask``.
 
     Args:
         model: The model whose modules are re-run.
         forward_outputs: The matched forward's dict; requires ``target_state``, ``mu_prior``,
             ``raw_logvar_prior`` and -- under ``query_uses_logvar`` -- ``logvar_prior``.
         h_u: The source state to attend over, ``(B, T, d_model)``.
+        key_mask: The per-sample key mask ``(B, T, L)`` to attend under. ``None`` takes the
+            matched forward's ``source_key_mask`` when it returned one, and the model's lag mask
+            otherwise.
 
     Returns:
         ``(alpha, mu_post, logvar_post, gate)``: the attention weights, the posterior's two
@@ -148,18 +157,23 @@ def _attend_and_pose(
         if model.query_uses_logvar
         else mu_prior
     )
+    if key_mask is None:
+        key_mask = forward_outputs.get("source_key_mask")
     _, alpha, attended_heads = model.lag_attn(
         model.query_proj(query),
         h_u,
-        model.build_lag_mask(h_u.shape[1], h_u.device),
+        model.build_lag_mask(h_u.shape[1], h_u.device) if key_mask is None else key_mask,
     )
     gate = model.posterior_head.event_gate_values(attended_heads)
+    applied = gate
+    if key_mask is not None:
+        applied, gate = model._close_gate(gate, key_mask.any(dim=-1), attended_heads.dtype)
     mu_post, logvar_post = model.posterior_head(
         forward_outputs["target_state"],
         attended_heads,
         mu_prior,
         forward_outputs["raw_logvar_prior"],
-        gate=gate,
+        gate=applied,
     )
     return alpha, mu_post, logvar_post, gate
 
@@ -256,8 +270,14 @@ def perm_forward_outputs(
     # The query, the attention under the model's own lag mask, and the posterior head: the tail
     # this arm shares with the source-null one, which is why it is one function rather than two
     # copies. What makes this arm a *permutation* is the single index below and nothing else.
+    # The donor's source arrives with the donor's quality mask: a key is judged by the recording
+    # it came from.
+    key_mask = forward_outputs.get("source_key_mask")
     alpha_perm, mu_post_perm, logvar_post_perm, gate_perm = _attend_and_pose(
-        model, forward_outputs, h_u[perm_index]
+        model,
+        forward_outputs,
+        h_u[perm_index],
+        key_mask=None if key_mask is None else key_mask[perm_index],
     )
     z_post_perm = mu_post_perm + torch.randn_like(mu_post_perm) * torch.exp(
         0.5 * logvar_post_perm
@@ -289,6 +309,10 @@ def perm_forward_outputs(
     )
     if gate_perm is not None:
         permuted["event_gate"] = gate_perm
+    if key_mask is not None:
+        # The arm attended under the donor's mask, so its readouts must count the donor's anchors.
+        permuted["source_key_mask"] = key_mask[perm_index]
+        permuted["source_open"] = permuted["source_key_mask"].any(dim=-1)
     return permuted
 
 

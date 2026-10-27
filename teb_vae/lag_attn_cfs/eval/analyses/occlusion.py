@@ -85,6 +85,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     batch_guids,
     batch_size_of,
     forecast_likelihood_terms,
+    forward_kwargs,
     masked_raw_block_per_horizon_step,
     model_inputs,
 )
@@ -348,8 +349,12 @@ def collect_batch(
     likelihood = str(task.hparams.get("likelihood", "gaussian_nll"))
     y_st, y_ph, u_stream, target_features, weight = model_inputs(task, batch)
     anchor_phase, anchor_stride = DENSE_ANCHOR_GEOMETRY
+    # The recording's own quality mask, here and in every arm below: the occluded arms re-attend
+    # under the matched forward's ``source_key_mask``, so a band zeroed by the intervention is not
+    # also a band of missing keys -- the recorded UA's quality decides which keys exist.
     outputs = model(
-        y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride
+        y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride,
+        **forward_kwargs(task, batch, u_stream),
     )
 
     device = y_st.device

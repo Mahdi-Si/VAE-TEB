@@ -137,7 +137,8 @@ def gradcam(
     Args:
         wrapper: The readout module, on a dense-latent (lag-attentive) cell.
         inputs: The row-expanded ``(y_st, y_ph, u_stream)``.
-        extra: The row-expanded ``(target_features, weight)``.
+        extra: The row-expanded ``(target_features, weight[, source_valid])``; see
+            :func:`~.attributions.readout_args`.
         columns: Per-row anchor-axis positions, $(N,)$.
         coordinates: Per-row latent coordinate, or ``None``.
 
@@ -167,7 +168,10 @@ def gradcam(
     ]
     try:
         with torch.enable_grad():
-            values = wrapper(*(x.detach().requires_grad_(True) for x in inputs), *extra, columns, coordinates)
+            values = wrapper(
+                *(x.detach().requires_grad_(True) for x in inputs),
+                *core.readout_args(extra, columns, coordinates),
+            )
             tensors = [captured[view] for view in VIEWS]
             grads = torch.autograd.grad(values.sum(), tensors, allow_unused=True)
     finally:

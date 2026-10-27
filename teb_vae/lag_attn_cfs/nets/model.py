@@ -113,11 +113,12 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         target_forecast_shift: Optional[Sequence[int]] = None,
         target_scored_horizon: Optional[Sequence[int]] = None,
         forecast_ar_residual: bool = False,
+        source_quality_mask: bool = False,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
-        Every keyword the base takes is forwarded unchanged or renamed; only the ten below are
+        Every keyword the base takes is forwarded unchanged or renamed; only the eleven below are
         this target domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The defaults that differ
         from the base's -- ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ -- are this target
         domain's geometry rather than a preference, and a run that leaves them at the base's values
@@ -168,6 +169,10 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             forecast_ar_residual: Score the horizon under a per-channel AR(1) residual with a
                 learnable $\phi_c = \tanh(a_c)$, seeded at $0$. ``False`` builds no parameter and
                 is the factorised score.
+            source_quality_mask: Require ``source_valid`` in every forward and apply it: bad UA
+                steps leave the lag keys, and an anchor with no valid key keeps $q = p$. Paired
+                with the dataset's ``ua_step_mask``. ``False`` builds the model bitwise as before
+                the keyword existed; either value adds no parameter.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -196,6 +201,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
             target_forecast_shift=target_forecast_shift,
+            source_quality_mask=source_quality_mask,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.

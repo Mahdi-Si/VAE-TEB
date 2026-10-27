@@ -35,6 +35,18 @@ from hdf5_dataset.hdf5_dataset import (  # noqa: E402
     resolve_transform,
 )
 
+# The signal-quality datasets a quality build stores beside the signals (written by
+# ``hdf5_dataset/new_pipeline/create_new_pipeline.py``, rules in ``hdf5_dataset/signal_quality.py``).
+# Named here rather than imported, because the builder module is far heavier than this reader.
+#: Raw signal -> its per-sample quality bits, ``(N, 5280)``.
+QUALITY_BITS_FIELDS = {'fhr': 'fhr_quality', 'up': 'up_quality'}
+#: Per-segment flag that picks the FHR invalid bits: 1 -> ``invalid_bits_exact``, 0 -> ``invalid_bits_rules``.
+FHR_REPAIR_EXACT_FIELD = 'fhr_repair_exact'
+#: Suffix of the per-coefficient contamination dataset, ``<block>_rho``, shaped like its block.
+RHO_SUFFIX = '_rho'
+#: Default contamination threshold: a coefficient with $\rho > 0.1$ is left out of the sums.
+DEFAULT_QUALITY_RHO_EPSILON = 0.1
+
 
 class DatasetStatsCalculator:
     r"""
@@ -80,6 +92,22 @@ class DatasetStatsCalculator:
     warm-up only changes which samples enter the sum. A two-sided or legacy
     file has no such attribute and accumulates exactly as it always has.
 
+    **The quality mask.** A quality build (root attribute ``quality_version``)
+    stores bridged signals: every invalid sample was interpolated before the
+    transform. Accumulating over the bridges, or over coefficients they
+    contaminate, would bias $\mu_c$ and $\sigma^2_c$ towards the interpolant. On
+    such a file the sums run over
+
+    $$V_c = \{\, t \ge W_c \ :\ \rho_c(t) \le \varepsilon \,\}$$
+
+    for a coefficient block, where $\rho_c(t) \in [0, 1]$ is the stored
+    contamination (``<block>_rho`` divided by ``quality_rho_scale``) and
+    $\varepsilon$ is ``quality_rho_epsilon``. For ``fhr`` and ``up`` they run
+    over the samples whose quality bits carry no invalid bit. The mask is
+    applied by the same NaN blanking as the warm-up, so the two combine as a
+    logical AND of "valid". A file without ``quality_version`` accumulates
+    exactly as before.
+
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
 
@@ -89,7 +117,42 @@ class DatasetStatsCalculator:
         new data in ``normalize_tensor_data``.
     """
 
-    def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
+    def __init__(
+        self,
+        trim_minutes: Optional[float] = None,
+        device: Optional[str] = None,
+        quality_mask: bool = True,
+        quality_rho_epsilon: float = DEFAULT_QUALITY_RHO_EPSILON,
+    ):
+        r"""Set the trim, the device and the quality mask.
+
+        Args:
+            trim_minutes: Symmetric trim in minutes; ``None`` for no trim.
+            device: Torch device; ``None`` picks CUDA when available.
+            quality_mask: Apply the quality mask when every source file is a
+                quality build. ``False`` accumulates a quality build exactly as
+                a file without quality datasets. No effect on other files.
+            quality_rho_epsilon: The threshold $\varepsilon \in [0, 1)$; a
+                coefficient with $\rho > \varepsilon$ is left out of the sums.
+
+        Raises:
+            ValueError: If ``quality_rho_epsilon`` is outside $[0, 1)$.
+        """
+        if not 0.0 <= float(quality_rho_epsilon) < 1.0:
+            raise ValueError(
+                f"quality_rho_epsilon must be in [0, 1), got {quality_rho_epsilon}. At 1 or above "
+                f"no coefficient is ever excluded; to accumulate without the quality mask, set "
+                f"quality_mask=False instead."
+            )
+        self.quality_mask = bool(quality_mask)
+        self.quality_rho_epsilon = float(quality_rho_epsilon)
+
+        # Set by _resolve_quality_build: the sources' quality_version (None when they are not
+        # quality builds), and the epsilon actually applied (None when no mask was applied).
+        # Instance state rather than stats-dict keys for the same reason as source_transform.
+        self.source_quality_version: Optional[int] = None
+        self.applied_rho_epsilon: Optional[float] = None
+
         self.stats_fields = [
             'fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph'
         ]
@@ -299,6 +362,203 @@ class DatasetStatsCalculator:
                 data[:, channel, :int(invalid_steps)] = np.nan
         return data
 
+    def _trim(self, data: np.ndarray, raw: bool) -> np.ndarray:
+        """Cut ``trim_minutes`` from each end of the last axis.
+
+        One helper for the data and for the quality arrays read beside it, so a
+        mask can never be trimmed differently from the values it masks.
+
+        Args:
+            data: ``(B, T)`` or ``(B, C, T)`` array.
+            raw: ``True`` for the raw-rate grid (``fhr``, ``up`` and their
+                quality bits), ``False`` for the decimated grid (coefficient
+                blocks and ``<block>_rho``).
+
+        Returns:
+            A view of *data* over the trimmed window, or *data* itself when no
+            trim is set.
+        """
+        if self.trim_minutes is None:
+            return data
+        trim = self.trim_samples_raw if raw else self.trim_samples_decimated
+        end_trim = -trim if trim > 0 else None
+        return data[..., trim:end_trim]
+
+    def _resolve_quality_build(self, valid_files: List[str]) -> bool:
+        r"""Refuse a file list that mixes quality builds, and decide whether to mask.
+
+        A file is a quality build when its root carries ``quality_version``.
+        Mixing such files with plain ones, or two versions, is refused: their
+        ``fhr``/``up`` mean different things (bridged or not, by different
+        rules), so one set of constants cannot describe both. Each quality file
+        must also carry every dataset the mask reads, with the shape of the
+        data it describes.
+
+        Args:
+            valid_files: Existing HDF5 files, in the order given.
+
+        Returns:
+            ``True`` when the quality mask applies: every file is a quality
+            build and :attr:`quality_mask` is on.
+
+        Raises:
+            ValueError: On a mixed list, on two quality versions, or on a quality
+                file whose quality datasets are missing or misshaped.
+        """
+        versions: Dict[str, Optional[int]] = {}
+        for path in valid_files:
+            with h5py.File(path, 'r') as f:
+                version = f.attrs.get('quality_version')
+                versions[path] = None if version is None else int(version)
+                if version is not None:
+                    self._check_quality_datasets(path, f)
+
+        quality = [path for path, version in versions.items() if version is not None]
+        plain = [path for path, version in versions.items() if version is None]
+        if quality and plain:
+            raise ValueError(
+                f"Mixed quality and non-quality files in one dataset: {quality[0]} is a quality "
+                f"build (quality_version={versions[quality[0]]}) but {plain[0]} is not. A quality "
+                f"build stores bridged signals, so one set of statistics cannot describe both; "
+                f"compute statistics per build."
+            )
+        found = sorted({version for version in versions.values() if version is not None})
+        if len(found) > 1:
+            raise ValueError(
+                f"Mixed quality versions in one dataset: {found}. Each version codes and bridges "
+                f"the signals by different rules; compute statistics per version."
+            )
+
+        self.source_quality_version = found[0] if found else None
+        applies = self.source_quality_version is not None and self.quality_mask
+        self.applied_rho_epsilon = self.quality_rho_epsilon if applies else None
+        return applies
+
+    def _check_quality_datasets(self, path: str, f: h5py.File) -> None:
+        """Refuse a quality build that lacks a dataset or attribute the mask reads.
+
+        Args:
+            path: The file, for the message.
+            f: The open file.
+
+        Raises:
+            ValueError: If a quality dataset or attribute is missing, or a
+                quality dataset does not have the shape of the data it masks.
+        """
+        needed: Dict[str, str] = {}
+        for field in self.stats_fields:
+            if field not in f:
+                continue
+            needed[QUALITY_BITS_FIELDS.get(field, field + RHO_SUFFIX)] = field
+        for name, field in needed.items():
+            if name not in f:
+                raise ValueError(
+                    f"{path} is a quality build but has no '{name}' dataset for '{field}'. The "
+                    f"mask of that field is then unknown, and accumulating it unmasked would mix "
+                    f"bridged values into the statistics."
+                )
+            if f[name].shape != f[field].shape:
+                raise ValueError(
+                    f"{path}: '{name}' has shape {f[name].shape} but '{field}' has shape "
+                    f"{f[field].shape}. The mask would describe different values than the data."
+                )
+        if 'fhr' in f and (FHR_REPAIR_EXACT_FIELD not in f
+                           or f[FHR_REPAIR_EXACT_FIELD].shape != (f['fhr'].shape[0],)):
+            raise ValueError(
+                f"{path} is a quality build but has no '{FHR_REPAIR_EXACT_FIELD}' dataset with "
+                f"one entry per segment; the FHR invalid bits cannot be chosen."
+            )
+        for name, attr in (('up_quality', 'invalid_bits'), ('fhr_quality', 'invalid_bits_exact'),
+                           ('fhr_quality', 'invalid_bits_rules')):
+            if name in f and attr not in f[name].attrs:
+                raise ValueError(f"{path}: '{name}' carries no '{attr}' attribute.")
+        if any(name.endswith(RHO_SUFFIX) for name in needed) and 'quality_rho_scale' not in f.attrs:
+            raise ValueError(f"{path} is a quality build but has no 'quality_rho_scale' attribute.")
+
+    @staticmethod
+    def _read_quality_codes(f: h5py.File) -> Dict[str, Any]:
+        """Read one quality file's invalid bits and $\\rho$ scale.
+
+        Args:
+            f: An open quality build, already checked by
+                :meth:`_check_quality_datasets`.
+
+        Returns:
+            ``up_invalid``, ``fhr_exact`` and ``fhr_rules`` bit masks (``int``)
+            for the fields present, and ``rho_scale`` (``float``) when present.
+        """
+        codes: Dict[str, Any] = {}
+        if 'up_quality' in f:
+            codes['up_invalid'] = int(f['up_quality'].attrs['invalid_bits'])
+        if 'fhr_quality' in f:
+            codes['fhr_exact'] = int(f['fhr_quality'].attrs['invalid_bits_exact'])
+            codes['fhr_rules'] = int(f['fhr_quality'].attrs['invalid_bits_rules'])
+        if 'quality_rho_scale' in f.attrs:
+            codes['rho_scale'] = float(f.attrs['quality_rho_scale'])
+        return codes
+
+    def _read_quality_invalid(
+        self,
+        f: h5py.File,
+        field: str,
+        selection: Any,
+        codes: Dict[str, Any],
+    ) -> np.ndarray:
+        r"""Read the invalid mask of one field for the rows of one batch.
+
+        Read with the same row selection as the data, and trimmed by the same
+        helper, so mask and data cover the same values.
+
+        - ``up``: invalid where ``up_quality & invalid_bits != 0``.
+        - ``fhr``: invalid where ``fhr_quality & B_i != 0``, with
+          $B_i$ = ``invalid_bits_exact`` if ``fhr_repair_exact[i] == 1``, else
+          ``invalid_bits_rules``.
+        - a coefficient block: invalid where
+          $\rho = \texttt{<block>\_rho} / \texttt{quality\_rho\_scale} > \varepsilon$.
+
+        Args:
+            f: The open quality build.
+            field: The field the mask is for.
+            selection: The batch's rows, a slice or a sorted index array.
+            codes: The file's :meth:`_read_quality_codes`.
+
+        Returns:
+            Boolean array of the trimmed data's shape; ``True`` marks an
+            invalid value.
+        """
+        if field == 'up':
+            bits = self._trim(f['up_quality'][selection], raw=True)
+            return (bits & codes['up_invalid']) != 0
+        if field == 'fhr':
+            bits = self._trim(f['fhr_quality'][selection], raw=True).astype(np.int64)
+            exact = f[FHR_REPAIR_EXACT_FIELD][selection].astype(bool)
+            invalid_bits = np.where(exact, codes['fhr_exact'], codes['fhr_rules'])
+            return (bits & invalid_bits[:, None]) != 0
+        rho = self._trim(f[field + RHO_SUFFIX][selection], raw=False)
+        return rho.astype(np.float64) / codes['rho_scale'] > self.quality_rho_epsilon
+
+    @staticmethod
+    def _blank_quality_region(data: np.ndarray, invalid: np.ndarray) -> Any:
+        """Blank the invalid values of a batch with NaN, in place, and count them.
+
+        Called after :meth:`_blank_warmup_region`, so a value the warm-up
+        already removed is not counted again: the count is the number of
+        values this mask alone kept out of the sums.
+
+        Args:
+            data: The trimmed batch, ``(B, T)`` or ``(B, C, T)``.
+            invalid: Its mask from :meth:`_read_quality_invalid`.
+
+        Returns:
+            The newly excluded count: an ``int`` for ``(B, T)``, a ``(C,)``
+            ``int64`` array for ``(B, C, T)``.
+        """
+        excluded = invalid & np.isfinite(data)
+        data[excluded] = np.nan
+        if data.ndim == 3:
+            return excluded.sum(axis=(0, 2), dtype=np.int64)
+        return int(excluded.sum())
+
     def _update_single_channel_stats(
         self, 
         stats: Dict[str, Any], 
@@ -388,6 +648,41 @@ class DatasetStatsCalculator:
             stats['sum'][channel] += torch.sum(valid_data)
             stats['sum_squares'][channel] += torch.sum(valid_data ** 2)
     
+    def _refuse_empty_after_quality_mask(self, stats: Dict[str, Dict[str, Any]]) -> None:
+        r"""Refuse a field or channel the quality mask left without a single value.
+
+        The same hazard the warm-up check guards against: a channel at
+        ``count == 0`` finishes with variance $0$, is saved as ``std = 0`` and
+        is divided by $0 + 10^{-8}$ at normalisation, with no exception
+        anywhere.
+
+        Args:
+            stats: The accumulators after the last batch.
+
+        Raises:
+            ValueError: Naming the first empty field or channel.
+        """
+        for field, field_stats in stats.items():
+            if field in ['fhr', 'up']:
+                if field_stats['count'] == 0:
+                    raise ValueError(
+                        f"'{field}' has no valid sample left after the quality mask: every sample "
+                        f"of the trimmed window carries an invalid bit. Set quality_mask=False to "
+                        f"accumulate the bridged signal instead."
+                    )
+                continue
+            counts = field_stats.get('channel_counts')
+            counts = (np.zeros(field_stats['n_channels'], dtype=np.int64) if counts is None
+                      else counts.cpu().numpy())
+            dead = np.flatnonzero(counts == 0)
+            if dead.size:
+                raise ValueError(
+                    f"'{field}' channel {int(dead[0])} has no valid step left after the quality "
+                    f"mask at quality_rho_epsilon={self.quality_rho_epsilon}. An all-invalid "
+                    f"channel normalises with std 0, so raise the threshold or set "
+                    f"quality_mask=False."
+                )
+
     def _finalize_stats(self, stats: Dict[str, Dict[str, Any]]) -> None:
         """
         Calculate final mean and variance from accumulated sums.
@@ -458,8 +753,10 @@ class DatasetStatsCalculator:
             Dictionary containing calculated statistics for each field
 
         Raises:
-            ValueError: If the files do not describe one coherent dataset, or if
-                a causal channel has no valid step to accumulate over.
+            ValueError: If the files do not describe one coherent dataset, if
+                they mix quality and non-quality builds or quality versions, or
+                if a channel has no valid step to accumulate over (after the
+                warm-up, or after the quality mask).
         """
         # Validate input files
         valid_files = []
@@ -475,6 +772,8 @@ class DatasetStatsCalculator:
         # What these files are, and which part of each channel is a function of
         # the recording rather than of the assumed pre-recording history.
         layout, warmup = self._resolve_valid_region(valid_files)
+        # And which values a quality build marks as bridged or contaminated.
+        quality_masked = self._resolve_quality_build(valid_files)
 
         # Get field shapes from first file
         field_shapes = {}
@@ -505,13 +804,23 @@ class DatasetStatsCalculator:
                 if field in stats:
                     stats[field]['causal_warmup_steps'] = vector.astype(np.int32)
 
+        # Values the quality mask kept out of the sums, beyond the warm-up: one count per raw
+        # signal, one per channel per block. Present only when the mask is applied.
+        if quality_masked:
+            for field, field_stats in stats.items():
+                field_stats['quality_excluded'] = (
+                    0 if field in ['fhr', 'up']
+                    else np.zeros(field_stats['n_channels'], dtype=np.int64)
+                )
+
         # Process each file
         total_samples = 0
         for file_path in (tqdm(valid_files, desc="Processing files") if progress_bar else valid_files):
             with h5py.File(file_path, 'r') as f:
                 file_samples = f[next(iter(self.stats_fields))].shape[0]
                 total_samples += file_samples
-                
+                codes = self._read_quality_codes(f) if quality_masked else None
+
                 # Process in batches for memory efficiency
                 for start_idx in (tqdm(range(0, file_samples, batch_size), 
                                      desc=f"Processing {os.path.basename(file_path)}", 
@@ -524,27 +833,29 @@ class DatasetStatsCalculator:
                         if field not in f:
                             continue
                             
-                        data = f[field][start_idx:end_idx]
-
-                        if self.trim_minutes is not None:
-                            if field in ['fhr', 'up']:
-                                start_trim = self.trim_samples_raw
-                                end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
-                                data = data[:, start_trim:end_trim]
-                            else:
-                                start_trim = self.trim_samples_decimated
-                                end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
-                                data = data[:, :, start_trim:end_trim]
+                        rows = slice(start_idx, end_idx)
+                        data = self._trim(f[field][rows], raw=field in ['fhr', 'up'])
 
                         # Applied after the trim, because the warm-up was rebased
                         # into the trimmed window's coordinates.
                         data = self._blank_warmup_region(field, data, warmup)
 
+                        # Then the quality mask, read from the same rows and
+                        # trimmed by the same helper as the data.
+                        if quality_masked:
+                            invalid = self._read_quality_invalid(f, field, rows, codes)
+                            stats[field]['quality_excluded'] += self._blank_quality_region(
+                                data, invalid
+                            )
+
                         if field in ['fhr', 'up']:
                             self._update_single_channel_stats(stats[field], data)
                         else:
                             self._update_multi_channel_stats(stats[field], data)
-        
+
+        if quality_masked:
+            self._refuse_empty_after_quality_mask(stats)
+
         # Finalize statistics
         self._finalize_stats(stats)
         
@@ -600,7 +911,16 @@ class DatasetStatsCalculator:
             # And the operator version, for the same reason: constants accumulated
             # over one operator's phase blocks must not normalise the other's.
             f.attrs['causal_phase_operator'] = self.source_phase_operator
-            
+
+            # The quality build the constants were computed over, and the threshold the mask
+            # applied. Each is written only when it holds: no quality_version means the sources
+            # were not quality builds; quality_version without quality_rho_epsilon means they
+            # were, and the mask was turned off.
+            if self.source_quality_version is not None:
+                f.attrs['quality_version'] = np.int64(self.source_quality_version)
+            if self.applied_rho_epsilon is not None:
+                f.attrs['quality_rho_epsilon'] = np.float64(self.applied_rho_epsilon)
+
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
             f.attrs['description'] = (
@@ -618,7 +938,13 @@ class DatasetStatsCalculator:
                 # Save basic info
                 field_group.attrs['shape'] = field_stats['shape']
                 field_group.attrs['count'] = field_stats['count']
-                
+                # Present only when the quality mask was applied: the values it kept out of the
+                # sums beyond the warm-up (a scalar for fhr / up, one entry per channel otherwise).
+                if 'quality_excluded' in field_stats:
+                    field_group.attrs['quality_excluded'] = np.asarray(
+                        field_stats['quality_excluded'], dtype=np.int64
+                    )
+
                 if field in ['fhr', 'up']:
                     # Single-channel data
                     field_group.create_dataset('mean', data=field_stats['mean'], dtype='f4')
@@ -689,6 +1015,10 @@ class DatasetStatsCalculator:
             self.source_transform = resolve_transform(f.attrs)
             self.source_leg_alignment = resolve_leg_alignment(f.attrs)
             self.source_phase_operator = resolve_phase_operator(f.attrs)
+            version = f.attrs.get('quality_version')
+            self.source_quality_version = None if version is None else int(version)
+            epsilon = f.attrs.get('quality_rho_epsilon')
+            self.applied_rho_epsilon = None if epsilon is None else float(epsilon)
 
             for field in f.keys():
                 if field == 'metadata':
@@ -700,7 +1030,9 @@ class DatasetStatsCalculator:
                     'count': field_group.attrs['count'],
                     'log_epsilon': log_epsilon
                 }
-                
+                if 'quality_excluded' in field_group.attrs:
+                    field_stats['quality_excluded'] = field_group.attrs['quality_excluded']
+
                 if field in ['fhr', 'up']:
                     # Single-channel data
                     field_stats['mean'] = field_group.attrs['mean_scalar']
@@ -759,12 +1091,20 @@ class DatasetStatsCalculator:
         print("- fhr_st / up_st: channel 0 regular, others log(x + 1e-6)")
         print("- fhr_ph: all asinh(x) transformed")
         print("- fhr_up_ph / up_ph: all asinh(x) transformed")
-        
+        if self.source_quality_version is not None:
+            mask = (f"rho <= {self.applied_rho_epsilon}" if self.applied_rho_epsilon is not None
+                    else "off")
+            print(f"Quality build: quality_version={self.source_quality_version}, mask {mask}")
+
         for field, field_stats in stats.items():
             print(f"\n{field.upper()}:")
             print(f"  Shape: {field_stats['shape']}")
             print(f"  Total samples: {field_stats['count']:,}")
-            
+            if 'quality_excluded' in field_stats:
+                excluded = int(np.sum(field_stats['quality_excluded']))
+                share = excluded / max(excluded + int(field_stats['count']), 1)
+                print(f"  Quality-masked values: {excluded:,} ({100.0 * share:.2f}%)")
+
             if field in ['fhr', 'up']:
                 # Single-channel data
                 mean = field_stats['mean']
@@ -813,7 +1153,8 @@ class DatasetStatsCalculator:
         valid_files: List[str],
         max_samples: int,
         warmup: Optional[Dict[str, np.ndarray]],
-        progress_bar: bool = True
+        progress_bar: bool = True,
+        quality_masked: bool = False,
     ) -> Dict[str, Any]:
         """Read a bounded, evenly spread subset of every field for plotting.
 
@@ -831,6 +1172,9 @@ class DatasetStatsCalculator:
             warmup: Rebased per-block warm-up, or ``None`` for a two-sided or
                 legacy dataset.
             progress_bar: Whether to show a progress bar.
+            quality_masked: Apply the quality mask, as
+                :meth:`_resolve_quality_build` decided for these files. Blanked
+                for the same reason the warm-up is.
 
         Returns:
             One array per field, ``None`` for a field no file carried.
@@ -856,21 +1200,18 @@ class DatasetStatsCalculator:
                 else:
                     indices = np.arange(file_samples)
 
+                codes = self._read_quality_codes(f) if quality_masked else None
                 for field in available_fields:
-                    data = f[field][indices]
-                    if self.trim_minutes is not None:
-                        if field in ['fhr', 'up']:
-                            start_trim = self.trim_samples_raw
-                            end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
-                            data = data[:, start_trim:end_trim]
-                        else:
-                            start_trim = self.trim_samples_decimated
-                            end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
-                            data = data[:, :, start_trim:end_trim]
+                    data = self._trim(f[field][indices], raw=field in ['fhr', 'up'])
                     # The same exclusion the accumulation applies, through the
                     # same helper; the plotting path below already drops
                     # non-finite values per channel.
-                    collected[field].append(self._blank_warmup_region(field, data, warmup))
+                    data = self._blank_warmup_region(field, data, warmup)
+                    if quality_masked:
+                        self._blank_quality_region(
+                            data, self._read_quality_invalid(f, field, indices, codes)
+                        )
+                    collected[field].append(data)
 
                 total_collected += samples_to_take
 
@@ -922,7 +1263,10 @@ class DatasetStatsCalculator:
         # it costs one attribute read per file and keeps this path correct
         # whichever order the two are called in.
         _, warmup = self._resolve_valid_region(valid_files)
-        sample_data = self._collect_sample_data(valid_files, max_samples, warmup, progress_bar)
+        quality_masked = self._resolve_quality_build(valid_files)
+        sample_data = self._collect_sample_data(
+            valid_files, max_samples, warmup, progress_bar, quality_masked=quality_masked
+        )
 
         available_fields = [field for field in self.stats_fields if sample_data[field] is not None]
         if not available_fields:
@@ -1111,7 +1455,9 @@ def plot_dataset_histograms(
     bins: int = 50,
     progress_bar: bool = True,
     trim_minutes: Optional[float] = None,
-    device: Optional[str] = None
+    device: Optional[str] = None,
+    quality_mask: bool = True,
+    quality_rho_epsilon: float = DEFAULT_QUALITY_RHO_EPSILON,
 ) -> None:
     """
     Convenience function to plot histograms of the 5-95th percentile of raw and normalized values.
@@ -1127,13 +1473,18 @@ def plot_dataset_histograms(
         progress_bar: Whether to show progress bars
         trim_minutes: Optional trimming time in minutes
         device: The device to use for calculation (e.g., 'cpu', 'cuda:0'). Autodetects if None.
+        quality_mask: Apply the quality mask to a quality build.
+        quality_rho_epsilon: Coefficients with $\\rho$ above this are excluded.
         
     Example:
         >>> hdf5_files = ['dataset1.h5', 'dataset2.h5']
         >>> plot_dataset_histograms(hdf5_files, './histogram_plots', max_channels=None)
         # Creates files like: ./histogram_plots/histogram_fhr.png, ./histogram_plots/histogram_up.png, etc.
     """
-    calculator = DatasetStatsCalculator(trim_minutes=trim_minutes, device=device)
+    calculator = DatasetStatsCalculator(
+        trim_minutes=trim_minutes, device=device,
+        quality_mask=quality_mask, quality_rho_epsilon=quality_rho_epsilon,
+    )
     calculator.plot_histograms(hdf5_files, save_path, max_channels, max_samples, figsize, bins, progress_bar)
 
 
@@ -1147,7 +1498,9 @@ def calculate_and_save_dataset_stats(
     device: Optional[str] = None,
     plot_histograms: bool = True,
     histograms_dir: Optional[str] = None,
-    max_histogram_samples: int = 50000
+    max_histogram_samples: int = 50000,
+    quality_mask: bool = True,
+    quality_rho_epsilon: float = DEFAULT_QUALITY_RHO_EPSILON,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Convenience function to calculate and save dataset statistics and plot histograms.
@@ -1163,6 +1516,8 @@ def calculate_and_save_dataset_stats(
         plot_histograms: Whether to generate histogram plots
         histograms_dir: Directory to save histogram plots (defaults to same dir as output_path)
         max_histogram_samples: Maximum number of samples to use for histogram plotting
+        quality_mask: Apply the quality mask when every file is a quality build.
+        quality_rho_epsilon: Coefficients with $\\rho$ above this are excluded.
         
     Returns:
         Dictionary containing calculated statistics
@@ -1176,7 +1531,10 @@ def calculate_and_save_dataset_stats(
         ...     plot_histograms=True
         ... )
     """
-    calculator = DatasetStatsCalculator(trim_minutes=trim_minutes, device=device)
+    calculator = DatasetStatsCalculator(
+        trim_minutes=trim_minutes, device=device,
+        quality_mask=quality_mask, quality_rho_epsilon=quality_rho_epsilon,
+    )
     
     # Calculate statistics
     print("Calculating dataset statistics...")
@@ -1208,7 +1566,9 @@ def calculate_and_save_dataset_stats(
             max_samples=max_histogram_samples,
             bins=50,
             trim_minutes=trim_minutes,
-            device=device
+            device=device,
+            quality_mask=quality_mask,
+            quality_rho_epsilon=quality_rho_epsilon,
         )
     
     return stats
@@ -1223,7 +1583,7 @@ def build_parser() -> argparse.ArgumentParser:
     No argument is ``required`` and none carries a non-``None`` default. ``required=True`` fires
     before :data:`RUN_ARGS` is consulted and would make the Run button unusable whatever the dict
     said; and the merge reads any non-``None`` parsed value as having come from the command line,
-    so an argparse default would make that key's ``RUN_ARGS`` entry unreachable. Both real
+    so an argparse default would make that key's ``RUN_ARGS`` entry unreachable. The real
     defaults are applied in :func:`main`, after the merge.
 
     Returns:
@@ -1255,6 +1615,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Where the histograms go. Default: beside the output file.")
     parser.add_argument("--max-histogram-samples", dest="max_histogram_samples", type=int,
                         help="Cap on the samples drawn for the histograms. Default: 50000.")
+    parser.add_argument("--quality-mask", dest="quality_mask",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="On a quality build, leave bridged samples and contaminated "
+                             "coefficients out of the sums. No effect on other files. Default: on.")
+    parser.add_argument("--quality-rho-epsilon", dest="quality_rho_epsilon", type=float,
+                        help="Contamination threshold in [0, 1): a coefficient with rho above it "
+                             "is excluded. Default: 0.1.")
     return parser
 
 
@@ -1267,6 +1634,8 @@ def main(
     plot_histograms: Optional[bool] = None,
     histograms_dir: Optional[str] = None,
     max_histogram_samples: Optional[int] = None,
+    quality_mask: Optional[bool] = None,
+    quality_rho_epsilon: Optional[float] = None,
 ) -> int:
     """Apply the defaults the parser is not allowed to carry, then accumulate and save.
 
@@ -1283,6 +1652,8 @@ def main(
         plot_histograms: Whether to write the histograms.
         histograms_dir: Where the histograms go.
         max_histogram_samples: Cap on the histogram sample draw.
+        quality_mask: Whether to apply the quality mask to a quality build.
+        quality_rho_epsilon: The contamination threshold $\\varepsilon$.
 
     Returns:
         The process exit code.
@@ -1309,6 +1680,10 @@ def main(
         histograms_dir=histograms_dir,
         max_histogram_samples=(
             50000 if max_histogram_samples is None else max_histogram_samples
+        ),
+        quality_mask=True if quality_mask is None else quality_mask,
+        quality_rho_epsilon=(
+            DEFAULT_QUALITY_RHO_EPSILON if quality_rho_epsilon is None else quality_rho_epsilon
         ),
     )
     return 0
@@ -1391,6 +1766,16 @@ RUN_ARGS: Dict[str, Any] = {
 
     # int | None -- cap on the samples drawn for the histograms.  (None -> 50000)
     "max_histogram_samples": None,
+
+    # bool | None -- on a quality build (root attribute quality_version), leave bridged samples
+    #        and contaminated coefficients out of the sums.  (None -> True)
+    #        No effect on a file without quality datasets. A list that mixes quality and
+    #        non-quality files is refused either way.
+    "quality_mask": None,
+
+    # float | None -- contamination threshold epsilon in [0, 1): a coefficient with
+    #        rho > epsilon is left out of the sums. Recorded in the output.  (None -> 0.1)
+    "quality_rho_epsilon": None,
 }
 
 

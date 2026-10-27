@@ -193,7 +193,8 @@ class LagCrossAttention(nn.Module):
         Args:
             h_y: Target state ``(B, T, d_model)``.
             h_u: Source state ``(B, T, d_model)``.
-            m_lag: Lag-validity mask ``(T, L)``.
+            m_lag: Key-validity mask in lag order: ``(T, L)``, shared by the batch, or
+                ``(B, T, L)``, per sample.
 
         Returns:
             The attended output, the attention weights in lag order, and the per-head summaries.
@@ -224,9 +225,17 @@ class LagCrossAttention(nn.Module):
         if self.lag_score_bias is not None:
             scores = scores + self.lag_score_bias.flip(-1)[None, None, :, :]
 
-        # Lag validity in window order: position j is valid iff t-(L-1-j) >= 0.
+        # Key validity in window order: position j holds lag L-1-j. A (T, L) mask is shared by
+        # the batch; a (B, T, L) one is per sample, e.g. the source-quality key mask.
         mask_window = m_lag.flip(-1).to(torch.bool)
-        scores = scores.masked_fill(~mask_window[None, :, None, :], float("-inf"))
+        if mask_window.dim() == 2:
+            mask_window = mask_window[None]
+        mask_window = mask_window[:, :, None, :]  # (1 or B, T, 1, L)
+        # A row with no valid key would be all -inf: NaN under softmax, and an index error inside
+        # entmax15. It is scored as all zeros here and its weights are zeroed below, which leaves
+        # every row with a valid key bitwise unchanged.
+        any_valid = mask_window.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~mask_window, float("-inf")).masked_fill(~any_valid, 0.0)
 
         # entmax ships no type stubs, hence the cast.
         alpha_window = (
@@ -234,10 +243,9 @@ class LagCrossAttention(nn.Module):
             if self.use_entmax
             else F.softmax(scores, dim=-1)
         )
-        # A row with no valid lag is all -inf, which normalises to NaN. Such rows exist by
-        # construction at t=0 under a restrictive band mask; zero is the right reading -- no lag
-        # was attended because none was available.
-        alpha_window = torch.nan_to_num(alpha_window, nan=0.0)
+        # A row with no valid key attends to nothing. Such rows exist by construction at t=0
+        # under a restrictive band mask, and wherever a source-quality mask removes every key.
+        alpha_window = alpha_window * any_valid
         alpha_window = self.attn_dropout(alpha_window)
 
         head_out = torch.einsum("btmj,btmdj->btmd", alpha_window, v_window)
@@ -259,9 +267,9 @@ class LagCrossAttention(nn.Module):
         Args:
             h_y: Target state ``(B, T, d_model)``.
             h_u: Source state ``(B, T, d_model)``.
-            m_lag: Optional lag-validity mask. ``(T, L)`` is preferred; a ``(B, T, L)`` mask is
-                accepted and collapsed, since it can only depend on ``(t, l)``. Built on the fly
-                when ``None``.
+            m_lag: Optional key-validity mask in lag order. ``(T, L)`` is shared by the batch;
+                ``(B, T, L)`` is applied per sample, which is how a source-quality mask removes
+                the keys of bad source steps. Built on the fly when ``None``.
 
         Returns:
             ``(A, alpha, a_heads)``: the attended output ``(B, T, d_model)``; the attention
@@ -270,8 +278,6 @@ class LagCrossAttention(nn.Module):
         """
         if m_lag is None:
             m_lag = self.build_lag_mask(h_y.shape[1], device=h_y.device)
-        elif m_lag.dim() == 3:
-            m_lag = m_lag[0]
         if self.grad_checkpoint and self.training:
             return cast(
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor],

@@ -68,6 +68,9 @@ Padding values (set in ``sequence_collate_fn``)::
     segment_indices -> -1
     all features    -> 0.0
     <block>_valid   -> False  (0.0 cast to bool; see _PAD_VALUES)
+    up_valid, fhr_valid -> False
+    <block>_rho     -> 1.0  (fully contaminated)
+    up_quality, fhr_quality -> 1  (the MISSING bit)
 
 Which coefficient blocks a sample carries depends on the file, not on this
 module: a two-sided dataset stores ``fhr_st``/``fhr_ph``/``fhr_up_ph``/
@@ -114,6 +117,8 @@ if not __package__ and _REPO_ROOT not in sys.path:
 from hdf5_dataset.hdf5_dataset import (
     CAUSAL,
     TWO_SIDED,
+    _QUALITY_BIT_FIELDS,
+    _RHO_FIELDS,
     CombinedHDF5Dataset,
     AttributeDict,
 )
@@ -135,9 +140,19 @@ _META_FIELDS = frozenset({
 # here would be the fragile option rather than the explicit one: the natural
 # thing to write is ``-1.0`` alongside ``target``, and ``-1.0`` cast to bool is
 # silently ``True`` — padding that claims every channel is valid.
+#
+# The quality fields follow the same rule: a padded segment was never recorded.
+# Its coefficients are fully contaminated ($\rho = 1$), and its samples carry
+# the ``MISSING`` bit (value 1), which both bit fields count as invalid. A pad
+# of 0 would read as clean data. ``up_valid``/``fhr_valid`` are boolean and
+# take ``_DEFAULT_PAD`` (``False``), like ``<block>_valid``, and so do the
+# ``ua_step_mask`` fields ``up_st_step_valid``/``up_ph_step_valid``.
+_QUALITY_MISSING_BIT = 1
 _PAD_VALUES: Dict[str, float] = {
     'target': -1.0,
     'weight': 0.0,
+    **{name: 1.0 for name in _RHO_FIELDS},
+    **{name: float(_QUALITY_MISSING_BIT) for name in _QUALITY_BIT_FIELDS},
 }
 _DEFAULT_PAD = 0.0
 _SEGMENT_INDICES_PAD = -1

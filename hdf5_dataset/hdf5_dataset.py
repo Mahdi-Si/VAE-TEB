@@ -1,7 +1,8 @@
 import os
 import h5py
 import numpy as np
-from typing import Union, Sequence, List, Tuple, Dict, Any, Optional, Iterable
+from typing import Union, Sequence, List, Tuple, Dict, Any, Optional, Iterable, FrozenSet, Mapping
+import json
 import torch
 from torch.utils.data import Dataset
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
@@ -39,6 +40,28 @@ _COEFFICIENT_FIELDS = frozenset(_SCATTERING_FIELDS + _PHASE_FIELDS)
 _RAW_FIELDS = ('fhr', 'up')
 #: Fields normalisation applies to: the coefficient blocks plus the raw signals.
 _NORMALISED_FIELDS = _COEFFICIENT_FIELDS | frozenset(_RAW_FIELDS)
+
+# A file built with the signal-quality step (root attribute ``quality_version``)
+# stores the bridged signals in ``fhr``/``up`` and adds the datasets below
+# (``hdf5_dataset/new_pipeline/create_new_pipeline.py``, ``quality_field_names``).
+# They are **opt-in**: ``load_fields=None`` never loads them, so a caller that
+# names no field reads a quality file exactly as it reads a file without them.
+# None of them is ever normalised.
+#
+#: Per-sample bit fields on the raw sample grid, one per raw signal.
+_QUALITY_BIT_FIELDS = tuple(f'{name}_quality' for name in _RAW_FIELDS)
+#: Per-sample signals before the fill, on the raw sample grid, in raw units.
+_QUALITY_RAW_FIELDS = tuple(f'{name}_raw' for name in _RAW_FIELDS)
+#: ``<block>_rho`` -> ``<block>``: the contamination $\rho \in [0, 1]$ of each
+#: coefficient, stored as $\mathrm{round}(s\,\rho)$ with $s$ = ``quality_rho_scale``
+#: in exactly the shape of its block.
+_RHO_FIELDS = {f'{name}_rho': name for name in sorted(_COEFFICIENT_FIELDS)}
+#: Per-segment scalars.
+_QUALITY_SEGMENT_FIELDS = ('fhr_valid_frac', 'up_valid_frac', 'up_censored_frac', 'fhr_repair_exact')
+_QUALITY_FIELDS = (
+    frozenset(_QUALITY_BIT_FIELDS + _QUALITY_RAW_FIELDS + _QUALITY_SEGMENT_FIELDS)
+    | frozenset(_RHO_FIELDS)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +149,7 @@ def resolve_phase_operator(attrs: Any) -> str:
 
 @dataclass(frozen=True)
 class _FileLayout:
-    """What one shard says about itself, read from attributes and shapes alone.
+    r"""What one shard says about itself, read from attributes and shapes alone.
 
     Costs one file open per path and reads no coefficient data. It exists
     because a list of files that disagree with each other is accepted silently
@@ -180,6 +203,17 @@ class _FileLayout:
             carry different *channel counts* as well as different vectors — so a
             consumer that resolves a channel budget must be able to see it
             without opening every file a second time.
+        quality_version: The root ``quality_version`` of a file built with the
+            signal-quality step, or ``None`` for a file built without it.
+        quality_attrs: Every root attribute whose name starts with
+            ``quality_`` (thresholds, look-ahead, $\rho$ scale, kernel digest),
+            in comparable form (see :func:`_comparable_attr`), or ``None``
+            without the step.
+        quality_bits: ``{bit field: {attribute: value}}`` for ``up_quality``
+            and ``fhr_quality``: the parsed ``bits`` map and the invalid-bit
+            masks, or ``None`` without the step.
+        quality_fields: The quality datasets the file stores; empty without
+            the step.
     """
 
     path: str
@@ -193,6 +227,115 @@ class _FileLayout:
     quantile: Optional[float]
     phase_operator: Optional[str] = None
     novelty_curve: Optional[Dict[str, np.ndarray]] = None
+    quality_version: Optional[int] = None
+    quality_attrs: Optional[Dict[str, Any]] = None
+    quality_bits: Optional[Dict[str, Dict[str, Any]]] = None
+    quality_fields: FrozenSet[str] = frozenset()
+
+
+def _comparable_attr(value: Any) -> Any:
+    """Turn one HDF5 attribute value into a plain value that ``==`` compares exactly.
+
+    Args:
+        value: The attribute as h5py returns it.
+
+    Returns:
+        A ``str`` for bytes, a ``tuple`` for an array, a Python scalar for a
+        NumPy scalar, and the value itself otherwise.
+    """
+    if isinstance(value, bytes):
+        return value.decode('utf-8')
+    if isinstance(value, np.ndarray):
+        return tuple(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _read_quality_layout(path: str, f: Any) -> Dict[str, Any]:
+    """Read the signal-quality part of one shard's self-description.
+
+    Args:
+        path: The file, for the error message.
+        f: The open file.
+
+    Returns:
+        The keyword arguments ``quality_version``, ``quality_attrs``,
+        ``quality_bits`` and ``quality_fields`` of :class:`_FileLayout`.
+
+    Raises:
+        ValueError: If the file stores quality datasets but no
+            ``quality_version``. The bit fields are then decoded against rules
+            nothing names.
+    """
+    fields = frozenset(name for name in _QUALITY_FIELDS if name in f)
+    version = f.attrs.get('quality_version')
+    if version is None:
+        if fields:
+            raise ValueError(
+                f"{path} stores the quality datasets {sorted(fields)} but no quality_version "
+                f"attribute, so the rules that wrote its bit fields are unknown."
+            )
+        return dict(quality_version=None, quality_attrs=None, quality_bits=None,
+                    quality_fields=fields)
+
+    attrs = {
+        key: _comparable_attr(value)
+        for key, value in f.attrs.items()
+        if key.startswith('quality_')
+    }
+    bits: Dict[str, Dict[str, Any]] = {}
+    for name in _QUALITY_BIT_FIELDS:
+        if name not in f:
+            continue
+        entry = {key: _comparable_attr(value) for key, value in f[name].attrs.items()}
+        if 'bits' in entry:
+            entry['bits'] = json.loads(entry['bits'])
+        bits[name] = entry
+    return dict(quality_version=int(version), quality_attrs=attrs, quality_bits=bits,
+                quality_fields=fields)
+
+
+@dataclass(frozen=True)
+class QualityInfo:
+    r"""What a signal-quality dataset says about its quality fields.
+
+    Read once from the first file; :func:`_check_layouts_agree` guarantees that
+    every file of the dataset agrees with it. Built fresh on every access of
+    :attr:`CombinedHDF5Dataset.quality_info`, so changing one does not change
+    the loader.
+
+    A UA sample is invalid where ``up_quality & up_invalid_bits != 0``. An FHR
+    sample of segment $i$ is invalid where ``fhr_quality & B != 0``, with
+    $B$ = ``fhr_invalid_bits_exact`` if ``fhr_repair_exact[i]`` else
+    ``fhr_invalid_bits_rules``.
+
+    Attributes:
+        version: The root ``quality_version``.
+        rho_scale: The root ``quality_rho_scale`` $s$; a stored $\rho$ field
+            holds $\mathrm{round}(s\,\rho)$. The loader already divides by it.
+        lookahead_s: The root ``quality_lookahead_s``.
+        kernel_digest: The root ``quality_kernel_digest``.
+        up_bits: UA bit name -> bit value.
+        up_invalid_bits: The UA bits that make a sample invalid.
+        fhr_bits: FHR bit name -> bit value.
+        fhr_invalid_bits_exact: The FHR invalid bits of a segment whose repair
+            mask came from the raw channel.
+        fhr_invalid_bits_rules: The FHR invalid bits of a segment where the
+            rules stood in for that mask.
+        attrs: Every root ``quality_*`` attribute, thresholds included.
+    """
+
+    version: int
+    rho_scale: int
+    lookahead_s: float
+    kernel_digest: str
+    up_bits: Dict[str, int]
+    up_invalid_bits: int
+    fhr_bits: Dict[str, int]
+    fhr_invalid_bits_exact: int
+    fhr_invalid_bits_rules: int
+    attrs: Dict[str, Any]
 
 
 def _read_file_layout(path: str) -> _FileLayout:
@@ -209,6 +352,7 @@ def _read_file_layout(path: str) -> _FileLayout:
             are missing or disagree with the channel axis they describe. Those
             attributes are all-or-nothing: a partially-attributed causal file
             would silently give some blocks a valid region and others none.
+            Also if the file stores quality datasets but no ``quality_version``.
     """
     with h5py.File(path, 'r', libver='latest') as f:
         transform = resolve_transform(f.attrs)
@@ -267,6 +411,7 @@ def _read_file_layout(path: str) -> _FileLayout:
                         f"axis than the data, so no channel's validity can be trusted."
                     )
                 warmup[name] = vector
+        quality = _read_quality_layout(path, f)
     return _FileLayout(
         path=path,
         transform=transform,
@@ -279,6 +424,7 @@ def _read_file_layout(path: str) -> _FileLayout:
         quantile=None if quantile is None else float(quantile),
         phase_operator=phase_operator,
         novelty_curve=curve,
+        **quality,
     )
 
 
@@ -295,8 +441,10 @@ def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
         reference: The shard every other one must agree with.
 
     Raises:
-        ValueError: On a disagreement about variant, leg alignment, block set
-            or a block width, naming both files and the disagreement.
+        ValueError: On a disagreement about variant, leg alignment, block set,
+            a block width or the signal-quality step (see
+            :func:`_check_quality_layouts_agree`), naming both files and the
+            disagreement.
     """
     if layout.transform != reference.transform:
         raise ValueError(
@@ -336,6 +484,70 @@ def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
                 f"Mismatched '{name}' width: {layout.path} stores {width} channels but "
                 f"{reference.path} stores {reference.widths[name]}."
             )
+    _check_quality_layouts_agree(layout, reference)
+
+
+def _check_quality_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
+    r"""Refuse two shards whose signal-quality step differs.
+
+    A quality build stores the bridged signals in ``fhr``/``up`` and computes
+    every coefficient from them, so beside a build without the step it holds
+    different data under the same names. Two quality builds with different
+    rules, thresholds or kernels decode their bit fields and $\rho$ differently.
+
+    Args:
+        layout: The shard being checked.
+        reference: The shard every other one must agree with.
+
+    Raises:
+        ValueError: On a quality file beside a non-quality file, or on a
+            disagreement about ``quality_version``, a root ``quality_*``
+            attribute, the bit-field attributes or the set of quality datasets.
+    """
+    if (layout.quality_version is None) != (reference.quality_version is None):
+        with_step, without = (
+            (layout, reference) if layout.quality_version is not None else (reference, layout)
+        )
+        raise ValueError(
+            f"Mixed quality and non-quality files in one dataset: {with_step.path} was built "
+            f"with the signal-quality step (quality_version={with_step.quality_version}) but "
+            f"{without.path} was not. The first stores bridged signals in fhr/up and coefficients "
+            f"computed from them, so the two hold different data under the same names; build one "
+            f"dataset per kind."
+        )
+    if layout.quality_version is None:
+        return
+    if layout.quality_version != reference.quality_version:
+        raise ValueError(
+            f"Mixed quality versions in one dataset: {layout.path} has quality_version="
+            f"{layout.quality_version} but {reference.path} has {reference.quality_version}. "
+            f"Their bit fields were written by different rules."
+        )
+    layout_attrs = layout.quality_attrs or {}
+    reference_attrs = reference.quality_attrs or {}
+    differing = sorted(
+        key for key in set(layout_attrs) | set(reference_attrs)
+        if layout_attrs.get(key) != reference_attrs.get(key)
+    )
+    if differing:
+        raise ValueError(
+            f"Mismatched quality attributes {differing} between {layout.path} and "
+            f"{reference.path}. Their invalid spans, bridges and rho were computed with "
+            f"different thresholds or kernels."
+        )
+    if layout.quality_bits != reference.quality_bits:
+        raise ValueError(
+            f"Mismatched quality bit-field attributes between {layout.path} and "
+            f"{reference.path}: {layout.quality_bits} against {reference.quality_bits}. One bit "
+            f"value would then mean different things depending on the file."
+        )
+    if layout.quality_fields != reference.quality_fields:
+        raise ValueError(
+            f"Mismatched quality datasets: {layout.path} is missing "
+            f"{sorted(reference.quality_fields - layout.quality_fields)} and adds "
+            f"{sorted(layout.quality_fields - reference.quality_fields)} relative to "
+            f"{reference.path}."
+        )
 
 
 def _resolve_dataset_layout(paths: Sequence[str]) -> Optional[_FileLayout]:
@@ -358,8 +570,9 @@ def _resolve_dataset_layout(paths: Sequence[str]) -> Optional[_FileLayout]:
         agrees with, or ``None`` if none could be read.
 
     Raises:
-        ValueError: On the first file that disagrees about variant, block set
-            or a block width, naming the file and the disagreement.
+        ValueError: On the first file that disagrees about variant, block set,
+            a block width or the signal-quality step, naming the file and the
+            disagreement.
     """
     reference: Optional[_FileLayout] = None
     for path in paths:
@@ -716,7 +929,7 @@ def normalize_tensor_data(
     normalize_fields: Optional[set] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """
+    r"""
     Normalizes a tensor using precomputed statistics from a stats dictionary.
 
     This function can be used independently of the CombinedHDF5Dataset class.
@@ -734,8 +947,12 @@ def normalize_tensor_data(
         dtype: The torch dtype for the tensors.
 
     Returns:
-        The normalized data tensor.
+        The normalized data tensor. A signal-quality field (bit codes, raw
+        units, $\rho$, per-segment scalars) is returned unchanged even if the
+        stats and ``normalize_fields`` name it.
     """
+    if field_name in _QUALITY_FIELDS:
+        return data
     if field_name not in normalization_stats:
         return data
 
@@ -1089,7 +1306,7 @@ class AttributeDict(dict):
 
 
 class CombinedHDF5Dataset(Dataset):
-    """
+    r"""
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
 
     Nothing in this class depends on a particular channel count: widths come
@@ -1146,9 +1363,38 @@ class CombinedHDF5Dataset(Dataset):
     - Advanced filtering and selective loading
     - Data normalization using precomputed statistics with optimal coefficient selection
 
+    **Signal-quality fields are opt-in.** A file built with the signal-quality
+    step (root ``quality_version``) stores the bridged signals in ``fhr``/``up``
+    and adds quality datasets beside them. ``load_fields=None`` loads every
+    field **except** those, so a caller that names no field gets the same keys
+    from a quality file as from a file without the step. A quality field loads
+    only when ``load_fields`` names it, and then comes out as follows, with
+    $L$ the trimmed raw length (4800 at ``trim_minutes=1.0``) and $T$, $C$ the
+    trimmed steps and channels of the block:
+
+    ======================================  ==========  =======================
+    Field                                   Shape       dtype
+    ======================================  ==========  =======================
+    ``up_quality``                          $(L,)$      ``int32`` (stored uint16)
+    ``fhr_quality``                         $(L,)$      ``uint8``
+    ``up_raw``, ``fhr_raw``                 $(L,)$      ``dtype``, raw units
+    ``<block>_rho``                         $(T, C)$    ``dtype``, $\rho \in [0, 1]$
+    ``up_valid_frac``, ``fhr_valid_frac``,  $()$        ``dtype``
+    ``up_censored_frac``
+    ``fhr_repair_exact``                    $()$        ``bool``
+    ======================================  ==========  =======================
+
+    Each is trimmed like the field it describes, and none is ever normalised,
+    whatever ``normalize_fields`` says. The bit fields keep their integer codes;
+    :attr:`quality_info` holds the bit names and the invalid-bit masks, and
+    ``emit_quality_mask`` decodes them into ``up_valid``/``fhr_valid``.
+
     Args:
         paths: Path(s) to HDF5 file(s).
-        load_fields: Specific fields to load (None loads all). Target and weight are always included.
+        load_fields: Specific fields to load. ``None`` loads every stored field
+            except the signal-quality fields above. Naming a quality field that
+            the files do not store raises at construction; any other missing
+            field is skipped.
         allowed_guids: Only samples with these GUIDs are included.
         cs_label: Filter by cs_label value (True/False/None for no filtering).
         bg_label: Filter by bg_label value (True/False/None for no filtering).
@@ -1168,6 +1414,35 @@ class CombinedHDF5Dataset(Dataset):
             collate and per host-to-device copy is only worth it for a model
             that consumes it batched. A model that does not can read
             :meth:`channel_valid_mask` once instead. Causal datasets only.
+        emit_quality_mask: Add ``up_valid`` and ``fhr_valid`` to every sample:
+            $(L,)$ bool on the trimmed raw grid, ``True`` where the sample is
+            valid. UA is valid where ``up_quality & up_invalid_bits == 0``; FHR
+            uses ``fhr_invalid_bits_exact`` or ``fhr_invalid_bits_rules`` per
+            segment, by ``fhr_repair_exact``. The bit fields need not be in
+            ``load_fields``. Default off. Signal-quality datasets only.
+        ua_step_mask: Add ``up_st_step_valid`` and ``up_ph_step_valid`` to every
+            sample that loads ``up_st`` / ``up_ph``: $(T, C)$ bool on the block's
+            own step grid, ``True`` where the coefficient is usable. A mapping
+            with three keys, all optional:
+
+            * ``bits`` -- UA bit names (``up_quality``'s ``bits`` attribute,
+              e.g. ``["TRANSIENT", "HOLD"]``; ``"invalid"`` is the file's
+              invalid set), OR-joined. Stored step $k$ reads raw sample $16k$,
+              so step $k$ is bad when any of the raw samples
+              $16k - 15, \dots, 16k$ carries one of the bits: the last 4 s it
+              reads, never a sample after it. One value for every channel.
+            * ``rho_epsilon`` -- a coefficient is bad when its stored
+              contamination $\rho > \varepsilon$. Per channel, and it covers
+              each coefficient's whole causal window, but the build computed
+              $\rho$ from the full invalid set only, so it cannot express a
+              subset of the bits.
+            * ``hold_steps`` -- extend each step the ``bits`` rule marks bad
+              forward by this many steps, a rough stand-in for the memory of
+              the coefficients. Default ``0``. Does not apply to $\rho$.
+
+            The two rules are OR-joined. ``None``, the default, emits nothing,
+            and so does a mapping that sets neither rule: that is how a config
+            variant turns an inherited mask off. Signal-quality datasets only.
     """
     def __init__(
         self,
@@ -1186,6 +1461,8 @@ class CombinedHDF5Dataset(Dataset):
         normalize_fields: Optional[Sequence[str]] = None,
         trim_minutes: Optional[float] = None,
         emit_validity_mask: bool = False,
+        emit_quality_mask: bool = False,
+        ua_step_mask: Optional[Mapping[str, Any]] = None,
     ):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.load_fields = None if load_fields is None else set(load_fields)
@@ -1202,6 +1479,8 @@ class CombinedHDF5Dataset(Dataset):
         self.normalize_fields = set(normalize_fields) if normalize_fields is not None else None
         self.trim_minutes = trim_minutes
         self.emit_validity_mask = emit_validity_mask
+        self.emit_quality_mask = emit_quality_mask
+        self.ua_step_mask = None if ua_step_mask is None else dict(ua_step_mask)
         self.trim_samples_raw, self.trim_samples_decimated = decimated_trim_steps(
             self.trim_minutes
         )
@@ -1255,6 +1534,14 @@ class CombinedHDF5Dataset(Dataset):
                 f"could emit is all-True — which would assert that every step of every channel "
                 f"is honest about the past, the very thing the causal variant exists to fix."
             )
+
+        # The quality fields this dataset may serve, checked before any sample is read.
+        self._check_quality_request()
+        self._ua_step_rule: Optional[Tuple[int, Optional[float], int]] = (
+            self._resolve_ua_step_mask()
+        )
+        #: The statistics file's root ``quality_rho_epsilon``; set by `_check_stats_pairing`.
+        self.stats_quality_rho_epsilon: Optional[float] = None
 
         # Load normalization statistics if provided
         if self.stats_path is not None:
@@ -1402,6 +1689,242 @@ class CombinedHDF5Dataset(Dataset):
         self._valid_mask_cache[field] = mask
         return mask
 
+    # ------------------------------------------------------------------
+    # Signal quality
+    # ------------------------------------------------------------------
+    def _check_quality_request(self) -> None:
+        """Refuse a quality field or mask the files do not store.
+
+        A missing ordinary field is skipped per sample. A missing quality field
+        is refused here instead: a caller that names one is building on it, and
+        a sample without it would surface as a ``KeyError`` far from the cause.
+
+        Raises:
+            ValueError: If ``load_fields`` names a quality field, or
+                ``emit_quality_mask`` is set, and the files do not store the
+                datasets that needs.
+        """
+        if self._layout is None:
+            return  # no readable file; the index build reports that
+        requested = set() if self.load_fields is None else self.load_fields & _QUALITY_FIELDS
+        if self.emit_quality_mask:
+            requested |= set(_QUALITY_BIT_FIELDS) | {'fhr_repair_exact'}
+        missing = sorted(requested - self._layout.quality_fields)
+        if not missing:
+            return
+        if self._layout.quality_version is None:
+            reason = (
+                f"these files were built without the signal-quality step (no quality_version "
+                f"attribute in {self._layout.path})"
+            )
+        else:
+            reason = (
+                f"{self._layout.path} (quality_version={self._layout.quality_version}) does not "
+                f"store them"
+            )
+        raise ValueError(
+            f"Requested signal-quality fields {missing} "
+            f"{'(emit_quality_mask=True) ' if self.emit_quality_mask else ''}but {reason}. Build "
+            f"the dataset with signal_quality=True, or do not request them."
+        )
+
+    @property
+    def quality_info(self) -> Optional[QualityInfo]:
+        r"""The bit maps, invalid-bit masks and $\rho$ scale of a quality dataset, or ``None``.
+
+        Returns:
+            A fresh :class:`QualityInfo` read from the first file, or ``None``
+            for a dataset built without the signal-quality step.
+        """
+        layout = self._layout
+        if layout is None or layout.quality_version is None:
+            return None
+        attrs = dict(layout.quality_attrs or {})
+        bits = layout.quality_bits or {}
+        up = bits.get('up_quality', {})
+        fhr = bits.get('fhr_quality', {})
+        return QualityInfo(
+            version=layout.quality_version,
+            rho_scale=int(attrs['quality_rho_scale']),
+            lookahead_s=float(attrs['quality_lookahead_s']),
+            kernel_digest=str(attrs.get('quality_kernel_digest', '')),
+            up_bits=dict(up.get('bits', {})),
+            up_invalid_bits=int(up['invalid_bits']),
+            fhr_bits=dict(fhr.get('bits', {})),
+            fhr_invalid_bits_exact=int(fhr['invalid_bits_exact']),
+            fhr_invalid_bits_rules=int(fhr['invalid_bits_rules']),
+            attrs=attrs,
+        )
+
+    def _raw_window(self) -> slice:
+        """The slice of the raw sample grid this dataset serves."""
+        if self.trim_minutes is None:
+            return slice(None)
+        trim = self.trim_samples_raw
+        return slice(trim, -trim if trim > 0 else None)
+
+    def _step_window(self) -> slice:
+        """The slice of the decimated step grid this dataset serves."""
+        if self.trim_minutes is None:
+            return slice(None)
+        trim = self.trim_samples_decimated
+        return slice(trim, -trim if trim > 0 else None)
+
+    def _load_quality_field(self, f: Any, name: str, sample_idx: int) -> torch.Tensor:
+        r"""Read one signal-quality field of one segment, trimmed, never normalised.
+
+        Args:
+            f: The open file.
+            name: A member of ``_QUALITY_FIELDS``.
+            sample_idx: The segment's row in ``f``.
+
+        Returns:
+            The tensor listed in the class docstring for ``name``.
+        """
+        if name in _RHO_FIELDS:
+            stored = f[name][sample_idx][:, self._step_window()]
+            scale = float(self._layout.quality_attrs['quality_rho_scale'])
+            rho = self._create_tensor(stored.astype(np.float32) / np.float32(scale))
+            return rho.transpose(0, 1)  # (C, T) -> (T, C), like its block
+        if name == 'fhr_repair_exact':
+            return torch.tensor(bool(f[name][sample_idx]))
+        if name in _QUALITY_SEGMENT_FIELDS:
+            return self._create_tensor(np.asarray(f[name][sample_idx]))
+        stored = f[name][sample_idx][self._raw_window()]
+        if name == 'up_quality':
+            # torch has few uint16 kernels; int32 holds every uint16 code exactly.
+            return torch.from_numpy(stored.astype(np.int32))
+        if name == 'fhr_quality':
+            return torch.from_numpy(np.ascontiguousarray(stored, dtype=np.uint8))
+        return self._create_tensor(stored)  # *_raw: raw units in self.dtype
+
+    def _quality_masks(self, f: Any, sample_idx: int) -> Dict[str, torch.Tensor]:
+        """Decode the bit fields of one segment into ``up_valid`` and ``fhr_valid``.
+
+        Args:
+            f: The open file.
+            sample_idx: The segment's row in ``f``.
+
+        Returns:
+            ``{'up_valid': (L,) bool, 'fhr_valid': (L,) bool}``, ``True`` = valid.
+        """
+        info = self._layout.quality_bits
+        window = self._raw_window()
+        up_bits = f['up_quality'][sample_idx][window]
+        fhr_bits = f['fhr_quality'][sample_idx][window]
+        fhr_invalid = (
+            info['fhr_quality']['invalid_bits_exact']
+            if bool(f['fhr_repair_exact'][sample_idx])
+            else info['fhr_quality']['invalid_bits_rules']
+        )
+        return {
+            'up_valid': torch.from_numpy(
+                (up_bits.astype(np.int64) & int(info['up_quality']['invalid_bits'])) == 0
+            ),
+            'fhr_valid': torch.from_numpy((fhr_bits.astype(np.int64) & int(fhr_invalid)) == 0),
+        }
+
+    def _resolve_ua_step_mask(self) -> Optional[Tuple[int, Optional[float], int]]:
+        r"""Validate ``ua_step_mask`` against the files and resolve it.
+
+        Returns:
+            ``(bit_mask, rho_epsilon, hold_steps)``, or ``None`` when the mask is off: no
+            mapping, or one that names no bit and sets no ``rho_epsilon``. ``bit_mask`` is ``0``
+            when no bit is named.
+
+        Raises:
+            ValueError: On an unknown key or bit name, a value out of range, or files that do not
+                store what the rules read.
+        """
+        spec = self.ua_step_mask
+        if spec is None or (not spec.get('bits') and spec.get('rho_epsilon') is None):
+            return None
+        unknown = sorted(set(spec) - {'bits', 'rho_epsilon', 'hold_steps'})
+        if unknown:
+            raise ValueError(
+                f"ua_step_mask has unknown keys {unknown}; use bits, rho_epsilon and hold_steps."
+            )
+        layout = self._layout
+        if layout is None or layout.quality_version is None:
+            raise ValueError(
+                "ua_step_mask needs a signal-quality build (root attribute quality_version); "
+                f"{self.paths[0]} has none. Build the dataset with signal_quality=True."
+            )
+        names = spec.get('bits')
+        names = [names] if isinstance(names, str) else list(names or [])
+        up = (layout.quality_bits or {}).get('up_quality', {})
+        known = {str(name).upper(): int(value) for name, value in up.get('bits', {}).items()}
+        bit_mask = 0
+        for name in names:
+            key = str(name).upper()
+            if key == 'INVALID':
+                bit_mask |= int(up['invalid_bits'])
+            elif key in known:
+                bit_mask |= known[key]
+            else:
+                raise ValueError(
+                    f"ua_step_mask.bits names {name!r}, which up_quality does not define. Use "
+                    f"any of {sorted(known)} or 'invalid'."
+                )
+        epsilon = spec.get('rho_epsilon')
+        if epsilon is not None:
+            epsilon = float(epsilon)
+            if not 0.0 <= epsilon < 1.0:
+                raise ValueError(f"ua_step_mask.rho_epsilon must be in [0, 1), got {epsilon}.")
+        hold = int(spec.get('hold_steps') or 0)
+        if hold < 0:
+            raise ValueError(f"ua_step_mask.hold_steps must be >= 0, got {hold}.")
+        needed = ({'up_quality'} if bit_mask else set()) | (
+            {'up_st_rho', 'up_ph_rho'} if epsilon is not None else set()
+        )
+        missing = sorted(needed - layout.quality_fields)
+        if missing:
+            raise ValueError(
+                f"ua_step_mask reads {missing}, which {layout.path} does not store."
+            )
+        return bit_mask, epsilon, hold
+
+    def _ua_step_masks(self, f: Any, sample_idx: int, blocks: Sequence[str]) -> Dict[str, torch.Tensor]:
+        r"""Build ``<block>_step_valid`` for the UA blocks this sample loaded.
+
+        The bit rule is evaluated on the untrimmed grid and trimmed afterwards, so the first served
+        step reads the four seconds before it rather than a window cut short by the trim, and a
+        held step that started in the trimmed lead-in still reaches the served window.
+
+        Args:
+            f: The open file.
+            sample_idx: The segment's row in ``f``.
+            blocks: The UA coefficient blocks present in the sample.
+
+        Returns:
+            ``{f'{block}_step_valid': (T, C) bool}`` per block, ``True`` = usable.
+        """
+        assert self._ua_step_rule is not None
+        bit_mask, epsilon, hold = self._ua_step_rule
+        steps = int(f[blocks[0]].shape[-1])
+        step_bad = np.zeros(steps, dtype=bool)
+        if bit_mask:
+            bad = (f['up_quality'][sample_idx].astype(np.int64) & bit_mask) != 0
+            # Step k reads raw sample D*k, so its window is samples D*k-(D-1) .. D*k: padding
+            # D-1 clean samples in front puts that window at [D*k, D*k + D) of the padded row.
+            padded = np.concatenate([np.zeros(DECIMATION - 1, dtype=bool), bad])
+            step_bad = padded[: steps * DECIMATION].reshape(steps, DECIMATION).any(axis=1)
+            if hold:
+                held = step_bad.copy()
+                for shift in range(1, hold + 1):
+                    held[shift:] |= step_bad[:-shift]
+                step_bad = held
+        step_bad = step_bad[self._step_window()]
+        out: Dict[str, torch.Tensor] = {}
+        for block in blocks:
+            bad = np.broadcast_to(step_bad[:, None], (step_bad.size, int(f[block].shape[1])))
+            if epsilon is not None:
+                stored = f[f'{block}_rho'][sample_idx][:, self._step_window()]
+                scale = float(self._layout.quality_attrs['quality_rho_scale'])
+                bad = bad | (stored.astype(np.float64) / scale > epsilon).T
+            out[f'{block}_step_valid'] = torch.from_numpy(np.ascontiguousarray(~bad))
+        return out
+
     def _check_stats_pairing(self) -> None:
         """Refuse a stats file that describes a different dataset than this one.
 
@@ -1424,15 +1947,23 @@ class CombinedHDF5Dataset(Dataset):
         identical widths, so a stats file built on one and paired with the
         other passes every other test here.
 
+        The signal-quality step is compared the same way: the stats file's root
+        ``quality_version`` must equal the data files' one, with an absent
+        attribute read as ``None`` on both sides. Old statistics beside old data
+        is ``None == None`` and passes. The stats file's ``quality_rho_epsilon``
+        (``None`` when absent) is kept as ``stats_quality_rho_epsilon``.
+
         Raises:
-            ValueError: On a variant or leg-alignment mismatch, or on a block
-                whose channel count disagrees with the stats file's.
+            ValueError: On a quality, variant or leg-alignment mismatch, or on
+                a block whose channel count disagrees with the stats file's.
         """
         try:
             with h5py.File(self.stats_path, 'r') as f:
                 stats_transform = resolve_transform(f.attrs)
                 stats_alignment = resolve_leg_alignment(f.attrs)
                 stats_operator = resolve_phase_operator(f.attrs)
+                stats_quality = f.attrs.get('quality_version')
+                stats_rho_epsilon = f.attrs.get('quality_rho_epsilon')
                 stats_widths = {
                     field: int(f[field].attrs['n_channels'])
                     for field in f.keys()
@@ -1443,6 +1974,25 @@ class CombinedHDF5Dataset(Dataset):
             # how this class answers one is not this check's business: the load
             # below hits the same error and warns exactly as it always has.
             return
+
+        stats_quality = None if stats_quality is None else int(stats_quality)
+        self.stats_quality_rho_epsilon = (
+            None if stats_rho_epsilon is None else float(stats_rho_epsilon)
+        )
+        if self._layout is not None and stats_quality != self._layout.quality_version:
+            def describe(version: Optional[int]) -> str:
+                return (
+                    "built without the signal-quality step" if version is None
+                    else f"a signal-quality build with quality_version={version}"
+                )
+
+            raise ValueError(
+                f"Statistics/dataset quality mismatch: {self.stats_path} was computed over "
+                f"{describe(stats_quality)}, but {self._layout.path} is "
+                f"{describe(self._layout.quality_version)}. A quality build stores bridged "
+                f"fhr/up and coefficients computed from them, so the constants do not describe "
+                f"this data. Recompute the statistics for this build."
+            )
 
         if stats_transform != self.transform:
             raise ValueError(
@@ -1507,9 +2057,9 @@ class CombinedHDF5Dataset(Dataset):
                      warnings.warn(f"Stats file was created with trim_minutes={stats_trim_minutes}, but dataset is not using trimming. Normalization might be incorrect.")
 
                 for field in f.keys():
-                    if field == 'metadata':
-                        continue
-                    
+                    if field == 'metadata' or field in _QUALITY_FIELDS:
+                        continue  # a quality field is never normalised
+
                     field_group = f[field]
                     field_stats = {
                         'shape': tuple(field_group.attrs['shape']),
@@ -1791,7 +2341,8 @@ class CombinedHDF5Dataset(Dataset):
         # Determine fields to load
         available_fields = self._get_sample_fields(file_idx)
         if self.load_fields is None:
-            fields = list(available_fields)
+            # Quality fields are opt-in: see the class docstring.
+            fields = [name for name in available_fields if name not in _QUALITY_FIELDS]
         else:
             fields = list(self.load_fields)
 
@@ -1803,21 +2354,21 @@ class CombinedHDF5Dataset(Dataset):
                 if name not in available_fields:
                     continue
 
+                if name in _QUALITY_FIELDS:
+                    # Own path: trimmed like the field it describes, no float cast of
+                    # the bit codes, no normalisation.
+                    out[name] = self._load_quality_field(f, name, sample_idx)
+                    continue
+
                 data = f[name][sample_idx]
 
                 if self.trim_minutes is not None:
                     if name in _RAW_FIELDS:
-                        start_trim = self.trim_samples_raw
-                        end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
-                        data = data[start_trim:end_trim]
+                        data = data[self._raw_window()]
                     elif name in _COEFFICIENT_FIELDS:
-                        start_trim = self.trim_samples_decimated
-                        end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
-                        data = data[:, start_trim:end_trim]
+                        data = data[:, self._step_window()]
                     elif name in ['target', 'weight']:
-                        start_trim = self.trim_samples_decimated
-                        end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
-                        data = data[start_trim:end_trim]
+                        data = data[self._step_window()]
 
                 if name in ('guid',):
                     out[name] = data.decode('utf-8') if isinstance(data, bytes) else str(data)
@@ -1853,6 +2404,14 @@ class CombinedHDF5Dataset(Dataset):
             for name in sorted(_COEFFICIENT_FIELDS):
                 if name in out:
                     out[f"{name}_valid"] = self.channel_valid_mask(name)
+
+        if self.emit_quality_mask:
+            out.update(self._quality_masks(f, sample_idx))
+
+        if self._ua_step_rule is not None:
+            blocks = [name for name in ('up_st', 'up_ph') if name in out]
+            if blocks:
+                out.update(self._ua_step_masks(f, sample_idx, blocks))
 
         out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
         out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))

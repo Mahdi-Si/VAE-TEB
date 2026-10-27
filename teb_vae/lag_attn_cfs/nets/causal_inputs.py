@@ -105,6 +105,7 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "target_forecast_shift",
     "target_scored_horizon",
     "forecast_ar_residual",
+    "source_quality_mask",
 )
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
@@ -181,6 +182,7 @@ class CausalWarmupInputs:
         anchor_stride: int,
         lag_floor: int,
         target_forecast_shift: Optional[Sequence[int]] = None,
+        source_quality_mask: bool = False,
     ) -> None:
         r"""Validate this mixin's keywords and set them, **before** the base constructor runs.
 
@@ -207,6 +209,11 @@ class CausalWarmupInputs:
                 ``None`` (or all zeros) is each channel's own stored index, which every run before
                 the keyword existed scored. A tuple rather than a buffer because it is set before
                 the module machinery exists; the target-side mixin turns it into indices per call.
+            source_quality_mask: Require a per-sample source-validity mask in every forward
+                (``source_valid``) and apply it: bad source steps are removed from the lag keys,
+                and an anchor with no valid key keeps its posterior on the prior. ``False``, the
+                default, refuses the mask and builds a model bitwise identical to one built before
+                the keyword existed. It adds no parameter and no buffer.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, if
@@ -222,6 +229,7 @@ class CausalWarmupInputs:
             )
         if int(lag_floor) < 0:
             raise ValueError(f"lag_floor must be >= 0, got {lag_floor}")
+        self.source_quality_mask = bool(source_quality_mask)
 
         # The two vectors are positional against their keep-indices, and the adapters are told
         # apart by which gate they were built for -- so a warm-up arriving without its keep-index
@@ -809,6 +817,7 @@ class CausalWarmupInputs:
         u_stream: torch.Tensor,
         anchor_phase: Optional[Union[int, torch.Tensor]] = None,
         anchor_stride: Optional[int] = None,
+        source_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         r"""Run the full pipeline, decoding a tiled anchor set.
 
@@ -835,6 +844,9 @@ class CausalWarmupInputs:
             anchor_phase: $\varphi$ per sample; see :meth:`_build_anchor_index`. Required once the
                 resolved stride exceeds $1$.
             anchor_stride: $S$; ``None`` uses the model's configured stride.
+            source_valid: Under ``source_quality_mask`` only, and required there: which source
+                values are usable, ``(B, T)`` per step or ``(B, T, c_u)`` per declared channel,
+                ``True`` = usable. See :meth:`source_key_mask` for how it becomes a key mask.
 
         Returns:
             The base's twenty keys, with ``mu_base``, ``logvar_base``, ``mu_full`` and
@@ -848,8 +860,18 @@ class CausalWarmupInputs:
               **only** under ``persistence_residual``. Present so a control re-decoding this
               forward's latents carries the same target-only tensor the forward decoded with.
             * ``event_gate`` -- the posterior event gate $(B, T, 1)$, **only** under
-              ``posterior_event_gate``; the objective charges it and the readouts plot it.
+              ``posterior_event_gate``; the objective charges it and the readouts plot it. Under
+              ``source_quality_mask`` it is the effective gate $g_t \cdot o_t$.
+            * ``source_key_mask`` -- the key mask $K$ $(B, T, L)$ in lag order, and
+              ``source_open`` -- $o_t = \exists \ell: K_{t\ell}$, $(B, T)$ -- **only** under
+              ``source_quality_mask``. Returned so every control that re-attends this forward's
+              source applies the same mask.
+
+        Raises:
+            ValueError: If ``source_valid`` is missing under ``source_quality_mask``, given without
+                it, or of the wrong shape.
         """
+        self._check_source_valid(source_valid, u_stream)
         anchor_index, anchor_valid = self._build_anchor_index(
             batch=int(y_st.shape[0]),
             device=y_st.device,
@@ -908,15 +930,21 @@ class CausalWarmupInputs:
             if self.query_uses_logvar
             else mu_prior
         )
-        _, alpha, attended_heads = self.lag_attn(
-            self.query_proj(query), h_u, self.build_lag_mask(h_u.shape[1], h_u.device)
-        )
+        key_mask = self.build_lag_mask(h_u.shape[1], h_u.device)
+        source_open: Optional[torch.Tensor] = None
+        if source_valid is not None:
+            key_mask = self.source_key_mask(source_valid, key_mask, u_stream.dtype)
+            source_open = key_mask.any(dim=-1)
+        _, alpha, attended_heads = self.lag_attn(self.query_proj(query), h_u, key_mask)
 
         # The event gate, when the model built one: computed from the attended summary and
         # threaded into the head so it can be returned and charged. ``None`` otherwise.
         event_gate = self.posterior_head.event_gate_values(attended_heads)
+        gate = event_gate
+        if source_open is not None:
+            gate, event_gate = self._close_gate(event_gate, source_open, attended_heads.dtype)
         mu_post, logvar_post = self.posterior_head(
-            h_y, attended_heads, mu_prior, raw_logvar_prior, gate=event_gate
+            h_y, attended_heads, mu_prior, raw_logvar_prior, gate=gate
         )
         z_prior, z_post = self._reparameterize_shared(
             mu_prior, logvar_prior, mu_post, logvar_post
@@ -988,7 +1016,110 @@ class CausalWarmupInputs:
         if event_gate is not None:
             # Present only under ``posterior_event_gate``, for the reason ``persistence`` is.
             outputs["event_gate"] = event_gate
+        if source_open is not None:
+            # Present only under ``source_quality_mask``, for the reason ``persistence`` is.
+            outputs["source_key_mask"] = key_mask
+            outputs["source_open"] = source_open
         return outputs
+
+    # ------------------------------------------------------------------
+    # The source-quality mask
+    def _check_source_valid(
+        self, source_valid: Optional[torch.Tensor], u_stream: torch.Tensor
+    ) -> None:
+        """Refuse a source-validity mask that disagrees with ``source_quality_mask`` or the stream.
+
+        A model trained with the mask and run without it, or the reverse, would report a
+        plausible number from a posterior it was never trained to be, so both directions raise.
+
+        Raises:
+            ValueError: As :meth:`forward` documents.
+        """
+        enabled = getattr(self, "source_quality_mask", False)
+        if source_valid is None:
+            if enabled:
+                raise ValueError(
+                    "source_quality_mask is on, so every forward needs source_valid: the source "
+                    "steps the dataset's ua_step_mask marks usable. A caller that builds the "
+                    "inputs itself must pass it as the sixth argument."
+                )
+            return
+        if not enabled:
+            raise ValueError(
+                "source_valid was given to a model built without source_quality_mask. Build the "
+                "model with source_quality_mask=True to apply it."
+            )
+        batch, steps, width = (int(n) for n in u_stream.shape)
+        shape = tuple(source_valid.shape)
+        if shape not in ((batch, steps), (batch, steps, width)):
+            raise ValueError(
+                f"source_valid has shape {shape}; expected ({batch}, {steps}) per step or "
+                f"({batch}, {steps}, {width}) per declared source channel."
+            )
+
+    def source_key_mask(
+        self,
+        source_valid: torch.Tensor,
+        lag_mask: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        r"""Turn a source-validity mask into the per-sample key mask of the lag attention.
+
+        A per-channel mask is first passed through the source gate, so it is gathered to the
+        surviving channels and delayed by each channel's $d_c$ exactly as the values are. A step
+        is usable only if every surviving channel is, $m_{b,s} = \bigwedge_c v_{b,s,c}$. The key
+        at lag $\ell$ of query $t$ is then
+
+        $$K_{b,t,\ell} = \mathrm{lag\_mask}_{t,\ell} \wedge m_{b,\,t-\ell},$$
+
+        with $m_{b,s}$ false for $s < 0$, where the lag mask is already false.
+
+        Args:
+            source_valid: ``(B, T)`` or ``(B, T, c_u)`` boolean, ``True`` = usable.
+            lag_mask: The lag-validity mask ``(T, L)`` from :meth:`build_lag_mask`.
+            dtype: The float dtype the gate runs a per-channel mask through.
+
+        Returns:
+            The boolean key mask ``(B, T, L)`` in lag order.
+        """
+        valid = source_valid.to(torch.bool)
+        if valid.dim() == 3:
+            if self.source_gate is not None:
+                valid = self.source_gate(valid.to(dtype)) > 0.5
+            valid = valid.all(dim=-1)
+        num_lags = int(lag_mask.shape[-1])
+        padded = torch.cat([valid.new_zeros(valid.shape[0], num_lags - 1), valid], dim=1)
+        # Window j holds step t-(L-1-j), oldest first; flipped, index l holds step t-l.
+        by_lag = padded.unfold(1, num_lags, 1).flip(-1)
+        return lag_mask.to(torch.bool)[None] & by_lag
+
+    @staticmethod
+    def _close_gate(
+        event_gate: Optional[torch.Tensor], source_open: torch.Tensor, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        r"""Close the posterior residual where no source key is valid: $g^{\mathrm{eff}}_t = g_t\,o_t$.
+
+        Removing every key is not enough on its own. The attended summary is then zero, but
+        LayerNorm of zero is the norm's bias, so the gate stays open and the fusion still moves
+        the posterior. Closing the gate at those anchors is what makes $q = p$ there exactly, so
+        their KL is zero and no gradient reaches the source pathway from them. A model built
+        without an event gate gets $o_t$ itself as the gate.
+
+        Args:
+            event_gate: The learned gate ``(B, T, 1)``, or ``None``.
+            source_open: $o_t$ ``(B, T)``, boolean.
+            dtype: The gate's dtype.
+
+        Returns:
+            ``(gate, event_gate)``: the gate the posterior head applies, and the value returned as
+            ``event_gate`` -- the effective gate, so the objective never charges a gate that had
+            no effect, or ``None`` when the model built no gate.
+        """
+        open_steps = source_open[..., None].to(dtype)
+        if event_gate is None:
+            return open_steps, None
+        effective = event_gate * open_steps
+        return effective, effective
 
 
 __all__ = ["CAUSAL_ONLY_KEYWORDS", "FORWARDED_EXCLUSIONS", "CausalWarmupInputs"]

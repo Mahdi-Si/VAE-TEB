@@ -121,3 +121,50 @@ to the signals before the MIMO fill; in the first production profile, this kept 
 segments.
 
 The outputs, `quality_report/` included, hold clinical traces. Keep them on the production box.
+
+## 2026-10-25, later: loader, statistics and viewer (Phase 3)
+
+Phase 3 makes the quality build usable for training. The loader reads the quality fields on request,
+the sequence collate pads them as invalid, and the statistics skip bridged samples and contaminated
+coefficients. The dataset viewer draws the quality fields. The design note, section 4.9, has the
+behaviour.
+
+**`mimo/` (untracked): no change.**
+
+| File | State in git here | Needed on the production/training box |
+|---|---|---|
+| `hdf5_dataset/hdf5_dataset.py` | tracked, modified (not staged) | yes: opt-in quality fields, `emit_quality_mask`, the `quality_version` checks |
+| `hdf5_dataset/guid_hdf5_dataset.py` | tracked, modified (not staged) | yes: the pad values of the quality fields |
+| `hdf5_dataset/calculate_dataset_stats.py` | tracked, modified (not staged) | yes: the masked statistics |
+| `hdf5_dataset/plot_dataset_samples.py` | tracked, modified (not staged) | only to view pages there; it imports `teb_vae.lag_attn_rws.eval.launch` |
+| `hdf5_dataset/tests/test_quality_loader.py`, `test_quality_stats.py` | new, untracked | no: tests only |
+| `teb_vae/lag_attn_rws/tests/test_eval_launch.py` | tracked, modified (one `ENTRY_POINTS` line) | no: test only |
+| `neurotome_teb/` | untracked; text edits only | no |
+| `research_notes/UA_QUALITY_MASK_DESIGN.md`, this record, `hdf5_dataset/dataset_explained_research.md`, `teb_vae/lag_attn_cfs/DESIGN.md`, `teb_vae/lag_attn_transformer_cfs/DESIGN.md` | tracked, modified (not staged) | no: documentation |
+| `hdf5_dataset/PIPELINE.md` | new, untracked | no: documentation |
+
+These four modules use package imports (`from hdf5_dataset.hdf5_dataset import ...`). Put them at the
+same paths below the repository root (`.../seqvae_teb/hdf5_dataset/`), not in the flat folder.
+
+**Old statistics files are refused with quality data.** A statistics file without `quality_version`
+does not describe the bridged signals. The loader raises at construction, names both files, and asks
+you to recompute the statistics for this build.
+
+To compute the statistics for the quality build:
+
+1. Copy the three `hdf5_dataset/` files marked "yes" to the same paths on the box.
+2. Open `pre_training_dataset/dataset_files.yaml` in the output folder of the quality build.
+3. Open `hdf5_dataset/calculate_dataset_stats.py`.
+4. Set `input_files` in `RUN_ARGS` to every file of both lists, train and test.
+5. Set `output_file` to a new path.
+6. Keep `trim_minutes` at 1.0, the loader's value.
+7. Keep `quality_mask` and `quality_rho_epsilon` at `None` (mask on, $\varepsilon$ = 0.1).
+8. Press Run.
+9. Check that the summary prints `quality_version=3, mask rho <= 0.1`.
+10. Set `stat_path` in the training config to the new file.
+
+The comment at the top of `dataset_files.yaml` gives the reason for step 4: `stat_path` must be
+computed over all of these files, train and test alike.
+
+The model configs do not name a quality field yet (Phase 4). With their current `load_fields`, a model
+trains on the bridged `fhr`/`up` and the coefficients computed from them, with the new statistics.

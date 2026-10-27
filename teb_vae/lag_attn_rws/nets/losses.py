@@ -1092,9 +1092,22 @@ def compute_loss(
     # Computed unconditionally so a run that never opted in still reports its prior's rate.
     prior_rate = masked_prior_rate(forward_outputs["logvar_prior"], kl_support)
 
+    # Under ``source_quality_mask``, the anchors whose every source key the mask removed: their
+    # posterior is the prior by construction, so they carry no gate to charge or to average.
+    source_open = forward_outputs.get("source_open")
+    if source_open is None:
+        gate_support = kl_support
+        source_mask_fraction = torch.zeros((), device=device, dtype=dtype)
+    else:
+        gate_support = kl_support * source_open.to(kl_support.dtype)
+        source_mask_fraction = (
+            1.0 - gate_support.sum() / kl_support.sum().clamp_min(1.0)
+        ).detach().to(dtype)
+
     # The event gate's sparsity term, over the KL's own anchor support so the two are in the same
-    # per-anchor units. Absent gate: the model is the ungated one, whose gate is identically 1, and
-    # a weight on it would be a knob that reaches nothing -- refused rather than ignored.
+    # per-anchor units, less the anchors the source mask closed. Absent gate: the model is the
+    # ungated one, whose gate is identically 1, and a weight on it would be a knob that reaches
+    # nothing -- refused rather than ignored.
     event_gate = forward_outputs.get("event_gate")
     if event_gate is None:
         if lambda_event_gate != 0.0:
@@ -1105,8 +1118,8 @@ def compute_loss(
         event_gate_mean = torch.ones((), device=device, dtype=dtype)
     else:
         event_gate_mean = (
-            event_gate.squeeze(-1) * kl_support
-        ).sum() / kl_support.sum().clamp_min(1.0)
+            event_gate.squeeze(-1) * gate_support
+        ).sum() / gate_support.sum().clamp_min(1.0)
 
     # The shape terms, each over both branches and each computed only when it is weighted; see
     # the zeros-when-off paragraph above for why an unweighted term reports 0.0 rather than its
@@ -1248,10 +1261,13 @@ def compute_loss(
         # The event mechanisms. ``nll_full_event_block`` is what entered the total for the full
         # branch -- the unweighted ``nll_full_block`` itself when no weight was given -- and
         # ``event_anchor_frac`` the share of scored anchors at weight 1 (1.0 unweighted).
-        # ``event_gate_mean`` is the gate's masked mean, 1.0 on a model without the gate.
+        # ``event_gate_mean`` is the gate's masked mean, 1.0 on a model without the gate, over
+        # the anchors the source mask left open. ``source_mask_fraction`` is the share of KL
+        # anchors the source mask closed, 0.0 without the mask.
         "nll_full_event_block": nll_full_event_block,
         "event_anchor_frac": event_anchor_frac,
         "event_gate_mean": event_gate_mean,
+        "source_mask_fraction": source_mask_fraction,
         "lambda_event_gate": torch.full(
             (), float(lambda_event_gate), device=device, dtype=dtype
         ),

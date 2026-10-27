@@ -708,6 +708,33 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             detector=self._event_detector(),
         )
 
+    def _close_event_weight(
+        self,
+        weight: Optional[torch.Tensor],
+        forward_outputs: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        r"""Return the contraction weight to its floor where the source-quality mask closed an anchor.
+
+        $w'_t = f + (w_t - f)\,o_t$, with $f$ the ``event_weight_floor`` and $o_t$ the forward's
+        ``source_open``. A closed anchor's posterior is its prior, so the full branch there decodes
+        the base latent; weighting it as a contraction would charge the source for a step it could
+        not see. The detector reads the bridged ``up``, so this also keeps a contraction the bridge
+        drew across removed UA from being weighted at the closed anchors. Unchanged when either
+        side is absent.
+
+        Args:
+            weight: The contraction weight $(B, T)$, or ``None`` when off.
+            forward_outputs: The forward's dict.
+
+        Returns:
+            The weight, closed where the mask closed the source.
+        """
+        source_open = forward_outputs.get("source_open")
+        if weight is None or source_open is None:
+            return weight
+        floor = float(self.hparams.get("event_weight_floor"))
+        return floor + (weight - floor) * source_open.to(weight.dtype)
+
     # ------------------------------------------------------------------
     # Loss + metrics
     # ------------------------------------------------------------------
@@ -735,6 +762,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         full_anchor_weight = self._event_anchor_weight(batch, weight)
 
         forward_outputs = self.model(*inputs)
+        full_anchor_weight = self._close_event_weight(full_anchor_weight, forward_outputs)
 
         beta = self._resolve_beta(self.current_epoch)
         beta_prior = float(self.hparams.get("beta_prior", 0.0))
