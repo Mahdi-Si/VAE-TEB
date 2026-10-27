@@ -139,6 +139,17 @@ FINAL_REVISION_KEYS = (
     "target_phase_fast_horizon",
 )
 
+#: The leaves the 2026-10-25 UA quality mask added, present in this config and in neither sibling's:
+#: the model flag and the loader's three-key rule. Shipped ON here; `tiny.yaml` and `smoke_hie.yaml`
+#: turn it off because their shards predate the signal-quality step.
+QUALITY_PATHS = (
+    f"{_VAE}.source_quality_mask",
+    *(
+        f"dataset_config.dataloader_config.dataset_kwargs.ua_step_mask.{key}"
+        for key in ("bits", "rho_epsilon", "hold_steps")
+    ),
+)
+
 #: The keys the 2026-10-13 event mechanisms added, present in this config and in neither sibling's:
 #: the posterior event gate and its sparsity weight, and the two contraction-weighting keys of the
 #: full branch. Shipped ON here; the two `sweep_no_event_*.yaml` arms are the ablations.
@@ -409,6 +420,7 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         *(f"{_VAE}.{key}" for key in ENCODER_KEYS),
         *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
         *(f"{_VAE}.{key}" for key in EVENT_KEYS),
+        *QUALITY_PATHS,
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -483,6 +495,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
         # The event mechanisms' keys, likewise carried here alone (shipped on; the arms turn them off).
         *(f"{_VAE}.{key}" for key in EVENT_KEYS),
+        # The UA quality mask, carried here alone: only a causal signal-quality build has the bits.
+        *QUALITY_PATHS,
     }
     assert set(theirs) - set(mine) == set()
 
