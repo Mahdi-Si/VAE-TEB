@@ -1098,8 +1098,15 @@ dataset_config:
       #   hold_steps:  extend each step the bit rule marks bad forward by this many steps.
       # A step is usable only if every source channel the model reads is. null = no mask (and
       # source_quality_mask must then be false).
+      #
+      # SHIPPED (2026-10-28): both rules. rho covers each coefficient's whole window. The bits
+      # close the one case rho can pass: a step whose own 4 s are bridged. The bridge there is drawn
+      # toward the first valid sample after the gap, which is later than the step, and a causal
+      # kernel puts little weight on its newest samples, so rho can stay at or below 0.1. Inside a
+      # gap rho already closes the step on the fast channels, so the bits add only the gap's
+      # edges. research_notes/UA_QUALITY_MASK_DESIGN.md section 4.11.
       ua_step_mask:
-        bits: null
+        bits: invalid
         rho_epsilon: 0.1
         hold_steps: 0
       # Add `up_valid` and `fhr_valid` (the raw-grid masks) to every sample. `event_weight_ua_valid`

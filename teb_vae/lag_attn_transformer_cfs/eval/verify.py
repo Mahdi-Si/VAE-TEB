@@ -88,8 +88,8 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         # The two event mechanisms (2026-10-13), shipped on; each ablation arm moves one of these.
         "posterior_event_gate",
         "event_weight_floor",
-        # The UA quality mask (2026-10-25), shipped on. No arm moves it yet; it is printed so a run
-        # trained before the key reads ``(absent)`` beside one trained under it.
+        # The UA quality mask (2026-10-25), shipped on; `sweep_no_quality_mask.yaml` turns it off
+        # with the other two quality switches. A run trained before the key reads ``(absent)``.
         "source_quality_mask",
         # The three quality switches of 2026-10-28. The default turns on the first two;
         # `sweep_source_event_mask.yaml` moves the third.

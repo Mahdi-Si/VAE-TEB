@@ -7,7 +7,8 @@ claims pinned here are claims about a log-density:
   innovation $e_\tau = r_\tau - \phi_c r_{\tau-1}$ with $r_{-1} = 0$. Both reduce bitwise to the
   factorised score at their neutral values, and the innovation sum is the exact joint negative
   log-density of a Gaussian AR(1) residual -- the map $r \mapsto e$ is unit lower-triangular, so
-  its Jacobian is $1$.
+  its Jacobian is $1$. With masked steps, the sum over the valid steps is the exact marginal
+  log-density of the valid residuals: the masked steps are integrated out, and none is read.
 * **The model.** Off by default and bitwise the historical model at initialisation
   ($\phi_c = \tanh(0) = 0$); on, both branches are scored under one $\phi$, so ``pred_gap`` and
   its in-training splits stay differences of one family's log-densities, and the coefficient is
@@ -153,6 +154,44 @@ def test_the_innovation_sum_is_the_exact_joint_ar1_log_density() -> None:
         density = torch.distributions.MultivariateNormal(torch.zeros(horizon, dtype=dtype), sigma)
         expected = -density.log_prob(residual[0, 0, :, c])
         torch.testing.assert_close(score[0, 0, :, c].sum(), expected, rtol=1e-12, atol=1e-12)
+
+
+def test_the_valid_steps_score_their_exact_marginal_ar1_log_density() -> None:
+    r"""With masked steps, the summed score of the valid steps is $-\log \mathcal N(r_V; 0, \Sigma_{VV})$.
+
+    $V$ is the set of valid steps and $\Sigma = L\, \mathrm{diag}(s^2) L^\top$ the joint covariance of
+    the horizon. The masked steps are marginalised, so a step after a gap is scored with the
+    marginal variance $\sum_j \phi^{2j} s^2_{\tau - j}$ rather than the innovation variance alone.
+    Gaps at the start, in the middle and two steps long, per channel, in float64.
+    """
+    dtype = torch.float64
+    horizon = 9
+    phis = torch.tensor([0.0, 0.7, -0.9], dtype=dtype)
+    generator = torch.Generator().manual_seed(5)
+    variances = 0.2 + torch.rand(horizon, phis.numel(), generator=generator, dtype=dtype)
+    residual = torch.randn(1, 1, horizon, phis.numel(), generator=generator, dtype=dtype)
+    mask = torch.ones(1, 1, horizon, dtype=dtype)
+    mask[..., [0, 3, 6, 7]] = 0.0
+
+    score = raw_sample_score(
+        torch.zeros_like(residual),
+        residual,
+        likelihood="gaussian_nll",
+        logvar=variances.log()[None, None],
+        ar_coef=phis,
+        step_mask=mask,
+    )
+
+    valid = mask[0, 0].bool()
+    for c, phi in enumerate(phis.tolist()):
+        steps = torch.arange(horizon, dtype=dtype)
+        lower = torch.tril(phi ** (steps[:, None] - steps[None, :]).clamp_min(0))
+        sigma = lower @ torch.diag(variances[:, c]) @ lower.T
+        marginal = torch.distributions.MultivariateNormal(
+            torch.zeros(int(valid.sum()), dtype=dtype), sigma[valid][:, valid]
+        )
+        expected = -marginal.log_prob(residual[0, 0, valid, c])
+        torch.testing.assert_close(score[0, 0, valid, c].sum(), expected, rtol=1e-10, atol=1e-10)
 
 
 def test_the_cell_mask_zeroes_exactly_the_masked_cells_and_shapes_are_checked() -> None:
@@ -451,12 +490,12 @@ def test_the_driver_hands_the_resolved_h_c_to_the_constructor(tmp_path) -> None:
     assert model.target_cell_mask.shape == (model.horizon, model.decoder_out_channels)
 
 
-def test_a_masked_step_restarts_the_ar_recursion() -> None:
+def test_a_masked_step_is_neither_read_nor_trained_through() -> None:
     r"""A gap inside the window is neither read nor trained through.
 
-    With the step at $\tau = 2$ masked, the innovation at $\tau = 3$ must not lag the gap's residual:
-    the recursion restarts there as it starts at $\tau = 0$. So changing the gap's target moves no
-    block score, and the mean at the gap receives exactly zero gradient.
+    With the step at $\tau = 2$ masked, the innovation at $\tau = 3$ lags the last valid residual,
+    at $\tau = 1$, and never the gap's own. So changing the gap's target moves no block score, and
+    the mean at the gap receives exactly zero gradient.
     """
     torch.manual_seed(0)
     horizon, channels = 6, 3
