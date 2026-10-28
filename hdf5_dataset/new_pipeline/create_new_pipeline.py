@@ -45,34 +45,54 @@ import matplotlib
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from tqdm import tqdm
 
-from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
-from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering import (
-    KymatioPhaseScattering1D,
-)
-# Absolute, with the production prefix, unlike every other module in this package: this file is
-# launched as a script and so has no ``__package__`` for a relative import to resolve against.
-from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering import (
-    CAUSAL_KERNEL_TAPS,
-    CAUSAL_WARMUP_QUANTILE,
-    GAMMATONE_ORDER,
-    LEG_ALIGNMENT_MODES,
-    PHASE_OPERATOR_INTEGER,
-    PHASE_OPERATOR_LEGACY,
-    PHASE_OPERATORS,
-    CausalChannelPlan,
-    build_causal_bank,
-    build_channel_plan,
-    build_filter_bank,
-    harmonic_index,
-    novelty_curve,
-    phase_k_steps_for,
-    resolve_leg_alignment,
-    validate_phase_operator,
-)
-from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch import (
-    CausalTorchBank,
-    transform_batch_numpy,
-)
+# The scattering modules, by the repository's own package name: the repository root is on
+# sys.path above. Imported BEFORE early_maestra, because importing ``hdf5_dataset`` pins the
+# vendored kymatio to the front of sys.path, and early_maestra imports kymatio itself; the other
+# order would load another kymatio first, which causal_scattering refuses. The production prefix
+# is the fallback for a checkout reached only as ``Variational_AutoEncoder/seqvae_teb``.
+try:
+    import hdf5_dataset.kymatio_phase_scattering as _kps
+    import hdf5_dataset.causal_scattering as _causal
+    import hdf5_dataset.causal_scattering_torch as _causal_torch
+except ModuleNotFoundError as _exc:
+    if not str(_exc.name).startswith("hdf5_dataset"):
+        raise
+    import Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering as _kps
+    import Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering as _causal
+    import Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch as _causal_torch
+
+KymatioPhaseScattering1D = _kps.KymatioPhaseScattering1D
+CAUSAL_KERNEL_TAPS = _causal.CAUSAL_KERNEL_TAPS
+CAUSAL_WARMUP_QUANTILE = _causal.CAUSAL_WARMUP_QUANTILE
+GAMMATONE_ORDER = _causal.GAMMATONE_ORDER
+LEG_ALIGNMENT_MODES = _causal.LEG_ALIGNMENT_MODES
+PHASE_OPERATOR_INTEGER = _causal.PHASE_OPERATOR_INTEGER
+PHASE_OPERATOR_LEGACY = _causal.PHASE_OPERATOR_LEGACY
+PHASE_OPERATORS = _causal.PHASE_OPERATORS
+CausalChannelPlan = _causal.CausalChannelPlan
+build_causal_bank = _causal.build_causal_bank
+build_channel_plan = _causal.build_channel_plan
+build_filter_bank = _causal.build_filter_bank
+harmonic_index = _causal.harmonic_index
+novelty_curve = _causal.novelty_curve
+phase_k_steps_for = _causal.phase_k_steps_for
+resolve_leg_alignment = _causal.resolve_leg_alignment
+validate_phase_operator = _causal.validate_phase_operator
+CausalTorchBank = _causal_torch.CausalTorchBank
+transform_batch_numpy = _causal_torch.transform_batch_numpy
+
+# early_maestra and the mimo package it imports live outside this repository; external_paths
+# puts the folders that hold them on sys.path (edit EXTERNAL_ROOTS there, or set
+# TEB_EXTERNAL_ROOTS).
+try:
+    import external_paths as _external_paths
+except ModuleNotFoundError as _exc:
+    if _exc.name != "external_paths":
+        raise
+    from hdf5_dataset.new_pipeline import external_paths as _external_paths
+_external_paths.add_external_roots()
+
+from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor  # noqa: E402
 
 # The production box keeps the scripts and their two helper modules in one folder, beside the
 # packages above; the repository keeps them in packages. Each import tries the folder first and
