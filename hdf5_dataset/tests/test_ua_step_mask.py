@@ -130,7 +130,8 @@ def test_the_two_rules_are_or_joined(quality_shard: Path) -> None:
     )[0]
     for block in BLOCKS:
         bad = _rho_bad(0, block, 0.1)
-        bad[[0, 1], :] = True
+        # The steps the invalid set marks: CODE in step 0, CODE and STEP in 1, FLAT in 3.
+        bad[[0, 1, 3], :] = True
         assert np.array_equal(sample[f"{block}_step_valid"].numpy(), ~bad), block
 
 
