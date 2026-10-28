@@ -259,3 +259,39 @@ the numbers from the version-3 diagnosis, is in `research_notes/UA_QUALITY_MASK_
 4.11: $\rho \le 0.1$ for the UA lag keys, `up_valid` for the contraction detector, and the raw FHR
 bits for the target. `hdf5_dataset/dataset_explained_research.md` section 11.4 has the build, report,
 statistics and config steps for the final files. Only the current quality version (4) is supported.
+
+## 2026-10-28, later: no more copies; the box runs from the git clone
+
+From this entry on, nothing is copied by hand. The box runs the build from its clone of this
+repository, and `git pull` brings every change. The old flat folder is no longer used; rename it
+so that none of its old copies (`signal_quality.py`, `launch.py`, `create_new_pipeline.py`) can
+be imported by accident.
+
+**What changed in the imports.** `create_new_pipeline.py` now imports the scattering modules as
+`hdf5_dataset.*`, from the clone, and keeps `Variational_AutoEncoder.seqvae_teb.hdf5_dataset.*`
+only as a fallback. It imports them before `early_maestra`, because `hdf5_dataset` pins the
+vendored kymatio and `early_maestra` imports kymatio itself. Then
+`hdf5_dataset/new_pipeline/external_paths.py` puts the two outside folders on `sys.path`:
+the folder that holds `early_maestra/` and the folder that holds `mimo/`. They go just after the
+repository root, so an older copy elsewhere on the path cannot win. The spawned worker processes
+inherit `sys.path`.
+
+`external_paths.py` finds the folders in this order: the environment variable
+`TEB_EXTERNAL_ROOTS` (folders separated by `:`), the list `EXTERNAL_ROOTS` in the file, and then a
+search for `EarlyMaestra/` and `MIMO_Sequence_Trainer/` in `<repo>/mimo`, `<repo>/tmp/TrainWithDataset`,
+`<repo>/../TrainWithDataset`, `<repo>/..` and `~/tmp/TrainWithDataset`.
+
+To set up the box:
+
+1. Run `git pull` in the clone.
+2. Rename the old flat folder.
+3. Open `hdf5_dataset/new_pipeline/external_paths.py`.
+4. Set `EXTERNAL_ROOTS` to your two folders, for example `.../tmp/TrainWithDataset/EarlyMaestra` and `.../tmp/TrainWithDataset/MIMO_Sequence_Trainer`.
+5. Open `hdf5_dataset/new_pipeline/prod_import_probe.py` with the build's interpreter.
+6. Press Run.
+7. Check in `prod_import_report.txt` that `early_maestra` and `mimo` resolve to your folders.
+8. Check that both build modules print `OK` and that `QUALITY_VERSION=4`.
+
+If the folders are under one of the searched places, step 4 is not needed; the report says what was
+found. Step 4 is a local edit on the box, so keep it out of your commits, or set
+`TEB_EXTERNAL_ROOTS` in the PyCharm run configuration instead.
