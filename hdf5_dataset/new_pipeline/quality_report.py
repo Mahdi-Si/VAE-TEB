@@ -197,8 +197,21 @@ def _display(block: np.ndarray) -> np.ndarray:
     return np.clip((a - centre) / np.where(spread > 1e-9, spread, 1.0), -3, 3)
 
 
-def plot_example(plt: Any, category: str, row: Mapping[str, Any], epsilon: float) -> Any:
-    """Draw one example page from the file: signals, bits, coefficients and contamination."""
+def plot_example(plt: Any, category: str, row: Mapping[str, Any], epsilon: float,
+                 title: Optional[str] = None) -> Any:
+    """Draw one example page from the file: signals, bits, coefficients and contamination.
+
+    Args:
+        plt: ``matplotlib.pyplot`` with the report style (:func:`_style`).
+        category: A key of :data:`EXAMPLE_CATEGORIES`, or any name when *title* is given.
+        row: The segment: ``path``, ``row``, ``file``, ``guid``, ``epoch`` and
+            ``up_valid_frac``.
+        epsilon: A coefficient is usable when $\\rho \\le \\varepsilon$.
+        title: The page title; ``None`` takes it from :data:`EXAMPLE_CATEGORIES`.
+
+    Returns:
+        The figure.
+    """
     import h5py
     from matplotlib.colors import LinearSegmentedColormap
 
@@ -221,7 +234,7 @@ def plot_example(plt: Any, category: str, row: Mapping[str, Any], epsilon: float
     decimation = n // coeffs["up_st"].shape[-1]
     fig = plt.figure(figsize=(12, 15), layout="constrained")
     grid = fig.add_gridspec(7, 1, height_ratios=[1.3, 0.8, 1.2, 0.6, 1.4, 1.4, 1.4])
-    fig.suptitle(f"{EXAMPLE_CATEGORIES[category][0]} · {row['file']} · {row['guid']} · "
+    fig.suptitle(f"{title or EXAMPLE_CATEGORIES[category][0]} · {row['file']} · {row['guid']} · "
                  f"epoch {row['epoch']:.0f} s · UA valid {100 * row['up_valid_frac']:.1f}%",
                  x=0.01, ha="left", fontweight="bold", fontsize=10)
 
