@@ -2,9 +2,11 @@
 
 Self-contained script that:
   1. Prescreens all GUIDs for valid signal in the last 6 hours.
-  2. Selects GUIDs for classification with class balancing + TLO constraints.
+  2. Selects GUIDs for classification (a fraction of each healthy subgroup, TLO constraints)
+     and a test set whose healthy subgroups have their population shares.
   3. Creates 10-fold stratified CV splits (80/10/10).
-  4. Builds pretraining (unsupervised) HDF5 datasets from BG subgroup leftovers.
+  4. Builds pretraining (unsupervised) HDF5 datasets from every healthy GUID outside
+     classification.
   5. Builds classification k-fold HDF5 datasets (12.4h range, v3 scattering).
 """
 
@@ -140,6 +142,10 @@ HEALTHY_SUBGROUPS = {
     "healthy_no_bg_no_cs",
 }
 BG_SUBGROUPS = {"healthy_bg_cs", "healthy_bg_no_cs"}
+#: The healthy subgroups in a fixed order: every loop that draws from the seeded generator walks
+#: this tuple, never a set, so the draws do not depend on ``PYTHONHASHSEED``.
+HEALTHY_SUBGROUP_ORDER = ("healthy_bg_cs", "healthy_bg_no_cs", "healthy_no_bg_cs",
+                          "healthy_no_bg_no_cs")
 
 # (pre_defined_target, cs_label, bg_label)
 SUBGROUP_META = {
@@ -168,6 +174,10 @@ MIN_DOMAIN_START_DATASET = -44640  # ~12.4 hours
 MIN_VALID_HOURS_UNHEALTHY = 2.0
 MIN_VALID_HOURS_HEALTHY = 3.0
 HEALTHY_BG_CLS_FRACTION = 0.10
+#: ``None`` keeps the original rule: healthy no-BG GUIDs only fill the train/val deficit
+#: $n_{\mathrm{unhealthy}} - n_{\mathrm{BG}}$. A float takes that fraction of each eligible no-BG
+#: subgroup instead, like ``HEALTHY_BG_CLS_FRACTION`` does for BG.
+HEALTHY_NO_BG_CLS_FRACTION = None
 TEST_HOLDOUT_FRACTION = 0.10
 HEALTHY_NO_BG_TLO_RATIO = 0.75
 WEIGHT_THRESHOLD = 0.90
@@ -2527,32 +2537,65 @@ def select_classification_guids(
     no_bg_tlo_ratio: float = HEALTHY_NO_BG_TLO_RATIO,
     random_state: int = RANDOM_STATE,
     verbose: bool = True,
+    no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
+    n_folds: int = N_FOLDS,
 ) -> Dict[str, Any]:
-    """Select GUIDs for classification with balanced train/val and representative test.
+    r"""Select GUIDs for classification, a population-proportional test set, and pretraining.
 
-    Unhealthy: all eligible (>=2 h).  Healthy BG: 10 % of eligible (>=3 h) per
-    CS/NoCS, natural TLO ratio.  Healthy no-BG: added to balance train/val
-    (75/25 TLO).  Test: population-proportional healthy subgroup distribution.
+    Unhealthy: all eligible (>=2 h). Healthy BG: ``bg_cls_fraction`` of eligible (>=3 h) per
+    CS/NoCS, natural TLO ratio. Healthy no-BG: ``no_bg_cls_fraction`` of eligible per CS/NoCS
+    (75/25 TLO), or, with ``None``, only enough to fill the train/val deficit
+    $n_{\mathrm{unhealthy}} - n_{\mathrm{BG}}$. These GUIDs form the *pool*. The classes may be
+    imbalanced; the classifier loss is expected to handle that.
+
+    **Test.** Each healthy subgroup $g$ gets a test share equal to its share of the eligible
+    healthy population, $p_g = E_g / \sum_h E_h$, where $E_g$ is the eligible count. Let $c_g$ be
+    the pool GUIDs of $g$ in one fold's test partition: $n_g / K$ in augmented mode, the held-out
+    count in holdout mode. The healthy test total per fold is the smallest that needs no pool
+    GUID removed,
+
+    $$T = \max_g \frac{c_g}{p_g},$$
+
+    and subgroup $g$ gets $\mathrm{round}(T p_g - c_g)$ *extra* test GUIDs from its eligible GUIDs
+    outside the pool. Extra GUIDs never appear in train/val. With equal fractions every extra
+    count is about zero; a subgroup with a lower fraction than the others gets the extras.
+
+    **Pretraining.** Every eligible healthy GUID outside the pool and the test set, all four
+    subgroups.
 
     Two test modes:
-        * **holdout** — fixed test holdout (~10 %) before 10-fold CV.
-        * **augmented** — standard 10-fold 80/10/10 on a balanced core pool;
-          each fold's test partition augmented with extra healthy no-BG GUIDs
-          that never appear in train/val.
+        * **holdout** — fixed test holdout (~10 % of each unhealthy and BG subgroup) before
+          10-fold CV, plus the extra test GUIDs.
+        * **augmented** — standard 10-fold 80/10/10 on the pool; each fold's test partition is
+          augmented with the same extra test GUIDs.
 
     Args:
         screening_df: DataFrame from prescreening (all GUIDs).
         test_mode: ``"augmented"`` (default) or ``"holdout"``.
-        bg_cls_fraction: Fraction of eligible BG to select for classification.
-        test_holdout_fraction: Fraction held out for test per subgroup.
+        bg_cls_fraction: Fraction of each eligible BG subgroup that goes to the pool, in
+            $(0, 1]$.
+        test_holdout_fraction: Fraction held out for test per subgroup (holdout mode).
         no_bg_tlo_ratio: Enforced TLO ratio for no-BG subgroups.
         random_state: Random seed.
         verbose: Verbosity flag.
+        no_bg_cls_fraction: Fraction of each eligible no-BG subgroup that goes to the pool, in
+            $[0, 1]$, or ``None`` for the deficit rule.
+        n_folds: The fold count $K$ of the augmented test partition.
 
     Returns:
-        Dict with keys ``test_mode``, ``trainval``, ``test``, ``tlo_map``,
-        ``pretraining_bg_cs``, ``pretraining_bg_no_cs``, ``stats``.
+        Dict with keys ``test_mode``, ``trainval`` (the pool), ``test`` (the extra test GUIDs in
+        augmented mode; the holdout plus the extra test GUIDs in holdout mode), ``tlo_map``,
+        ``pretraining`` (``{healthy subgroup: paths}``) and ``stats``.
+
+    Raises:
+        ValueError: If a fraction is outside its range.
+        RuntimeError: If the pool, the test set and the pretraining set overlap.
     """
+    if not 0.0 < bg_cls_fraction <= 1.0:
+        raise ValueError(f"bg_cls_fraction={bg_cls_fraction}; use a value in (0, 1]")
+    if no_bg_cls_fraction is not None and not 0.0 <= no_bg_cls_fraction <= 1.0:
+        raise ValueError(f"no_bg_cls_fraction={no_bg_cls_fraction}; use a value in [0, 1] "
+                         f"or None")
     rng = random.Random(random_state)
 
     # ------------------------------------------------------------------
@@ -2635,7 +2678,7 @@ def select_classification_guids(
     )
 
     # ------------------------------------------------------------------
-    # E. Balance train/val with healthy_no_bg
+    # E. Healthy no-BG pool: a fraction of each subgroup, or the deficit
     # ------------------------------------------------------------------
     deficit = n_unhealthy_trainval - n_bg_trainval
 
@@ -2648,7 +2691,17 @@ def select_classification_guids(
 
     total_no_bg_eligible = sum(len(p) for p in no_bg_pools.values())
 
-    if deficit > 0 and total_no_bg_eligible > 0:
+    if no_bg_cls_fraction is not None:
+        # Per subgroup, like the BG fraction, so CS : NoCS inside no-BG stays the population's.
+        for sg in ("healthy_no_bg_cs", "healthy_no_bg_no_cs"):
+            n_pool = len(no_bg_pools[sg])
+            n_tv = round(n_pool * no_bg_cls_fraction)
+            if n_pool and no_bg_cls_fraction > 0:
+                n_tv = max(n_tv, 1)
+            trainval[sg] = _sample_with_tlo_constraint(
+                no_bg_pools[sg], n_tv, no_bg_tlo_ratio, rng
+            )
+    elif deficit > 0 and total_no_bg_eligible > 0:
         frac_cs = len(no_bg_pools["healthy_no_bg_cs"]) / total_no_bg_eligible
         n_no_bg_cs_tv = min(
             round(deficit * frac_cs), len(no_bg_pools["healthy_no_bg_cs"])
@@ -2680,58 +2733,70 @@ def select_classification_guids(
         for sg in NO_BG_SUBGROUPS:
             trainval[sg] = []
 
-    # Track which no_bg paths are used for train/val (for exclusion later)
-    used_no_bg_paths: set = set()
-    for sg in NO_BG_SUBGROUPS:
-        used_no_bg_paths.update(trainval.get(sg, []))
-
     # ------------------------------------------------------------------
-    # F. Healthy no-BG for test (population-proportional)
+    # F. Extra test GUIDs: every healthy subgroup at its population share
     # ------------------------------------------------------------------
+    healthy_eligible = pd.concat([healthy_bg_eligible, healthy_no_bg_eligible])
     eligible_healthy_counts = {
-        "healthy_bg_cs": len(
-            healthy_bg_eligible[healthy_bg_eligible["subgroup"] == "healthy_bg_cs"]
-        ),
-        "healthy_bg_no_cs": len(
-            healthy_bg_eligible[healthy_bg_eligible["subgroup"] == "healthy_bg_no_cs"]
-        ),
-        "healthy_no_bg_cs": len(no_bg_pools["healthy_no_bg_cs"]),
-        "healthy_no_bg_no_cs": len(no_bg_pools["healthy_no_bg_no_cs"]),
+        sg: int((healthy_eligible["subgroup"] == sg).sum()) for sg in HEALTHY_SUBGROUP_ORDER
     }
     total_eligible_healthy = sum(eligible_healthy_counts.values())
+    p = {
+        sg: n / total_eligible_healthy if total_eligible_healthy else 0.0
+        for sg, n in eligible_healthy_counts.items()
+    }
 
-    if total_eligible_healthy > 0:
-        p = {
-            sg: eligible_healthy_counts[sg] / total_eligible_healthy
-            for sg in eligible_healthy_counts
-        }
-    else:
-        p = {sg: 0.25 for sg in eligible_healthy_counts}
-
+    # c_g: the pool GUIDs of subgroup g that sit in one fold's test partition. The extra GUIDs
+    # top each subgroup up to T * p_g, and T is the smallest total that needs no c_g reduced.
     if test_mode == "holdout":
-        # BG test counts are known from the holdout split in Step D
-        n_bg_test = sum(len(test_guids.get(sg, [])) for sg in BG_SUBGROUPS)
+        pool_test = {sg: float(len(test_guids.get(sg, []))) for sg in HEALTHY_SUBGROUP_ORDER}
     else:
-        # Augmented: estimate per-fold BG test count (~1/N_FOLDS of core BG)
-        n_bg_in_core = sum(len(trainval.get(sg, [])) for sg in BG_SUBGROUPS)
-        n_bg_test = max(round(n_bg_in_core / N_FOLDS), 1) if n_bg_in_core else 0
+        pool_test = {sg: len(trainval.get(sg, [])) / n_folds for sg in HEALTHY_SUBGROUP_ORDER}
+    total_healthy_test = max(
+        (pool_test[sg] / p[sg] for sg in HEALTHY_SUBGROUP_ORDER if p[sg] > 0), default=0.0
+    )
 
-    p_bg = p["healthy_bg_cs"] + p["healthy_bg_no_cs"]
-
-    if p_bg > 0 and n_bg_test > 0:
-        total_healthy_test = round(n_bg_test / p_bg)
-    else:
-        total_healthy_test = n_bg_test
-
-    for sg in NO_BG_SUBGROUPS:
-        n_need = round(total_healthy_test * p[sg])
-        remaining = no_bg_pools[sg][
-            ~no_bg_pools[sg]["record_path"].isin(used_no_bg_paths)
-        ]
-        n_need = min(n_need, len(remaining))
-        test_guids[sg] = _sample_with_tlo_constraint(
-            remaining, n_need, no_bg_tlo_ratio, rng
+    extra_test: Dict[str, List[str]] = {}
+    for sg in HEALTHY_SUBGROUP_ORDER:
+        used = set(trainval.get(sg, [])) | set(test_guids.get(sg, []))
+        n_need = max(round(total_healthy_test * p[sg] - pool_test[sg]), 0)
+        if sg in BG_SUBGROUPS:
+            # Shuffled in step C, so the first n_need keep the natural TLO ratio.
+            candidates: Any = [path for path in bg_pretrain[sg] if path not in used]
+        else:
+            candidates = no_bg_pools[sg][~no_bg_pools[sg]["record_path"].isin(list(used))]
+        if n_need > len(candidates):
+            logger.warning(
+                f"{sg}: the test needs {n_need} extra GUIDs, only {len(candidates)} are outside "
+                f"the pool; its test share falls below the population share {p[sg]:.3f}"
+            )
+            n_need = len(candidates)
+        extra_test[sg] = (
+            candidates[:n_need] if sg in BG_SUBGROUPS
+            else _sample_with_tlo_constraint(candidates, n_need, no_bg_tlo_ratio, rng)
         )
+        test_guids[sg] = test_guids.get(sg, []) + extra_test[sg]
+
+    # ------------------------------------------------------------------
+    # Pretraining: every eligible healthy GUID outside the pool and the test set
+    # ------------------------------------------------------------------
+    pool_paths = {path for paths in trainval.values() for path in paths}
+    test_paths = {path for paths in test_guids.values() for path in paths}
+    pretraining = {
+        sg: sorted(
+            set(healthy_eligible.loc[healthy_eligible["subgroup"] == sg, "record_path"])
+            - pool_paths - test_paths
+        )
+        for sg in HEALTHY_SUBGROUP_ORDER
+    }
+    pretrain_paths = {path for paths in pretraining.values() for path in paths}
+    overlap = {
+        "pool & test": len(pool_paths & test_paths),
+        "pretraining & pool": len(pretrain_paths & pool_paths),
+        "pretraining & test": len(pretrain_paths & test_paths),
+    }
+    if any(overlap.values()):
+        raise RuntimeError(f"the classification and pretraining sets overlap: {overlap}")
 
     # ------------------------------------------------------------------
     # G. Build stats & log
@@ -2739,55 +2804,62 @@ def select_classification_guids(
     n_trainval_healthy = sum(
         len(v) for sg, v in trainval.items() if sg in HEALTHY_SUBGROUPS
     )
+    # Healthy GUIDs of one fold's test partition: the pool part plus the extra GUIDs.
+    test_per_fold = {sg: pool_test[sg] + len(extra_test[sg]) for sg in HEALTHY_SUBGROUP_ORDER}
+    n_healthy_test = sum(test_per_fold.values())
+    test_share = {
+        sg: n / n_healthy_test if n_healthy_test else 0.0 for sg, n in test_per_fold.items()
+    }
     stats = {
         "n_unhealthy": n_unhealthy,
         "n_bg_cls": n_bg_cls,
         "n_unhealthy_trainval": n_unhealthy_trainval,
         "n_bg_trainval": n_bg_trainval,
         "n_trainval_healthy": n_trainval_healthy,
-        "deficit_filled": deficit,
+        "deficit_filled": deficit if no_bg_cls_fraction is None else None,
         "test_mode": test_mode,
+        "bg_cls_fraction": bg_cls_fraction,
+        "no_bg_cls_fraction": no_bg_cls_fraction,
+        "eligible_healthy": eligible_healthy_counts,
+        "population_share": p,
+        "healthy_test_per_fold": test_per_fold,
+        "healthy_test_share": test_share,
+        "n_extra_test": {sg: len(v) for sg, v in extra_test.items()},
+        "n_pretraining": {sg: len(v) for sg, v in pretraining.items()},
     }
 
     if verbose:
-        logger.info("=" * 80)
+        logger.info("=" * 96)
         logger.info("GUID SELECTION SUMMARY")
-        logger.info("=" * 80)
+        logger.info("=" * 96)
         logger.info(
-            f"{'Subgroup':<28} {'Eligible':>8} {'TrainVal':>8} "
-            f"{'Test':>6} {'Pretrain':>8}"
+            f"  {'Subgroup':<22} {'Eligible':>8} {'Pool':>6} {'Test/fold':>9} {'Extra':>6} "
+            f"{'Pretrain':>8} {'Test %':>7} {'Pop %':>7}"
         )
-        logger.info("-" * 80)
-        all_sgs = sorted(
-            set(list(trainval.keys()) + list(test_guids.keys()))
-        )
-        for sg in all_sgs:
-            el = eligible_healthy_counts.get(sg, 0)
-            if sg in UNHEALTHY_SUBGROUPS:
-                el = len(
-                    unhealthy_eligible[unhealthy_eligible["subgroup"] == sg]
-                )
+        logger.info("-" * 96)
+        for sg in sorted(UNHEALTHY_SUBGROUPS) + list(HEALTHY_SUBGROUP_ORDER):
             tv = len(trainval.get(sg, []))
-            ts = len(test_guids.get(sg, []))
-            pt = len(bg_pretrain.get(sg, []))
+            if sg in UNHEALTHY_SUBGROUPS:
+                el = len(unhealthy_eligible[unhealthy_eligible["subgroup"] == sg])
+                ts = (len(test_guids.get(sg, [])) if test_mode == "holdout"
+                      else tv / n_folds)
+                logger.info(f"  {sg:<22} {el:>8} {tv:>6} {ts:>9.1f}")
+                continue
             logger.info(
-                f"  {sg:<28} {el:>8} {tv:>8} {ts:>6} {pt:>8}"
+                f"  {sg:<22} {eligible_healthy_counts[sg]:>8} {tv:>6} "
+                f"{test_per_fold[sg]:>9.1f} {len(extra_test[sg]):>6} "
+                f"{len(pretraining[sg]):>8} {100 * test_share[sg]:>7.2f} {100 * p[sg]:>7.2f}"
             )
-        logger.info("-" * 80)
-        logger.info(
-            f"  Total unhealthy trainval: {n_unhealthy_trainval}"
-        )
-        logger.info(f"  Total healthy   trainval: {n_trainval_healthy}")
-        logger.info(
-            f"  Total test GUIDs: "
-            f"{sum(len(v) for v in test_guids.values())}"
-        )
-        logger.info(
-            f"  Pretraining BG leftovers: "
-            f"{sum(len(v) for v in bg_pretrain.values())}"
-        )
-        logger.info(f"  Test mode: {test_mode}")
-        logger.info("=" * 80)
+        logger.info("-" * 96)
+        logger.info(f"  Pool: {n_unhealthy_trainval} unhealthy, {n_trainval_healthy} healthy "
+                    f"(healthy : unhealthy = "
+                    f"{n_trainval_healthy / max(n_unhealthy_trainval, 1):.2f})")
+        logger.info(f"  Healthy test per fold: {n_healthy_test:.1f}; extra test GUIDs: "
+                    f"{sum(len(v) for v in extra_test.values())}")
+        logger.info(f"  Pretraining: {sum(len(v) for v in pretraining.values())} healthy GUIDs")
+        logger.info(f"  Test mode: {test_mode}; bg_cls_fraction={bg_cls_fraction}, "
+                    f"no_bg_cls_fraction={no_bg_cls_fraction}")
+        logger.info("=" * 96)
 
     # Build path -> tlo_hours lookup for stratification in create_cv_splits
     all_trainval_paths = set()
@@ -2801,8 +2873,7 @@ def select_classification_guids(
         "trainval": trainval,
         "test": test_guids,
         "tlo_map": tlo_map,
-        "pretraining_bg_cs": bg_pretrain.get("healthy_bg_cs", []),
-        "pretraining_bg_no_cs": bg_pretrain.get("healthy_bg_no_cs", []),
+        "pretraining": pretraining,
         "stats": stats,
     }
 
@@ -2868,7 +2939,7 @@ def create_cv_splits(
       fold. The fixed test holdout is returned separately.
     * **augmented** (default) — Standard 80/10/10 via ``KFold`` + inner
       ``train_test_split``. Each fold's test partition is augmented with extra
-      healthy no-BG GUIDs that never appear in train/val.
+      healthy GUIDs that never appear in train/val.
 
     Args:
         selection_result: Dict returned by ``select_classification_guids()``.
@@ -3649,6 +3720,78 @@ def _build_hdf5_for_partition(
         )
 
 
+def run_selection_steps(
+    records_base_path: str,
+    output_base_path: str,
+    tlo_csv_path: str,
+    test_mode: str = "augmented",
+    verbose: bool = True,
+    num_workers: Optional[int] = None,
+    screening_csv_path: Optional[str] = None,
+    bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
+    no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
+) -> Tuple[Dict[str, Any], Dict[str, List[str]]]:
+    """Steps 1-3: prescreen, select the classification GUIDs, and cut the folds.
+
+    Writes into *output_base_path*: ``guid_screening_results.csv`` (only when step 1 runs),
+    ``classification_guid_selection_summary.json`` and
+    ``classification_dataset_records.pickle``. Writes no HDF5 file and needs no scattering
+    masks.
+
+    Args:
+        records_base_path: Root dir with StudyGroup subfolders (step 1 only).
+        output_base_path: Output directory.
+        tlo_csv_path: CSV with the TLO and second-stage columns (step 1 only).
+        test_mode: ``"augmented"`` or ``"holdout"``.
+        verbose: Verbosity flag.
+        num_workers: Parallel prescreening workers.
+        screening_csv_path: Skip step 1 and load this screening CSV.
+        bg_cls_fraction: See :func:`select_classification_guids`.
+        no_bg_cls_fraction: See :func:`select_classification_guids`.
+
+    Returns:
+        ``(cv_result, pretraining)``: the folds, as pickled, and ``{healthy subgroup: paths}``
+        of the pretraining GUIDs.
+    """
+    # --- Step 1: Prescreening ---
+    if screening_csv_path is not None:
+        logger.info(f"Loading screening CSV: {screening_csv_path}")
+        screening_df = pd.read_csv(screening_csv_path)
+    else:
+        screening_csv_out = os.path.join(output_base_path, "guid_screening_results.csv")
+        screening_df = prescreen_all_guids(
+            records_base_path, tlo_csv_path, screening_csv_out,
+            verbose=verbose, num_workers=num_workers,
+        )
+
+    # --- Step 2: GUID selection ---
+    selection_result = select_classification_guids(
+        screening_df, test_mode=test_mode, verbose=verbose,
+        bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
+    )
+
+    # Save selection summary
+    summary_path = os.path.join(output_base_path, "classification_guid_selection_summary.json")
+    summary: Dict[str, Any] = {"test_mode": test_mode, "stats": selection_result["stats"]}
+    for pool_name in ["trainval", "test", "pretraining"]:
+        summary[pool_name] = {
+            sg: {"count": len(paths), "paths_sample": paths[:3]}
+            for sg, paths in selection_result[pool_name].items()
+        }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # --- Step 3: Fold creation ---
+    cv_result = create_cv_splits(
+        selection_result, n_splits=N_FOLDS, val_ratio=VAL_RATIO, random_state=RANDOM_STATE,
+    )
+    pickle_path = os.path.join(output_base_path, "classification_dataset_records.pickle")
+    with open(pickle_path, "wb") as f:
+        pickle.dump(cv_result, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info(f"CV result saved to {pickle_path}")
+    return cv_result, selection_result["pretraining"]
+
+
 def create_new_pipeline(
     records_base_path: str,
     output_base_path: str,
@@ -3664,17 +3807,20 @@ def create_new_pipeline(
     device: Optional[str] = None,
     phase_operator: str = PHASE_OPERATOR_LEGACY,
     signal_quality: bool = False,
+    bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
+    no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
+    selection_only: bool = False,
 ):
     """Run the complete new dataset creation pipeline.
 
     Steps:
         1. Prescreen all GUIDs for valid signal in last 6 hours.
-        2. Select GUIDs for classification (balanced train/val,
-           population-proportional test).
+        2. Select GUIDs for classification (a fraction of each healthy
+           subgroup, population-proportional healthy test).
         3. Create 10-fold stratified CV splits (stratified by labour
            duration within each subgroup).
-        4. Build pretraining (unsupervised) HDF5 datasets from BG subgroup
-           leftovers.
+        4. Build pretraining (unsupervised) HDF5 datasets from every healthy
+           GUID that classification does not use, all four healthy subgroups.
         5. Build classification k-fold HDF5 datasets.
 
     Steps 4 and 5 are independent: both consume only the masks, the CSV maps
@@ -3724,11 +3870,18 @@ def create_new_pipeline(
             every kept segment, and store the quality datasets beside the coefficients (see
             :func:`attach_signal_quality`). ``fhr``/``up`` then hold the bridged signals, so
             write such a build to a **separate** output path with its own statistics.
+        bg_cls_fraction: Step 2: fraction of each eligible healthy BG subgroup in the
+            classification pool. Ignored when resuming from a pickle.
+        no_bg_cls_fraction: Step 2: fraction of each eligible healthy no-BG subgroup in the
+            classification pool; ``None`` fills only the train/val deficit. Ignored when
+            resuming from a pickle. See :func:`select_classification_guids`.
+        selection_only: Run steps 1-3 only (see :func:`run_selection_steps`) and stop: no
+            masks, no HDF5 file. Needs ``classification_pickle_path=None``.
 
     Raises:
         ValueError: On an unknown *transform*, *leg_alignment* or
-            *phase_operator*, or *signal_quality* on a two-sided build, before anything is
-            created.
+            *phase_operator*, *signal_quality* on a two-sided build, a fraction out of range,
+            or *selection_only* with a pickle, before anything is created.
     """
     # First statements, before os.makedirs and before the CSV is read: a refusal that arrives
     # later leaves an output directory behind and reports a CSV problem instead of the real one.
@@ -3738,9 +3891,30 @@ def create_new_pipeline(
     validate_test_mode(test_mode)
     if signal_quality and transform != CAUSAL:
         raise ValueError("signal_quality=True needs transform='causal'")
+    if not 0.0 < bg_cls_fraction <= 1.0:
+        raise ValueError(f"bg_cls_fraction={bg_cls_fraction}; use a value in (0, 1]")
+    if no_bg_cls_fraction is not None and not 0.0 <= no_bg_cls_fraction <= 1.0:
+        raise ValueError(f"no_bg_cls_fraction={no_bg_cls_fraction}; use a value in [0, 1] or None")
+
+    if selection_only and classification_pickle_path is not None:
+        raise ValueError("selection_only=True runs steps 1-3, which classification_pickle_path "
+                         "skips; set classification_pickle_path to None")
+    existing = os.path.join(output_base_path, "classification_dataset_records.pickle")
+    if selection_only and os.path.exists(existing):
+        raise FileExistsError(f"{existing} exists; a selection-only run never replaces a fold "
+                              f"pickle. Choose a NEW output_base_path.")
 
     setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
+    if selection_only:
+        # Before the masks and the TLO maps: a selection-only run needs neither.
+        run_selection_steps(
+            records_base_path, output_base_path, tlo_csv_path, test_mode=test_mode,
+            verbose=verbose, num_workers=num_workers, screening_csv_path=screening_csv_path,
+            bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
+        )
+        logger.info("selection_only: steps 1-3 done, no HDF5 file written.")
+        return
     torch_device = None if device is None else torch.device(device)
 
     # Load CSV metadata (needed for HDF5 creation in all paths)
@@ -3815,76 +3989,29 @@ def create_new_pipeline(
             f"(mode={cv_result['test_mode']})"
         )
 
-        # Need pretraining BG leftovers — derive from all BG files minus
-        # those used in classification (union across all folds/partitions)
-        all_bg_cs_files = _discover_mat_files(
-            records_base_path, "HEALTHY_NO_ACIDOSIS_CS"
-        )
-        all_bg_no_cs_files = _discover_mat_files(
-            records_base_path, "HEALTHY_NO_ACIDOSIS_NoCS"
-        )
-        cls_bg_cs: set = set()
-        cls_bg_no_cs: set = set()
+        # Pretraining takes every healthy file of the four healthy folders that classification
+        # does not use (union across all folds, partitions and the test dict). No screening is
+        # at hand here, so the per-segment quality filter of the transform is the only filter.
+        cls_paths: set = set()
         for fold_data in cv_result["folds"].values():
             for part in fold_data.values():
-                cls_bg_cs.update(part.get("healthy_bg_cs", []))
-                cls_bg_no_cs.update(part.get("healthy_bg_no_cs", []))
-        # Also include test holdout if present
+                for paths in part.values():
+                    cls_paths.update(paths)
         test_dict = cv_result.get("test", cv_result.get("test_augmentation", {}))
-        cls_bg_cs.update(test_dict.get("healthy_bg_cs", []))
-        cls_bg_no_cs.update(test_dict.get("healthy_bg_no_cs", []))
-
-        pretrain_bg_cs = [f for f in all_bg_cs_files if f not in cls_bg_cs]
-        pretrain_bg_no_cs = [
-            f for f in all_bg_no_cs_files if f not in cls_bg_no_cs
-        ]
+        for paths in test_dict.values():
+            cls_paths.update(paths)
+        pretraining = {
+            sg: [f for f in _discover_mat_files(records_base_path, SUBGROUP_TO_FOLDER[sg])
+                 if f not in cls_paths]
+            for sg in HEALTHY_SUBGROUP_ORDER
+        }
 
     else:
-        # --- Step 1: Prescreening ---
-        if screening_csv_path is not None:
-            logger.info(f"Loading screening CSV: {screening_csv_path}")
-            screening_df = pd.read_csv(screening_csv_path)
-        else:
-            screening_csv_out = os.path.join(
-                output_base_path, "guid_screening_results.csv"
-            )
-            screening_df = prescreen_all_guids(
-                records_base_path, tlo_csv_path, screening_csv_out,
-                verbose=verbose, num_workers=num_workers,
-            )
-
-        # --- Step 2: GUID selection ---
-        selection_result = select_classification_guids(
-            screening_df, test_mode=test_mode, verbose=verbose
+        cv_result, pretraining = run_selection_steps(
+            records_base_path, output_base_path, tlo_csv_path, test_mode=test_mode,
+            verbose=verbose, num_workers=num_workers, screening_csv_path=screening_csv_path,
+            bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
         )
-
-        # Save selection summary
-        summary_path = os.path.join(
-            output_base_path, "classification_guid_selection_summary.json"
-        )
-        summary: Dict[str, Any] = {"test_mode": test_mode, "stats": selection_result["stats"]}
-        for pool_name in ["trainval", "test"]:
-            summary[pool_name] = {
-                sg: {"count": len(paths), "paths_sample": paths[:3]}
-                for sg, paths in selection_result[pool_name].items()
-            }
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-
-        # --- Step 3: Fold creation ---
-        cv_result = create_cv_splits(
-            selection_result, n_splits=N_FOLDS,
-            val_ratio=VAL_RATIO, random_state=RANDOM_STATE,
-        )
-        pickle_path = os.path.join(
-            output_base_path, "classification_dataset_records.pickle"
-        )
-        with open(pickle_path, "wb") as f:
-            pickle.dump(cv_result, f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info(f"CV result saved to {pickle_path}")
-
-        pretrain_bg_cs = selection_result["pretraining_bg_cs"]
-        pretrain_bg_no_cs = selection_result["pretraining_bg_no_cs"]
 
     # ------------------------------------------------------------------
     # Step 4: Pretraining (unsupervised) HDF5 creation
@@ -3897,28 +4024,27 @@ def create_new_pipeline(
     os.makedirs(pretrain_path, exist_ok=True)
 
     logger.info(
-        f"Pretraining leftovers: BG_CS={len(pretrain_bg_cs)}, "
-        f"BG_NoCS={len(pretrain_bg_no_cs)}"
+        "Pretraining leftovers: "
+        + ", ".join(f"{sg}={len(pretraining[sg])}" for sg in HEALTHY_SUBGROUP_ORDER)
     )
 
-    random.shuffle(pretrain_bg_cs)
-    split_cs = int(len(pretrain_bg_cs) * 0.9)
-    train_cs = pretrain_bg_cs[:split_cs]
-    test_cs = pretrain_bg_cs[split_cs:]
-
-    random.shuffle(pretrain_bg_no_cs)
-    split_no_cs = int(len(pretrain_bg_no_cs) * 0.9)
-    train_no_cs = pretrain_bg_no_cs[:split_no_cs]
-    test_no_cs = pretrain_bg_no_cs[split_no_cs:]
-
+    # The BG files keep their original names, so existing configs still find them.
+    file_stem = {"healthy_bg_cs": "cs", "healthy_bg_no_cs": "no_cs",
+                 "healthy_no_bg_cs": "no_bg_cs", "healthy_no_bg_no_cs": "no_bg_no_cs"}
+    pretrain_splits = {}
+    for sg in HEALTHY_SUBGROUP_ORDER:
+        records = list(pretraining[sg])
+        random.shuffle(records)
+        n_train = int(len(records) * 0.9)
+        pretrain_splits[sg] = {"train": records[:n_train], "test": records[n_train:]}
     pretrain_sets = [
-        ("train_dataset_cs.hdf5", train_cs, True, True),
-        ("train_dataset_no_cs.hdf5", train_no_cs, False, True),
-        ("test_dataset_cs.hdf5", test_cs, True, True),
-        ("test_dataset_no_cs.hdf5", test_no_cs, False, True),
+        (f"{split}_dataset_{file_stem[sg]}.hdf5", pretrain_splits[sg][split],
+         SUBGROUP_META[sg][1], SUBGROUP_META[sg][2])
+        for sg in HEALTHY_SUBGROUP_ORDER
+        for split in ("train", "test")
     ]
 
-    # These four bypass _build_hdf5_for_partition entirely, which is exactly why they go through
+    # These eight bypass _build_hdf5_for_partition entirely, which is exactly why they go through
     # the same create_hdf5_for_masks: a variant threaded into the partition path alone would
     # produce a directory whose classification and pre-training files disagree.
     for fname, records, cs, bg in pretrain_sets:
@@ -4103,6 +4229,16 @@ def build_parser() -> argparse.ArgumentParser:
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Causal only: read with the MIMO fill off, store the bridged signals "
                              "and the quality datasets. Default: off.")
+    parser.add_argument("--bg-cls-fraction", dest="bg_cls_fraction", type=float,
+                        help="Step 2: fraction of each eligible healthy BG subgroup in the "
+                             f"classification pool. Default: {HEALTHY_BG_CLS_FRACTION}.")
+    parser.add_argument("--no-bg-cls-fraction", dest="no_bg_cls_fraction", type=float,
+                        help="Step 2: fraction of each eligible healthy no-BG subgroup in the "
+                             "classification pool. Default: fill only the train/val deficit.")
+    parser.add_argument("--selection-only", dest="selection_only",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Run steps 1-3 only: screening CSV, selection summary and fold "
+                             "pickle; no HDF5 file. Default: off.")
     return parser
 
 
@@ -4121,6 +4257,9 @@ def main(
     device: Optional[str] = None,
     phase_operator: Optional[str] = None,
     signal_quality: Optional[bool] = None,
+    bg_cls_fraction: Optional[float] = None,
+    no_bg_cls_fraction: Optional[float] = None,
+    selection_only: Optional[bool] = None,
 ) -> int:
     """Apply the defaults the parser is not allowed to carry, then run the build.
 
@@ -4143,6 +4282,11 @@ def main(
         device: Torch device for the transform.
         phase_operator: Causal phase-harmonic operator version.
         signal_quality: Causal only: the signal-quality step.
+        bg_cls_fraction: Fraction of each eligible healthy BG subgroup in the classification
+            pool.
+        no_bg_cls_fraction: Fraction of each eligible healthy no-BG subgroup in the
+            classification pool; ``None`` fills only the train/val deficit.
+        selection_only: Run steps 1-3 only; no HDF5 file.
 
     Returns:
         The process exit code.
@@ -4164,6 +4308,9 @@ def main(
         device=device,
         phase_operator=phase_operator or PHASE_OPERATOR_LEGACY,
         signal_quality=bool(signal_quality),
+        bg_cls_fraction=HEALTHY_BG_CLS_FRACTION if bg_cls_fraction is None else bg_cls_fraction,
+        no_bg_cls_fraction=no_bg_cls_fraction,
+        selection_only=bool(selection_only),
     )
     return 0
 
@@ -4294,6 +4441,29 @@ RUN_ARGS: Dict[str, Any] = {
     # str | None -- a pre-computed guid_screening_results.csv to skip step 1 with.
     #        (None -> run step 1)
     "screening_csv_path": None,
+
+    # bool | None -- run steps 1-3 only and stop: guid_screening_results.csv (only if step 1
+    #        runs), classification_guid_selection_summary.json and
+    #        classification_dataset_records.pickle. No masks, no HDF5 file. Needs
+    #        classification_pickle_path=None and a NEW output_base_path.  (None -> False)
+    #        This is the input of build_minimization_folds.py; build_fold_datasets.py then
+    #        writes the HDF5 files.
+    "selection_only": None,
+
+    # ================== Step 2: the classification pool (fresh runs only) ==================
+    # Both are ignored when classification_pickle_path is set: the pickle already fixes the
+    # GUIDs. Set it to None (and screening_csv_path to the CSV) to run a new selection.
+    # choose_selection_fractions.py prints the consequences of each pair of values.
+    # The healthy test share of every healthy subgroup always equals its share of the eligible
+    # healthy population; every eligible healthy GUID outside classification goes to
+    # pretraining.
+    # float | None -- fraction of each eligible healthy BG subgroup (CS and NoCS alike) in the
+    #        pool, in (0, 1].  (None -> 0.10)
+    "bg_cls_fraction": None,
+    # float | None -- fraction of each eligible healthy no-BG subgroup in the pool, in [0, 1].
+    #        Equal to bg_cls_fraction gives a train/val healthy mix equal to the population's.
+    #        (None -> only enough no-BG GUIDs to give healthy = unhealthy in train/val)
+    "no_bg_cls_fraction": None,
 }
 
 
