@@ -129,6 +129,71 @@ def horizon_decay_weight(halflife_steps: float, horizon: int) -> torch.Tensor:
     return weights * (float(int(horizon)) / float(weights.sum()))
 
 
+def ar_innovation(
+    residual: torch.Tensor,
+    ar_coef: torch.Tensor,
+    step_mask: Optional[torch.Tensor] = None,
+    logvar: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""The AR(1) innovation along the horizon, and its log-variance, across masked steps.
+
+    The residual $r = x - \mu$ of channel $c$ follows $r_\tau = \phi_c\, r_{\tau-1} + e_\tau$ with
+    $e_\tau \sim \mathcal N(0, s^2_\tau)$, $s^2_\tau = \exp(\log\sigma^2_\tau)$ the decoder's own
+    variance, and $r_{-1} = 0$. A valid step $\tau$ whose last valid predecessor is
+    $\tau - k$ is scored on the exact conditional density of $r_\tau$ given $r_{\tau - k}$, with the
+    $k - 1$ masked steps between them marginalised:
+
+    $$e_\tau = r_\tau - \phi_c^{k} r_{\tau-k}, \qquad
+    V_\tau = \sum_{j=0}^{k-1} \phi_c^{2j}\, s^2_{\tau-j}.$$
+
+    With no valid predecessor the virtual $r_{-1} = 0$ takes its place. The recursion that computes
+    both, from $p_0 = 0$ and $V_0 = s^2_0$, is
+
+    $$p_\tau = \phi_c\,\bigl(m_{\tau-1} r_{\tau-1} + (1 - m_{\tau-1})\, p_{\tau-1}\bigr), \qquad
+    V_\tau = s^2_\tau + (1 - m_{\tau-1})\, \phi_c^2 V_{\tau-1}, \qquad e_\tau = r_\tau - p_\tau.$$
+
+    No masked target is read: a masked step enters only through its predicted variance. A
+    restart at $e_\tau = r_\tau$ under $s^2_\tau$ alone would score the step after a gap with the
+    innovation variance, though its residual carries the marginal variance, about
+    $1 / (1 - \phi_c^2)$ times larger; that pays the decoder to widen its variance everywhere,
+    because the variance head has no mask input. $V$ is formed in the log domain as
+    $\log s^2_\tau + \operatorname{log1p}\bigl((1 - m_{\tau-1})\,\phi_c^2 V_{\tau-1} / s^2_\tau\bigr)$,
+    so a step whose predecessor is valid keeps its log-variance bitwise, and a horizon with no
+    masked step is bitwise the plain innovation $r_\tau - \phi_c r_{\tau-1}$.
+
+    Args:
+        residual: $r$, $(\ldots, H, C)$.
+        ar_coef: $\phi_c$, $(C,)$.
+        step_mask: The per-step validity $(\ldots, H)$, broadcastable against ``residual`` without
+            its channel axis; ``None`` treats every step as valid.
+        logvar: $\log s^2$, broadcastable to ``residual``; ``None`` returns no variance (the
+            ``'mse'`` score).
+
+    Returns:
+        ``(innovation, logvar_eff)``: $e$ in the shape of ``residual``, and $\log V$ in that shape
+        (``logvar`` itself when ``step_mask`` is ``None``), or ``None`` without ``logvar``.
+    """
+    if step_mask is None:
+        previous = F.pad(residual[..., :-1, :], (0, 0, 1, 0))
+        return residual - ar_coef * previous, logvar
+    mask = torch.broadcast_to(step_mask[..., None], residual.shape[:-1] + (1,)).to(residual.dtype)
+    log_s2 = None if logvar is None else torch.broadcast_to(logvar, residual.shape)
+    phi_sq = ar_coef * ar_coef
+    innovations = [residual[..., 0, :]]
+    log_vars = [] if log_s2 is None else [log_s2[..., 0, :]]
+    prediction = torch.zeros_like(residual[..., 0, :])
+    for tau in range(1, residual.shape[-2]):
+        valid_prev = mask[..., tau - 1, :]
+        gap_prev = 1.0 - valid_prev
+        prediction = ar_coef * (valid_prev * residual[..., tau - 1, :] + gap_prev * prediction)
+        innovations.append(residual[..., tau, :] - prediction)
+        if log_s2 is not None:
+            carried = gap_prev * phi_sq * torch.exp(log_vars[-1] - log_s2[..., tau, :])
+            log_vars.append(log_s2[..., tau, :] + torch.log1p(carried))
+    innovation = torch.stack(innovations, dim=-2)
+    return innovation, None if log_s2 is None else torch.stack(log_vars, dim=-2)
+
+
 def raw_sample_score(
     mu: torch.Tensor,
     target: torch.Tensor,
@@ -203,9 +268,10 @@ def raw_sample_score(
             joint negative log-density of a horizon whose residuals are serially correlated.
             ``None`` is the factorised score, bitwise.
         step_mask: Optional per-step validity $(\ldots, H)$ -- the forecast mask -- read only with
-            ``ar_coef``. A masked step's residual is zeroed before it is lagged, so the recursion
-            restarts after a gap as it starts at $\tau = 0$ and never conditions on a gap's target.
-            The mask itself is still applied by the caller afterwards.
+            ``ar_coef``. A valid step after masked steps is scored on its exact conditional
+            density given the last valid residual, with the masked steps marginalised
+            (:func:`ar_innovation`); no masked target is read. The mask itself is still applied
+            by the caller afterwards.
 
     Returns:
         The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
@@ -229,12 +295,9 @@ def raw_sample_score(
                 f"ar_coef must be 1-D of the block's channel width {residual.shape[-1]}, got "
                 f"shape {tuple(ar_coef.shape)}"
             )
-        # A masked step (a gap inside the window) restarts the recursion exactly as r_{-1} = 0
-        # starts it: its residual is not conditioned on, so no gap target is read and no gradient
-        # reaches the mean at a step the objective does not score.
-        lagged = residual if step_mask is None else residual * step_mask[..., None]
-        previous = F.pad(lagged[..., :-1, :], (0, 0, 1, 0))
-        residual = residual - ar_coef * previous
+        # A masked step (a gap inside the window) is marginalised: the next valid step is scored
+        # on its conditional density given the last valid residual, so no gap target is read.
+        residual, logvar = ar_innovation(residual, ar_coef, step_mask, logvar)
     diff2 = residual**2
     if likelihood == "mse":
         score = diff2
@@ -1104,10 +1167,17 @@ def compute_loss(
             1.0 - gate_support.sum() / kl_support.sum().clamp_min(1.0)
         ).detach().to(dtype)
 
-    # The event gate's sparsity term, over the KL's own anchor support so the two are in the same
-    # per-anchor units, less the anchors the source mask closed. Absent gate: the model is the
-    # ungated one, whose gate is identically 1, and a weight on it would be a knob that reaches
-    # nothing -- refused rather than ignored.
+    # The event gate's sparsity term. Absent gate: the model is the ungated one, whose gate is
+    # identically 1, and a weight on it would be a knob that reaches nothing -- refused rather
+    # than ignored.
+    #
+    # Two means, because the source mask makes them differ. ``event_gate_mean`` is the readout:
+    # the gate's mean over the anchors the source mask left open. ``event_gate_penalty`` is the
+    # objective term: the open anchors' gate summed and divided by the KL's own anchor count, the
+    # denominator of the KL. A closed anchor contributes 0 to both sums, so the penalty and the KL
+    # weigh one open anchor alike whatever share $f$ the mask closed. The open-anchor mean as the
+    # penalty would weigh the gate $1/(1 - f)$ times more against the KL than in an arm without
+    # the mask. Without the mask the two are the same value, bitwise.
     event_gate = forward_outputs.get("event_gate")
     if event_gate is None:
         if lambda_event_gate != 0.0:
@@ -1116,10 +1186,22 @@ def compute_loss(
                 f"build the model with posterior_event_gate=True, or set lambda_event_gate to 0.0"
             )
         event_gate_mean = torch.ones((), device=device, dtype=dtype)
+        event_gate_penalty = event_gate_mean
     else:
-        event_gate_mean = (
-            event_gate.squeeze(-1) * gate_support
-        ).sum() / gate_support.sum().clamp_min(1.0)
+        gate_sum = (event_gate.squeeze(-1) * gate_support).sum()
+        event_gate_mean = gate_sum / gate_support.sum().clamp_min(1.0)
+        event_gate_penalty = (
+            event_gate_mean if source_open is None
+            else gate_sum / kl_support.sum().clamp_min(1.0)
+        )
+
+    # The coupling rate over the open anchors alone. ``source_conditioned_kl_raw`` averages over
+    # every KL anchor, so under the source mask it holds the exact zeros of the closed ones and
+    # reads about $(1 - f)$ times this value. Equal to it without the mask.
+    with torch.no_grad():
+        source_conditioned_kl_open = (
+            (kld_btd.sum(dim=-1) * gate_support).sum() / gate_support.sum().clamp_min(1.0)
+        ).to(dtype)
 
     # The shape terms, each over both branches and each computed only when it is weighted; see
     # the zeros-when-off paragraph above for why an unweighted term reports 0.0 rather than its
@@ -1154,7 +1236,7 @@ def compute_loss(
         + lambda_ms * aux_multiscale
         + lambda_deriv * aux_derivative
         + lambda_boundary * aux_boundary
-        + lambda_event_gate * beta * event_gate_mean
+        + lambda_event_gate * beta * event_gate_penalty
     )
 
     # Diagnostics over the same masked supports the losses use, so each stays inside its own
@@ -1240,6 +1322,8 @@ def compute_loss(
         "nll_base_sample": nll_base_sample,
         "pred_gap": pred_gap,
         "source_conditioned_kl_raw": kl_terms["source_conditioned_kl_raw"],
+        # The same rate over the anchors the source mask left open; equal to the raw one without it.
+        "source_conditioned_kl_open": source_conditioned_kl_open,
         "source_conditioned_kl_train": kl_terms["source_conditioned_kl_train"],
         "kld_active_frac": kl_terms["kld_active_frac"],
         "prior_rate": prior_rate,

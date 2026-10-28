@@ -378,6 +378,17 @@ because the resolver refuses a source reference against an unaligned target by n
 `planted.yaml` is not an arm: it is the identifiability check's own geometry, with its alignment
 pinned so a default flip cannot move the instrument.
 
+**The quality-mask experiment (2026-10-28) adds one arm and two production overlays.** That
+sentence about a closed inventory predates the event and quality arms. `sweep_no_quality_mask.yaml`
+is the default with its three quality switches off and both loader step masks unset, on the same
+version-4 shards. `prod_q4_masked.yaml` and `prod_q4_no_quality_mask.yaml` put the default and that
+arm on the 2026-10-27 build, 4 GPUs each, so the two arms train side by side at one effective batch.
+Both checkpoints are evaluated under `eval/configs/eval_overrides_prod_q4.yaml`, which labels every
+anchor with `ua_key_open` and `target_bad_steps`. `eval/compare_quality_arms.py` then compares the
+arms on the anchors both score alike (`ua_key_open == 1`, `target_bad_steps == 0`). Their training
+`nll_*` and KL levels do not compare, because the masked arm scores fewer target steps and averages
+exact zeros at its closed anchors. `source_conditioned_kl_open` is the KL over the open anchors.
+
 ---
 
 ## Where the numbers come from

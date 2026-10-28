@@ -1,0 +1,28 @@
+# SMOKE RUN on the production box before the two long runs of the quality-mask experiment.
+#
+# The masked arm's production overlay on one train shard and one test shard, 2 GPUs, 2 epochs and
+# MLflow off. It proves on the real build that the pre-flight passes (shards, statistics file,
+# quality layouts, warm-up budget), that DDP starts, that a training and a validation epoch run with
+# every quality mask on, and that a checkpoint is written. Read `full.log` for the "Causal
+# validity" lines and the normalisation fields, and `metrics_history.csv` for
+# `source_mask_fraction` and `source_conditioned_kl_open`.
+#
+# Launch from the PyCharm Run button: set RUN_CONFIG in teb_vae/lag_attn_transformer_cfs/trainer.py
+# to this file and press Run.
+base: prod_q4_masked.yaml
+
+general_config:
+  tag: lag_attn_trf_cfs_q4_smoke
+  cuda_devices: [0, 1]
+  epochs: 2
+
+dataset_config:
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false

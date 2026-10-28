@@ -103,7 +103,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
@@ -112,6 +111,7 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_CAVEAT
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.losses import (
     KLD_ACTIVE_EPS,
+    ar_innovation,
     masked_raw_block_per_anchor,
     raw_sample_score,
 )
@@ -488,11 +488,37 @@ def forecast_innovation(
     Returns:
         The innovation, the broadcast shape of ``target - mu``.
     """
+    return forecast_innovation_and_logvar(mu, target, None, ar_coef, step_mask)[0]
+
+
+def forecast_innovation_and_logvar(
+    mu: torch.Tensor,
+    target: torch.Tensor,
+    logvar: Optional[torch.Tensor],
+    ar_coef: Optional[torch.Tensor] = None,
+    step_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""The innovation of :func:`forecast_innovation` and the log-variance it is scored under.
+
+    Without a masked step inside a window the log-variance is ``logvar`` itself. After a masked
+    step it is the marginal one of
+    :func:`~teb_vae.lag_attn_rws.nets.losses.ar_innovation`, so a statistic standardised by it
+    describes the density the block NLL scores.
+
+    Args:
+        mu: Forecast mean, broadcastable to $(B, A_{\max}, H, C_{\mathrm{keep}})$.
+        target: The gathered forecast target.
+        logvar: The forecast log-variance, or ``None``.
+        ar_coef: $\phi_c$, $(C_{\mathrm{keep}},)$, or ``None``.
+        step_mask: The forecast mask $(B, A_{\max}, H)$, or ``None``.
+
+    Returns:
+        ``(innovation, logvar_eff)``; ``logvar_eff`` is ``logvar`` without ``ar_coef``.
+    """
     residual = target - mu
     if ar_coef is None:
-        return residual
-    lagged = residual if step_mask is None else residual * step_mask[..., None]
-    return residual - ar_coef * F.pad(lagged[..., :-1, :], (0, 0, 1, 0))
+        return residual, logvar
+    return ar_innovation(residual, ar_coef, step_mask, logvar)
 
 
 def _scored_cells(mask: torch.Tensor, cell_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1279,11 +1305,8 @@ def horizon_residual_sums(
         The four sums, each $(H,)$ in float64.
     """
     residual_sq = (target - mu) ** 2
-    innovation_sq = (
-        residual_sq
-        if ar_coef is None
-        else forecast_innovation(mu, target, ar_coef, step_mask=mask) ** 2
-    )
+    innovation, logvar_eff = forecast_innovation_and_logvar(mu, target, logvar, ar_coef, mask)
+    innovation_sq = residual_sq if ar_coef is None else innovation**2
     masked = _scored_cells(mask, cell_mask)
     count = (
         mask.sum(dim=(0, 1), dtype=torch.float64) * float(target.shape[-1])
@@ -1292,7 +1315,7 @@ def horizon_residual_sums(
     )
     return {
         "sum_sq": (residual_sq * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
-        "sum_standardised_sq": (innovation_sq * torch.exp(-logvar) * masked).sum(
+        "sum_standardised_sq": (innovation_sq * torch.exp(-logvar_eff) * masked).sum(
             dim=(0, 1, 3), dtype=torch.float64
         ),
         "sum_logvar": (logvar * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
@@ -1792,10 +1815,9 @@ def calibration_sums(
         the reduction does not already give.
     """
     weights = _scored_cells(mask, cell_mask).expand_as(target).reshape(-1)
-    residual = (
-        forecast_innovation(mu, target, ar_coef, step_mask=mask).expand_as(target).reshape(-1)
-    )
-    flat_logvar = logvar.expand_as(target).reshape(-1)
+    innovation, logvar_eff = forecast_innovation_and_logvar(mu, target, logvar, ar_coef, mask)
+    residual = innovation.expand_as(target).reshape(-1)
+    flat_logvar = logvar_eff.expand_as(target).reshape(-1)
     sigma = torch.exp(0.5 * flat_logvar)
     standardised = residual / sigma
 
@@ -2222,6 +2244,73 @@ def anchor_support(
     )
     kl_support = kl_mask(mask, model.geometry, anchors=anchors, anchor_valid=anchor_valid)
     return mask, coverage, kl_support
+
+
+@torch.no_grad()
+def anchor_quality_labels(
+    task: Any, batch: Any, u_stream: torch.Tensor, outputs: Mapping[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    r"""The signal quality of each decoded anchor, read from the batch whatever the model applies.
+
+    Two labels, so that a model trained with the quality masks and a control trained without them
+    can be compared on one anchor set:
+
+    * ``ua_key_open`` -- $1$ where at least one lag key of the anchor survives the UA step mask,
+      $o_t = \exists \ell: K_{t\ell}$, built by the net's own :meth:`source_key_mask` from the
+      batch's ``up_*_step_valid``. Under ``source_quality_mask`` it equals the forward's
+      ``source_open``; on a control it says which anchors that mask would have closed.
+    * ``target_bad_steps`` -- the forecast steps of the anchor that the FHR step mask removes,
+      $\sum_\tau (m^{\mathrm{plain}}_{\tau} - m^{\mathrm{clean}}_{\tau})$, both masks without the
+      coverage floor. $0$ means the anchor's forecast window holds no bridged FHR, so the two arms
+      score the same cells there.
+
+    The step masks are the loader's own (``dataset_kwargs.ua_step_mask`` and ``fhr_step_mask``),
+    so an evaluation of a control sets those two keys in its overrides to get the labels. A label
+    whose fields the batch lacks is left out. Neither label applies the ``source_event_mask``
+    ablation: both describe signal quality, not the model's own mask.
+
+    Args:
+        task: The Lightning task wrapping the loaded net.
+        batch: A batch from the data module.
+        u_stream: The assembled source stream $(B, T, c_u)$.
+        outputs: The forward's dict, carrying ``anchor_index`` and ``anchor_valid``.
+
+    Returns:
+        ``{name: (B, A_max) float}`` for each label the batch can give.
+
+    Raises:
+        RuntimeError: If a step mask is not the shape of the stream it describes.
+    """
+    model = task.orig_model
+    anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
+    labels: Dict[str, torch.Tensor] = {}
+    source_names = (
+        ("up_st", "up_ph") if bool(getattr(model, "use_up_st", False)) else ("up_ph",)
+    )
+    source_blocks = [batch_field(batch, f"{name}_step_valid") for name in source_names]
+    if all(block is not None for block in source_blocks):
+        valid = torch.cat([b.to(u_stream.device) for b in source_blocks], dim=-1).to(torch.bool)
+        if tuple(valid.shape) != tuple(u_stream.shape):
+            raise RuntimeError(
+                f"the UA step mask has shape {tuple(valid.shape)} but the source stream has "
+                f"{tuple(u_stream.shape)}"
+            )
+        lag_mask = model.build_lag_mask(int(u_stream.shape[1]), u_stream.device)
+        key_mask = model.source_key_mask(valid, lag_mask, u_stream.dtype)
+        labels["ua_key_open"] = key_mask.any(dim=-1).gather(1, anchors).to(u_stream.dtype)
+    target_blocks = [batch_field(batch, f"{name}_step_valid") for name in ("fhr_st", "fhr_ph")]
+    if all(block is not None for block in target_blocks):
+        _, weight = task._build_raw_target(batch)
+        valid = task._target_step_valid(batch).to(device=weight.device, dtype=weight.dtype)
+        masks = [
+            forecast_mask(
+                model.scored_weight(w), model.geometry, coverage_floor=0.0,
+                anchors=anchors, anchor_valid=anchor_valid,
+            )[0]
+            for w in (weight, weight * valid)
+        ]
+        labels["target_bad_steps"] = (masks[0] - masks[1]).sum(dim=-1)
+    return labels
 
 
 @torch.no_grad()
@@ -2757,6 +2846,10 @@ def evaluate_batch(
         per_anchor["source_open"] = outputs["source_open"].gather(1, anchors).to(
             training_block.dtype
         )
+    # The signal quality of each anchor, whatever the model applies, so two arms can be compared
+    # on the anchors whose UA keys are open and whose forecast window holds no bridged FHR.
+    for name, label in anchor_quality_labels(task, batch, u_stream, outputs).items():
+        per_anchor[name] = label.to(training_block.dtype)
     # The effective posterior gate per anchor ($g_t o_t$ under the mask), when the net builds one.
     event_gate = outputs.get("event_gate")
     if event_gate is not None:
