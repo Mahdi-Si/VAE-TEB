@@ -426,8 +426,9 @@ def test_the_pre_training_dataset_is_built_before_the_folds(
 
     pre_training = [i for i, name in enumerate(order) if name.startswith("pre_training:")]
     classification = [i for i, name in enumerate(order) if name.startswith("classification:")]
-    # Four pre-training files -- train/test crossed with cs/no_cs -- and one partition per fold.
-    assert len(pre_training) == 4, order
+    # Eight pre-training files -- train/test crossed with the four healthy subgroups -- and one
+    # partition per fold.
+    assert len(pre_training) == 8, order
     assert classification, order
     assert max(pre_training) < min(classification), order
 
