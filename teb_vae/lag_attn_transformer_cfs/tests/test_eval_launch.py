@@ -26,6 +26,9 @@ import pytest
 ENTRY_POINTS: Tuple[str, ...] = (
     "teb_vae.lag_attn_transformer_cfs.eval.run",
     "teb_vae.lag_attn_transformer_cfs.eval.verify",
+    # The quality-mask experiment's two runners: the per-arm launcher and the comparison.
+    "teb_vae.lag_attn_transformer_cfs.eval.run_quality_arms",
+    "teb_vae.lag_attn_transformer_cfs.eval.compare_quality_arms",
 )
 
 
