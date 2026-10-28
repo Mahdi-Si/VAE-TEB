@@ -41,6 +41,7 @@ both geometries side by side rather than choosing one.
 | Signal-quality rules (§8.3) | `hdf5_dataset/signal_quality.py` |
 | Signal-quality report, profile and diagnosis | `hdf5_dataset/new_pipeline/quality_report.py`, `hdf5_dataset/new_pipeline/profile_signal_quality.py`, `hdf5_dataset/new_pipeline/diagnose_signal_quality.py` |
 | K-fold and pretraining build (final) | `hdf5_dataset/new_pipeline/build_fold_datasets.py` (§11.4) |
+| Folders of `early_maestra` and `mimo`, and the import check | `hdf5_dataset/new_pipeline/external_paths.py`, `hdf5_dataset/new_pipeline/prod_import_probe.py` (§11.4) |
 | Signal-quality design | `research_notes/UA_QUALITY_MASK_DESIGN.md` |
 | Normalisation statistics | `hdf5_dataset/calculate_dataset_stats.py` |
 | PyTorch segment dataset | `hdf5_dataset/hdf5_dataset.py` |
@@ -2888,15 +2889,21 @@ quality versions.
 
 Build the files:
 
-1. Copy the current `hdf5_dataset/` files to the production box.
-2. Open `hdf5_dataset/new_pipeline/build_fold_datasets.py`.
-3. Set `fold_dir`, `screening_csv_path` and `tlo_csv_path` in `RUN_ARGS`.
-4. Set `output_base_path` to a new, empty folder.
-5. Keep `dry_run` at `True` and press Run.
-6. Check the GUID counts in the printed table and in `manifest.json`.
-7. Set `dry_run` to `False` and set `devices`.
-8. Press Run.
-9. Check that `manifest.json` has `"quality_version": 4` under `settings`.
+1. On the production box, run `git pull` in the clone of this repository.
+2. Open `hdf5_dataset/new_pipeline/external_paths.py`.
+3. Set `EXTERNAL_ROOTS` to the folders that hold `early_maestra/` and `mimo/`, for example
+   `.../TrainWithDataset/EarlyMaestra` and `.../TrainWithDataset/MIMO_Sequence_Trainer`.
+4. Press Run on `hdf5_dataset/new_pipeline/prod_import_probe.py`.
+5. Check in `prod_import_report.txt` that both build modules import and that
+   `QUALITY_VERSION=4`.
+6. Open `hdf5_dataset/new_pipeline/build_fold_datasets.py`.
+7. Set `fold_dir`, `screening_csv_path` and `tlo_csv_path` in `RUN_ARGS`.
+8. Set `output_base_path` to a new, empty folder.
+9. Keep `dry_run` at `True` and press Run.
+10. Check the GUID counts in the printed table and in `manifest.json`.
+11. Set `dry_run` to `False` and set `devices`.
+12. Press Run.
+13. Check that `manifest.json` has `"quality_version": 4` under `settings`.
 
 Check the quality report:
 
