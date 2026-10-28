@@ -1,6 +1,7 @@
 r"""Build the k-fold and pretraining HDF5 datasets from a minimization fold folder.
 
-``build_minimization_folds.py`` (run in the ``em_analysis`` checkout) writes a fold folder: the
+``build_minimization_folds.py`` (this folder; run with the ``em_analysis`` environment) writes a
+fold folder: the
 partition of every classification GUID in every fold (``fold_partitions.csv``). This module turns
 that folder into the two datasets ``create_new_pipeline.py`` builds, with three changes.
 

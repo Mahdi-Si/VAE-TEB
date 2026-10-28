@@ -178,6 +178,14 @@ HEALTHY_BG_CLS_FRACTION = 0.10
 #: $n_{\mathrm{unhealthy}} - n_{\mathrm{BG}}$. A float takes that fraction of each eligible no-BG
 #: subgroup instead, like ``HEALTHY_BG_CLS_FRACTION`` does for BG.
 HEALTHY_NO_BG_CLS_FRACTION = None
+#: The screening column that makes a healthy GUID eligible for classification. The unhealthy
+#: subgroups always use ``eligible_2h``; ``eligible_2h`` here applies the same rule to both
+#: classes, so the amount of valid signal is no class cue.
+HEALTHY_ELIGIBILITY = "eligible_3h"
+ELIGIBILITY_COLUMNS = ("eligible_2h", "eligible_3h")
+#: Pretraining keeps the 3 h rule whatever the classification rule, as ``build_fold_datasets``
+#: does by default.
+PRETRAIN_ELIGIBILITY_COLUMN = "eligible_3h"
 TEST_HOLDOUT_FRACTION = 0.10
 HEALTHY_NO_BG_TLO_RATIO = 0.75
 WEIGHT_THRESHOLD = 0.90
@@ -2539,14 +2547,22 @@ def select_classification_guids(
     verbose: bool = True,
     no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
     n_folds: int = N_FOLDS,
+    healthy_eligibility: str = HEALTHY_ELIGIBILITY,
 ) -> Dict[str, Any]:
     r"""Select GUIDs for classification, a population-proportional test set, and pretraining.
 
-    Unhealthy: all eligible (>=2 h). Healthy BG: ``bg_cls_fraction`` of eligible (>=3 h) per
-    CS/NoCS, natural TLO ratio. Healthy no-BG: ``no_bg_cls_fraction`` of eligible per CS/NoCS
-    (75/25 TLO), or, with ``None``, only enough to fill the train/val deficit
-    $n_{\mathrm{unhealthy}} - n_{\mathrm{BG}}$. These GUIDs form the *pool*. The classes may be
-    imbalanced; the classifier loss is expected to handle that.
+    Unhealthy: all eligible (>=2 h). Healthy: eligible by ``healthy_eligibility`` (>=3 h by
+    default, >=2 h with ``'eligible_2h'``). Healthy BG: ``bg_cls_fraction`` of eligible per
+    CS/NoCS, drawn at random. Healthy no-BG, two rules:
+
+    * ``no_bg_cls_fraction`` set: that fraction of eligible per CS/NoCS, drawn at random, so
+      every subgroup keeps its population TLO rate.
+    * ``None``: only enough to fill the train/val deficit
+      $n_{\mathrm{unhealthy}} - n_{\mathrm{BG}}$, drawn at ``no_bg_tlo_ratio`` TLO (the original
+      rule, kept so that old builds reproduce).
+
+    These GUIDs form the *pool*. The classes may be imbalanced; the classifier loss is expected
+    to handle that.
 
     **Test.** Each healthy subgroup $g$ gets a test share equal to its share of the eligible
     healthy population, $p_g = E_g / \sum_h E_h$, where $E_g$ is the eligible count. Let $c_g$ be
@@ -2560,8 +2576,8 @@ def select_classification_guids(
     outside the pool. Extra GUIDs never appear in train/val. With equal fractions every extra
     count is about zero; a subgroup with a lower fraction than the others gets the extras.
 
-    **Pretraining.** Every eligible healthy GUID outside the pool and the test set, all four
-    subgroups.
+    **Pretraining.** Every healthy GUID with ``eligible_3h`` outside the pool and the test set,
+    all four subgroups, whatever ``healthy_eligibility`` is.
 
     Two test modes:
         * **holdout** — fixed test holdout (~10 % of each unhealthy and BG subgroup) before
@@ -2575,12 +2591,14 @@ def select_classification_guids(
         bg_cls_fraction: Fraction of each eligible BG subgroup that goes to the pool, in
             $(0, 1]$.
         test_holdout_fraction: Fraction held out for test per subgroup (holdout mode).
-        no_bg_tlo_ratio: Enforced TLO ratio for no-BG subgroups.
+        no_bg_tlo_ratio: Enforced TLO ratio of the no-BG draws, deficit rule only.
         random_state: Random seed.
         verbose: Verbosity flag.
         no_bg_cls_fraction: Fraction of each eligible no-BG subgroup that goes to the pool, in
             $[0, 1]$, or ``None`` for the deficit rule.
         n_folds: The fold count $K$ of the augmented test partition.
+        healthy_eligibility: ``'eligible_3h'`` or ``'eligible_2h'``: the screening column
+            that makes a healthy GUID eligible for classification.
 
     Returns:
         Dict with keys ``test_mode``, ``trainval`` (the pool), ``test`` (the extra test GUIDs in
@@ -2588,7 +2606,7 @@ def select_classification_guids(
         ``pretraining`` (``{healthy subgroup: paths}``) and ``stats``.
 
     Raises:
-        ValueError: If a fraction is outside its range.
+        ValueError: If a fraction is outside its range or *healthy_eligibility* is unknown.
         RuntimeError: If the pool, the test set and the pretraining set overlap.
     """
     if not 0.0 < bg_cls_fraction <= 1.0:
@@ -2596,7 +2614,19 @@ def select_classification_guids(
     if no_bg_cls_fraction is not None and not 0.0 <= no_bg_cls_fraction <= 1.0:
         raise ValueError(f"no_bg_cls_fraction={no_bg_cls_fraction}; use a value in [0, 1] "
                          f"or None")
+    if healthy_eligibility not in ELIGIBILITY_COLUMNS:
+        raise ValueError(f"healthy_eligibility={healthy_eligibility!r}; use one of "
+                         f"{ELIGIBILITY_COLUMNS}")
     rng = random.Random(random_state)
+
+    def sample_no_bg(pool_df: pd.DataFrame, n: int) -> List[str]:
+        # Fraction mode draws at random, so the pool keeps the population TLO rate; the deficit
+        # rule keeps its original TLO quota.
+        if no_bg_cls_fraction is None:
+            return _sample_with_tlo_constraint(pool_df, n, no_bg_tlo_ratio, rng)
+        paths = pool_df["record_path"].tolist()
+        rng.shuffle(paths)
+        return paths[:max(n, 0)]
 
     # ------------------------------------------------------------------
     # A. Filter eligible pools with per-subgroup thresholds
@@ -2611,13 +2641,13 @@ def select_classification_guids(
 
     healthy_bg_eligible = screening_df[
         no_err
-        & (screening_df["eligible_3h"] == True)
+        & (screening_df[healthy_eligibility] == True)
         & screening_df["subgroup"].isin(BG_SUBGROUPS)
     ].copy()
 
     healthy_no_bg_eligible = screening_df[
         no_err
-        & (screening_df["eligible_3h"] == True)
+        & (screening_df[healthy_eligibility] == True)
         & screening_df["subgroup"].isin(NO_BG_SUBGROUPS)
     ].copy()
 
@@ -2698,9 +2728,7 @@ def select_classification_guids(
             n_tv = round(n_pool * no_bg_cls_fraction)
             if n_pool and no_bg_cls_fraction > 0:
                 n_tv = max(n_tv, 1)
-            trainval[sg] = _sample_with_tlo_constraint(
-                no_bg_pools[sg], n_tv, no_bg_tlo_ratio, rng
-            )
+            trainval[sg] = sample_no_bg(no_bg_pools[sg], n_tv)
     elif deficit > 0 and total_no_bg_eligible > 0:
         frac_cs = len(no_bg_pools["healthy_no_bg_cs"]) / total_no_bg_eligible
         n_no_bg_cs_tv = min(
@@ -2772,19 +2800,23 @@ def select_classification_guids(
             )
             n_need = len(candidates)
         extra_test[sg] = (
-            candidates[:n_need] if sg in BG_SUBGROUPS
-            else _sample_with_tlo_constraint(candidates, n_need, no_bg_tlo_ratio, rng)
+            candidates[:n_need] if sg in BG_SUBGROUPS else sample_no_bg(candidates, n_need)
         )
         test_guids[sg] = test_guids.get(sg, []) + extra_test[sg]
 
     # ------------------------------------------------------------------
-    # Pretraining: every eligible healthy GUID outside the pool and the test set
+    # Pretraining: every 3 h healthy GUID outside the pool and the test set
     # ------------------------------------------------------------------
     pool_paths = {path for paths in trainval.values() for path in paths}
     test_paths = {path for paths in test_guids.values() for path in paths}
+    pretrain_eligible = screening_df[
+        no_err
+        & (screening_df[PRETRAIN_ELIGIBILITY_COLUMN] == True)
+        & screening_df["subgroup"].isin(HEALTHY_SUBGROUPS)
+    ]
     pretraining = {
         sg: sorted(
-            set(healthy_eligible.loc[healthy_eligible["subgroup"] == sg, "record_path"])
+            set(pretrain_eligible.loc[pretrain_eligible["subgroup"] == sg, "record_path"])
             - pool_paths - test_paths
         )
         for sg in HEALTHY_SUBGROUP_ORDER
@@ -2820,6 +2852,9 @@ def select_classification_guids(
         "test_mode": test_mode,
         "bg_cls_fraction": bg_cls_fraction,
         "no_bg_cls_fraction": no_bg_cls_fraction,
+        "healthy_eligibility": healthy_eligibility,
+        "no_bg_sampling": ("random" if no_bg_cls_fraction is not None
+                           else f"tlo_ratio={no_bg_tlo_ratio}"),
         "eligible_healthy": eligible_healthy_counts,
         "population_share": p,
         "healthy_test_per_fold": test_per_fold,
@@ -2858,7 +2893,8 @@ def select_classification_guids(
                     f"{sum(len(v) for v in extra_test.values())}")
         logger.info(f"  Pretraining: {sum(len(v) for v in pretraining.values())} healthy GUIDs")
         logger.info(f"  Test mode: {test_mode}; bg_cls_fraction={bg_cls_fraction}, "
-                    f"no_bg_cls_fraction={no_bg_cls_fraction}")
+                    f"no_bg_cls_fraction={no_bg_cls_fraction}, "
+                    f"healthy_eligibility={healthy_eligibility}")
         logger.info("=" * 96)
 
     # Build path -> tlo_hours lookup for stratification in create_cv_splits
@@ -3730,6 +3766,7 @@ def run_selection_steps(
     screening_csv_path: Optional[str] = None,
     bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
     no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
+    healthy_eligibility: str = HEALTHY_ELIGIBILITY,
 ) -> Tuple[Dict[str, Any], Dict[str, List[str]]]:
     """Steps 1-3: prescreen, select the classification GUIDs, and cut the folds.
 
@@ -3748,6 +3785,7 @@ def run_selection_steps(
         screening_csv_path: Skip step 1 and load this screening CSV.
         bg_cls_fraction: See :func:`select_classification_guids`.
         no_bg_cls_fraction: See :func:`select_classification_guids`.
+        healthy_eligibility: See :func:`select_classification_guids`.
 
     Returns:
         ``(cv_result, pretraining)``: the folds, as pickled, and ``{healthy subgroup: paths}``
@@ -3768,6 +3806,7 @@ def run_selection_steps(
     selection_result = select_classification_guids(
         screening_df, test_mode=test_mode, verbose=verbose,
         bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
+        healthy_eligibility=healthy_eligibility,
     )
 
     # Save selection summary
@@ -3810,6 +3849,7 @@ def create_new_pipeline(
     bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
     no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
     selection_only: bool = False,
+    healthy_eligibility: str = HEALTHY_ELIGIBILITY,
 ):
     """Run the complete new dataset creation pipeline.
 
@@ -3877,6 +3917,9 @@ def create_new_pipeline(
             resuming from a pickle. See :func:`select_classification_guids`.
         selection_only: Run steps 1-3 only (see :func:`run_selection_steps`) and stop: no
             masks, no HDF5 file. Needs ``classification_pickle_path=None``.
+        healthy_eligibility: Step 2: ``'eligible_3h'`` or ``'eligible_2h'``, the screening
+            column that makes a healthy GUID eligible for classification. Ignored when
+            resuming from a pickle.
 
     Raises:
         ValueError: On an unknown *transform*, *leg_alignment* or
@@ -3895,6 +3938,9 @@ def create_new_pipeline(
         raise ValueError(f"bg_cls_fraction={bg_cls_fraction}; use a value in (0, 1]")
     if no_bg_cls_fraction is not None and not 0.0 <= no_bg_cls_fraction <= 1.0:
         raise ValueError(f"no_bg_cls_fraction={no_bg_cls_fraction}; use a value in [0, 1] or None")
+    if healthy_eligibility not in ELIGIBILITY_COLUMNS:
+        raise ValueError(f"healthy_eligibility={healthy_eligibility!r}; use one of "
+                         f"{ELIGIBILITY_COLUMNS}")
 
     if selection_only and classification_pickle_path is not None:
         raise ValueError("selection_only=True runs steps 1-3, which classification_pickle_path "
@@ -3912,6 +3958,7 @@ def create_new_pipeline(
             records_base_path, output_base_path, tlo_csv_path, test_mode=test_mode,
             verbose=verbose, num_workers=num_workers, screening_csv_path=screening_csv_path,
             bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
+            healthy_eligibility=healthy_eligibility,
         )
         logger.info("selection_only: steps 1-3 done, no HDF5 file written.")
         return
@@ -4011,6 +4058,7 @@ def create_new_pipeline(
             records_base_path, output_base_path, tlo_csv_path, test_mode=test_mode,
             verbose=verbose, num_workers=num_workers, screening_csv_path=screening_csv_path,
             bg_cls_fraction=bg_cls_fraction, no_bg_cls_fraction=no_bg_cls_fraction,
+            healthy_eligibility=healthy_eligibility,
         )
 
     # ------------------------------------------------------------------
@@ -4239,6 +4287,10 @@ def build_parser() -> argparse.ArgumentParser:
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Run steps 1-3 only: screening CSV, selection summary and fold "
                              "pickle; no HDF5 file. Default: off.")
+    parser.add_argument("--healthy-eligibility", dest="healthy_eligibility",
+                        choices=ELIGIBILITY_COLUMNS,
+                        help="Step 2: the screening column that makes a healthy GUID eligible "
+                             f"for classification. Default: {HEALTHY_ELIGIBILITY}.")
     return parser
 
 
@@ -4260,6 +4312,7 @@ def main(
     bg_cls_fraction: Optional[float] = None,
     no_bg_cls_fraction: Optional[float] = None,
     selection_only: Optional[bool] = None,
+    healthy_eligibility: Optional[str] = None,
 ) -> int:
     """Apply the defaults the parser is not allowed to carry, then run the build.
 
@@ -4287,6 +4340,7 @@ def main(
         no_bg_cls_fraction: Fraction of each eligible healthy no-BG subgroup in the
             classification pool; ``None`` fills only the train/val deficit.
         selection_only: Run steps 1-3 only; no HDF5 file.
+        healthy_eligibility: ``'eligible_3h'`` or ``'eligible_2h'`` for healthy GUIDs.
 
     Returns:
         The process exit code.
@@ -4311,6 +4365,7 @@ def main(
         bg_cls_fraction=HEALTHY_BG_CLS_FRACTION if bg_cls_fraction is None else bg_cls_fraction,
         no_bg_cls_fraction=no_bg_cls_fraction,
         selection_only=bool(selection_only),
+        healthy_eligibility=healthy_eligibility or HEALTHY_ELIGIBILITY,
     )
     return 0
 
@@ -4463,7 +4518,14 @@ RUN_ARGS: Dict[str, Any] = {
     # float | None -- fraction of each eligible healthy no-BG subgroup in the pool, in [0, 1].
     #        Equal to bg_cls_fraction gives a train/val healthy mix equal to the population's.
     #        (None -> only enough no-BG GUIDs to give healthy = unhealthy in train/val)
+    #        A fraction draws the no-BG GUIDs at random (population TLO rate); None keeps the
+    #        old 75/25 TLO quota.
     "no_bg_cls_fraction": None,
+    # "eligible_3h" | "eligible_2h" | None -- the screening column that makes a healthy GUID
+    #        eligible for classification. Unhealthy GUIDs always use eligible_2h, so
+    #        "eligible_2h" gives both classes the same signal rule. Pretraining keeps 3 h.
+    #        (None -> "eligible_3h")
+    "healthy_eligibility": None,
 }
 
 
