@@ -1307,6 +1307,13 @@ four seconds the step stores. $\rho$ measures exactly that contamination, per ch
 cannot express a subset through $\rho$, because $\rho$ is computed against the full invalid set;
 a bit rule is the way to mask on selected codes only.
 
+**Quality version 4 (2026-10-28).** The build adds a term to the UA $\rho$: a coefficient whose
+window straddles a level shift gets $2\min(A, 1-A)$, where $A$ is its kernel mass after the shift
+(`research_notes/UA_QUALITY_MASK_DESIGN.md`, section 4.5). The shipped rule $\rho > 0.1$ therefore
+also closes the source while a slow channel mixes two baselines. Version 4 also adds three bits:
+`REST` and `PUSH` are valid, and `FLAT` is invalid, so the `"invalid"` alias covers it. No model key
+changes. A version-4 build needs version-4 statistics; the loader refuses a pairing of two versions.
+
 **The model.** UA reaches the posterior at query $t$ through the lag keys at $t-\ell$. A step is
 usable when every source channel the source gate keeps is valid there; the per-step mask $m_{b,s}$
 is that conjunction. The key mask is
@@ -1356,3 +1363,51 @@ Old checkpoints load unchanged: the key adds no parameter or buffer, and their s
 build report's masked share means the rule is stricter than intended; a share near zero means the
 mask changes almost nothing. Tests: `tests/test_source_quality_mask.py` (model, controls, objective,
 task, pre-flight) and `hdf5_dataset/tests/test_ua_step_mask.py` (the loader rule).
+
+## Amendment (2026-10-28): the detector, the target and the stem read the quality mask
+
+The 2026-10-25 mask closes the source where the UA coefficients are contaminated. Three gaps remained,
+and this amendment closes them. `research_notes/UA_QUALITY_MASK_DESIGN.md` section 4.10 gives the
+full reasons, and section 8.2 lists the files.
+
+**The contraction detector reads the UA mask.** The full-branch weight found its contractions on the
+bridged `up`, with only `weight` as the validity. A flat line, a step or a hold that `weight` calls
+valid could therefore give a false onset, and the weight then rewarded the source pathway there. With
+`event_weight_ua_valid: true`, the detector also treats a sample that the loader's `up_valid` marks
+invalid as a gap, and it drops an event that touches such a sample. The evaluation retains `up_valid`
+for such a run, so its event tables find the same contractions. The key needs
+`dataset_kwargs.emit_quality_mask: true` and an `event_weight_floor`.
+
+**The target leaves the bridged FHR out.** With `target_quality_mask: true`, the task multiplies the
+loss weight by the loader's `fhr_step_mask`, after the detector has read the unmasked weight. The
+shipped rule `{bits: invalid, rho_epsilon: null}` marks a step whose 4 s hold a bridged FHR sample.
+The coverage floor and the KL support use the same weight, so the model is neither scored nor charged
+where the FHR target is a value that the build supplied. The pre-flight refuses the key without an
+active `fhr_step_mask`, and the reverse. The $\rho$ rule stays off for the target: a fast FHR channel
+keeps $\rho > 0.1$ for about 20 s after a gap, so with `coverage_floor: 0.9` over `horizon: 30`
+each gap would drop about 150 s of anchors, and 80% of the segments have an FHR gap
+(`research_notes/UA_QUALITY_MASK_DESIGN.md` section 4.11).
+
+**A wide K/V body widens the key mask.** Under `conv_stem` and `encoder`, the key at step $s$ reads
+the steps $s-R+1, \dots, s$, where $R$ is the body's receptive field. `source_key_mask` therefore
+marks a key bad when any step in that field is bad (a max-pool over the bad indicator). Under the
+shipped `adapter`, $R = 1$ and nothing changes. An `encoder` without a finite receptive field closes
+every key after the first bad step.
+
+**The ablation `sweep_source_event_mask.yaml`.** `source_event_mask: true` ANDs the detected
+contraction spans [onset, end] into `source_valid`, so the posterior reads UA only from inside a
+contraction. The arm asks whether the baseline between contractions carries coupling. It needs
+`source_quality_mask` and a floor.
+
+**What does not change.** No key adds a parameter or a buffer, so every checkpoint loads under every
+value. All three keys default off in the constructor, and the off state is the model before this
+amendment, bitwise. `default.yaml` ships the first two on. `sweep_no_event_weight.yaml` turns
+`event_weight_ua_valid` off, because it has no floor, and `tiny.yaml` and `smoke_hie.yaml` turn all
+of them off, because their shards predate the quality step. `eval/verify.py` prints the three keys
+in its arm table, and the per-anchor table gets `source_open` and `event_gate`.
+
+**Measure first.** Compare `source_mask_fraction` with the build report's `usable_ua_steps`. The
+report column is the share of steps where every UA channel is usable, and the model keeps 42 of
+them, so the model's open share can be higher than the report's but should not be much lower.
+Read `event_anchor_frac` against a run without `event_weight_ua_valid`: the difference is the share
+of anchors that a false onset rewarded.

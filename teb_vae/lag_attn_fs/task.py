@@ -141,3 +141,49 @@ class SeqVaeLagAttnFsTask(SeqVaeLagAttnRwsTask):
                 "dataset_kwargs.load_fields."
             )
         return torch.cat([y_st, y_ph], dim=-1), weight
+
+    def _target_step_valid(self, batch: Any) -> torch.Tensor:
+        r"""The $(B, T)$ target-step validity of ``target_quality_mask``.
+
+        The loader's ``fhr_st_step_valid`` and ``fhr_ph_step_valid`` are concatenated in the order
+        :meth:`_build_raw_target` concatenates the blocks, gathered to the channels the net's target
+        gate forecasts, and reduced over them: a step is valid only where every forecast channel
+        is. A channel the net does not forecast cannot remove a step.
+
+        Only the gate's keep-index applies, not its per-channel delay: the forecast truth is
+        gathered with the keep-index alone (:meth:`_build_forecast_target`), because the delay
+        guards the target *encoder's* input. The result is a step mask on the stored grid, like
+        ``weight``, so a forecast clock shift reaches it through ``scored_weight`` with the rest
+        of the weight.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            Boolean $(B, T)$, ``True`` = the target step may be scored.
+
+        Raises:
+            RuntimeError: If a block's mask is absent, naming the config key that emits it, or if
+                the mask is not as wide as the target stream.
+        """
+        blocks = []
+        for name in ("fhr_st", "fhr_ph"):
+            mask = getattr(batch, f"{name}_step_valid", None)
+            if mask is None:
+                raise RuntimeError(
+                    f"target_quality_mask is set but the batch has no `{name}_step_valid` field. "
+                    f"Set dataset_kwargs.fhr_step_mask in the config; it needs a signal-quality "
+                    f"build (root attribute quality_version)."
+                )
+            blocks.append(mask)
+        valid = torch.cat(blocks, dim=-1).to(torch.bool)
+        expected = int(self.orig_model.c_y)
+        if int(valid.shape[-1]) != expected:
+            raise RuntimeError(
+                f"the target-step mask is {int(valid.shape[-1])} channels wide but the target "
+                f"stream is {expected}; both must come from the same fhr_st / fhr_ph blocks."
+            )
+        gate = getattr(self.orig_model, "target_gate", None)
+        if gate is not None:
+            valid = torch.index_select(valid, -1, gate.keep_index.to(valid.device))
+        return valid.all(dim=-1)

@@ -668,6 +668,18 @@ def make_source(cfg: SourceCfg, probe_shard: str, *, device: str = "cpu") -> Any
 INFO_FIELDS = {"code_revision"}
 
 
+def _quality_version(path: Any) -> Dict[str, int]:
+    """``{'quality_version': v}`` for a signal-quality shard, ``{}`` for any other.
+
+    A rebuild with other quality rules can keep a shard's path, and a copy can keep its size and
+    mtime, so the rule version enters the cache key on its own. A shard without the attribute adds
+    nothing, so the key of a cache built before the field existed does not change.
+    """
+    with h5py.File(path, "r") as handle:
+        version = handle.attrs.get("quality_version")
+    return {} if version is None else {"quality_version": int(version)}
+
+
 def _check_fingerprint(stored: Mapping[str, Any], expected: Mapping[str, Any], where: Any) -> None:
     differences = {key: (stored.get(key), expected.get(key))
                    for key in sorted((set(stored) | set(expected)) - INFO_FIELDS)
@@ -711,8 +723,8 @@ def extract(source: Any, segments: pd.DataFrame, shards: Mapping[Tuple[int, str]
                     for p in shards[key]})
     fingerprint = json.loads(json.dumps({
         **source.fingerprint, "cache_dtype": dtype, "code_revision": software_record()["revision"],
-        "shards": [{"path": p, "size": os.stat(p).st_size, "mtime": os.stat(p).st_mtime}
-                   for p in paths],
+        "shards": [{"path": p, "size": os.stat(p).st_size, "mtime": os.stat(p).st_mtime,
+                    **_quality_version(p)} for p in paths],
         "index_sha256": hashlib.sha256(
             index[INDEX_COLUMNS].to_csv(index=False).encode()).hexdigest(),
     }, default=str))

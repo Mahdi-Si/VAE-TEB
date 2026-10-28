@@ -566,6 +566,46 @@ def test_a_pass_with_no_model_records_a_skip(tmp_path) -> None:
 
 
 # =================================================================================================
+# The detector's validity on a retained UP trace
+# =================================================================================================
+#: Raw samples per decimated step, and the steps of the retained rows below.
+_DECIMATION, _STEPS = 16, 6
+
+
+def test_the_up_event_validity_is_the_weight_alone_without_a_retained_ua_mask() -> None:
+    """A run trained without ``event_weight_ua_valid`` retains no ``up_valid``: the validity is
+    the expanded weight, as before, and a zero-weight step is a gap."""
+    weight = np.ones((1, _STEPS))
+    weight[0, 2] = 0.0
+    valid = traces.up_event_validity({"weight": weight}, 0, _STEPS * _DECIMATION)
+    expected = np.repeat(weight[0] > 0.0, _DECIMATION)
+    assert valid is not None and np.array_equal(valid, expected)
+    assert traces.up_event_validity({}, 0, _STEPS * _DECIMATION) is None
+
+
+def test_the_up_event_validity_ands_the_retained_ua_mask_and_pads_a_short_one_invalid() -> None:
+    """With ``up_valid`` retained, an invalid UA sample is a gap as a zero-weight step is; a mask
+    shorter than the trace marks the tail invalid rather than valid."""
+    raw_len = _STEPS * _DECIMATION
+    weight = np.ones((2, _STEPS))
+    weight[0, 2] = 0.0
+    up_valid = np.ones((2, raw_len), dtype=bool)
+    up_valid[0, 70:75] = False
+    retained = {"weight": weight, "up_valid": up_valid}
+
+    valid = traces.up_event_validity(retained, 0, raw_len)
+    expected = np.repeat(weight[0] > 0.0, _DECIMATION) & up_valid[0]
+    assert valid.dtype == bool and np.array_equal(valid, expected)
+
+    short = traces.up_event_validity({"up_valid": up_valid[:, : raw_len - 8]}, 1, raw_len)
+    assert short is not None and bool(short[: raw_len - 8].all()) and not bool(short[raw_len - 8 :].any())
+
+    # A row the mask does not reach falls back to the weight alone.
+    beyond = traces.up_event_validity({"weight": np.ones((3, _STEPS)), "up_valid": up_valid}, 2, raw_len)
+    assert bool(beyond.all())
+
+
+# =================================================================================================
 # Against the real run
 # =================================================================================================
 @pytest.mark.slow

@@ -290,7 +290,8 @@ QUALITY_DECIMATION = 16
 QUALITY_SIGNAL_FIELDS = {"up_quality": "u2", "fhr_quality": "u1", "up_raw": "f2", "fhr_raw": "f2"}
 #: Per-segment datasets ``(n,)`` and their dtypes.
 QUALITY_SEGMENT_FIELDS = {"up_valid_frac": "f4", "up_censored_frac": "f4",
-                          "fhr_valid_frac": "f4", "fhr_repair_exact": "u1"}
+                          "fhr_valid_frac": "f4", "fhr_repair_exact": "u1",
+                          "fhr_raw_match": "f4"}
 
 # How the test split is formed. ``'augmented'`` puts a test partition in every fold and augments
 # it; ``'holdout'`` fixes one test set across all folds.
@@ -1441,12 +1442,23 @@ def _clean_record(
     domain_starts: List[float],
     quality: Mapping[str, Any],
     rho_banks: Mapping[str, Any],
+    second_stage_s: float = float("nan"),
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     r"""Code, bridge and measure the kept segments of one record.
 
     A sample is present when its weight is positive and its FHR is not 0, as in the profile. The
     FHR repair mask comes from the raw channel of the record (read again with ``scipy.io``); if
     that fails, the hold, ramp and jump rules stand in for it and ``fhr_repair_exact`` is 0.
+    ``fhr_raw_match`` is the share of the record's present samples where the raw channel equals
+    the stored FHR (``NaN`` when the channel was not read). It is one value per record: a low
+    value says the raw channel is not the one the repair started from, so ``REPAIRED`` covers
+    most of the record and the segment's FHR mask is not trustworthy.
+
+    Sample $i$ of segment $j$ lies in the second stage when $t_j + i / f_s \ge t_{ss}$, with
+    $t_j$ the segment start and $t_{ss}$ the onset, both in seconds relative to delivery. The UA
+    push rule reads that mask. The UA contamination of each stored step is the larger of the
+    invalid-sample term and :meth:`signal_quality.ContaminationBank.step_term` of the segment's
+    level shifts.
 
     Args:
         record: The ``.mat`` file.
@@ -1456,6 +1468,8 @@ def _clean_record(
         domain_starts: Segment start times in seconds.
         quality: ``masks["signal_quality"]``.
         rho_banks: Block name -> ``signal_quality.ContaminationBank``.
+        second_stage_s: Second-stage onset $t_{ss}$ in seconds relative to delivery; ``NaN``
+            when it is unknown, which disables the push rule.
 
     Returns:
         ``(fhr_clean, up_clean, fields)``: the bridged signals, sanitised as the stored signals
@@ -1465,10 +1479,15 @@ def _clean_record(
     n, length = fhr.shape
     name = os.path.basename(record)
     present = np.repeat(np.asarray(weight) > 0, QUALITY_DECIMATION, axis=1)[:, :length] & (fhr != 0)
+    starts = np.asarray(domain_starts, dtype=np.float64)
+    stage2: List[Optional[np.ndarray]] = [None] * n
+    if np.isfinite(second_stage_s):
+        clock = np.arange(length) / cfg.fs
+        stage2 = [starts[j] + clock >= second_stage_s for j in range(n)]
     repaired = None
+    info: Dict[str, Any] = {}
     try:
-        repaired, info = sq.raw_fhr_repaired(record, np.asarray(domain_starts, dtype=np.float64),
-                                             fhr, present)
+        repaired, info = sq.raw_fhr_repaired(record, starts, fhr, present)
         if repaired is None:
             logger.warning(f"{name}: {info['raw_fhr']}; the FHR repair mask falls back to the "
                            f"rules")
@@ -1476,7 +1495,7 @@ def _clean_record(
         logger.warning(f"{name}: the raw FHR channel could not be read ({exc!r}); the FHR "
                        f"repair mask falls back to the rules")
     results = [sq.clean_segment(fhr[j], up[j], present[j],
-                                None if repaired is None else repaired[j], cfg)
+                                None if repaired is None else repaired[j], cfg, stage2[j])
                for j in range(n)]
     up_bits = np.stack([r.up_bits for r in results]).astype(np.uint16)
     up_bad = np.stack([r.up_invalid for r in results])
@@ -1491,9 +1510,18 @@ def _clean_record(
                                     axis=1).astype(np.float32),
         "fhr_valid_frac": np.mean(~fhr_bad, axis=1).astype(np.float32),
         "fhr_repair_exact": np.full(n, repaired is not None, dtype=np.uint8),
+        "fhr_raw_match": np.full(n, info.get("raw_match", np.nan) if repaired is not None
+                                 else np.nan, dtype=np.float32),
     }
     for block in CAUSAL_BLOCKS:
-        rho = rho_banks[block](up_bad if block.startswith("up") else fhr_bad)
+        if block.startswith("up"):
+            bank = rho_banks[block]
+            rho = bank(up_bad)
+            for j, result in enumerate(results):
+                if result.steps:
+                    np.maximum(rho[j], bank.step_term([e.at for e in result.steps]), out=rho[j])
+        else:
+            rho = rho_banks[block](fhr_bad)
         fields[f"{block}_rho"] = np.rint(rho * QUALITY_RHO_SCALE).astype(np.uint8)
     inexact = int(np.count_nonzero(fields["up_raw"] != up)
                   + np.count_nonzero(fields["fhr_raw"] != fhr))
@@ -3478,7 +3506,7 @@ def create_hdf5_dataset_from_records_list(
             if quality is not None:
                 valid_fhr, valid_up, quality_fields = _clean_record(
                     record, valid_fhr, valid_up, sample_weights[valid_indices],
-                    [domain_starts[i] for i in valid_indices], quality, rho_banks,
+                    [domain_starts[i] for i in valid_indices], quality, rho_banks, ss_sec,
                 )
             scatter_failed: set = set()
             causal_blocks: List[Optional[Dict[str, np.ndarray]]] = []
