@@ -168,3 +168,94 @@ computed over all of these files, train and test alike.
 
 The model configs do not name a quality field yet (Phase 4). With their current `load_fields`, a model
 trains on the bridged `fhr`/`up` and the coefficients computed from them, with the new statistics.
+
+## 2026-10-28: quality rules version 4 and the report pages
+
+A diagnosis of the version-3 build (`diagnose_signal_quality.py`, committed in 512ba66) found six
+defects. `QUALITY_VERSION` is now 4. `CENSORED` is a ceiling crest only. Three new bits come in:
+`REST` (a clamped rest, valid), `PUSH` (a second-stage push, valid) and `FLAT` (a flat line after
+300 s, invalid). The UA $\rho$ also counts level shifts, and a new per-segment field,
+`fhr_raw_match`, stores the raw FHR channel's match share. Each report page now shows the UA
+coefficients of `up_raw` before the mask and the bridge. The design note, sections 2.9, 4.3, 4.5 and
+4.8, has the details.
+
+**`mimo/` (untracked): no change.**
+
+| File here | Name in the flat folder | State in git here | Copy to the box |
+|---|---|---|---|
+| `hdf5_dataset/signal_quality.py` | `signal_quality.py` | tracked, modified, staged | yes: version 4 |
+| `hdf5_dataset/new_pipeline/create_new_pipeline.py` | `create_new_pipeline.py` | tracked, modified, staged | yes: the second-stage mask, the step term of $\rho$, `fhr_raw_match` |
+| `hdf5_dataset/new_pipeline/build_fold_datasets.py` | `build_fold_datasets.py` | tracked, modified, staged | yes: hands the transform to the report |
+| `hdf5_dataset/new_pipeline/quality_report.py` | `quality_report.py` | tracked, modified, staged | yes: the new pages, columns and raw-coefficient row |
+| `hdf5_dataset/hdf5_dataset.py` | — (package path) | tracked, modified, staged | yes, on the training box: `fhr_raw_match` is a quality field |
+| `teb_vae/lag_attn_transformer_cfs/configs/default.yaml` | — | tracked, modified, staged | yes, on the training box: comment only |
+| `hdf5_dataset/tests/test_signal_quality_rules.py` | — | new, staged | no: tests only |
+| `hdf5_dataset/tests/test_quality_loader.py` | — | untracked, modified | no: tests only |
+| `hdf5_dataset/PIPELINE.md`, `hdf5_dataset/dataset_explained_research.md`, `research_notes/UA_QUALITY_MASK_DESIGN.md`, `teb_vae/lag_attn_transformer_cfs/DESIGN.md`, this record | — | documentation | no |
+
+The report's raw-coefficient row needs the causal bank. The build computes the masks again on the CPU
+when the transform ran in worker processes, so the report step takes a little longer. If the bank
+cannot be built, the pages leave the row out and the log says why.
+
+To build the fold datasets and the pretraining shards with version 4:
+
+1. Copy the four flat-folder files marked "yes" over the old copies.
+2. Open `build_fold_datasets.py`.
+3. Set `output_base_path` in `RUN_ARGS` to a new folder.
+4. Check that `signal_quality` is `True`.
+5. Keep `dry_run` at `True` and press Run.
+6. Check the GUID counts in the printed table and in `manifest.json`.
+7. Set `dry_run` to `False` and set `devices`.
+8. Press Run.
+9. Check that `manifest.json` says `"quality_version": 4` under `settings`.
+10. Read `quality_report/REPORT.md`, and look at the `rest`, `push` and `flat` pages.
+11. Check that no page title names a mismatch of the recomputed coefficients.
+12. Compute the dataset statistics for this build into a new file (section "Phase 3" above).
+13. Check that the statistics summary prints `quality_version=4, mask rho <= 0.1`.
+
+A version-3 statistics file is refused with version-4 data, and the two versions cannot be mixed in
+one file list. The outputs, `quality_report/` included, hold clinical traces. Keep them on the
+production box.
+
+## 2026-10-28, later: the model reads the quality mask (Phase 4, second part)
+
+The dataset files and the build do not change in this entry; the version-4 build of the previous
+entry is the one to use. The loader, the training task, the model inputs, the evaluation and the
+classifier cache change. `research_notes/UA_QUALITY_MASK_DESIGN.md`, sections 4.10 and 8.2, has the
+details.
+
+| File here | State in git here | Copy to the box |
+|---|---|---|
+| `hdf5_dataset/hdf5_dataset.py` | tracked, modified, staged | yes, on the training box: `fhr_step_mask`, the $\varepsilon$ refusal, the legacy append refusal |
+| `hdf5_dataset/guid_hdf5_dataset.py` | tracked, modified, staged | yes, on the training box: the NaN pad of `fhr_raw_match` |
+| `hdf5_dataset/new_pipeline/quality_report.py` | tracked, modified, staged | yes, to the flat folder: the `usable_ua_steps` column |
+| `teb_vae/lag_attn_rws/event_weight.py`, `task.py`, `trainer.py` | tracked, modified, staged | yes, on the training box |
+| `teb_vae/lag_attn_fs/task.py`, `teb_vae/lag_attn_cfs/task.py`, `trainer.py`, `nets/causal_inputs.py` | tracked, modified, staged | yes, on the training box |
+| `teb_vae/lag_attn_cfs/eval/` (`collect.py`, `metrics.py`, `traces.py`, `analyses/events.py`, `analyses/forecast.py`), `teb_vae/lag_slot_transformer_cfs/eval/collect.py`, `teb_vae/lag_attn_transformer_cfs/eval/verify.py` | tracked, modified, staged | yes, on the training box |
+| `teb_vae/classifier/sources.py` | tracked, modified, staged | yes, on the training box: the cache fingerprint |
+| `teb_vae/lag_attn_transformer_cfs/configs/` (`default.yaml`, `tiny.yaml`, `smoke_hie.yaml`, `sweep_no_event_weight.yaml`, new `sweep_source_event_mask.yaml`) | tracked, modified or new, staged | yes, on the training box |
+| tests | new or modified, staged | no: tests only |
+| documentation | — | no |
+
+The classifier cache key now includes each shard's `quality_version`, so the first classifier run on
+the version-4 build computes its cache again.
+
+To train the transformer cfs model on the version-4 build:
+
+1. Build the version-4 datasets and their statistics (previous entry).
+2. Copy the files marked "yes" to the training box.
+3. Point `vae_train_datasets`, `vae_test_datasets` and `stat_path` in `default.yaml` to the new build.
+4. Start the run.
+5. In the first epoch, compare `source_mask_fraction` with `usable_ua_steps` in `quality_report/REPORT.md`.
+6. Check that `event_anchor_frac` is above zero.
+
+The loader refuses a statistics file whose `quality_rho_epsilon` differs from the step masks'
+`rho_epsilon` (0.1 in `default.yaml`). If you compute the statistics with another $\varepsilon$,
+change `ua_step_mask.rho_epsilon` to the same value.
+
+**The mask decision for the final build (2026-10-28).** The build does not depend on which mask the
+model reads, because the files store the raw bits and $\rho$ side by side. The final choice, with
+the numbers from the version-3 diagnosis, is in `research_notes/UA_QUALITY_MASK_DESIGN.md` section
+4.11: $\rho \le 0.1$ for the UA lag keys, `up_valid` for the contraction detector, and the raw FHR
+bits for the target. `hdf5_dataset/dataset_explained_research.md` section 11.4 has the build, report,
+statistics and config steps for the final files. Only the current quality version (4) is supported.

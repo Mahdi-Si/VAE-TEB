@@ -1,12 +1,13 @@
 # UA quality mask, cleaning and scattering: research and design
 
 Date: 2026-10-25. Status: Phases 0 to 3 are implemented, except the evaluation sample pages. Phase 4
-(the model side) is open. The rules in `hdf5_dataset/signal_quality.py` and the profile
+(the model side) is in part done (sections 4.10, 8.1 and 8.2). The rules in `hdf5_dataset/signal_quality.py` and the profile
 `hdf5_dataset/new_pipeline/profile_signal_quality.py` exist, and the builder writes the quality fields
 when `signal_quality` is on. The loader, the sequence collate and the statistics read those fields,
 and the dataset viewer draws them (section 4.9). A local run on the two `.mat` records changed several
 rules (section 2.6). The first production profile (320 records) changed three more (section 2.7,
-version 2), and the second one added the oscillation rule (section 2.8, `QUALITY_VERSION` = 3).
+version 2), and the second one added the oscillation rule (section 2.8, version 3). A diagnosis of the
+version-3 build (2026-10-28) changed six more and added three bits (section 2.9, `QUALITY_VERSION` = 4).
 Section 4.3 describes the rules as implemented.
 
 Scope: the dataset-creation pipeline (`hdf5_dataset/new_pipeline/create_new_pipeline.py`) and the
@@ -164,7 +165,7 @@ example pages showed five defects. Each fix below is in `signal_quality.py`.
 |---|---|
 | A 15-unit jump inside a steep contraction rise opened a transient that lasted until the signal came back to the pre-jump level. Whole contractions (up to 90 s) became flat bridges. | A jump marks only the discontinuity (about 3 s). A wider span needs specific evidence: a box, a step or a spike. |
 | A box closed on a 1-s spike that touched the old level, and 45 s of real low UA became invalid. | A box closes only if the signal stays at the old level for 5 s after the opposite jump. |
-| Clamped rests at a floor of 10 or 25 were `HOLD`; 45% of one segment was invalid. | A constant run at the minimum of the past 120 s, with no edge jump and no joint FHR hold, is `CENSORED` (valid) for up to 300 s. |
+| Clamped rests at a floor of 10 or 25 were `HOLD`; 45% of one segment was invalid. | A constant run at the minimum of the past 120 s, with no edge jump and no joint FHR hold, is `CENSORED` (valid) for up to 300 s. Version 4 gives it a bit of its own, `REST` (section 2.9). |
 | A spike that began where a rest ended counted as the rest's end edge. | The end edge also needs the 10-s median after the run to stay 10 units away. |
 | The jump out of a frozen run passed the step test, because a frozen run is exactly constant. The correction would shift the rest of the segment by 31 units. | A step that leaves a `HOLD` becomes a plain jump mark. |
 
@@ -230,6 +231,26 @@ Two smaller findings stay open. Short handling plateaus (a few seconds, flat, be
 when no rule reaches them. The run also stopped while it drew the example pages, before it wrote
 `REPORT.md`. The profile now writes the report before the pages and again after them, and one failed page
 no longer stops the others.
+
+### 2.9 What the diagnosis of the version-3 build changed
+
+`hdf5_dataset/new_pipeline/diagnose_signal_quality.py` read a version-3 build back and sampled
+129,712 of its 2,432,063 segments. It measured flat regions, transients by labour stage, level offsets
+after a `STEP`, drops to the floor, and the raw FHR channel. Six findings changed the rules, and
+version 4 fixes them.
+
+| Defect seen | Evidence | Fix (version 4) |
+|---|---|---|
+| A flat line with a monitor pulse every 302 s passed every duration limit. | Flat stretches of 300 s or more were in 0.25% of the segments (0.07% of the UA time), and 80% of their samples were valid. The 302-s pulse was in 44 sampled GUIDs, all on one monitor model. Each pulse cut the line into runs below 300 s, so neither the builder's flat gate nor the rest limit saw it. | Constant runs at one value with gaps of at most 15 s form one *flat region*. A pulse of 3 units or more in a region of 60 s or more is `TRANSIENT`. After the first 300 s of a region, the valid samples are `FLAT` (invalid). |
+| `CENSORED` named two different things. | Clamped rests held 1.34% of the samples as `CENSORED`, and ceiling crests 0.79%. Ceiling flats of 300 s or more were still 19% valid. | `CENSORED` is a ceiling crest only. A clamped rest is `REST` (valid). Ceiling runs at one value with gaps of at most 15 s form one region, and a region of more than 120 s is `TRANSIENT` as a whole. |
+| The mask followed the delivery mode. | `TRANSIENT` covered 1.2–1.4% of the UA in the first stage in every subgroup, and 7.1% in the second stage (22.8 runs per hour against 6.4). In the last hour, it covered 6.2% after a vaginal delivery and 2.2% before a CS. The pages showed bearing-down peaks on contractions. | In the second stage, a `TRANSIENT` run of at most 60 s on a contraction is `PUSH` (valid). The contraction test: a median of the 10 s before or after the run is at least 10 units above the rest level (the 10th percentile of the 120 s before it). A run that touches a gap, a code or a ceiling stays invalid. |
+| $\rho$ did not see a level offset. | 2.6% of the segments had a settled offset of 10 units or more after a `STEP` (median 32), and 94% of the samples after it were valid. A coefficient whose window spans the step mixes two baselines. | Every level shift adds the term of section 4.5 to the UA $\rho$. A settled change across a short invalid span (at most 60 s) also counts as a shift. |
+| A drop to the floor after a step stayed valid. | 11% of the steps fell to 5 units or less. The low run lasted 46 s (median; 90th percentile 177 s), and about 47% of it was valid. | A floor run that a downward `STEP` settles into is `FLOOR` (lost contact). |
+| Some records have a raw FHR channel that is not the repair's source. | Only 0.02% of the segments were more than half `REPAIRED`. In those records, raw `HR2` differed from `Repaired HR2` by a median of 5 bpm on 92% of the samples, at every offset within ±2 s. | The rule does not change. The per-segment field `fhr_raw_match` stores the record's match share, so a reader can find these records. |
+
+Dense noise (0.6% of the segments) did not need a new rule. These numbers come from one sample of one
+build, and they show the scale of each effect. The report of the version-4 build checks them (section
+4.8): the `rest`, `push` and `flat` pages, and the columns `ua_rest`, `ua_push` and `ua_flat`.
 
 ---
 
@@ -301,25 +322,30 @@ equals `HR2` at 99.5% of shared samples, so a direct comparison gives an exact F
 
 ### 4.3 Step 1: per-sample quality codes
 
-One bit field per signal and per sample: `uint16` for UA (nine bits), `uint8` for FHR. A sample can
+One bit field per signal and per sample: `uint16` for UA (twelve bits), `uint8` for FHR. A sample can
 carry several bits.
 
 **UA codes (`up_quality`)**
 
-As implemented (`QUALITY_VERSION` = 3). A "jump" is $\lvert x_n - x_{n-4}\rvert \ge 15$: 15 units
-within one stored 1-s step.
+As implemented (`QUALITY_VERSION` = 4). A "jump" is $\lvert x_n - x_{n-4}\rvert \ge 15$: 15 units
+within one stored 1-s step. A *flat region* is a set of constant runs of at least 10 s at one value,
+with gaps of at most 15 s between them; a gap can hold a pulse, a one-unit wiggle or a few missing
+samples.
 
 | Bit | Name | Rule (4 Hz, $x$ = UP) | Class | Lookahead |
 |---|---|---|---|---|
 | 0 | `MISSING` | outside a recorded run, or a padding tail (`weight` = 0) | invalid | none |
 | 1 | `CODE` | $x > 127.5$ or $x < 0$ (128, 255) | invalid | none |
-| 2 | `CENSORED` | a whole ceiling run ($x$ = 100 or 127) of at most 120 s with no transient or step sample in it; or a clamped rest: a constant run of $\ge 30$ s at the minimum of the past 120 s (+1 unit), with no edge jump and no joint FHR hold, for up to 300 s | valid | 122 s (ceiling run) |
-| 3 | `TRANSIENT` | a lone jump: the discontinuity and one stored step on each side; a box: a jump undone within 60 s by an opposite jump that lands, and stays for 5 s, within 10 units of the pre-jump level; a spike: height $\ge 12$ units above both 3-s sides, at half height plus 1 s on each side (also dips); after a gap, a value 10 units from the pre-gap level, until the signal returns or settles; a whole ceiling run that a jump enters or leaves, or that is longer than 120 s | invalid | 122 s (ceiling run) |
-| 4 | `STEP` | a jump from a settled level (range $\le 6$ over the last 5 s, every sample usable, off the ceiling and outside earlier transients) to a settled 20-s window that starts within 10 s, $\ge 10$ units away in the jump's direction, with no return to the old level within 120 s; not out of a `HOLD`. Masked, not corrected | invalid | 121 s |
-| 5 | `HOLD` | a constant run of $\ge 30$ s with a start jump $\ge 10$, an end jump $\ge 10$ that stays 10 s (runs under 60 s), or a joint FHR hold; any other constant run of $\ge 60$ s that is not a clamped rest; a clamped rest past 300 s | invalid | 70 s |
-| 6 | `FLOOR` | $x \le 2$ for $\ge 20$ s that is all exact zeros or starts within 30 s after `CODE`/`MISSING`; the part within 60 s before a `CODE`/`MISSING` that follows within 30 s | invalid | 60 s |
+| 2 | `CENSORED` | a ceiling region ($x$ = 100 or 127; runs at one value with gaps $\le 15$ s) that spans at most 120 s and holds no transient or step sample: a clamped contraction crest | valid | 137 s (ceiling region) |
+| 3 | `TRANSIENT` | a lone jump: the discontinuity and one stored step on each side; a box: a jump undone within 60 s by an opposite jump that lands, and stays for 5 s, within 10 units of the pre-jump level; a spike: height $\ge 12$ units above both 3-s sides, at half height plus 1 s on each side (also dips); after a gap, a value 10 units from the pre-gap level, until the signal returns or settles; a whole ceiling region that a jump enters or leaves, or that spans more than 120 s; a pulse of a flat region of $\ge 60$ s: a gap in which a sample lies $\ge 3$ units from the region's value | invalid | 137 s (ceiling region) |
+| 4 | `STEP` | a jump from a settled level (range $\le 6$ over the last 5 s, every sample usable, off the ceiling and outside earlier transients) to a settled 20-s window that starts within 10 s, $\ge 10$ units away in the jump's direction, with no return to the old level within 120 s; not out of a `HOLD` or a `FLAT` run. Masked, not corrected | invalid | 121 s |
+| 5 | `HOLD` | a constant run of $\ge 30$ s with a start jump $\ge 10$, an end jump $\ge 10$ that stays 10 s (runs under 60 s), or a joint FHR hold; any other constant run of $\ge 60$ s that is not a clamped rest. A pulse of a flat region is not an edge | invalid | 70 s |
+| 6 | `FLOOR` | $x \le 2$ for $\ge 20$ s that is all exact zeros, starts within 30 s after `CODE`/`MISSING`, or that a downward `STEP` of $\ge 10$ units settles into (its settled window starts at most 30 s before the run, or inside it); the part within 60 s before a `CODE`/`MISSING` that follows within 30 s | invalid | 121 s (step) |
 | 7 | `ISLAND` | a valid run shorter than 20 s, invalid on both sides, with $\ge 50\%$ invalid samples in the 20 s before it and also in the 20 s after it; never at the segment's start or end | invalid | 40 s |
 | 8 | `OSCILLATION` | a train of $\ge 5$ peaks (or troughs) of prominence 6–30 units, spaced 5–20 s apart, with a ratio of $\le 1.5$ between consecutive spacings; from the first to the last peak, plus half the median spacing on each side. Inside it, a jump is a transient only where it touches a ceiling run, and a crest is not a spike | valid | 100 s |
+| 9 | `REST` | a clamped rest: a constant run of $\ge 30$ s off the floor at the minimum of the past 120 s (+1 unit), with no edge jump and no joint FHR hold. The true value is at most the stored one | valid | 70 s |
+| 10 | `PUSH` | in the second stage only: a run of $\le 60$ s that carries `TRANSIENT` and no other invalid bit, touches no gap, code or ceiling, has valid neighbours, sits on a contraction (a median of the 10 s before or after it is $\ge 10$ units above the rest level, the 10th percentile of the valid samples in the 120 s before it) and never falls 5 units below that rest level. `TRANSIENT` is cleared | valid | 70 s |
+| 11 | `FLAT` | a valid sample of a flat region more than 300 s after the region's start; it loses `REST` | invalid | 25 s |
 
 Every invalid sample is bridged (section 4.4), so a separate `BRIDGED` bit is not needed.
 
@@ -333,14 +359,23 @@ Evidence for the thresholds:
 - A contraction returns to its rest level within about 2 min. With 40 s, flat-topped contractions with
   40–60 s plateaus passed the step test in the production profile; the step test now waits 120 s.
 - The 30-s and 60-s hold limits sit above the 24-s natural plateaus seen in the samples. The 300-s rest
-  limit is the builder's flat-UA gate.
+  limit is the builder's flat-UA gate. Version 4 applies it to the flat region, because the 302-s
+  monitor pulse kept every single run below it (section 2.9).
+- A bearing-down effort lasts about 5–10 s and comes two to four times per contraction, so a push run
+  is short and rides on the contraction. A 60-s cap and the rest-level test keep a dropout or a
+  sensor toggle out.
 - The 5–20 s band holds the 8-s wave of section 2.8 and slow paced breathing in labour (about 6–10
   breaths per minute). It stays far below a contraction's 30–60 s rise. Five peaks make a train that
   one contraction with two or three bumps does not form.
 
-The lookahead of the whole rule set is 122 s (70 s in version 1); `QualityConfig.lookahead_s`
-computes it, and `as_attrs()` writes it as `quality_lookahead_s`. The oscillation rule needs 100 s,
-so the total does not change.
+The lookahead of the whole rule set is 180 s (122 s in versions 2 and 3, 70 s in version 1);
+`QualityConfig.lookahead_s` computes it, and `as_attrs()` writes it as `quality_lookahead_s`. The
+level shift across an invalid span sets it: a span of up to 60 s, then 120 s without a return. The
+shift only feeds $\rho$ (section 4.5); it marks no sample.
+
+The second-stage onset comes from the record's metadata (`second_stage_map` in
+`create_new_pipeline.py`). Sample $i$ of a segment that starts at $t_0$ is in the second stage when
+$t_0 + i / f_s \ge t_{ss}$, both relative to delivery. Without an onset, `PUSH` is never set.
 
 **FHR codes (`fhr_quality`)**
 
@@ -412,6 +447,20 @@ A short bridged gap is handled without a special rule. A 10-s gap fills a large 
 support of ch1 but less than 1% of the 1172-s support of ch35. So $\rho$ masks the fine channels around
 the gap and keeps the slow channels valid.
 
+**Level shifts (version 4).** A step leaves a new level in valid samples, and the term above does not
+see it. For a shift at raw sample $s$, let $A_c[k] = \sum_{j=0}^{16k-s} w_c[j]$ be the kernel mass on
+the new level. The UA blocks store
+
+$$\rho_c[k] = \max\Big(\rho^{\mathrm{inv}}_c[k],\ \max_s 2\min\big(A_c[k],\, 1 - A_c[k]\big)\Big).$$
+
+The step term is 0 before the shift and after the kernel has passed it, and 1 when the window is split
+in half. With $\varepsilon = 0.1$, a channel is masked while $0.05 < A_c < 0.95$: about 90% of its
+support after the shift. For example, a 512-s kernel loses about 460 s after a shift at 600 s, where the
+invalid samples of a 20-s gap give only $\rho \approx 0.04$. The shifts are the `STEP` events and the
+settled changes of at least 10 units across an invalid span of at most 60 s, with a valid, settled
+level before the span and no return within 120 s after it. `ContaminationBank.step_term` computes the
+term from the cumulative kernels. The FHR blocks have no step term.
+
 ### 4.6 Step 4: informative UA
 
 - **Contraction detector.** Run it on cleaned, valid UA only:
@@ -425,9 +474,9 @@ the gap and keeps the slow channels valid.
 - **Do not hard-mask quiet UA.** Instead, give the later gate a soft prior: contraction onset to
   156 s after it, which is the model's lag range of 39 steps × 4 s.
 - **The existing contraction weight reads raw UP.** `lag_attn_rws/event_weight.py`
-  (`contraction_anchor_weight`) currently runs its detector on raw `up`, with only `weight` as the
-  validity input. It therefore finds "contractions" at the 128 blocks. It must take the cleaned `up` and
-  the UA mask.
+  (`contraction_anchor_weight`) ran its detector on raw `up`, with only `weight` as the validity
+  input, so it found "contractions" at the 128 blocks. Since 2026-10-28 it reads the bridged `up`
+  and, under `event_weight_ua_valid`, the UA mask `up_valid` (section 4.10).
 - **Per-segment scalars** for filtering, stratification and shortcut checks: `up_valid_frac`,
   `up_censored_frac`, `fhr_valid_frac` and `n_contractions`.
 - **Do not reject a segment because its UA is bad.** The FHR in that segment is still useful. Mask the UA
@@ -444,6 +493,7 @@ the gap and keeps the slow channels valid.
 | `fhr_st_rho`, `fhr_ph_rho` | (N, 36, 330), (N, 44, 330) uint8 | 26 KB together; mostly zeros |
 | `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | (N,) float32 | — |
 | `fhr_repair_exact` | (N,) uint8 | 1 if the raw channel gave the FHR repair mask |
+| `fhr_raw_match` | (N,) float32 | the record's share of present samples where the raw FHR channel equals the stored FHR; NaN without the raw channel (version 4) |
 | attrs `quality_version`, `quality_lookahead_s`, `quality_<threshold>`, `quality_rho_scale` (255), `quality_kernel_digest` | file attributes | — |
 | attrs `bits`, `invalid_bits` on `up_quality`; `bits`, `invalid_bits_exact`, `invalid_bits_rules` on `fhr_quality` | dataset attributes | the bit names as JSON |
 
@@ -461,6 +511,15 @@ As implemented, `signal_quality=True` in `create_new_pipeline.py` or `build_fold
 record with the MIMO fill off (`mimo_fill`), runs the gates on the pre-fill signals, and then cleans each
 kept segment (`_clean_record`). `build_fold_datasets.py` ends with `quality_report/`
 (`quality_report.py`): a summary per file and example pages read back from the files.
+
+A page of the report has these rows: UA (raw and bridged), the UA bits, FHR, the FHR bits, the UA
+coefficients of `up_raw` before the mask and the bridge, the UA coefficients as stored, the UA $\rho$
+and the FHR $\rho$. In a bit strip, red lanes are invalid bits and green lanes with a check mark are
+valid bits. The two coefficient rows share one colour scale per channel, set by the stored
+coefficients. The raw row is the audit of section 5: it shows what each mask decision removes from the
+coefficients. The build computes it with its own transform on the CPU. It first transforms the stored
+`up` again, and a difference above $10^{-3}$ of a block's largest value is logged and named in the row
+title.
 
 | Where | Change | Status |
 |---|---|---|
@@ -500,7 +559,7 @@ A named quality field comes out as follows. $L$ is the trimmed raw length (4800 
 | `fhr_quality` | $(L,)$ | `uint8` | bit codes, trimmed like `fhr` |
 | `up_raw`, `fhr_raw` | $(L,)$ | the loader `dtype` | the signal before the MIMO fill, in raw units |
 | `<block>_rho` | $(T, C)$ | the loader `dtype` | $\rho \in [0, 1]$: the stored value divided by `quality_rho_scale`, trimmed like the block |
-| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac` | scalar | the loader `dtype` | per segment |
+| `up_valid_frac`, `up_censored_frac`, `fhr_valid_frac`, `fhr_raw_match` | scalar | the loader `dtype` | per segment |
 | `fhr_repair_exact` | scalar | `bool` | per segment |
 
 **Three loader additions decode the bits.**
@@ -546,6 +605,133 @@ A local measurement on two records (hie_cs only) gives the size of the effect. W
 the mask excluded 2.3% (`fhr_st`), 2.2% (`fhr_ph`), 4.7% (`up_st`) and 3.3% (`up_ph`) of the
 coefficient steps. These shares come from one subgroup and can differ on the production build.
 
+### 4.10 Using the mask in the model
+
+**The file masks nothing.** The quality step writes flags beside the signals, and it changes no
+coefficient. The table gives each mask, its grid and its reader. $L$ is the trimmed raw length, and
+$T$, $C$ are the steps and the channels of a block.
+
+| Mask | Grid | Made by | Read by |
+|---|---|---|---|
+| `up_quality`, `fhr_quality` | raw, $(L,)$ | the build (section 4.3) | the loader only |
+| `up_valid`, `fhr_valid` | raw, $(L,)$ | the loader, `emit_quality_mask` | the contraction detector (`event_weight_ua_valid`) |
+| `<block>_rho` | coefficient, $(T, C)$ | the build (section 4.5) | the statistics, and the loader's step masks |
+| `up_st_step_valid`, `up_ph_step_valid` | coefficient, $(T, C)$ | the loader, `ua_step_mask` | the source key mask (`source_quality_mask`) |
+| `fhr_st_step_valid`, `fhr_ph_step_valid` | coefficient, $(T, C)$ | the loader, `fhr_step_mask` | the target mask (`target_quality_mask`) |
+
+**The scattering transform runs on the bridged signal.** A bridged sample is a value that the build
+supplied, so every coefficient whose window covers it carries part of that value. A raw-grid mask cannot
+say which coefficients those are, because a slow channel reads 20 minutes of history and a fast one
+reads 24 s. The coefficient $\rho_c[k]$ answers this per channel and per step (section 4.5), and a
+coefficient with $\rho_c[k] > \varepsilon$ is masked. The masked value stays in the tensor. The
+statistics exclude it (section 4.9), and the model reads no lag key there, so the value has no effect
+on the posterior.
+
+**The source mask is a conjunction.** The transformer cfs model reads UA only through the lag keys of
+its posterior. A step $s$ is usable when every kept source channel is usable there:
+
+$$m_{b,s} = \bigwedge_{c \in \mathcal{K}} v_{b,s,c},$$
+
+where $v$ is the loader's step mask and $\mathcal{K}$ is the source gate's channel set (42 channels in
+the shipped `default.yaml`). The key at lag $\ell$ is open when $\mathrm{lag\_mask}_{t,\ell} \wedge
+m_{b,t-\ell}$, and the posterior gate is closed where no key is open, so $q = p$ and the KL is 0 there.
+The conjunction is strict: one slow channel with a high $\rho$ closes the step for all channels. The
+cost of this is measured, not assumed. The report column `usable_ua_steps` gives the share of steps
+after the warm-up where every UA channel is usable, and the training metric `source_mask_fraction`
+gives the share of KL anchors that the mask closed. A per-channel mask would keep more steps, but the
+attention reads all channels of a step together, so it needs a change to the model.
+
+**A wide K/V body widens the mask.** Under `lag_kv_source: adapter` (the shipped arm) a key at step
+$s$ reads only step $s$. Under `conv_stem` and `encoder`, the key at $s$ reads a receptive field of
+$R$ steps, so a bad step at $s$ also contaminates the keys at $s, \dots, s+R-1$. `source_key_mask`
+therefore widens each bad step forward by $R - 1$ steps (a max-pool over the bad indicator). An
+`encoder` without a finite receptive field closes the whole segment after its first bad step.
+
+**Valid is not informative.** A valid UA step can still carry no drive for the FHR, for example a
+quiet baseline between two contractions. The quality mask removes only what is wrong. Three
+switches act on the rest, and each is task-level: it adds no parameter and does not change what a
+checkpoint holds.
+
+1. **`event_weight_ua_valid`** (shipped on). The contraction detector of the full-branch weight reads
+   the bridged `up`. With the switch on, it also treats a sample that `up_valid` marks invalid as a
+   gap. It interpolates across the gap, and it drops an event whose span touches an invalid sample.
+   A `FLAT` region, a `STEP` or a `HOLD` therefore cannot give a false onset. `CENSORED`, `REST` and
+   `PUSH` stay valid, so a crest at the ceiling still counts. The evaluation reads the same mask:
+   the collector retains `up_valid` for such a run, and the event analyses use it.
+2. **`target_quality_mask`** (shipped on). A forecast step that `fhr_step_mask` marks bad leaves the
+   loss weight, so the model is not scored on a bridged FHR. The shipped rule is
+   `{bits: invalid, rho_epsilon: null}`: a step is bad when its 4 s hold a bridged FHR sample. The
+   $\rho$ rule is off for the target, because of the coverage floor (section 4.11). The coverage
+   floor and the KL support read the same weight.
+3. **`source_event_mask`** (an ablation, `sweep_source_event_mask.yaml`). Only the source steps
+   inside a detected contraction, from onset to end, keep their lag keys. The arm measures whether
+   the posterior also uses the baseline between contractions.
+
+The pre-flight refuses a switch without the loader key it reads, and the reverse. Section 8.2 lists
+the pairing rules.
+
+### 4.11 Which mask for which input (decision, 2026-10-28)
+
+**Decision.** The source uses the coefficient mask $\rho \le 0.1$. The contraction detector uses the
+raw mask `up_valid`. The FHR target uses the raw bit mask of the step. The HDF5 files store both
+kinds, so this choice is a loader and model setting, and the build does not depend on it.
+
+| Input | Reads | Mask | Shipped setting |
+|---|---|---|---|
+| Lag keys (source) | UA coefficients | $\rho_c[k] \le \varepsilon$, all kept channels | `ua_step_mask: {bits: null, rho_epsilon: 0.1}` |
+| Contraction detector | raw `up` | `up_valid` | `emit_quality_mask: true`, `event_weight_ua_valid: true` |
+| Forecast target | FHR coefficients | the step's raw FHR bits | `fhr_step_mask: {bits: invalid, rho_epsilon: null}`, `target_quality_mask: true` |
+
+The numbers below come from the diagnosis of the version-3 build (`tmp/pages`, 129,712 sampled
+segments, weighted) and the version-3 report (`tmp/REPORT`). The kernel figures are estimates from
+the filter bank of section 7.1 of `hdf5_dataset/dataset_explained_research.md`, not measurements.
+
+| Quantity | Value |
+|---|---|
+| UA invalid share, mean | 2.6% |
+| UA `TRANSIENT` runs per segment, mean | 3.0 |
+| Segments with a level-shift candidate | 18–35% (upper bounds; the version-4 rule is stricter) |
+| FHR invalid share, mean | 3.4% |
+| Segments with at least one invalid FHR sample | 80.5% |
+| Usable coefficients, version 3 (`up_st`, `up_ph`, `fhr_st`, `fhr_ph`) | 93.5%, 93.0%, 90.4%, 90.4% |
+
+**Why the source uses $\rho$ and not the raw mask.** The lag keys are UA coefficients, and a
+coefficient at step $k$ reads a causal window of up to about 10 minutes (the slowest kept channel,
+filter 30, has an envelope width $\sigma_t \approx 186$ s). A raw mask marks only the 4 s of step
+$k$. It therefore keeps a fast coefficient whose window still holds a bridged gap, and it keeps a
+slow coefficient whose window straddles a level shift. A shift adds a broadband transient that a
+slow channel reports as energy for several minutes, which looks like a slow contraction. One raw
+mask with a hold cannot fix both cases: a hold long enough for the slow channels masks the fast
+channels for minutes after every short gap. The coefficient $\rho_c[k]$ gives each channel its own
+extent. For example, a 10-s gap gives $\rho \approx 0.02$ in filter 30, so that channel stays usable,
+while channel 1 (a 24-s kernel) is masked for about the gap plus 20 s.
+
+**The conjunction costs less on the source than it seems.** A step is usable only when all kept
+channels are, so a short gap closes the step for about 30 s. A query reads $L = 38$ lags (148 s),
+and its gate closes only when every key is closed. A closure shorter than 148 s therefore removes
+some keys and keeps the anchor open. The cost is concentrated after level shifts, where the slowest
+kept channel stays masked for about 10 minutes. If `source_mask_fraction` is much higher than
+expected, drop the slowest channels from `causal_source_channels` before you relax $\varepsilon$.
+The statistics use $\varepsilon = 0.1$, and the loader refuses a different value.
+
+**Why the detector uses the raw mask.** The detector reads raw `up`, sample by sample, so the
+per-sample mask is its exact validity. $\rho$ describes coefficients and has no meaning for it.
+
+**Why the target uses the raw bits and not $\rho$.** The objective drops an anchor when less than
+90% of its 30 forecast steps are valid (`coverage_floor: 0.9`), so an anchor allows 3 masked steps.
+Under $\rho$, a fast FHR channel stays masked for about 20 s after a gap, so one short gap masks about
+8 steps. It then drops every anchor whose horizon covers it, about 150 s of anchors per gap, and 80%
+of the segments have a gap. The bit rule masks only the gap itself. The cost is that the fast FHR
+channels in the 20 s after a gap are scored while their window still holds bridged samples. Their
+share of the scored cells is small, and the bridge is a smooth line, so the error it adds is
+bounded. A per-channel target mask would remove this cost, but the objective's masks are
+$(B, A, H)$ by design.
+
+**What a version-4 build should show.** `usable_ua_steps` in `REPORT.md` is the per-step conjunction
+over all UA channels. The model's `source_mask_fraction` counts closed anchors, so it should be well
+below $1 -$ `usable_ua_steps`. A value near or above it means that long closures (level shifts or
+`FLAT` regions) dominate.
+
 ---
 
 ## 5. Scattering-based detection
@@ -575,12 +761,15 @@ frames) is an option only if the audit shows misses that the rules cannot catch.
   - The production profile shows the risk (section 2.7): the invalid share rises from 1.8% more than
     6 h before delivery to 14.5% in the last 30 min, and it is higher without CS.
   - Report the mask statistics per subgroup in the fold EDA.
+  - Version 4 removes one known path: the second-stage push peaks, which made the mask follow the
+    delivery mode (section 2.9). Check `ua_push` and `ua_transient` per subgroup on the new build.
   - After the build, fit a small classifier on mask summary features alone. If it predicts the label
     (for example AUROC above 0.6), the gate can carry the shortcut.
   - Evaluate per quality stratum.
   - During training, mask random valid UA spans, so that "masked" does not mean "abnormal".
-- **Lookahead.** The ceiling, step, box, hold, floor and island rules mark a span before their
-  confirmation time ends, up to 122 s ahead. The attribute `quality_lookahead_s` declares the bound. If strict causality is
+- **Lookahead.** The ceiling, step, box, hold, floor, island, pulse and push rules mark a span before
+  their confirmation time ends, up to 137 s ahead; the level-shift term of $\rho$ reads up to 180 s
+  ahead. The attribute `quality_lookahead_s` declares the bound. If strict causality is
   required, mark from the confirmation point only, and accept that the start of each span stays unmasked.
 - **FHR rules as a label shortcut.** `HOLD` and `LINEAR` also fire on smooth, low-variability FHR, and low
   variability is a sign of hypoxia. With the raw channel they do not invalidate. Without it, report
@@ -625,15 +814,16 @@ frames) is an option only if the audit shows misses that the rules cannot catch.
 | Phase | Work | Output | Status |
 |---|---|---|---|
 | 0 | A profile script (read only), run on the production box | numbers that confirm or change section 4.3 | done |
-| 1 | `hdf5_dataset/signal_quality.py`: pure NumPy codes, bridge, $\rho$ kernels, with unit tests | a tested module | done; the rule unit tests are not written |
-| 2 | Builder integration (section 4.8), with `quality_version` = 3 | a new dataset variant | done |
+| 1 | `hdf5_dataset/signal_quality.py`: pure NumPy codes, bridge, $\rho$ kernels, with unit tests | a tested module | done; `hdf5_dataset/tests/test_signal_quality_rules.py` covers the version-4 rules |
+| 2 | Builder integration (section 4.8), with `quality_version` = 4 | a new dataset variant | done |
 | 3 | Loader mask group, masked statistics, sample-page rows | a loadable, visible mask | done, except the evaluation sample pages (section 4.9) |
-| 4 | Model: `load_fields` in the model configs, key mask in the lag attention, gate prior, contraction weight on cleaned UA; the UA axis of the evaluation sample pages; `quality_version` in the classifier cache fingerprint | a separate task | in part: the key mask and the gate are done (section 8.1) |
+| 4 | Model: `load_fields` in the model configs, key mask in the lag attention, gate prior, contraction weight on cleaned UA; the UA axis of the evaluation sample pages; `quality_version` in the classifier cache fingerprint | a separate task | in part: the key mask, the gate, the contraction weight, the target mask and the fingerprint are done (sections 8.1 and 8.2) |
 
-Status: Phases 0 to 3 exist. The signal-quality rules still have no unit tests. The loader and the
-statistics have tests in `hdf5_dataset/tests/test_quality_loader.py` and `test_quality_stats.py`. The
-first production profile ran on version 1, and version 2 fixes what it found (section 2.7). The second
-ran on version 2, and version 3 fixes what it found (section 2.8). A local build of the two `.mat`
+Status: Phases 0 to 3 exist. The version-4 rules have tests in
+`hdf5_dataset/tests/test_signal_quality_rules.py`, and the loader and the statistics in
+`test_quality_loader.py` and `test_quality_stats.py`. The first production profile ran on version 1,
+and version 2 fixes what it found (section 2.7). The second ran on version 2, and version 3 fixes what
+it found (section 2.8). The diagnosis of the version-3 build led to version 4 (section 2.9). A local build of the two `.mat`
 records with the quality step kept every valid sample exactly as recorded. On two local records
 (hie_cs only), the masked statistics excluded 2.2–4.7% of the coefficient steps per block (section 4.9).
 
@@ -649,7 +839,7 @@ weight returns to its floor at a closed anchor, so open item 9 is answered for c
 only: the detector still reads the bridged `up`.
 
 Still open in Phase 4: the prior is not gated (it never reads UA), the evaluation sample pages,
-`quality_version` in the classifier cache fingerprint, and the lag-slot and patch cells.
+and the lag-slot and patch cells. Section 8.2 closes the contraction weight and the fingerprint.
 
 Without `ua_step_mask`, a model reads a quality build through its current `load_fields`. It therefore gets the
 bridged `fhr`/`up` and the coefficients computed from them, but no quality field. It still needs a
@@ -661,11 +851,57 @@ Decisions taken (2026-10-25, the recommended option each time):
 3. Level correction after a `STEP`: off. Version 1 had it on; version 2 removes it (section 2.7).
 4. The UP staircase: drop ch1–ch7 in the model, not in the data.
 5. Read raw `HR2` for an exact FHR repair mask.
-6. A declared lookahead, now 122 s (section 4.3).
+6. A declared lookahead, now 180 s (section 4.3).
 7. The build computes its flat gates on the pre-fill signals; the prescreen stays unchanged
    (section 4.8). In the production profile this keeps 172 of 19,644 segments.
 
 Open:
 8. Confirm the version-3 oscillation rule on a third production profile before the full build.
 9. Phase 4: whether the training weight's contraction detector reads the quality mask (section 2.7).
+   Answered on 2026-10-28: yes, under `event_weight_ua_valid` (section 8.2).
 10. Short handling plateaus between jumps stay valid (section 2.8). Low priority.
+11. Confirm the version-4 rules on the report of the full build: the `rest`, `push` and `flat` pages,
+    and `ua_push` against `ua_transient` per subgroup in the second stage (section 2.9).
+12. Decisions taken for version 4 (2026-10-28): `CENSORED` and `REST` stay valid, because they carry
+    information; a sample with no information gets its own invalid bit (`FLAT`); second-stage pushes
+    stay valid (`PUSH`).
+
+### 8.2 Phase 4, second part: the detector, the target and the stem (2026-10-28)
+
+Section 4.10 gives the reasons. This part adds the following:
+
+- **Loader.** `fhr_step_mask` emits `fhr_st_step_valid` and `fhr_ph_step_valid`, with the keys of
+  `ua_step_mask`. The stats pairing refuses a step-mask `rho_epsilon` that differs from the
+  statistics' `quality_rho_epsilon`. The legacy append writers refuse a quality file. The sequence
+  collate pads `fhr_raw_match` with NaN.
+- **Task** (`teb_vae/lag_attn_rws/task.py`). `event_weight_ua_valid` gives `up_valid` to the
+  contraction detector. `target_quality_mask` multiplies the loss weight by the FHR step mask, after
+  the detector has read the unmasked weight. `source_event_mask` ANDs the contraction spans into
+  `source_valid`.
+- **Model** (`teb_vae/lag_attn_cfs/nets/causal_inputs.py`). `source_key_mask` widens the mask by the
+  receptive field of the K/V body.
+- **Evaluation.** The collector retains `up_valid` for a run with `event_weight_ua_valid`, and the
+  event analyses read it, so the evaluation finds the contractions that the training weight found.
+  The per-anchor table gets `source_open` and `event_gate`.
+- **Classifier.** The cache fingerprint of `teb_vae/classifier/sources.py` includes each shard's
+  `quality_version`.
+- **Report.** `quality_summary.csv` gets `usable_ua_steps`, the reference for
+  `source_mask_fraction`.
+
+The pre-flight (`_check_quality_switch_pairing` in `teb_vae/lag_attn_cfs/trainer.py`) refuses:
+
+1. `event_weight_ua_valid` without `emit_quality_mask: true` or without an `event_weight_floor`;
+2. `target_quality_mask` without an active `fhr_step_mask`, and an active `fhr_step_mask` without the
+   switch;
+3. `source_event_mask` without `source_quality_mask` or without an `event_weight_floor`.
+
+The task also checks two of the switches when it is built, so a cell whose pre-flight does not run
+this check still refuses them: `target_quality_mask` on a raw-FHR target, and `source_event_mask` on a
+net without `source_quality_mask`. The lag-slot task and the classifier's preservation gate apply
+the same target mask as the shared evaluation.
+
+The transformer cfs `default.yaml` ships `event_weight_ua_valid` and `target_quality_mask` on, with
+`emit_quality_mask: true` and `fhr_step_mask: {bits: invalid, rho_epsilon: null}`.
+`sweep_no_event_weight.yaml` turns `event_weight_ua_valid` off, because it has no floor. `tiny.yaml`
+and `smoke_hie.yaml` turn all of them off, because their shards predate the quality step.
+

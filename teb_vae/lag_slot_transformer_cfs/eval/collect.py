@@ -2440,6 +2440,7 @@ def collect_tables(
         model=model,
         num_mc_samples=int(num_samples),
         device=next(model.parameters()).device,
+        ua_valid_events=bool(task.hparams.get("event_weight_ua_valid", False)),
     )
     retain = plan.tensor_names()
 

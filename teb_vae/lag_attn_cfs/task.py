@@ -444,6 +444,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         :meth:`_build_source_stream` concatenates the blocks, so channel $c$ of the mask describes
         channel $c$ of the stream.
 
+        Under ``source_event_mask`` the mask is also ``False`` at every step outside a detected
+        contraction (:meth:`_source_event_steps`).
+
         Args:
             batch: A batch from the data module.
             source: The assembled source stream, for the width check.
@@ -475,7 +478,14 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 f"the source-validity mask has shape {tuple(valid.shape)} but the source stream "
                 f"has {tuple(source.shape)}; the two must come from the same blocks."
             )
-        return valid.to(device=source.device, dtype=torch.bool)
+        valid = valid.to(device=source.device, dtype=torch.bool)
+        # The ``source_event_mask`` ablation: a step outside every detected contraction leaves the
+        # keys as well. Detected under the unmasked ``weight``, as the contraction weight is.
+        weight = getattr(batch, "weight", None)
+        inside = None if weight is None else self._source_event_steps(batch, weight)
+        if inside is not None:
+            valid = valid & inside.to(device=source.device)[..., None]
+        return valid
 
     # ------------------------------------------------------------------
     # Diagnostics

@@ -146,11 +146,15 @@ _META_FIELDS = frozenset({
 # the ``MISSING`` bit (value 1), which both bit fields count as invalid. A pad
 # of 0 would read as clean data. ``up_valid``/``fhr_valid`` are boolean and
 # take ``_DEFAULT_PAD`` (``False``), like ``<block>_valid``, and so do the
-# ``ua_step_mask`` fields ``up_st_step_valid``/``up_ph_step_valid``.
+# step-mask fields ``up_st_step_valid``/``up_ph_step_valid`` (``ua_step_mask``)
+# and ``fhr_st_step_valid``/``fhr_ph_step_valid`` (``fhr_step_mask``).
+# ``fhr_raw_match`` pads to NaN, the value the build writes when the raw FHR
+# channel was not read: a pad of 0 would read as "no sample matched".
 _QUALITY_MISSING_BIT = 1
 _PAD_VALUES: Dict[str, float] = {
     'target': -1.0,
     'weight': 0.0,
+    'fhr_raw_match': float('nan'),
     **{name: 1.0 for name in _RHO_FIELDS},
     **{name: float(_QUALITY_MISSING_BIT) for name in _QUALITY_BIT_FIELDS},
 }

@@ -91,6 +91,11 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         # The UA quality mask (2026-10-25), shipped on. No arm moves it yet; it is printed so a run
         # trained before the key reads ``(absent)`` beside one trained under it.
         "source_quality_mask",
+        # The three quality switches of 2026-10-28. The default turns on the first two;
+        # `sweep_source_event_mask.yaml` moves the third.
+        "event_weight_ua_valid",
+        "target_quality_mask",
+        "source_event_mask",
     )
 )
 

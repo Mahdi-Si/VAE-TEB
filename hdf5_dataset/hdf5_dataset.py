@@ -57,7 +57,8 @@ _QUALITY_RAW_FIELDS = tuple(f'{name}_raw' for name in _RAW_FIELDS)
 #: in exactly the shape of its block.
 _RHO_FIELDS = {f'{name}_rho': name for name in sorted(_COEFFICIENT_FIELDS)}
 #: Per-segment scalars.
-_QUALITY_SEGMENT_FIELDS = ('fhr_valid_frac', 'up_valid_frac', 'up_censored_frac', 'fhr_repair_exact')
+_QUALITY_SEGMENT_FIELDS = ('fhr_valid_frac', 'up_valid_frac', 'up_censored_frac', 'fhr_repair_exact',
+                           'fhr_raw_match')
 _QUALITY_FIELDS = (
     frozenset(_QUALITY_BIT_FIELDS + _QUALITY_RAW_FIELDS + _QUALITY_SEGMENT_FIELDS)
     | frozenset(_RHO_FIELDS)
@@ -1170,6 +1171,28 @@ def create_initial_hdf5(
         )
 
 
+def _refuse_quality_file(h5f: Any, path: str) -> None:
+    """Refuse a legacy append to a signal-quality file.
+
+    The legacy writers resize every dataset and write only the fields they know. On a quality file
+    the quality fields of the new rows would stay 0, and a 0 bit code reads as a clean sample.
+
+    Args:
+        h5f: The open file.
+        path: Its path, for the message.
+
+    Raises:
+        ValueError: If the file has the root attribute ``quality_version``.
+    """
+    if h5f.attrs.get('quality_version') is not None:
+        raise ValueError(
+            f"{path} is a signal-quality build (quality_version="
+            f"{int(h5f.attrs['quality_version'])}); the legacy append writers do not write its "
+            f"quality fields, and zeros there would read as clean samples. Append through the "
+            f"builder (create_new_pipeline.append_samples_batch with the quality fields)."
+        )
+
+
 def append_sample(
     path: str,
     fhr: np.ndarray,
@@ -1206,8 +1229,12 @@ def append_sample(
         bg_label:  Background label flag.
         time_from_labor_onset: Seconds since labor onset (NaN if unavailable).
         up_st:     UP scattering array, shape (n_channels, len_sequence). Optional.
+
+    Raises:
+        ValueError: If the file is a signal-quality build.
     """
     with h5py.File(path, "a", libver="latest") as h5f:
+        _refuse_quality_file(h5f, path)
         idx = h5f["fhr"].shape[0]
         new_size = idx + 1
         for name, ds in h5f.items():
@@ -1267,11 +1294,15 @@ def append_samples_batch(
         bg_label_batch:  BG label array, shape (K,), dtype uint8.
         tlo_batch:       Time-from-labor-onset array, shape (K,).
         up_st_batch:     UP scattering array, shape (K, n_ch, len_seq). Optional.
+
+    Raises:
+        ValueError: If the file is a signal-quality build.
     """
     k = fhr_batch.shape[0]
     if k == 0:
         return
     with h5py.File(path, "a", libver="latest") as h5f:
+        _refuse_quality_file(h5f, path)
         idx = h5f["fhr"].shape[0]
         new_size = idx + k
         for _name, ds in h5f.items():
@@ -1380,7 +1411,7 @@ class CombinedHDF5Dataset(Dataset):
     ``up_raw``, ``fhr_raw``                 $(L,)$      ``dtype``, raw units
     ``<block>_rho``                         $(T, C)$    ``dtype``, $\rho \in [0, 1]$
     ``up_valid_frac``, ``fhr_valid_frac``,  $()$        ``dtype``
-    ``up_censored_frac``
+    ``up_censored_frac``, ``fhr_raw_match``
     ``fhr_repair_exact``                    $()$        ``bool``
     ======================================  ==========  =======================
 
@@ -1443,6 +1474,16 @@ class CombinedHDF5Dataset(Dataset):
             The two rules are OR-joined. ``None``, the default, emits nothing,
             and so does a mapping that sets neither rule: that is how a config
             variant turns an inherited mask off. Signal-quality datasets only.
+            When the statistics file records the $\varepsilon$ it was computed
+            with (``quality_rho_epsilon``), ``rho_epsilon`` must equal it: the
+            mask then removes exactly the values the normalisation excluded.
+        fhr_step_mask: Add ``fhr_st_step_valid`` and ``fhr_ph_step_valid`` to
+            every sample that loads ``fhr_st`` / ``fhr_ph``: the same rules as
+            ``ua_step_mask``, on ``fhr_quality`` and ``fhr_*_rho``. ``"invalid"``
+            names the segment's own FHR invalid set: ``invalid_bits_exact``
+            where ``fhr_repair_exact`` is 1, ``invalid_bits_rules`` otherwise.
+            A model uses it to remove target steps built from repaired or
+            missing FHR from its loss. ``None``, the default, emits nothing.
     """
     def __init__(
         self,
@@ -1463,6 +1504,7 @@ class CombinedHDF5Dataset(Dataset):
         emit_validity_mask: bool = False,
         emit_quality_mask: bool = False,
         ua_step_mask: Optional[Mapping[str, Any]] = None,
+        fhr_step_mask: Optional[Mapping[str, Any]] = None,
     ):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.load_fields = None if load_fields is None else set(load_fields)
@@ -1481,6 +1523,7 @@ class CombinedHDF5Dataset(Dataset):
         self.emit_validity_mask = emit_validity_mask
         self.emit_quality_mask = emit_quality_mask
         self.ua_step_mask = None if ua_step_mask is None else dict(ua_step_mask)
+        self.fhr_step_mask = None if fhr_step_mask is None else dict(fhr_step_mask)
         self.trim_samples_raw, self.trim_samples_decimated = decimated_trim_steps(
             self.trim_minutes
         )
@@ -1539,6 +1582,9 @@ class CombinedHDF5Dataset(Dataset):
         self._check_quality_request()
         self._ua_step_rule: Optional[Tuple[int, Optional[float], int]] = (
             self._resolve_ua_step_mask()
+        )
+        self._fhr_step_rule: Optional[Tuple[int, bool, Optional[float], int]] = (
+            self._resolve_fhr_step_mask()
         )
         #: The statistics file's root ``quality_rho_epsilon``; set by `_check_stats_pairing`.
         self.stats_quality_rho_epsilon: Optional[float] = None
@@ -1830,59 +1876,98 @@ class CombinedHDF5Dataset(Dataset):
         Returns:
             ``(bit_mask, rho_epsilon, hold_steps)``, or ``None`` when the mask is off: no
             mapping, or one that names no bit and sets no ``rho_epsilon``. ``bit_mask`` is ``0``
-            when no bit is named.
+            when no bit is named; ``'invalid'`` resolves to the file's ``invalid_bits``.
 
         Raises:
             ValueError: On an unknown key or bit name, a value out of range, or files that do not
                 store what the rules read.
         """
-        spec = self.ua_step_mask
+        resolved = self._resolve_step_mask('ua_step_mask', self.ua_step_mask, 'up')
+        if resolved is None:
+            return None
+        bit_mask, invalid, epsilon, hold = resolved
+        if invalid:
+            up = (self._layout.quality_bits or {}).get('up_quality', {})
+            bit_mask |= int(up['invalid_bits'])
+        return bit_mask, epsilon, hold
+
+    def _resolve_fhr_step_mask(self) -> Optional[Tuple[int, bool, Optional[float], int]]:
+        r"""Validate ``fhr_step_mask`` against the files and resolve it.
+
+        Returns:
+            ``(bit_mask, invalid, rho_epsilon, hold_steps)``, or ``None`` when the mask is off.
+            ``invalid`` says ``'invalid'`` was named: the FHR invalid set is chosen per segment by
+            ``fhr_repair_exact``, so it cannot be folded into a constant ``bit_mask``.
+
+        Raises:
+            ValueError: As :meth:`_resolve_ua_step_mask`.
+        """
+        return self._resolve_step_mask('fhr_step_mask', self.fhr_step_mask, 'fhr')
+
+    def _resolve_step_mask(
+        self, key: str, spec: Optional[Mapping[str, Any]], signal: str
+    ) -> Optional[Tuple[int, bool, Optional[float], int]]:
+        r"""The validation both step masks share.
+
+        Args:
+            key: The constructor argument, for the messages.
+            spec: Its mapping, or ``None``.
+            signal: ``'up'`` or ``'fhr'``: the bit field is ``<signal>_quality`` and the blocks
+                are ``<signal>_st`` and ``<signal>_ph``.
+
+        Returns:
+            ``(bit_mask, invalid, rho_epsilon, hold_steps)`` without the ``'invalid'`` alias in
+            ``bit_mask``, or ``None`` when the mask is off.
+        """
         if spec is None or (not spec.get('bits') and spec.get('rho_epsilon') is None):
             return None
         unknown = sorted(set(spec) - {'bits', 'rho_epsilon', 'hold_steps'})
         if unknown:
             raise ValueError(
-                f"ua_step_mask has unknown keys {unknown}; use bits, rho_epsilon and hold_steps."
+                f"{key} has unknown keys {unknown}; use bits, rho_epsilon and hold_steps."
             )
         layout = self._layout
         if layout is None or layout.quality_version is None:
             raise ValueError(
-                "ua_step_mask needs a signal-quality build (root attribute quality_version); "
+                f"{key} needs a signal-quality build (root attribute quality_version); "
                 f"{self.paths[0]} has none. Build the dataset with signal_quality=True."
             )
+        field = f'{signal}_quality'
         names = spec.get('bits')
         names = [names] if isinstance(names, str) else list(names or [])
-        up = (layout.quality_bits or {}).get('up_quality', {})
-        known = {str(name).upper(): int(value) for name, value in up.get('bits', {}).items()}
-        bit_mask = 0
+        table = (layout.quality_bits or {}).get(field, {})
+        known = {str(name).upper(): int(value) for name, value in table.get('bits', {}).items()}
+        bit_mask, invalid = 0, False
         for name in names:
-            key = str(name).upper()
-            if key == 'INVALID':
-                bit_mask |= int(up['invalid_bits'])
-            elif key in known:
-                bit_mask |= known[key]
+            upper = str(name).upper()
+            if upper == 'INVALID':
+                invalid = True
+            elif upper in known:
+                bit_mask |= known[upper]
             else:
                 raise ValueError(
-                    f"ua_step_mask.bits names {name!r}, which up_quality does not define. Use "
+                    f"{key}.bits names {name!r}, which {field} does not define. Use "
                     f"any of {sorted(known)} or 'invalid'."
                 )
         epsilon = spec.get('rho_epsilon')
         if epsilon is not None:
             epsilon = float(epsilon)
             if not 0.0 <= epsilon < 1.0:
-                raise ValueError(f"ua_step_mask.rho_epsilon must be in [0, 1), got {epsilon}.")
+                raise ValueError(f"{key}.rho_epsilon must be in [0, 1), got {epsilon}.")
         hold = int(spec.get('hold_steps') or 0)
         if hold < 0:
-            raise ValueError(f"ua_step_mask.hold_steps must be >= 0, got {hold}.")
-        needed = ({'up_quality'} if bit_mask else set()) | (
-            {'up_st_rho', 'up_ph_rho'} if epsilon is not None else set()
+            raise ValueError(f"{key}.hold_steps must be >= 0, got {hold}.")
+        needed = ({field} if (bit_mask or invalid) else set()) | (
+            {f'{signal}_st_rho', f'{signal}_ph_rho'} if epsilon is not None else set()
         )
+        if invalid and signal == 'fhr':
+            needed.add('fhr_repair_exact')
         missing = sorted(needed - layout.quality_fields)
         if missing:
             raise ValueError(
-                f"ua_step_mask reads {missing}, which {layout.path} does not store."
+                f"{key} reads {missing}, which {layout.path} does not store."
             )
-        return bit_mask, epsilon, hold
+        return bit_mask, invalid, epsilon, hold
 
     def _ua_step_masks(self, f: Any, sample_idx: int, blocks: Sequence[str]) -> Dict[str, torch.Tensor]:
         r"""Build ``<block>_step_valid`` for the UA blocks this sample loaded.
@@ -1901,10 +1986,48 @@ class CombinedHDF5Dataset(Dataset):
         """
         assert self._ua_step_rule is not None
         bit_mask, epsilon, hold = self._ua_step_rule
+        return self._step_masks(f, sample_idx, blocks, 'up', bit_mask, epsilon, hold)
+
+    def _fhr_step_masks(
+        self, f: Any, sample_idx: int, blocks: Sequence[str]
+    ) -> Dict[str, torch.Tensor]:
+        r"""Build ``<block>_step_valid`` for the FHR blocks this sample loaded.
+
+        As :meth:`_ua_step_masks`, with the segment's own FHR invalid set behind ``'invalid'``.
+
+        Args:
+            f: The open file.
+            sample_idx: The segment's row in ``f``.
+            blocks: The FHR coefficient blocks present in the sample.
+
+        Returns:
+            ``{f'{block}_step_valid': (T, C) bool}`` per block, ``True`` = usable.
+        """
+        assert self._fhr_step_rule is not None
+        bit_mask, invalid, epsilon, hold = self._fhr_step_rule
+        if invalid:
+            info = self._layout.quality_bits['fhr_quality']
+            bit_mask |= int(
+                info['invalid_bits_exact'] if bool(f['fhr_repair_exact'][sample_idx])
+                else info['invalid_bits_rules']
+            )
+        return self._step_masks(f, sample_idx, blocks, 'fhr', bit_mask, epsilon, hold)
+
+    def _step_masks(
+        self,
+        f: Any,
+        sample_idx: int,
+        blocks: Sequence[str],
+        signal: str,
+        bit_mask: int,
+        epsilon: Optional[float],
+        hold: int,
+    ) -> Dict[str, torch.Tensor]:
+        r"""The bit and $\rho$ rules both step masks share; see :meth:`_ua_step_masks`."""
         steps = int(f[blocks[0]].shape[-1])
         step_bad = np.zeros(steps, dtype=bool)
         if bit_mask:
-            bad = (f['up_quality'][sample_idx].astype(np.int64) & bit_mask) != 0
+            bad = (f[f'{signal}_quality'][sample_idx].astype(np.int64) & bit_mask) != 0
             # Step k reads raw sample D*k, so its window is samples D*k-(D-1) .. D*k: padding
             # D-1 clean samples in front puts that window at [D*k, D*k + D) of the padded row.
             padded = np.concatenate([np.zeros(DECIMATION - 1, dtype=bool), bad])
@@ -1951,10 +2074,12 @@ class CombinedHDF5Dataset(Dataset):
         ``quality_version`` must equal the data files' one, with an absent
         attribute read as ``None`` on both sides. Old statistics beside old data
         is ``None == None`` and passes. The stats file's ``quality_rho_epsilon``
-        (``None`` when absent) is kept as ``stats_quality_rho_epsilon``.
+        (``None`` when absent) is kept as ``stats_quality_rho_epsilon``, and a
+        step mask whose ``rho_epsilon`` differs from it is refused.
 
         Raises:
-            ValueError: On a quality, variant or leg-alignment mismatch, or on
+            ValueError: On a quality, variant or leg-alignment mismatch, on a
+                step-mask $\varepsilon$ that differs from the statistics', or on
                 a block whose channel count disagrees with the stats file's.
         """
         try:
@@ -1979,6 +2104,18 @@ class CombinedHDF5Dataset(Dataset):
         self.stats_quality_rho_epsilon = (
             None if stats_rho_epsilon is None else float(stats_rho_epsilon)
         )
+        for key, rule in (('ua_step_mask', self._ua_step_rule),
+                          ('fhr_step_mask', self._fhr_step_rule)):
+            epsilon = None if rule is None else rule[-2]
+            if (epsilon is not None and self.stats_quality_rho_epsilon is not None
+                    and not np.isclose(epsilon, self.stats_quality_rho_epsilon)):
+                raise ValueError(
+                    f"{key}.rho_epsilon is {epsilon:g} but {self.stats_path} was computed with "
+                    f"quality_rho_epsilon={self.stats_quality_rho_epsilon:g}. The mask would "
+                    f"then keep values the normalisation excluded, or remove values it used. "
+                    f"Set {key}.rho_epsilon to {self.stats_quality_rho_epsilon:g}, or recompute "
+                    f"the statistics with the epsilon you want."
+                )
         if self._layout is not None and stats_quality != self._layout.quality_version:
             def describe(version: Optional[int]) -> str:
                 return (
@@ -2412,6 +2549,11 @@ class CombinedHDF5Dataset(Dataset):
             blocks = [name for name in ('up_st', 'up_ph') if name in out]
             if blocks:
                 out.update(self._ua_step_masks(f, sample_idx, blocks))
+
+        if self._fhr_step_rule is not None:
+            blocks = [name for name in ('fhr_st', 'fhr_ph') if name in out]
+            if blocks:
+                out.update(self._fhr_step_masks(f, sample_idx, blocks))
 
         out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
         out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))

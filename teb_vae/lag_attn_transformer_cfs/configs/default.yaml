@@ -796,6 +796,22 @@ model_config:
     # `sweep_no_event_weight.yaml` is the ablation.
     event_weight_floor: 0.0
     event_weight_reach_steps: 55
+    # THE QUALITY SWITCHES (2026-10-28). Each is task-level: no parameter, no change to what a
+    # checkpoint holds. research_notes/UA_QUALITY_MASK_DESIGN.md section 4.10 has the reasons.
+    #   event_weight_ua_valid: the contraction detector above also treats a sample the loader's
+    #     `up_valid` marks invalid as a gap, so a flat rest, a step or a hold that the weight alone
+    #     calls valid cannot give a false onset. An event that touches such a sample is dropped.
+    #     Needs `dataset_kwargs.emit_quality_mask: true` and a floor.
+    #   target_quality_mask: the forecast steps the loader's `fhr_step_mask` marks bad leave the
+    #     weight, so the model is not scored on a bridged FHR (the coverage floor and the KL
+    #     support use the same weight). Needs an active `fhr_step_mask`, and the reverse.
+    #   source_event_mask: the ablation. Only source steps inside a detected contraction
+    #     [onset, end] keep their lag keys. Needs `source_quality_mask` and a floor.
+    #     `sweep_source_event_mask.yaml` turns it on.
+    # false on all three = the model before 2026-10-28, bitwise.
+    event_weight_ua_valid: true
+    target_quality_mask: true
+    source_event_mask: false
     num_heads: 4
     d_head: 32
     use_entmax: true       # exact zeros in the lag distribution, not merely small weights
@@ -1070,12 +1086,14 @@ dataset_config:
       trim_minutes: 1.0
       # Which UA steps `source_quality_mask` treats as usable; the two rules are OR-joined.
       #   bits:        UA bit names, OR-joined: MISSING, CODE, CENSORED, TRANSIENT, STEP, HOLD,
-      #                FLOOR, ISLAND, OSCILLATION, or "invalid" (the file's invalid set, every bit
-      #                but CENSORED and OSCILLATION). A step is bad if any raw sample of the 4 s it
-      #                reads carries one. One value for every channel. null = no bit rule.
+      #                FLOOR, ISLAND, OSCILLATION, REST, PUSH, FLAT (quality version 4), or
+      #                "invalid" (the file's invalid set, every bit but CENSORED, OSCILLATION,
+      #                REST and PUSH). A step is bad if any raw sample of the 4 s it reads carries
+      #                one. One value for every channel. null = no bit rule.
       #   rho_epsilon: a coefficient is bad if its stored contamination rho > epsilon. Per channel,
       #                and it covers each coefficient's whole causal window, but rho was computed
-      #                from the full invalid set only. 0.1 = the statistics file's threshold, so a
+      #                from the full invalid set and, for UA from version 4, from the level shifts
+      #                inside the window. 0.1 = the statistics file's threshold, so a
       #                masked value is exactly a value the normalisation excluded. null = off.
       #   hold_steps:  extend each step the bit rule marks bad forward by this many steps.
       # A step is usable only if every source channel the model reads is. null = no mask (and
@@ -1083,6 +1101,22 @@ dataset_config:
       ua_step_mask:
         bits: null
         rho_epsilon: 0.1
+        hold_steps: 0
+      # Add `up_valid` and `fhr_valid` (the raw-grid masks) to every sample. `event_weight_ua_valid`
+      # reads `up_valid`. Signal-quality builds only.
+      emit_quality_mask: true
+      # Which FHR target steps `target_quality_mask` scores; the same keys as `ua_step_mask`, read
+      # from `fhr_quality` and the `fhr_*_rho` blocks. "invalid" uses the segment's own invalid set
+      # (`fhr_invalid_bits_exact` or `fhr_invalid_bits_rules`, by `fhr_repair_exact`). A step is bad
+      # if any raw FHR sample of its 4 s is invalid, i.e. bridged. A step is scored only if every
+      # kept target channel is usable. rho is off for the target because of the coverage floor: a
+      # fast FHR channel stays above rho 0.1 for about 20 s after a gap, so each gap would mask
+      # about 8 steps, and at `coverage_floor: 0.9` over `horizon: 30` an anchor allows only 3.
+      # One gap would then drop every anchor whose horizon covers it (about 150 s), and 80% of the
+      # segments have an FHR gap. research_notes/UA_QUALITY_MASK_DESIGN.md section 4.11.
+      fhr_step_mask:
+        bits: invalid
+        rho_epsilon: null
         hold_steps: 0
 
 

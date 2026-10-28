@@ -1,0 +1,38 @@
+# Ablation of the source steps: the default with lag keys only inside detected contractions.
+#
+# The default keeps every UA step whose coefficients the quality mask calls usable. A usable step
+# is valid, but it is not always informative: a long quiet baseline between contractions passes
+# every quality rule and still carries no drive for the FHR. The contraction weight already takes
+# the reward away at quiet target anchors; this arm also takes the quiet source steps away from the
+# keys, so the posterior can read UA history only from inside a contraction.
+#
+# `source_event_mask: true` ANDs a (B, T) mask into `source_valid`: True on the steps from a
+# detected onset to its end, with the same detector, the same validity (`event_weight_ua_valid`)
+# and the same cache as the contraction weight. The key mask then widens it by the K/V body reach,
+# as it does for every other bad step. An anchor with no key inside a contraction keeps its gate
+# closed, so q = p and the KL there is exactly 0.
+#
+# WHAT TO READ. `source_mask_fraction` rises against the default by the share of quiet steps;
+# `event_gate_mean` over the anchors left open; `source_conditioned_kl_raw` and `pred_gap` on
+# validation. If this arm keeps the default's coupling at a lower KL, the quiet steps were cost
+# without information. If it loses coupling, the posterior used the baseline between contractions
+# (e.g. the time since the last one), and the event span is too narrow a definition of
+# "informative".
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_source_event_mask.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_event_mask: true
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_source_event_mask
+      tags:
+        variant: lag_attn_trf_cfs_source_event_mask

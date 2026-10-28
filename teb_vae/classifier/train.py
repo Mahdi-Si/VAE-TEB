@@ -601,6 +601,9 @@ def preservation(source: VaeSource, rows: Mapping[str, Any], chunk: int) -> Dict
             batch = task.transfer_batch_to_device(AttributeDict({k: v[i:i + chunk] for k, v in rows.items()}), device, 0)
             out = model(*task._build_forward_inputs(batch))
             target, weight = task._build_raw_target(batch)
+            # The VAE's own target mask (target_quality_mask), so the gate scores the steps the VAE was trained on.
+            masked = getattr(task, "_target_quality_weight", None)
+            weight = masked(batch, weight) if callable(masked) else weight
             m = model.compute_loss(out, target, weight=weight, beta=0.0, likelihood="mse")["metrics"]
             k = len(batch["weight"]) / n
             for name, value in (("forecast_mse", m["nll_full_block"]), ("kld_active_frac", m["kld_active_frac"]),

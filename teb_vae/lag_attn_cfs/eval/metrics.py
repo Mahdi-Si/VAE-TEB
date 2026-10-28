@@ -258,6 +258,12 @@ def model_inputs(task: Any, batch: Any) -> Tuple[torch.Tensor, ...]:
     concatenated at $(B, T, c_y)$ -- the declared width the model's keep-index is positional into.
     The name is the family's and is kept so this seam stays one function across the grid.
 
+    The ``weight`` is the one the objective reads: under ``target_quality_mask`` the task's
+    ``_target_quality_weight`` has zeroed the target steps built from invalid FHR, so the
+    evaluation scores exactly the steps training scored. The contraction table still reads the
+    batch's own ``weight`` (:mod:`~teb_vae.lag_attn_cfs.eval.collect`), as the training detector
+    does.
+
     Args:
         task: The Lightning task wrapping the loaded net.
         batch: A batch from the data module.
@@ -268,6 +274,9 @@ def model_inputs(task: Any, batch: Any) -> Tuple[torch.Tensor, ...]:
     y_st, y_ph = task._build_target_streams(batch)
     u_stream = task._build_source_stream(batch)
     target_features, weight = task._build_raw_target(batch)
+    masked = getattr(task, "_target_quality_weight", None)
+    if callable(masked):
+        weight = masked(batch, weight)
     return y_st, y_ph, u_stream, target_features, weight
 
 
@@ -2741,6 +2750,18 @@ def evaluate_batch(
         .gather(1, anchors[:, :, None].expand(-1, -1, n_lags))
         .argmax(dim=-1),
     }
+    # The source-quality state of each anchor, under ``source_quality_mask`` only: ``source_open``
+    # is 1 where at least one lag key survived the mask, so a reader can split every per-anchor
+    # readout into anchors that could see the UA and anchors whose posterior was its prior.
+    if outputs.get("source_open") is not None:
+        per_anchor["source_open"] = outputs["source_open"].gather(1, anchors).to(
+            training_block.dtype
+        )
+    # The effective posterior gate per anchor ($g_t o_t$ under the mask), when the net builds one.
+    event_gate = outputs.get("event_gate")
+    if event_gate is not None:
+        gate = event_gate[..., 0] if event_gate.dim() == 3 else event_gate
+        per_anchor["event_gate"] = gate.gather(1, anchors).to(training_block.dtype)
     # The two per-anchor lag maps, gathered at the same anchors as the scalars above so a row of
     # the per-anchor table and a row of the per-anchor vector sidecar describe one anchor. The
     # pooled attribution rather than the per-head one: an anchor selection by $K_t$ is a selection
@@ -2800,8 +2821,17 @@ def evaluate_batch(
         # ``up_raw`` is the only signal in this pipeline the model never sees in raw form -- the
         # source reaches it as scattering and phase channels -- so a contraction can be located
         # nowhere else; and ``weight`` is what says which decimated steps are real, since the
-        # coefficients carry no gap sentinel of their own.
-        available["weight"] = weight
+        # coefficients carry no gap sentinel of their own. The batch's own ``weight``, not the one
+        # ``target_quality_mask`` zeroed: the retained traces are drawn and their contractions
+        # detected under the coverage the per-anchor table's detector read.
+        batch_weight = batch_field(batch, "weight")
+        available["weight"] = batch_weight if isinstance(batch_weight, torch.Tensor) else weight
+        # The UA mask the training detector read, under ``event_weight_ua_valid`` only, so the
+        # event analyses find the contractions the contraction column was measured from.
+        if bool(task.hparams.get("event_weight_ua_valid", False)):
+            up_valid = batch_field(batch, "up_valid")
+            if isinstance(up_valid, torch.Tensor):
+                available["up_valid"] = up_valid
         up_raw = batch_field(batch, "up")
         if isinstance(up_raw, torch.Tensor):
             available["up_raw"] = up_raw

@@ -22,8 +22,33 @@ shards every such run starts with a jump of 30 units or more, most of them from 
 less. A run at exactly 100 (or 127, the top of a 0--127 monitor range) entered smoothly is a
 contraction crest that the device or the export clamped: it is *censored* -- the timing is right
 and the true value is at least the stored one -- and it stays valid. A ceiling run that a jump
-enters or leaves, or that is longer than :attr:`QualityConfig.censored_max_s`, is an artifact as
-a whole.
+enters or leaves, or a ceiling region longer than :attr:`QualityConfig.censored_max_s`, is an
+artifact as a whole. A constant rest at the minimum of the recent past is the other clamp: the
+uterus has decayed into the device's floor or reference level, the true value is at most the
+stored one, and it is a valid ``REST``. ``CENSORED`` and ``REST`` carry information and stay
+valid; a sample that carries none gets an invalid bit of its own.
+
+**Flat regions.** Constant runs at one value with short excursions between them form one flat
+region (:attr:`QualityConfig.flat_merge_gap_s`). Each rule that limits a duration applies to
+the region, not to a single run: a monitor that adds a pulse to a flat line every $302$ s kept
+every run below $300$ s, and so below every limit. A region carries no information after
+:attr:`QualityConfig.rest_max_s`; its later samples are ``FLAT`` (invalid). A pulse of a long
+flat region, which leaves the value and returns to it, is a ``TRANSIENT``, and it is not an edge
+of the runs beside it.
+
+**Pushing.** In the second stage of labour, bearing-down efforts add short peaks on top of each
+contraction. The jump and spike rules mark them, and the mask then follows the delivery mode,
+because a vaginal delivery spends its last hour in the second stage. With the second-stage onset
+known, a ``TRANSIENT`` run that rides on a contraction, stays above the rest and touches no code,
+gap or ceiling is a valid ``PUSH`` (:attr:`QualityConfig.push_on_units`). Without the onset the
+rule is off.
+
+**Level shifts.** A step leaves a new level in valid samples, and a coefficient whose kernel
+spans the step responds to the jump although few of its samples are invalid. Every ``STEP``, and
+every short invalid span between two settled levels that differ by
+:attr:`QualityConfig.step_units` without a return, is a level shift (:class:`StepEvent`).
+:meth:`ContaminationBank.step_term` gives the coefficients that straddle it a contamination of
+their own. A floor run that a downward ``STEP`` settles into is a lost contact (``FLOOR``).
 
 **Jumps are local.** A jump of :attr:`QualityConfig.jump_units` within one stored step marks only
 the discontinuity, because a steep contraction rise can contain one. A wider span is marked only
@@ -51,14 +76,21 @@ is not regular, so it is still marked. A sensor that toggles to the ceiling can 
 wave swings at most :attr:`QualityConfig.osc_max_units`, and a jump to or from a ceiling value is
 marked inside a wave too.
 
-**Causality.** Most rules read only past samples. Nine read ahead, and each read is bounded by
+**Causality.** Most rules read only past samples. Twelve read ahead, and each read is bounded by
 :attr:`QualityConfig.lookahead_s`:
 
 * a box is closed by its opposite jump within :attr:`QualityConfig.box_max_s`;
 * a step needs a settled window within :attr:`QualityConfig.step_search_s` and no return to the
   old level within :attr:`QualityConfig.step_confirm_s`;
-* a ceiling run is censored only if it ends within :attr:`QualityConfig.censored_max_s` without
-  a jump;
+* a level shift across an invalid span of at most :attr:`QualityConfig.shift_span_max_s` needs
+  a settled window within :attr:`QualityConfig.shift_search_s` and no return within
+  :attr:`QualityConfig.step_confirm_s`;
+* a ceiling region is censored only if it ends within :attr:`QualityConfig.censored_max_s`
+  without a jump;
+* a pulse of a flat region is known once the run after it starts, within
+  :attr:`QualityConfig.flat_merge_gap_s` plus :attr:`QualityConfig.flat_run_min_s`, and once
+  its region reaches :attr:`QualityConfig.pulse_region_s`;
+* a push is judged by the :attr:`QualityConfig.push_context_s` after it;
 * the transient after a gap ends at the start of a settled window of
   :attr:`QualityConfig.settle_window_s`;
 * a spike is measured over :attr:`QualityConfig.spike_side_s` on both sides;
@@ -87,7 +119,7 @@ import numpy as np
 
 #: Version of the rules and of the stored fields. A builder writes it as a file attribute, and a
 #: file with another version is not complete for a build of this one.
-QUALITY_VERSION = 3
+QUALITY_VERSION = 4
 
 
 class UaBit(enum.IntFlag):
@@ -96,18 +128,24 @@ class UaBit(enum.IntFlag):
     Attributes:
         MISSING: Outside a recorded run, or in a padding tail.
         CODE: An invalid code: a value above 127, or below 0.
-        CENSORED: Clamped by the device, valid. At the ceiling (100 or 127) after a smooth rise,
-            the true value is at least the stored one; in a constant rest at the floor the
-            uterus has decayed into, it is at most the stored one.
-        TRANSIENT: A jump, a box between two opposite jumps, a spike, or the settling after a
-            gap.
+        CENSORED: A contraction crest that the device clamped at the ceiling (100 or 127) after
+            a smooth rise. Valid; the true value is at least the stored one.
+        TRANSIENT: A jump, a box between two opposite jumps, a spike, the settling after a gap,
+            or a pulse of a flat region.
         STEP: A jump from a settled level to a new settled level: a sensor repositioning.
         HOLD: A constant hold that a repair or a frozen sensor produced.
-        FLOOR: A floor (loss of contact) next to an invalid code, or an exact-zero run.
+        FLOOR: A floor (loss of contact): next to an invalid code, after a downward step, or an
+            exact-zero run.
         ISLAND: A short run that passed every other rule inside a mostly invalid region.
         OSCILLATION: Inside a regular train of peaks or dips (maternal breathing). Valid: the
             bit only records that the jump and spike rules were not applied here. It is the
             ninth bit, so the UA bits are ``uint16``.
+        REST: A constant rest at the minimum of the recent past: the uterus has decayed into the
+            device's floor or reference level. Valid; the true value is at most the stored one.
+        PUSH: In the second stage, a run the jump and spike rules marked that rides on a
+            contraction: a bearing-down effort. Valid.
+        FLAT: A sample of a flat region more than :attr:`QualityConfig.rest_max_s` after its
+            start. Invalid: it carries no information.
     """
 
     MISSING = 1
@@ -119,6 +157,9 @@ class UaBit(enum.IntFlag):
     FLOOR = 64
     ISLAND = 128
     OSCILLATION = 256
+    REST = 512
+    PUSH = 1024
+    FLAT = 2048
 
 
 class FhrBit(enum.IntFlag):
@@ -140,12 +181,13 @@ class FhrBit(enum.IntFlag):
     LINEAR = 64
 
 
-#: Storage type of the UA bits: :class:`UaBit` has nine bits.
+#: Storage type of the UA bits: :class:`UaBit` has twelve bits.
 UA_DTYPE = np.uint16
-#: The UA bits that make a sample invalid. ``CENSORED`` and ``OSCILLATION`` samples stay valid.
+#: The UA bits that make a sample invalid. ``CENSORED``, ``OSCILLATION``, ``REST`` and ``PUSH``
+#: samples stay valid.
 UA_INVALID = int(
     UaBit.MISSING | UaBit.CODE | UaBit.TRANSIENT | UaBit.STEP | UaBit.HOLD | UaBit.FLOOR
-    | UaBit.ISLAND
+    | UaBit.ISLAND | UaBit.FLAT
 )
 #: The FHR bits that make a sample invalid when the upstream repair is not known: every FHR bit.
 FHR_INVALID = int(FhrBit.MISSING | FhrBit.REPAIRED | FhrBit.JUMP | FhrBit.HOLD | FhrBit.LINEAR)
@@ -188,8 +230,9 @@ class QualityConfig:
         spike_units: Smallest height of a spike above the higher of its two sides.
         spike_side_s: Width of each side window of a spike. A contraction crest falls by about
             $4$ units over $3$ s, so $12$ units is $3\times$ that.
-        censored_max_s: A ceiling run longer than this is an artifact as a whole: no
-            contraction crest stays clamped this long.
+        censored_max_s: A ceiling region longer than this is an artifact as a whole: no
+            contraction crest stays clamped this long. Ceiling runs at one value with at most
+            :attr:`flat_merge_gap_s` between them form one region.
         gap_level_units: After a gap, a level this far from the level before the gap starts a
             transient that runs until the signal returns or settles.
         hold_min_s: Shortest constant run that can be a hold or a clamped rest.
@@ -201,10 +244,17 @@ class QualityConfig:
             of its first :attr:`hold_min_s`.
         rest_context_s: A constant run is a clamped rest when its value is at most the minimum of
             the usable samples in this window before it, plus :attr:`rest_units`. The uterus has
-            decayed into the device's floor.
+            decayed into the device's floor. The rest level of the push rule is read over the
+            same window.
         rest_units: Tolerance of the clamped-rest test.
-        rest_max_s: A clamped rest is censored for this long, and a hold after it. The builder's
-            flat-UA gate uses the same $300$ s.
+        rest_max_s: A flat region carries information for this long from its start; its later
+            samples are ``FLAT``. The builder's flat-UA gate uses the same $300$ s.
+        flat_run_min_s: Shortest constant run of a flat region.
+        flat_merge_gap_s: Longest excursion between two constant runs of one flat region. In the
+            profile, monitor pulses on a flat line last $1$--$12$ s.
+        pulse_units: Smallest height of a pulse of a flat region, above or below its value. The
+            monitor pulses rise $8$--$16$ units; a quiet rest wiggles by $1$.
+        pulse_region_s: A flat region at least this long has its pulses marked.
         floor_units: A UA value at most this is a floor value.
         floor_min_s: Shortest floor run.
         floor_near_s: A floor run is invalid when an invalid code or a missing sample lies
@@ -225,6 +275,14 @@ class QualityConfig:
             a period of about $3$--$20$ s; contractions are at least $1$ minute apart.
         osc_min_peaks: Fewest peaks of a train. A random burst of $5$ spikes is rarely regular.
         osc_ratio: Largest ratio of two consecutive spacings in a train.
+        push_on_units: In the second stage, a ``TRANSIENT`` run is a push when the level just
+            before or just after it is at least this far above the rest level (the 10th
+            percentile of the :attr:`rest_context_s` before it).
+        push_max_s: Longest push run.
+        push_context_s: Window before and after a run that gives the contraction level.
+        shift_span_max_s: Longest invalid span that can carry a level shift.
+        shift_search_s: A level shift needs a settled window that starts within this after its
+            span.
         fhr_hold_min_s: Shortest exactly constant FHR run that is a hold. Natural integer runs
             reach about $11$ s.
         fhr_linear_min_s: Shortest monotone FHR ramp that can be a linear repair.
@@ -262,6 +320,10 @@ class QualityConfig:
     rest_context_s: float = 120.0
     rest_units: float = 1.0
     rest_max_s: float = 300.0
+    flat_run_min_s: float = 10.0
+    flat_merge_gap_s: float = 15.0
+    pulse_units: float = 3.0
+    pulse_region_s: float = 60.0
     floor_units: float = 2.0
     floor_min_s: float = 20.0
     floor_near_s: float = 30.0
@@ -274,6 +336,11 @@ class QualityConfig:
     osc_period_max_s: float = 20.0
     osc_min_peaks: int = 5
     osc_ratio: float = 1.5
+    push_on_units: float = 10.0
+    push_max_s: float = 60.0
+    push_context_s: float = 10.0
+    shift_span_max_s: float = 60.0
+    shift_search_s: float = 30.0
     fhr_hold_min_s: float = 15.0
     fhr_linear_min_s: float = 15.0
     fhr_linear_tol_bpm: float = 0.75
@@ -291,10 +358,17 @@ class QualityConfig:
         """The longest look into the future of any rule: see the module docstring."""
         return float(max(self.box_max_s + self.pre_level_s, self.step_search_s + self.settle_window_s,
                          self.step_confirm_s + self.jump_lag_s,
-                         self.censored_max_s + 2.0 * self.jump_lag_s, self.settle_window_s,
+                         self.censored_max_s + self.flat_merge_gap_s + 2.0 * self.jump_lag_s,
+                         self.settle_window_s,
                          self.spike_side_s, self.hold_long_s + 2.0 * self.pre_level_s,
                          2.0 * self.floor_near_s, self.island_max_s + self.island_context_s,
-                         self.osc_min_peaks * self.osc_period_max_s))
+                         self.osc_min_peaks * self.osc_period_max_s,
+                         self.flat_merge_gap_s + self.flat_run_min_s,
+                         # A pulse is marked only once its flat region reaches pulse_region_s.
+                         self.pulse_region_s + self.flat_merge_gap_s,
+                         self.push_max_s + self.push_context_s,
+                         self.shift_span_max_s + max(self.step_confirm_s,
+                                                     self.shift_search_s + self.settle_window_s)))
 
     def as_attrs(self) -> Dict[str, Any]:
         """Return the thresholds as flat HDF5-attribute values, prefixed ``quality_``."""
@@ -459,17 +533,71 @@ def _linear_ramps(y: np.ndarray, present: np.ndarray, cfg: QualityConfig) -> Lis
 # =================================================================================================
 @dataclass(frozen=True)
 class StepEvent:
-    """One detected baseline step. It is recorded and masked; the level is not corrected.
+    """One level shift. It is recorded and masked; the level is not corrected.
 
     Attributes:
-        start: First sample of the step's ``STEP`` span.
-        settle: First sample of the settled window, where the ``STEP`` span ends.
-        delta: Settled level minus the level before the jump, in UA units.
+        start: First sample of the step's ``STEP`` span, or of the invalid span.
+        settle: First sample of the settled window after it.
+        delta: Settled level minus the level before, in UA units.
+        at: The sample of the discontinuity: the jump of a step, the middle of a span.
+            :meth:`ContaminationBank.step_term` reads it.
+        kind: ``'step'`` for a ``STEP`` jump, ``'span'`` for a shift across an invalid span.
     """
 
     start: int
     settle: int
     delta: float
+    at: int
+    kind: str = "step"
+
+
+@dataclass(frozen=True)
+class FlatRegion:
+    """One flat line: constant runs at one value, with short gaps between them.
+
+    Attributes:
+        start: First sample of the first run.
+        stop: One past the last sample of the last run.
+        value: The constant value, in TOCO units.
+        gaps: ``[(start, stop), ...]`` between consecutive runs, ``stop`` exclusive.
+    """
+
+    start: int
+    stop: int
+    value: float
+    gaps: Tuple[Tuple[int, int], ...]
+
+
+def flat_regions(x: np.ndarray, usable: np.ndarray, cfg: QualityConfig) -> List[FlatRegion]:
+    """Return the flat regions of one segment.
+
+    A region joins the constant runs of at least :attr:`QualityConfig.flat_run_min_s` at one
+    value whose gaps are at most :attr:`QualityConfig.flat_merge_gap_s`. A gap can hold a pulse,
+    a one-unit wiggle or a few missing samples; the line on both sides is the same.
+
+    Args:
+        x: UA in TOCO units.
+        usable: Samples that may belong to a run (data off the ceiling).
+        cfg: The thresholds.
+
+    Returns:
+        The regions in order. A region of one run has no gaps.
+    """
+    gap = cfg.samples(cfg.flat_merge_gap_s)
+    out: List[FlatRegion] = []
+    current: Optional[List[Any]] = None
+    for start, stop in constant_runs(x, usable, cfg.samples(cfg.flat_run_min_s)):
+        value = float(x[start])
+        if current is not None and value == current[2] and start - current[1] <= gap:
+            current[3].append((current[1], start))
+            current[1] = stop
+            continue
+        if current is not None:
+            out.append(FlatRegion(current[0], current[1], current[2], tuple(current[3])))
+        current = [start, stop, value, []]
+    if current is not None:
+        out.append(FlatRegion(current[0], current[1], current[2], tuple(current[3])))
+    return out
 
 
 def ua_quality(
@@ -477,8 +605,9 @@ def ua_quality(
     present: np.ndarray,
     fhr_hold: Optional[np.ndarray] = None,
     cfg: QualityConfig = DEFAULT_CONFIG,
+    stage2: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, List[StepEvent]]:
-    """Return the UA quality bits of one segment and its baseline steps.
+    """Return the UA quality bits of one segment and its level shifts.
 
     Args:
         up: Pre-fill UA in TOCO units, ``(N,)``.
@@ -486,9 +615,12 @@ def ua_quality(
         fhr_hold: Samples where the FHR is a constant hold (the ``HOLD`` bit of
             :func:`fhr_quality`); ``None`` disables the joint-hold rule.
         cfg: The thresholds.
+        stage2: Samples at or after the second-stage onset; ``None`` (onset unknown) disables
+            the push rule.
 
     Returns:
-        ``(bits, steps)``: ``uint16`` bits ``(N,)``, and the ``STEP`` events in order.
+        ``(bits, shifts)``: ``uint16`` bits ``(N,)``, and the level shifts (``STEP`` jumps and
+        shifts across invalid spans) in order of :attr:`StepEvent.at`.
     """
     x = np.asarray(up, dtype=np.float64)
     present = np.asarray(present, dtype=bool)
@@ -503,14 +635,17 @@ def ua_quality(
     # First, because the jump and spike rules must not read a breathing wave as artifacts.
     regular = _oscillations(x, data, cfg)
     q[regular] |= UA_DTYPE(UaBit.OSCILLATION)
+    regions = flat_regions(x, data & ~ceiling, cfg)
+    pulses = _mark_pulses(x, data, regions, q, cfg)
     steps = _mark_transients(x, data, ceiling, q, regular, cfg)
     _mark_spikes(x, data, q, regular & ~ceiling, cfg)
-    _mark_censored(ceiling, q, cfg)
-    _mark_holds(x, data & ~ceiling, q, fhr_hold, cfg)
-    _mark_floors(x, data, q, cfg)
+    _mark_censored(x, ceiling, q, cfg)
+    _mark_holds(x, data & ~ceiling, q, fhr_hold, pulses, cfg)
+    _mark_flat(regions, q, cfg)
     # A frozen run is exactly constant, so the jump out of it passes the step's settled-level
-    # test. Its level is not a baseline: the jump is only a discontinuity.
-    held = (q & UaBit.HOLD) != 0
+    # test. Its level is not a baseline: the jump is only a discontinuity. A flat line past the
+    # rest limit is the same.
+    held = (q & (UaBit.HOLD | UaBit.FLAT)) != 0
     kept: List[StepEvent] = []
     for step in steps:
         if step.start > 0 and held[step.start - 1]:
@@ -519,9 +654,13 @@ def ua_quality(
             q[span] |= UA_DTYPE(UaBit.TRANSIENT)
         else:
             kept.append(step)
+    _mark_floors(x, data, q, kept, cfg)
+    if stage2 is not None:
+        _mark_pushes(x, data, ceiling, q, np.asarray(stage2, dtype=bool), cfg)
     # Last, because an island is judged by every other invalid bit around it.
     _mark_islands(q, cfg)
-    return q, kept
+    shifts = kept + _span_shifts(x, data & ~ceiling, q, kept, cfg)
+    return q, sorted(shifts, key=lambda event: event.at)
 
 
 def _level_before(x: np.ndarray, data: np.ndarray, stop: int, cfg: QualityConfig) -> Optional[float]:
@@ -689,7 +828,7 @@ def _mark_transients(
             if step is not None:
                 settle, settled = step
                 q[start:settle] |= UA_DTYPE(UaBit.STEP)
-                steps.append(StepEvent(start=start, settle=settle, delta=settled - level))
+                steps.append(StepEvent(start=start, settle=settle, delta=settled - level, at=i))
                 resume = max(settle, i + lag)
                 continue
             q[max(0, start - lag):min(n, i + 1 + lag)] |= UA_DTYPE(UaBit.TRANSIENT)
@@ -826,21 +965,32 @@ def _regular_trains(
     return trains
 
 
-def _mark_censored(ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
-    """Decide each ceiling run as a whole: ``CENSORED`` crest or ``TRANSIENT`` artifact.
+def _mark_censored(x: np.ndarray, ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
+    """Decide each ceiling region as a whole: ``CENSORED`` crest or ``TRANSIENT`` artifact.
 
-    A run is an artifact if it is longer than :attr:`QualityConfig.censored_max_s`, or if any of
-    its samples is already a transient or a step: a jump entered or left it, or it lies in a
-    box, a spike or the settling after a gap. Otherwise every sample is censored. A decision per
-    sample would keep the tail of a jump-entered run valid, and the bridge would anchor on it.
+    Ceiling runs at one value with at most :attr:`QualityConfig.flat_merge_gap_s` between them
+    form one region. A region is an artifact if it spans more than
+    :attr:`QualityConfig.censored_max_s`, or if any sample of its runs is already a transient or
+    a step: a jump entered or left it, or it lies in a box, a spike or the settling after a gap.
+    Otherwise every sample of its runs is censored. A decision per run would keep a clamp that
+    dips by one unit now and then censored for minutes; a decision per sample would keep the
+    tail of a jump-entered run valid, and the bridge would anchor on it.
     """
     limit = cfg.samples(cfg.censored_max_s)
+    gap = cfg.samples(cfg.flat_merge_gap_s)
     artifact = (q & (UaBit.TRANSIENT | UaBit.STEP)) != 0
+    groups: List[List[Tuple[int, int]]] = []
     for start, stop in runs(ceiling):
-        if stop - start > limit or artifact[start:stop].any():
-            q[start:stop] |= UA_DTYPE(UaBit.TRANSIENT)
+        last = groups[-1][-1] if groups else None
+        if last is not None and x[start] == x[last[0]] and start - last[1] <= gap:
+            groups[-1].append((start, stop))
         else:
-            q[start:stop] |= UA_DTYPE(UaBit.CENSORED)
+            groups.append([(start, stop)])
+    for group in groups:
+        bad = group[-1][1] - group[0][0] > limit or any(artifact[a:b].any() for a, b in group)
+        bit = UA_DTYPE(UaBit.TRANSIENT if bad else UaBit.CENSORED)
+        for start, stop in group:
+            q[start:stop] |= bit
 
 
 def _mark_holds(
@@ -848,6 +998,7 @@ def _mark_holds(
     usable: np.ndarray,
     q: np.ndarray,
     fhr_hold: Optional[np.ndarray],
+    pulses: np.ndarray,
     cfg: QualityConfig,
 ) -> None:
     r"""Mark constant UA runs that a repair or a frozen sensor produced, and clamped rests.
@@ -856,29 +1007,31 @@ def _mark_holds(
     A run of at least :attr:`QualityConfig.hold_min_s` is a hold if it has an edge jump or a
     joint FHR hold. Otherwise it is a clamped rest if its value is the minimum of the
     :attr:`QualityConfig.rest_context_s` before it: the uterus has decayed into the device's
-    floor, which is valid and ``CENSORED`` up to :attr:`QualityConfig.rest_max_s`. Any other run
-    of :attr:`QualityConfig.hold_long_s` is a hold.
+    floor, which is a valid ``REST``; :func:`_mark_flat` limits it to
+    :attr:`QualityConfig.rest_max_s`. Any other run of :attr:`QualityConfig.hold_long_s` is a
+    hold.
 
     The start edge is a jump of :attr:`QualityConfig.hold_edge_units` within one stored step into
     the run. The end edge is such a jump out of a run shorter than
     :attr:`QualityConfig.hold_long_s` after which the signal stays away: the median of the
     $2\times$ :attr:`QualityConfig.pre_level_s` after the run is also that far. A spike that
-    starts where a rest ends is not an edge; the spike rule marks it.
+    starts where a rest ends is not an edge; the spike rule marks it. Nor is a pulse of a flat
+    region (*pulses*): the runs on either side of it are one flat line, and one of them must not
+    become a hold while the other stays a rest.
     """
     floor = x <= cfg.floor_units
     lag = cfg.samples(cfg.jump_lag_s)
     first = cfg.samples(cfg.hold_min_s)
     context = cfg.samples(cfg.rest_context_s)
-    rest_max = cfg.samples(cfg.rest_max_s)
     settle = cfg.samples(2.0 * cfg.pre_level_s)
     for start, stop in constant_runs(x, usable & ~floor, first):
         long_run = stop - start >= cfg.samples(cfg.hold_long_s)
         edge = False
         before = start - lag
-        if before >= 0 and usable[before]:
+        if before >= 0 and usable[before] and not pulses[before]:
             edge |= abs(x[start] - x[before]) >= cfg.hold_edge_units
         after = stop - 1 + lag
-        if not long_run and after < x.size and usable[after]:
+        if not long_run and after < x.size and usable[after] and not pulses[after]:
             window = slice(stop, min(x.size, stop + settle))
             later = float(np.median(x[window][usable[window]]))
             edge |= (abs(x[after] - x[stop - 1]) >= cfg.hold_edge_units
@@ -893,34 +1046,210 @@ def _mark_holds(
         past = slice(max(0, start - context), start)
         prior = x[past][usable[past]]
         if prior.size == 0 or x[start] <= prior.min() + cfg.rest_units:
-            cut = min(stop, start + rest_max)
-            q[start:cut] |= UA_DTYPE(UaBit.CENSORED)
-            q[cut:stop] |= UA_DTYPE(UaBit.HOLD)
+            q[start:stop] |= UA_DTYPE(UaBit.REST)
         elif long_run:
             q[start:stop] |= UA_DTYPE(UaBit.HOLD)
 
 
-def _mark_floors(x: np.ndarray, data: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
+def _mark_floors(x: np.ndarray, data: np.ndarray, q: np.ndarray, steps: Sequence[StepEvent],
+                 cfg: QualityConfig) -> None:
     r"""Mark floor runs that are a lost contact rather than a quiet uterus.
 
     A floor run (values at most :attr:`QualityConfig.floor_units` for at least
     :attr:`QualityConfig.floor_min_s`) is invalid if it is all exact zeros, if it starts within
-    :attr:`QualityConfig.floor_near_s` after a code or a missing sample, or -- for its samples
-    within $2\times$ that distance of the next one -- if it ends within that distance before one.
+    :attr:`QualityConfig.floor_near_s` after a code or a missing sample, if a downward ``STEP``
+    of at least :attr:`QualityConfig.step_units` settles into it (the settled window starts at
+    most that distance before the run, or inside it), or -- for its samples within $2\times$
+    that distance of the next code or missing sample -- if it ends within that distance before
+    one. A uterus relaxes over tens of seconds; a level that falls to the floor in one stored
+    step is a sensor that lost contact.
     """
     bad = (q & (UaBit.CODE | UaBit.MISSING)) != 0
     since = _distance_to(bad, forward=False)
     until = _distance_to(bad, forward=True)
     near = cfg.samples(cfg.floor_near_s)
+    drops = [step.settle for step in steps if step.delta <= -cfg.step_units]
     floor = data & (x <= cfg.floor_units)
     for start, stop in runs(floor):
         if stop - start < cfg.samples(cfg.floor_min_s):
             continue
-        if np.all(x[start:stop] == 0.0) or since[start] <= near:
+        entered = any(start - near <= settle < stop for settle in drops)
+        if np.all(x[start:stop] == 0.0) or since[start] <= near or entered:
             q[start:stop] |= UA_DTYPE(UaBit.FLOOR)
         elif until[stop - 1] <= near:
             span = np.arange(start, stop)
             q[span[until[start:stop] <= 2 * near]] |= UA_DTYPE(UaBit.FLOOR)
+
+
+def _mark_pulses(
+    x: np.ndarray, data: np.ndarray, regions: Sequence[FlatRegion], q: np.ndarray,
+    cfg: QualityConfig,
+) -> np.ndarray:
+    """Mark the pulses of long flat regions as ``TRANSIENT``.
+
+    A pulse is a gap of a flat region of at least :attr:`QualityConfig.pulse_region_s` in which
+    a usable sample lies :attr:`QualityConfig.pulse_units` or more from the region's value. The
+    spike rule misses the monitor pulses on a flat line, which rise only $8$ units; a quiet rest
+    does not leave an exact value and come back to it within seconds.
+
+    Args:
+        x: UA in TOCO units.
+        data: Usable samples: present and not a code.
+        regions: Output of :func:`flat_regions`.
+        q: UA bits, changed in place.
+        cfg: The thresholds.
+
+    Returns:
+        Boolean ``(N,)``, ``True`` on a pulse.
+    """
+    pulse = np.zeros(x.size, dtype=bool)
+    longest = cfg.samples(cfg.pulse_region_s)
+    for region in regions:
+        if region.stop - region.start < longest:
+            continue
+        for start, stop in region.gaps:
+            values = x[start:stop][data[start:stop]]
+            if values.size and float(np.max(np.abs(values - region.value))) >= cfg.pulse_units:
+                pulse[start:stop] = True
+    q[pulse] |= UA_DTYPE(UaBit.TRANSIENT)
+    return pulse
+
+
+def _mark_flat(regions: Sequence[FlatRegion], q: np.ndarray, cfg: QualityConfig) -> None:
+    """Mark the valid samples of each flat region after :attr:`QualityConfig.rest_max_s` ``FLAT``.
+
+    The limit counts from the start of the region, so pulses or wiggles between its runs do not
+    reset it. A ``REST`` sample that becomes ``FLAT`` loses its ``REST`` bit: ``REST`` stays the
+    name of a valid clamped rest.
+    """
+    cap = cfg.samples(cfg.rest_max_s)
+    valid = (q & UA_DTYPE(UA_INVALID)) == 0
+    keep = UA_DTYPE(0xFFFF ^ int(UaBit.REST))
+    for region in regions:
+        cut = region.start + cap
+        if cut >= region.stop:
+            continue
+        index = np.arange(cut, region.stop)[valid[cut:region.stop]]
+        q[index] &= keep
+        q[index] |= UA_DTYPE(UaBit.FLAT)
+
+
+def _median_in(x: np.ndarray, ok: np.ndarray, start: int, stop: int) -> Optional[float]:
+    """Median of ``x[start:stop]`` over the samples where ``ok``; ``None`` if there is none."""
+    start, stop = max(0, start), min(x.size, stop)
+    values = x[start:stop][ok[start:stop]] if stop > start else x[:0]
+    return float(np.median(values)) if values.size else None
+
+
+def _mark_pushes(
+    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, q: np.ndarray, stage2: np.ndarray,
+    cfg: QualityConfig,
+) -> None:
+    r"""In the second stage, turn ``TRANSIENT`` runs that ride on a contraction into ``PUSH``.
+
+    A run qualifies when every one of its samples carries ``TRANSIENT`` and no other invalid
+    bit, every sample lies in the second stage, and:
+
+    * it is at most :attr:`QualityConfig.push_max_s` long;
+    * it and its two neighbours are usable data, its neighbours are valid, and it touches no
+      ceiling value: a gap, a code or a ceiling toggle stays an artifact;
+    * the median of the valid samples in the :attr:`QualityConfig.push_context_s` before it, or
+      after it, lies at least :attr:`QualityConfig.push_on_units` above the rest level $r$, the
+      10th percentile of the valid samples in the :attr:`QualityConfig.rest_context_s` before
+      it: the run sits on a contraction;
+    * no sample falls below $r -$ :attr:`QualityConfig.return_units`: a dropout is not a push.
+
+    Args:
+        x: UA in TOCO units.
+        data: Usable samples: present and not a code.
+        ceiling: Usable samples at a ceiling value.
+        q: UA bits, changed in place.
+        stage2: Samples at or after the second-stage onset.
+        cfg: The thresholds.
+    """
+    transient = int(UaBit.TRANSIENT)
+    only = (((q & UA_DTYPE(transient)) != 0) & ((q & UA_DTYPE(UA_INVALID ^ transient)) == 0)
+            & stage2)
+    if not only.any():
+        return
+    clean = data & ((q & UA_DTYPE(UA_INVALID)) == 0)
+    n = x.size
+    longest = cfg.samples(cfg.push_max_s)
+    context = cfg.samples(cfg.push_context_s)
+    past = cfg.samples(cfg.rest_context_s)
+    for start, stop in runs(only):
+        if stop - start > longest or start == 0 or stop >= n:
+            continue
+        if not (clean[start - 1] and clean[stop]) or not data[start:stop].all() \
+                or ceiling[start:stop].any():
+            continue
+        prior = x[max(0, start - past):start][clean[max(0, start - past):start]]
+        if prior.size == 0:
+            continue
+        rest = float(np.percentile(prior, 10))
+        sides = [v for v in (_median_in(x, clean, start - context, start),
+                             _median_in(x, clean, stop, stop + context)) if v is not None]
+        if not sides or max(sides) < rest + cfg.push_on_units:
+            continue
+        if float(x[start:stop].min()) < rest - cfg.return_units:
+            continue
+        q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
+        q[start:stop] |= UA_DTYPE(UaBit.PUSH)
+
+
+def _span_shifts(
+    x: np.ndarray, usable: np.ndarray, q: np.ndarray, steps: Sequence[StepEvent],
+    cfg: QualityConfig,
+) -> List[StepEvent]:
+    """Find level shifts across short invalid spans.
+
+    The ``STEP`` test, applied to a whole invalid span instead of one jump. A run of invalid
+    samples of at most :attr:`QualityConfig.shift_span_max_s` that holds no ``STEP`` is a level
+    shift when the :attr:`QualityConfig.pre_level_s` before it is valid and settled (range at
+    most :attr:`QualityConfig.settle_range_units`), a settled window starts within
+    :attr:`QualityConfig.shift_search_s` after it at least :attr:`QualityConfig.step_units` away
+    from the level before, and no valid sample of the :attr:`QualityConfig.step_confirm_s` after
+    the span comes back to within :attr:`QualityConfig.return_units` of that level. A
+    contraction returns to its rest within about $2$ minutes, so it fails the last test. Nothing
+    is marked; the shifts only feed :meth:`ContaminationBank.step_term`.
+
+    Args:
+        x: UA in TOCO units.
+        usable: Samples that are data and off the ceiling.
+        q: The final UA bits.
+        steps: The ``STEP`` events.
+        cfg: The thresholds.
+
+    Returns:
+        One :class:`StepEvent` of kind ``'span'`` per shift; ``at`` is the middle of the span.
+    """
+    n = x.size
+    invalid = (q & UA_DTYPE(UA_INVALID)) != 0
+    good = usable & ~invalid
+    no_ceiling = np.zeros(n, dtype=bool)
+    pre_n = cfg.samples(cfg.pre_level_s)
+    longest = cfg.samples(cfg.shift_span_max_s)
+    search = cfg.samples(cfg.shift_search_s)
+    confirm = cfg.samples(cfg.step_confirm_s)
+    out: List[StepEvent] = []
+    for start, stop in runs(invalid):
+        if stop - start > longest or start < pre_n or stop >= n:
+            continue
+        if any(step.start < stop and step.settle > start for step in steps):
+            continue
+        before = x[start - pre_n:start]
+        if not good[start - pre_n:start].all() or before.max() - before.min() > cfg.settle_range_units:
+            continue
+        level = float(np.median(before))
+        found = _settled_window(x, good, no_ceiling, stop, stop + search, cfg)
+        if found is None or abs(found[1] - level) < cfg.step_units:
+            continue
+        after = slice(stop, min(n, stop + confirm))
+        if np.any(np.abs(x[after][good[after]] - level) <= cfg.return_units):
+            continue
+        out.append(StepEvent(start=start, settle=found[0], delta=found[1] - level,
+                             at=(start + stop) // 2, kind="span"))
+    return out
 
 
 def _mark_islands(q: np.ndarray, cfg: QualityConfig) -> None:
@@ -1033,7 +1362,8 @@ class CleanResult:
         fhr_bits: FHR quality bits, ``uint8 (N,)``.
         up_clean: Bridged UA. Its level is not corrected after a step.
         fhr_clean: Bridged FHR.
-        steps: The UA baseline steps, recorded only.
+        steps: The UA level shifts (``STEP`` jumps and shifts across invalid spans), recorded
+            only; :meth:`ContaminationBank.step_term` turns them into contamination.
         fhr_invalid_bits: The FHR bits that invalidate a sample: :data:`FHR_INVALID_EXACT`
             when the repair mask was given, else :data:`FHR_INVALID`.
     """
@@ -1062,6 +1392,7 @@ def clean_segment(
     present: np.ndarray,
     repaired: Optional[np.ndarray] = None,
     cfg: QualityConfig = DEFAULT_CONFIG,
+    stage2: Optional[np.ndarray] = None,
 ) -> CleanResult:
     """Code and clean one segment.
 
@@ -1072,13 +1403,15 @@ def clean_segment(
         repaired: FHR samples the upstream repair wrote, or ``None``. When it is given, only
             :data:`FHR_INVALID_EXACT` invalidates an FHR sample.
         cfg: The thresholds.
+        stage2: UA samples at or after the second-stage onset, or ``None`` when the onset is
+            unknown; see :func:`ua_quality`.
 
     Returns:
         The :class:`CleanResult`.
     """
     fhr_bits = fhr_quality(fhr, present, repaired, cfg)
     fhr_hold = (fhr_bits & FhrBit.HOLD) != 0
-    up_bits, steps = ua_quality(up, present, fhr_hold, cfg)
+    up_bits, steps = ua_quality(up, present, fhr_hold, cfg, stage2)
     up_invalid = (up_bits & UA_INVALID) != 0
     up_clean = bridge(np.asarray(up, dtype=np.float64), up_invalid, cfg)
     fhr_invalid_bits = FHR_INVALID if repaired is None else FHR_INVALID_EXACT
@@ -1172,6 +1505,36 @@ class ContaminationBank:
         self.n_fft = 1 << int(np.ceil(np.log2(self.n_signal + 2 * self.history)))
         self.spectra = np.stack([np.fft.rfft(k, n=self.n_fft) for k in kernels])
         self.picks = self.history + np.arange(self.n_signal // self.decimation) * self.decimation
+        # cum[c, j] = mass of kernel c on lags 0..j; 1 past its end.
+        self.cumulative = np.ones((len(kernels), self.history + 1), dtype=np.float64)
+        for c, kernel in enumerate(kernels):
+            self.cumulative[c, :kernel.size] = np.cumsum(kernel)
+
+    def step_term(self, positions: Sequence[int]) -> np.ndarray:
+        r"""Return the contamination that level shifts add, for one segment.
+
+        A shift at raw sample $s$ splits the window of the coefficient at $n = Dk$: the mass
+        $A_c = \sum_{j=0}^{n-s} w_c[j]$ lies on the new level and $1 - A_c$ on the old one. The
+        coefficient mixes two baselines, which no valid-sample count shows, so the term is
+        $$\rho^{\mathrm{step}}_c[k] = \max_s 2\min(A_c, 1 - A_c),$$
+        which is $0$ before the shift and after the kernel has passed it, and $1$ when the
+        window is split in half. It is combined with :meth:`__call__` by a maximum.
+
+        Args:
+            positions: Raw samples of the shifts (:attr:`StepEvent.at`).
+
+        Returns:
+            ``(C, T)`` ``float32`` values in $[0, 1]$; zeros when there is no shift.
+        """
+        out = np.zeros((self.cumulative.shape[0], self.picks.size), dtype=np.float32)
+        now = np.arange(self.picks.size) * self.decimation
+        for position in positions:
+            lag = now - int(position)
+            ahead = lag >= 0
+            mass = np.zeros((self.cumulative.shape[0], now.size), dtype=np.float64)
+            mass[:, ahead] = self.cumulative[:, np.minimum(lag[ahead], self.history)]
+            np.maximum(out, 2.0 * np.minimum(mass, 1.0 - mass), out=out, casting="unsafe")
+        return out
 
     def __call__(self, bad: np.ndarray) -> np.ndarray:
         """Return the contamination of ``(N,)`` or ``(B, N)`` invalid indicators.

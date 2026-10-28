@@ -398,6 +398,9 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
         try:
             inputs = self._build_forward_inputs(batch)
             target_features, weight = self._build_raw_target(batch)
+            # Under ``target_quality_mask``, the steps built from invalid FHR leave the objective,
+            # as they do in the shared evaluation (``metrics.model_inputs``).
+            weight = self._target_quality_weight(batch, weight)
             forward_outputs = self.model(*inputs)
 
             loss_metrics = self.orig_model.compute_loss(
