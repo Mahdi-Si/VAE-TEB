@@ -672,13 +672,14 @@ the pairing rules.
 
 ### 4.11 Which mask for which input (decision, 2026-10-28)
 
-**Decision.** The source uses the coefficient mask $\rho \le 0.1$. The contraction detector uses the
-raw mask `up_valid`. The FHR target uses the raw bit mask of the step. The HDF5 files store both
+**Decision.** The source uses the coefficient mask $\rho \le 0.1$, OR-joined with the raw bits of
+the step (revised later on 2026-10-28; see "Why the source also uses the raw bits" below). The
+contraction detector uses the raw mask `up_valid`. The FHR target uses the raw bit mask of the step. The HDF5 files store both
 kinds, so this choice is a loader and model setting, and the build does not depend on it.
 
 | Input | Reads | Mask | Shipped setting |
 |---|---|---|---|
-| Lag keys (source) | UA coefficients | $\rho_c[k] \le \varepsilon$, all kept channels | `ua_step_mask: {bits: null, rho_epsilon: 0.1}` |
+| Lag keys (source) | UA coefficients | $\rho_c[k] \le \varepsilon$, all kept channels, and no invalid raw sample in the step | `ua_step_mask: {bits: invalid, rho_epsilon: 0.1}` |
 | Contraction detector | raw `up` | `up_valid` | `emit_quality_mask: true`, `event_weight_ua_valid: true` |
 | Forecast target | FHR coefficients | the step's raw FHR bits | `fhr_step_mask: {bits: invalid, rho_epsilon: null}`, `target_quality_mask: true` |
 
@@ -705,6 +706,15 @@ mask with a hold cannot fix both cases: a hold long enough for the slow channels
 channels for minutes after every short gap. The coefficient $\rho_c[k]$ gives each channel its own
 extent. For example, a 10-s gap gives $\rho \approx 0.02$ in filter 30, so that channel stays usable,
 while channel 1 (a 24-s kernel) is masked for about the gap plus 20 s.
+
+**Why the source also uses the raw bits.** $\rho$ alone can pass a step whose own 4 s are bridged.
+The bridge across a gap is drawn toward the first valid sample after the gap, so at such a step it
+carries UA from later than the step. A causal kernel puts little weight on its newest samples, so
+$\rho$ can stay at or below 0.1 there, and the key would then read a little future UA. The bit rule
+closes exactly this case: a step is bad if any raw sample of its 4 s is invalid. Steps after the gap
+read a bridge whose end is already in their past, so they leak nothing. Inside a gap $\rho$ already
+closes the step on the fast channels, so the bits add only the gap's edges, and no anchor closes
+because of them alone.
 
 **The conjunction costs less on the source than it seems.** A step is usable only when all kept
 channels are, so a short gap closes the step for about 30 s. A query reads $L = 38$ lags (148 s),

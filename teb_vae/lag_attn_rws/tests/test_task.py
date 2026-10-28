@@ -29,8 +29,9 @@ _STAGE_METRICS = {
     # The event mechanisms' four columns, present on every stage whether or not an arm uses them,
     # for the same reason the shape pairs are.
     "nll_full_event_block", "event_anchor_frac", "event_gate_mean", "lambda_event_gate",
-    # The UA quality mask's closed-anchor share, 0.0 on every model without the mask.
-    "source_mask_fraction",
+    # The UA quality mask's closed-anchor share, 0.0 on every model without the mask, and the
+    # coupling rate over the anchors it left open.
+    "source_mask_fraction", "source_conditioned_kl_open",
     "anchor_coverage_frac",
     "mean_logvar_full", "mean_logvar_base",
     "logvar_full_floor_frac", "logvar_full_ceil_frac",

@@ -156,10 +156,14 @@ REQUIRED_EVAL_LOAD_FIELDS: Tuple[str, ...] = (
 #: The same tuple the experiment driver declares as its ``TARGET_FIELDS``.
 TARGET_FIELDS: Tuple[str, ...] = ("fhr_st", "fhr_ph")
 
-#: Objective keys reconciled against the checkpoint's own ``hyper_parameters``. These four decide
-#: which loss the readouts are, so a disagreement means the run would report one objective's numbers
-#: under another's name.
-OBJECTIVE_KEYS: Tuple[str, ...] = ("likelihood", "free_bits", "lambda_full", "lambda_base")
+#: Objective keys reconciled against the checkpoint's own ``hyper_parameters``. These decide which
+#: loss the readouts are, so a disagreement means the run would report one objective's numbers
+#: under another's name. The three quality switches decide which target steps are scored, which
+#: contractions the detector names and which lag keys the ablation keeps.
+OBJECTIVE_KEYS: Tuple[str, ...] = (
+    "likelihood", "free_bits", "lambda_full", "lambda_base",
+    "event_weight_ua_valid", "target_quality_mask", "source_event_mask",
+)
 
 #: Recorded from the checkpoint but never compared: $\beta$ and its ramp weight the *training* total
 #: and enter none of the evaluated readouts, so a config that changed the schedule after the fit is

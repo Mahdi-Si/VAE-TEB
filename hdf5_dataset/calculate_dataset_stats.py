@@ -1737,11 +1737,37 @@ RUN_ARGS: Dict[str, Any] = {
     #        Statistics computed over a subset normalise the rest with constants they never
     #        contributed to, and nothing downstream says so. One entry per file.
     "input_files": [
-        r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5",
+        # The 2026-10-27 quality-version-4 build: the 20 train and 5 test pretraining shards that
+        # configs/prod_q4_*.yaml train on. Compare with pre_training_dataset/dataset_files.yaml.
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5",
+        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5",
     ],
 
     # str -- path for the output statistics HDF5. Required. Overwritten if it exists.
-    "output_file": r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5",
+    "output_file": r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/stats.hdf5",
 
     # ============================ Must match the loader ============================
     # float | None -- symmetric trim in minutes the statistics are accumulated over.
@@ -1753,13 +1779,15 @@ RUN_ARGS: Dict[str, Any] = {
 
     # ========================= Everything below has a default =========================
     # str | None -- torch device, e.g. "cuda:0".  (None -> CUDA if available, else CPU)
-    "device": None,
+    "device": "cuda:0",
 
     # int | None -- samples per read. Affects memory only, never the result.  (None -> 100)
     "batch_size": None,
 
     # bool | None -- write per-field histogram plots beside the output.  (None -> True)
-    "plot_histograms": None,
+    # False on the production build: the histogram pass reads up to max_histogram_samples rows
+    # of every field at once (about 12 GB at 50000).
+    "plot_histograms": False,
 
     # str | None -- directory for those plots.  (None -> beside output_file)
     "histograms_dir": None,

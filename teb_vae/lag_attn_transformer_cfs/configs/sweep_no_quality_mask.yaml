@@ -1,0 +1,53 @@
+# Control of the quality masks: the default with every quality switch off, on the SAME data.
+#
+# The default uses the version-4 quality masks in three places: the lag keys (`source_quality_mask`
+# with `ua_step_mask`: rho <= 0.1 OR the step's raw bits), the contraction detector
+# (`event_weight_ua_valid`, which reads `up_valid`) and the forecast target (`target_quality_mask`
+# with `fhr_step_mask`: the step's raw bits). This arm turns all three off. It keeps the same
+# shards, in which UA and FHR are bridged across every invalid span, the same statistics file, the
+# contraction weight and the event gate. A difference against the default is therefore the effect
+# of the model-side masks alone: does the model learn more from UA when the bad UA is removed?
+#
+# The arm still trains on bridged signals, so it measures "bridged but unmasked", not "before the
+# quality step". `emit_quality_mask` stays true: nothing in training reads `up_valid` here, but the
+# key set must stay the default's.
+#
+# WHAT TO READ. `source_mask_fraction` is exactly 0.0 here, and `source_conditioned_kl_open` equals
+# `source_conditioned_kl_raw`. The `nll_*`, `pred_gap` and `source_conditioned_kl_raw` LEVELS do not
+# compare with the default's: the default scores fewer target steps and averages exact zeros at its
+# closed anchors. Compare instead, inside each arm, `shuffle_penalty`, `kld_shuffled` against
+# `source_conditioned_kl_open`, `source_conditioned_kl_open - kld_source_null` and the train-minus-val
+# `pred_gap`. Across arms, compare the held-out evaluation on the anchors whose per-anchor labels say
+# `ua_key_open == 1` and `target_bad_steps == 0`: both arms score the same cells there. Evaluate this
+# arm with `eval/configs/eval_overrides_prod_q4.yaml` (or a copy for another build), which sets the
+# two loader masks so the labels exist; the default's checkpoint carries them already.
+#
+#   python -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_no_quality_mask.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_quality_mask: false
+    event_weight_ua_valid: false
+    target_quality_mask: false
+
+dataset_config:
+  dataloader_config:
+    dataset_kwargs:
+      # Leaf by leaf rather than `ua_step_mask: null`: the arm keeps the default's key set. Neither
+      # rule set = no mask, as the loader and the pre-flight read it.
+      ua_step_mask:
+        bits: null
+        rho_epsilon: null
+      fhr_step_mask:
+        bits: null
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_no_quality_mask
+      tags:
+        variant: lag_attn_trf_cfs_no_quality_mask
