@@ -41,7 +41,8 @@ exists to check.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
+import inspect
+from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -53,6 +54,56 @@ from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight, contrac
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 from train.pl_model_base import LightningModelBase, MetricDict
+
+
+#: Constructor keywords that a checkpoint rebuild never takes from ``hyper_parameters``: the net
+#: and its kwargs are passed apart, and an evaluation needs the eager module.
+_REBUILD_EXCLUDED: Set[str] = {"self", "base_model", "model_kwargs", "compile_model"}
+
+
+def task_constructor_names(task_cls: type) -> Set[str]:
+    """Return the keyword names that ``task_cls(...)`` accepts.
+
+    The names of the first ``__init__`` up the MRO, and, while an ``__init__`` takes
+    ``**kwargs``, the names of the next ``__init__`` up the MRO, which it forwards to. For example,
+    the causal cells add ``seed`` and forward every loss weight to this module's task.
+
+    Args:
+        task_cls: A task class of this family.
+
+    Returns:
+        The keyword names, without ``self``.
+    """
+    names: Set[str] = set()
+    for klass in task_cls.__mro__:
+        if "__init__" not in klass.__dict__:
+            continue
+        params = inspect.signature(klass.__dict__["__init__"]).parameters.values()
+        names |= {p.name for p in params
+                  if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)} - {"self"}
+        if not any(p.kind is p.VAR_KEYWORD for p in params):
+            break
+    return names
+
+
+def checkpoint_task_kwargs(task_cls: type, hparams: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the task keywords to rebuild a checkpoint's task under its own objective.
+
+    Every saved hyperparameter that the constructor accepts is passed. A key that the checkpoint
+    does not hold keeps the class default, which is the pre-key behaviour of that key. A rebuild
+    that passes only a fixed list drops each later key without a word: the quality switches
+    (``target_quality_mask``, ``event_weight_ua_valid``, ``source_event_mask``), the contraction
+    weight and the auxiliary loss weights would then fall back to off at evaluation.
+
+    Args:
+        task_cls: The task class to construct.
+        hparams: The checkpoint's ``hyper_parameters``.
+
+    Returns:
+        The keyword arguments, without the net, its kwargs and ``compile_model``.
+    """
+    names = task_constructor_names(task_cls) - _REBUILD_EXCLUDED
+    return {name: hparams[name] for name in sorted(names) if name in hparams}
 
 
 class SeqVaeLagAttnRwsTask(LightningModelBase):

@@ -1,0 +1,62 @@
+# PRODUCTION RUN of the MASKED (default) arm on the 2026-10-27 quality-version-4 build.
+#
+# The base file holds the model and the objective; this overlay holds only what is a property of
+# the box: the shards, the statistics file, the GPUs, the loader workers and the run directory's
+# tag. The two arms of the quality-mask experiment run at the same time on one box, 4 GPUs each, so
+# both see the same effective batch (4 x 128 = 512) and the same wall clock:
+#
+#   prod_q4_masked.yaml           base default.yaml                cuda_devices [0, 1, 2, 3]
+#   prod_q4_no_quality_mask.yaml  base sweep_no_quality_mask.yaml  cuda_devices [4, 5, 6, 7]
+#
+# The effective batch differs from the 7-GPU runs before 2026-10-28 (896), so their loss curves do
+# not compare step for step with these. The tag differs between the arms, so two launches in the
+# same minute write to two run directories.
+#
+# Launch from the PyCharm Run button: set RUN_CONFIG in teb_vae/lag_attn_transformer_cfs/trainer.py
+# to this file and press Run. Or from the repo root:
+#   python -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/prod_q4_masked.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_cfs_q4_masked
+  cuda_devices: [0, 1, 2, 3]
+
+dataset_config:
+  # The 2026-10-27 quality-version-4 build: every healthy subgroup, BG and no-BG, 20 train shards and
+  # 5 test shards. Compare with pre_training_dataset/dataset_files.yaml on the box before a run.
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5
+  # Computed by hdf5_dataset/calculate_dataset_stats.py over ALL 25 shards above, train and test,
+  # at trim_minutes 1.0. It records quality_version 4 and rho epsilon 0.1, and the loader refuses a
+  # statistics file whose quality attributes differ from the shards'.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/stats.hdf5
+  dataloader_config:
+    # 6, not 8: the two arms run side by side, 4 ranks each, and every rank keeps a train and a val
+    # pool alive, so 8 ranks x 2 pools x 6 = 96 workers on the box's 128 cores.
+    num_workers: 6

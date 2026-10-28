@@ -143,7 +143,12 @@ def _resolve_cli_config_path(config_path: str) -> str:
 #: Config used when the module is launched with no ``--config`` -- i.e. an IDE's Run button.
 #: ``--config`` on the command line always wins over this value. A relative path is resolved against
 #: the repository root, not the working directory.
-RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/default.yaml"
+#:
+#: The quality-mask experiment on the 2026-10-27 build, in launch order (edit, press Run, repeat):
+#:   1. configs/prod_q4_smoke.yaml            -- 2 GPUs, 2 epochs, 1 shard each; proves the box.
+#:   2. configs/prod_q4_masked.yaml           -- the masked arm, GPUs 0-3.
+#:   3. configs/prod_q4_no_quality_mask.yaml  -- the control arm, GPUs 4-7, at the same time as 2.
+RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/prod_q4_smoke.yaml"
 
 
 if __name__ == "__main__":

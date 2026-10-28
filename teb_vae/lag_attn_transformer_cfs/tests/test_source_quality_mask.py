@@ -20,13 +20,15 @@ What is asserted here:
 * a K/V body with a reach $R$ widens a bad step over the $R - 1$ keys after it, an unbounded body
   over the rest of the sequence, and the per-step adapter not at all;
 * the controls re-attend under the same mask, and the permutation arm carries the donor's;
-* the objective averages the gate over the open anchors and reports the closed share;
+* the objective averages the gate over the open anchors and reports the closed share, charges
+  the gate over the KL's own anchor count, and reports the KL over the open anchors;
 * the task appends the mask as the sixth input and returns the contraction weight to its floor
   where an anchor is closed;
 * the task zeroes the target steps the FHR step mask marks bad (``target_quality_mask``),
   refuses ``event_weight_ua_valid`` without ``up_valid``, and ANDs the contraction spans into the
   source mask (``source_event_mask``);
-* the per-anchor readout carries ``source_open`` and ``event_gate``;
+* the per-anchor readout carries ``source_open`` and ``event_gate``, and the quality labels
+  ``ua_key_open`` and ``target_bad_steps`` whatever the model applies;
 * the pre-flight refuses the flag without the loader rule, and the reverse; the three quality
   switches without the fields they read; and every shipped config passes both checks.
 """
@@ -291,6 +293,40 @@ def test_the_gate_mean_counts_only_open_anchors_and_the_closed_share_is_reported
     assert abs(part_mean - full_mean) < 0.5 * share * full_mean
 
 
+def test_the_gate_penalty_and_the_kl_share_one_denominator(perturb_posterior):
+    """A closed anchor adds 0 to the gate's sum and to the KL's, and both divide by the KL's anchor
+    count, so the mask cannot reweigh the gate against the KL. The open-anchor KL is the raw KL
+    over the open share."""
+    kwargs, _, on = _pair(perturb_posterior, posterior_event_gate=True)
+    # Float64: the penalty is read as a difference of two total losses, and in float32 that
+    # difference keeps only about 4 significant digits.
+    on = on.double()
+    y_st, y_ph, u = (x.double() for x in make_streams(kwargs, batch=BATCH))
+    ones, partial = _masks(u)
+    weight = torch.ones(u.shape[0], u.shape[1], dtype=u.dtype)
+    target = torch.cat([y_st, y_ph], dim=-1)
+    with torch.no_grad():
+        full_out = on(y_st, y_ph, u, None, None, ones)
+        part_out = on(y_st, y_ph, u, None, None, partial)
+        results = {
+            (name, lam): on.compute_loss(out, target, weight=weight, beta=1.0,
+                                         lambda_event_gate=lam)["metrics"]
+            for name, out in (("full", full_out), ("part", part_out)) for lam in (0.0, 0.5)
+        }
+    for name in ("full", "part"):
+        charged, free = results[(name, 0.5)], results[(name, 0.0)]
+        share = float(charged["source_mask_fraction"])
+        penalty = float(charged["total_loss"] - free["total_loss"]) / 0.5
+        assert penalty == pytest.approx(float(charged["event_gate_mean"]) * (1.0 - share),
+                                        rel=1e-4, abs=1e-6)
+        assert float(charged["source_conditioned_kl_open"]) * (1.0 - share) == pytest.approx(
+            float(charged["source_conditioned_kl_raw"]), rel=1e-4, abs=1e-6)
+    # Without a closed anchor the two KL readouts are one value.
+    full = results[("full", 0.0)]
+    assert float(full["source_conditioned_kl_open"]) == pytest.approx(
+        float(full["source_conditioned_kl_raw"]), rel=1e-6, abs=1e-9)
+
+
 def test_the_closed_share_is_zero_without_the_mask(perturb_posterior):
     kwargs, off, _ = _pair(perturb_posterior)
     y_st, y_ph, u = make_streams(kwargs, batch=BATCH)
@@ -488,6 +524,41 @@ def test_the_per_anchor_readout_carries_the_source_state_of_each_anchor(perturb_
     plain.eval()
     unmasked = evaluate_batch(plain, make_stub_batch(), num_samples=1).per_anchor
     assert "source_open" not in unmasked and "event_gate" in unmasked
+
+
+def test_the_quality_labels_are_read_from_the_batch_whatever_the_model_applies(perturb_posterior):
+    r"""``ua_key_open`` is the masked model's ``source_open`` on both a masked and an unmasked net,
+    and ``target_bad_steps`` counts the forecast steps the FHR step mask removes. A control and a
+    masked arm can then be compared on the same clean anchors."""
+    batch = make_stub_batch()
+    batch.up_st_step_valid = torch.ones(batch.up_st.shape, dtype=torch.bool)
+    batch.up_ph_step_valid = torch.ones(batch.up_ph.shape, dtype=torch.bool)
+    batch.up_st_step_valid[0] = False
+    masked = make_task(dict(tiny_warmup_kwargs(posterior_event_gate=True), source_quality_mask=True))
+    plain = make_task(tiny_warmup_kwargs(posterior_event_gate=True))
+    for module in (masked, plain):
+        perturb_posterior(module.orig_model)
+        module.eval()
+    torch.manual_seed(0)
+    on = evaluate_batch(masked, batch, num_samples=1).per_anchor
+    torch.manual_seed(0)
+    off = evaluate_batch(plain, batch, num_samples=1).per_anchor
+    assert torch.equal(on["ua_key_open"], on["source_open"])
+    assert torch.equal(off["ua_key_open"], on["source_open"])
+    assert "target_bad_steps" not in off
+
+    y_width = batch.fhr_st.shape[-1]
+    batch.fhr_st_step_valid = torch.ones(batch.fhr_st.shape, dtype=torch.bool)
+    batch.fhr_ph_step_valid = torch.ones(batch.fhr_ph.shape, dtype=torch.bool)
+    clean = evaluate_batch(plain, batch, num_samples=1).per_anchor
+    assert bool((clean["target_bad_steps"] == 0.0).all())
+    kept = int(TINY_TARGET_KEEP_INDEX[0])
+    block, channel = ("fhr_st", kept) if kept < y_width else ("fhr_ph", kept - y_width)
+    getattr(batch, f"{block}_step_valid")[1, :, channel] = False
+    gapped = evaluate_batch(plain, batch, num_samples=1).per_anchor
+    assert bool((gapped["target_bad_steps"][0] == 0.0).all())
+    supported = gapped["contributing"][1] > 0
+    assert bool((gapped["target_bad_steps"][1][supported] > 0.0).all())
 
 
 # ---------------------------------------------------------------------------------------

@@ -93,6 +93,7 @@ from teb_vae.lag_attn_rws.eval import cohort, collect, preflight, probe as probe
 from teb_vae.lag_attn_rws.eval._reuse import configure_numerics, subsample_indices  # noqa: E402
 from teb_vae.lag_attn_rws.eval import launch  # noqa: E402
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding  # noqa: E402
+from teb_vae.lag_attn_rws.task import checkpoint_task_kwargs  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
     AnalysisContext,
@@ -669,18 +670,12 @@ def load_task(
         )
 
     model = binding.model_cls(**model_kwargs)
+    # Every saved hyperparameter the constructor takes, so the run is scored under its own
+    # objective, quality switches included; a key the checkpoint predates keeps the class default.
     task = binding.task_cls(
         model,
         model_kwargs=model_kwargs,
-        beta_schedule=hparams.get("beta_schedule"),
-        kld_beta=hparams.get("kld_beta", 1.0),
-        # Defaulted for checkpoints that predate the prior anchor; a checkpoint trained at a
-        # non-zero weight must be scored under that same objective.
-        beta_prior=hparams.get("beta_prior", 0.0),
-        lambda_full=hparams.get("lambda_full", 1.0),
-        lambda_base=hparams.get("lambda_base", 1.0),
-        likelihood=hparams.get("likelihood", "gaussian_nll"),
-        free_bits=hparams.get("free_bits", 0.0),
+        **checkpoint_task_kwargs(binding.task_cls, hparams),
     )
     if load_checkpoint_strict(model=task.orig_model, checkpoint=blob) is None:
         raise RuntimeError(

@@ -94,6 +94,12 @@ TASK_LEVEL_KEYS = (
     # frequencies into the `target_scored_horizon` tuple the constructor takes.
     "target_phase_fast_cutoff_hz",
     "target_phase_fast_horizon",
+    # The quality switches the task reads: the detector's `up_valid` rule, the target's step mask
+    # and the source event-mask ablation. The source key mask itself is `source_quality_mask`, a
+    # constructor argument.
+    "event_weight_ua_valid",
+    "target_quality_mask",
+    "source_event_mask",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -144,8 +150,16 @@ FINAL_REVISION_KEYS = (
 #: turn it off because their shards predate the signal-quality step.
 QUALITY_PATHS = (
     f"{_VAE}.source_quality_mask",
+    # The task's three quality switches: the detector's `up_valid` rule, the target's step mask and
+    # the source event-mask ablation. Neither sibling has them.
+    f"{_VAE}.event_weight_ua_valid",
+    f"{_VAE}.target_quality_mask",
+    f"{_VAE}.source_event_mask",
+    # The loader key that adds the raw-grid `up_valid` / `fhr_valid` masks the two switches read.
+    "dataset_config.dataloader_config.dataset_kwargs.emit_quality_mask",
     *(
-        f"dataset_config.dataloader_config.dataset_kwargs.ua_step_mask.{key}"
+        f"dataset_config.dataloader_config.dataset_kwargs.{mask}.{key}"
+        for mask in ("ua_step_mask", "fhr_step_mask")
         for key in ("bits", "rho_epsilon", "hold_steps")
     ),
 )
