@@ -198,13 +198,10 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: run directory as the durable record; a value injected from Python would appear in no artifact
 #: and could not be recovered from the output afterwards.
 RUN_ARGS: Dict[str, Any] = {
-    # The quality-mask experiment: run this once per arm, with that arm's best val/total_loss
-    # checkpoint (<run>/model_checkpoints/lag-attn-trf-cfs-epoch=NN.ckpt) and its own output_dir.
-    # eval/compare_quality_arms.py reads the two output directories named here:
-    #   masked arm:  /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_masked
-    #   control arm: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_no_quality_mask
+    # The quality-mask experiment: use eval/run_quality_arms.py instead. It takes both arms'
+    # checkpoints and output folders by exact path and runs this module once per arm.
     "checkpoint": None,
-    "output_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_masked",
+    "output_dir": None,
     # The 2026-10-27 build's fold-1 test files and the loader masks that give every arm the
     # per-anchor quality labels. Both arms use this file.
     "overrides": "teb_vae/lag_attn_transformer_cfs/eval/configs/eval_overrides_prod_q4.yaml",
