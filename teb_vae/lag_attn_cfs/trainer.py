@@ -297,6 +297,7 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         _check_phase_key_fields(config)
         _check_source_block_kept(config)
         _check_source_quality_pairing(config)
+        _check_quality_switch_pairing(config)
         # Last, because it is the expensive one -- it opens every configured shard -- and because
         # its own refusals (a two-sided shard, disagreeing shards, a trim that does not produce the
         # declared window, a reach budget set alongside this one) are the ones a cheap check cannot
@@ -455,6 +456,61 @@ def _check_source_quality_pairing(config: Dict[str, Any]) -> None:
             f"dataset_config.dataloader_config.dataset_kwargs.ua_step_mask is {spec!r}, which "
             f"{'sets' if active else 'sets no'} rule. Set both (the flag true and at least one of "
             f"bits / rho_epsilon) or neither."
+        )
+
+
+def _check_quality_switch_pairing(config: Dict[str, Any]) -> None:
+    """Refuse a quality switch of the objective without the loader field it reads, and the reverse.
+
+    Each switch fails at the first batch without its field, after the run directory exists; and an
+    ``fhr_step_mask`` that nothing reads is collated and moved every step while the run trains an
+    unmasked objective.
+
+    * ``event_weight_ua_valid`` reads ``up_valid``, so it needs ``emit_quality_mask: true`` and an
+      ``event_weight_floor``: without the weight there is no detector to give the mask to.
+    * ``target_quality_mask`` reads ``fhr_*_step_valid``, so it needs an active ``fhr_step_mask``,
+      and an active ``fhr_step_mask`` needs the switch.
+    * ``source_event_mask`` narrows the source-quality key mask with the contraction detector, so
+      it needs ``source_quality_mask`` and an ``event_weight_floor``.
+
+    Args:
+        config: The resolved run config.
+
+    Raises:
+        ValueError: Naming the keys and their values.
+    """
+    vae = (config.get("model_config") or {}).get("VAE_model") or {}
+    dataloader = (config.get("dataset_config") or {}).get("dataloader_config") or {}
+    kwargs = dataloader.get("dataset_kwargs") or {}
+    floor_set = vae.get("event_weight_floor") is not None
+    if bool(vae.get("event_weight_ua_valid", False)):
+        if not bool(kwargs.get("emit_quality_mask", False)) or not floor_set:
+            raise ValueError(
+                f"model_config.VAE_model.event_weight_ua_valid is true but "
+                f"dataset_kwargs.emit_quality_mask is {kwargs.get('emit_quality_mask')!r} and "
+                f"event_weight_floor is {vae.get('event_weight_floor')!r}. The detector reads "
+                f"up_valid, which only emit_quality_mask emits, and it runs only with a floor."
+            )
+    spec = kwargs.get("fhr_step_mask")
+    active = isinstance(spec, dict) and (
+        bool(spec.get("bits")) or spec.get("rho_epsilon") is not None
+    )
+    flag = bool(vae.get("target_quality_mask", False))
+    if flag != active:
+        raise ValueError(
+            f"model_config.VAE_model.target_quality_mask is {flag} but "
+            f"dataset_config.dataloader_config.dataset_kwargs.fhr_step_mask is {spec!r}, which "
+            f"{'sets' if active else 'sets no'} rule. Set both (the flag true and at least one of "
+            f"bits / rho_epsilon) or neither."
+        )
+    if bool(vae.get("source_event_mask", False)) and (
+        not bool(vae.get("source_quality_mask", False)) or not floor_set
+    ):
+        raise ValueError(
+            f"model_config.VAE_model.source_event_mask is true but source_quality_mask is "
+            f"{vae.get('source_quality_mask')!r} and event_weight_floor is "
+            f"{vae.get('event_weight_floor')!r}. The ablation narrows the source-quality key mask "
+            f"with the contraction weight's detector, so it needs both."
         )
 
 

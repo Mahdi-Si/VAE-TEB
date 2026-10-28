@@ -844,7 +844,10 @@ def build_overlay_figure(
                 axis.set_yticks([])
                 continue
             raw = np.asarray(values[row], dtype=np.float64).reshape(-1)
-            valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+            valid = (
+                traces.up_event_validity(retained, row, raw.size) if name == "up"
+                else None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+            )
             physical, unit = traces.physical_raw(raw, name, raw_scales or {}, valid)
             # Raw sample i ends at (i + 1) / f_s into the segment; the anchor's step ends at 4(t + 1).
             x = (np.arange(raw.size) + 1.0) / events.FS_RAW - (step + 1) * SECONDS_PER_STEP
