@@ -7,8 +7,9 @@ writes ``prod_import_report.txt`` next to this file, with:
 * the interpreter, the working directory, ``PYTHONPATH`` and the active environment;
 * ``sys.path`` in order, as the script starts;
 * the ``.pth`` files of every site-packages folder;
-* the file each module name of the build resolves to, after the repository root is added to
-  ``sys.path`` exactly as ``build_fold_datasets.py`` adds it;
+* the folders ``external_paths.py`` finds for ``early_maestra`` and ``mimo``;
+* the file each module name of the build resolves to, after the repository root and those
+  folders are added to ``sys.path`` exactly as the build adds them;
 * the result of a full import of ``create_new_pipeline`` and ``build_fold_datasets``, with the
   traceback of a failure, and the ``signal_quality`` module that the import used.
 
@@ -31,6 +32,9 @@ REPO_ROOT = HERE.parents[1]
 MODULES = [
     "early_maestra",
     "early_maestra.adaptor.mimo_adaptor",
+    "mimo",
+    "mimo.sequence.mimo_sequence",
+    "mimo.adaptor.mimo_adaptor",
     "Variational_AutoEncoder",
     "Variational_AutoEncoder.seqvae_teb",
     "Variational_AutoEncoder.seqvae_teb.hdf5_dataset",
@@ -90,11 +94,25 @@ def main() -> Path:
             rows = pth.read_text(errors="replace").splitlines()[:20]
             out(f"{pth}:\n    " + "\n    ".join(rows))
 
-    # The same step build_fold_datasets.py takes when it runs as a script.
+    # The same steps the build takes: the repository root, then the external roots.
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    out("\n== external roots (hdf5_dataset/new_pipeline/external_paths.py) ==")
+    try:
+        from hdf5_dataset.new_pipeline import external_paths
 
-    out("\n== module origins (after adding the repo root, as the build does) ==")
+        out(f"{external_paths.ENV_VAR}: {os.environ.get(external_paths.ENV_VAR)}")
+        out(f"EXTERNAL_ROOTS: {external_paths.EXTERNAL_ROOTS}")
+        found = external_paths.add_external_roots()
+        for package in external_paths.PACKAGES:
+            out(f"{package}: {found.get(package, 'NOT FOUND')}")
+    except Exception:  # noqa: BLE001 -- the traceback is the point
+        out(f"external_paths: FAILED\n{traceback.format_exc()}")
+
+    out("\n== sys.path after the build's additions ==")
+    out("\n".join(f"[{index}] {entry}" for index, entry in enumerate(sys.path)))
+
+    out("\n== module origins ==")
     for name in MODULES:
         out(f"{name}: {_origin(name)}")
 
