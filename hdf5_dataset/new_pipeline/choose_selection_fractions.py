@@ -69,7 +69,8 @@ def _pipeline() -> Any:
 
 
 def evaluate_pair(cnp: Any, screening: pd.DataFrame, bg_fraction: float,
-                  no_bg_fraction: float, test_mode: str) -> Dict[str, Any]:
+                  no_bg_fraction: float, test_mode: str,
+                  healthy_eligibility: str = "eligible_3h") -> Dict[str, Any]:
     """Run the real selection for one pair and summarize it.
 
     Args:
@@ -78,13 +79,15 @@ def evaluate_pair(cnp: Any, screening: pd.DataFrame, bg_fraction: float,
         bg_fraction: $f_{BG}$.
         no_bg_fraction: $f_{noBG}$.
         test_mode: ``'augmented'`` or ``'holdout'``.
+        healthy_eligibility: ``'eligible_3h'`` or ``'eligible_2h'``.
 
     Returns:
         One row of the table.
     """
     result = cnp.select_classification_guids(
         screening, test_mode=test_mode, bg_cls_fraction=bg_fraction,
-        no_bg_cls_fraction=no_bg_fraction, verbose=False)
+        no_bg_cls_fraction=no_bg_fraction, verbose=False,
+        healthy_eligibility=healthy_eligibility)
     stats, pool = result["stats"], result["trainval"]
     k = cnp.N_FOLDS
     n_unhealthy = sum(len(pool.get(sg, [])) for sg in cnp.UNHEALTHY_SUBGROUPS)
@@ -130,7 +133,8 @@ def recommend(table: pd.DataFrame, max_healthy_per_unhealthy: float,
 
 
 def build_table(cnp: Any, screening: pd.DataFrame, fractions: Sequence[float],
-                test_mode: str, equal_only: bool) -> pd.DataFrame:
+                test_mode: str, equal_only: bool,
+                healthy_eligibility: str = "eligible_3h") -> pd.DataFrame:
     """Evaluate every pair of the grid.
 
     Args:
@@ -139,6 +143,7 @@ def build_table(cnp: Any, screening: pd.DataFrame, fractions: Sequence[float],
         fractions: The grid values, used for both fractions.
         test_mode: ``'augmented'`` or ``'holdout'``.
         equal_only: Evaluate the pairs with $f_{BG} = f_{noBG}$ only.
+        healthy_eligibility: ``'eligible_3h'`` or ``'eligible_2h'``.
 
     Returns:
         One row per pair.
@@ -148,7 +153,8 @@ def build_table(cnp: Any, screening: pd.DataFrame, fractions: Sequence[float],
         for f_no_bg in fractions:
             if equal_only and f_bg != f_no_bg:
                 continue
-            rows.append(evaluate_pair(cnp, screening, f_bg, f_no_bg, test_mode))
+            rows.append(evaluate_pair(cnp, screening, f_bg, f_no_bg, test_mode,
+                                      healthy_eligibility))
             logger.info(f"evaluated f_bg={f_bg}, f_no_bg={f_no_bg}")
     return pd.DataFrame(rows)
 
@@ -157,7 +163,8 @@ def main(screening_csv_path: Optional[str] = None, fractions: Optional[Sequence[
          test_mode: Optional[str] = None, equal_only: Optional[bool] = None,
          max_healthy_per_unhealthy: Optional[float] = None,
          min_pretrain_share: Optional[float] = None,
-         output_csv_path: Optional[str] = None) -> int:
+         output_csv_path: Optional[str] = None,
+         healthy_eligibility: Optional[str] = None) -> int:
     """Print the eligible counts, the table and the recommendation.
 
     Args:
@@ -168,6 +175,7 @@ def main(screening_csv_path: Optional[str] = None, fractions: Optional[Sequence[
         max_healthy_per_unhealthy: Limit of the rule. Default: 7.0.
         min_pretrain_share: Limit of the rule. Default: 0.8.
         output_csv_path: Also write the table here. Default: no file.
+        healthy_eligibility: ``'eligible_3h'`` or ``'eligible_2h'``. Default: ``'eligible_3h'``.
 
     Returns:
         The process exit code.
@@ -186,11 +194,13 @@ def main(screening_csv_path: Optional[str] = None, fractions: Optional[Sequence[
         "eligible_2h": usable.groupby("subgroup")["eligible_2h"].sum(),
         "eligible_3h": usable.groupby("subgroup")["eligible_3h"].sum(),
     }).fillna(0).astype(int)
-    print("Screening CSV, per subgroup (unhealthy use eligible_2h, healthy eligible_3h):")
+    print(f"Screening CSV, per subgroup (unhealthy use eligible_2h, healthy "
+          f"{healthy_eligibility or cnp.HEALTHY_ELIGIBILITY}):")
     print(counts.to_string())
     print()
 
-    table = build_table(cnp, screening, fractions, test_mode, bool(equal_only))
+    table = build_table(cnp, screening, fractions, test_mode, bool(equal_only),
+                        healthy_eligibility or cnp.HEALTHY_ELIGIBILITY)
     if output_csv_path:
         table.to_csv(output_csv_path, index=False)
     with pd.option_context("display.width", 200, "display.max_columns", None,
@@ -231,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-healthy-per-unhealthy", dest="max_healthy_per_unhealthy", type=float)
     p.add_argument("--min-pretrain-share", dest="min_pretrain_share", type=float)
     p.add_argument("--output-csv-path", dest="output_csv_path")
+    p.add_argument("--healthy-eligibility", dest="healthy_eligibility",
+                   choices=("eligible_2h", "eligible_3h"))
     return p
 
 
@@ -278,6 +290,10 @@ RUN_ARGS: Dict[str, Any] = {
 
     # str | None -- also write the table as a CSV.  (None -> no file)
     "output_csv_path": None,
+
+    # "eligible_2h" | "eligible_3h" | None -- the healthy classification rule; use the value you
+    #        will give create_new_pipeline.py.  (None -> "eligible_3h")
+    "healthy_eligibility": "eligible_2h",
 }
 
 
