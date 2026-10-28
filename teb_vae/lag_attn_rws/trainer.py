@@ -381,6 +381,9 @@ class LagAttnRwsTrainer(GraphModelBase):
             lambda_event_gate=vae_config.get("lambda_event_gate", 0.0),
             event_weight_floor=vae_config.get("event_weight_floor"),
             event_weight_reach_steps=vae_config.get("event_weight_reach_steps"),
+            event_weight_ua_valid=bool(vae_config.get("event_weight_ua_valid", False)),
+            target_quality_mask=bool(vae_config.get("target_quality_mask", False)),
+            source_event_mask=bool(vae_config.get("source_event_mask", False)),
             compile_model=self.compile_model_requested(),
         )
         # Re-forces the config's values onto hparams, so a checkpoint-restored run follows the

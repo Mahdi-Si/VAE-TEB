@@ -62,6 +62,8 @@ model_config:
     likelihood: mse
     # The fixture shards are not signal-quality builds, so they carry nothing to mask with.
     source_quality_mask: false
+    event_weight_ua_valid: false
+    target_quality_mask: false
 
 dataset_config:
   # Repo-root-relative: entry points run from the repo root. The fixtures are the family's -- every
@@ -75,6 +77,8 @@ dataset_config:
     num_workers: 0       # no worker spawn for 4 samples
     dataset_kwargs:
       ua_step_mask: {bits: null, rho_epsilon: null}   # neither rule set = no mask
+      fhr_step_mask: {bits: null, rho_epsilon: null}  # neither rule set = no mask
+      emit_quality_mask: false
 
 advanced_config:
   tracking:

@@ -49,7 +49,7 @@ from loguru import logger
 from torch import nn
 
 from teb_vae.lag_attn_rws.eval import events as rws_events
-from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight
+from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight, contraction_source_mask
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 from train.pl_model_base import LightningModelBase, MetricDict
@@ -101,6 +101,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_event_gate: float = 0.0,
         event_weight_floor: Optional[float] = None,
         event_weight_reach_steps: Optional[int] = None,
+        event_weight_ua_valid: bool = False,
+        target_quality_mask: bool = False,
+        source_event_mask: bool = False,
         compile_model: bool = False,
     ) -> None:
         r"""Initialize the task.
@@ -151,6 +154,23 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             event_weight_reach_steps: $\ell$, the reach of a contraction in decimated steps.
                 ``None`` -- the default -- resolves to the net's ``max_lag``, the lag window the
                 attention can read. Read only when ``event_weight_floor`` is set.
+            event_weight_ua_valid: Let the contraction detector read the UA quality mask: an
+                invalid UA sample (the loader's ``up_valid``) is a gap, so a contraction that
+                touches removed or bridged UA weighs nothing. Needs
+                ``dataset_kwargs.emit_quality_mask``. ``False`` -- the default -- is the
+                detector on ``weight`` alone, bitwise.
+            target_quality_mask: Remove target steps built from invalid FHR from the objective:
+                a step is kept only where every forecast target channel is valid in the loader's
+                ``fhr_st_step_valid`` / ``fhr_ph_step_valid`` (``dataset_kwargs.fhr_step_mask``).
+                The mask multiplies ``weight``, so it reaches the forecast mask, the coverage
+                floor and the KL support. The contraction detector still reads the unmasked
+                ``weight``. Feature-target cells only. ``False`` -- the default -- changes
+                nothing.
+            source_event_mask: An ablation. Keep a source step in the lag keys only inside a
+                detected contraction, $o \le s \le e$, on top of the quality mask. Needs a net
+                built with ``source_quality_mask`` and ``event_weight_floor`` set (the detector
+                and its validity are shared). ``False`` -- the default -- is the quality mask
+                alone.
             compile_model: Wrap the net in ``torch.compile``. Defaults to ``False``, which is
                 the only correct value **for this net**: its LSTM encoders defeat TorchInductor
                 on their own, and a checkpointed attention region defeats it again whenever
@@ -188,6 +208,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             "lambda_event_gate",
             "event_weight_floor",
             "event_weight_reach_steps",
+            "event_weight_ua_valid",
+            "target_quality_mask",
+            "source_event_mask",
         )
         self._model_kwargs: Dict[str, Any] = dict(model_kwargs or {})
         self._perm_generator: Optional[torch.Generator] = None
@@ -197,6 +220,38 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # not an hparam -- it is derivable from the shards and must not reach a checkpoint.
         # ponytail: unbounded per-rank cache (~300 B per segment); bound it if host memory binds.
         self._event_onset_cache: Dict[Any, Any] = {}
+        # Contraction spans for ``source_event_mask``, keyed the same way; a separate cache because
+        # it holds (onset, end) pairs rather than onsets.
+        self._event_span_cache: Dict[Any, Any] = {}
+        self._check_quality_switches()
+
+    def _check_quality_switches(self) -> None:
+        """Refuse a quality switch that this task or its net cannot serve.
+
+        Every trainer builds the task, so this runs for every cell, including the ones whose
+        pre-flight does not check the switches. Without it, ``target_quality_mask`` fails at the
+        first batch of a raw-target cell, and ``source_event_mask`` is ignored without a word by a
+        net that has no source mask.
+
+        Raises:
+            ValueError: Naming the switch and the reason.
+        """
+        if bool(self.hparams.get("target_quality_mask", False)) and (
+            type(self)._target_step_valid is SeqVaeLagAttnRwsTask._target_step_valid
+        ):
+            raise ValueError(
+                f"target_quality_mask is set, but {type(self).__name__} forecasts the raw FHR and "
+                f"has no per-step FHR mask to read. Use it with a feature-target cell, or turn it "
+                f"off."
+            )
+        if bool(self.hparams.get("source_event_mask", False)) and not bool(
+            getattr(self.orig_model, "source_quality_mask", False)
+        ):
+            raise ValueError(
+                "source_event_mask is set, but the net was not built with source_quality_mask, "
+                "so there is no source mask to narrow. Set model_config.VAE_model."
+                "source_quality_mask: true (and dataset_kwargs.ua_step_mask), or turn it off."
+            )
 
     def setup(self, stage: str) -> None:
         """Seed the derangement generator, once the module knows its rank.
@@ -692,11 +747,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # The segment keys the onsets are cached under. Both fields are load-bearing in every
         # causal config (the tile phase is keyed on the same pair); a batch without them simply runs
         # the detector every step.
-        guids, epochs = getattr(batch, "guid", None), getattr(batch, "epoch", None)
-        keys = None
-        if guids is not None and epochs is not None:
-            epoch_values = epochs.tolist() if isinstance(epochs, torch.Tensor) else list(epochs)
-            keys = [(str(guid), float(epoch)) for guid, epoch in zip(guids, epoch_values)]
+        keys = self._segment_keys(batch)
         return contraction_anchor_weight(
             up,
             weight,
@@ -706,7 +757,115 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             keys=keys,
             cache=self._event_onset_cache,
             detector=self._event_detector(),
+            raw_valid=self._event_ua_valid(batch),
         )
+
+    def _segment_keys(self, batch: Any) -> Optional[list]:
+        """The ``(guid, epoch)`` cache key of every row, or ``None`` when the batch lacks either."""
+        guids, epochs = getattr(batch, "guid", None), getattr(batch, "epoch", None)
+        if guids is None or epochs is None:
+            return None
+        epoch_values = epochs.tolist() if isinstance(epochs, torch.Tensor) else list(epochs)
+        return [(str(guid), float(epoch)) for guid, epoch in zip(guids, epoch_values)]
+
+    def _event_ua_valid(self, batch: Any) -> Optional[torch.Tensor]:
+        r"""The UA mask the contraction detector reads, or ``None`` when ``event_weight_ua_valid`` is off.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            The loader's ``up_valid`` $(B, L)$, on the trimmed raw grid of ``up``.
+
+        Raises:
+            RuntimeError: If the switch is on and the batch carries no ``up_valid``.
+        """
+        if not bool(self.hparams.get("event_weight_ua_valid", False)):
+            return None
+        valid = getattr(batch, "up_valid", None)
+        if valid is None:
+            raise RuntimeError(
+                "event_weight_ua_valid is set but the batch has no `up_valid` field. Set "
+                "dataset_kwargs.emit_quality_mask: true; it needs a signal-quality build."
+            )
+        return valid
+
+    def _source_event_steps(self, batch: Any, weight: torch.Tensor) -> Optional[torch.Tensor]:
+        r"""The $(B, T)$ steps inside a detected contraction, or ``None`` when ``source_event_mask`` is off.
+
+        The same detector and the same validity as the contraction weight, so the ablation keeps
+        exactly the source steps of the contractions the weight rewards.
+
+        Args:
+            batch: A batch from the data module.
+            weight: The decimated validity signal $(B, T)$, before the target quality mask.
+
+        Returns:
+            Boolean $(B, T)$, ``True`` inside a contraction.
+
+        Raises:
+            RuntimeError: If the switch is on and the batch carries no ``up`` field.
+        """
+        if not bool(self.hparams.get("source_event_mask", False)):
+            return None
+        up = getattr(batch, "up", None)
+        if up is None:
+            raise RuntimeError(
+                "source_event_mask is set but the batch has no `up` field; contractions are "
+                "detected on the raw UP trace. Add 'up' to dataset_kwargs.load_fields."
+            )
+        return contraction_source_mask(
+            up,
+            weight,
+            decimation=int(self.orig_model.geometry.decimation),
+            raw_valid=self._event_ua_valid(batch),
+            keys=self._segment_keys(batch),
+            cache=self._event_span_cache,
+            detector=self._event_detector(),
+        )
+
+    def _target_step_valid(self, batch: Any) -> torch.Tensor:
+        r"""The $(B, T)$ target-step validity ``target_quality_mask`` multiplies into ``weight``.
+
+        A raw-signal target has no stored per-step FHR mask, so this cell refuses the switch; the
+        feature-target cells override it.
+
+        Args:
+            batch: A batch from the data module.
+
+        Raises:
+            RuntimeError: Always, on a raw-signal target.
+        """
+        raise RuntimeError(
+            f"target_quality_mask is set, but {type(self).__name__} forecasts the raw FHR, and "
+            f"the per-step FHR mask (dataset_kwargs.fhr_step_mask) describes coefficient blocks. "
+            f"Use it with a feature-target cell, or turn it off."
+        )
+
+    def _target_quality_weight(self, batch: Any, weight: torch.Tensor) -> torch.Tensor:
+        r"""Return ``weight`` with the invalid target steps zeroed, under ``target_quality_mask``.
+
+        $w'_t = w_t \cdot \mathbb 1[\text{every forecast target channel is valid at } t]$. The
+        forecast mask, the coverage floor and the KL support are all built from ``weight``, so a
+        zeroed step leaves every window it falls in, and an anchor whose window loses more than
+        the coverage floor allows is not scored. Unchanged when the switch is off.
+
+        Args:
+            batch: A batch from the data module.
+            weight: The decimated validity signal $(B, T)$.
+
+        Returns:
+            The weight the objective reads.
+        """
+        if not bool(self.hparams.get("target_quality_mask", False)):
+            return weight
+        valid = self._target_step_valid(batch).to(device=weight.device)
+        if tuple(valid.shape) != tuple(weight.shape):
+            raise RuntimeError(
+                f"the target-step mask has shape {tuple(valid.shape)} but weight has "
+                f"{tuple(weight.shape)}; both must be on the trimmed decimated grid."
+            )
+        return weight * valid.to(weight.dtype)
 
     def _close_event_weight(
         self,
@@ -760,6 +919,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # on the forward's kernels. ``None`` unless an event floor is configured: the objective is
         # then bitwise unweighted.
         full_anchor_weight = self._event_anchor_weight(batch, weight)
+        # After the detector, which reads the unmasked weight as the evaluation's table does: the
+        # target mask removes scored steps, not contractions.
+        weight = self._target_quality_weight(batch, weight)
 
         forward_outputs = self.model(*inputs)
         full_anchor_weight = self._close_event_weight(full_anchor_weight, forward_outputs)

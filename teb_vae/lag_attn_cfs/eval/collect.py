@@ -204,13 +204,14 @@ _PER_ANCHOR_CONSUMED: Tuple[str, ...] = ("contributing", "anchor_index")
 RETAINED_QUANTITIES: Dict[str, Tuple[str, ...]] = {
     "waveforms": (
         "target", "mu_base", "mu_full", "logvar_base", "logvar_full", "up_raw", "fhr_raw",
-        "weight", "anchor_index",
+        "weight", "up_valid", "anchor_index",
     ),
     "attention": ("attn_weights",),
 }
 
-#: Retained names a batch carries only when ``load_fields`` asked for the raw trace behind them.
-OPTIONAL_RETAINED: Tuple[str, ...] = ("up_raw", "fhr_raw")
+#: Retained names a batch carries only when ``load_fields`` asked for the raw trace behind them,
+#: or, for ``up_valid``, only when the run trained with ``event_weight_ua_valid``.
+OPTIONAL_RETAINED: Tuple[str, ...] = ("up_raw", "fhr_raw", "up_valid")
 
 #: How the retained forecast pair was decoded, written into the retention record so the arrays are
 #: self-describing on disk.
@@ -530,6 +531,14 @@ class Collector:
     whichever of :data:`~teb_vae.lag_attn_cfs.eval.metrics.VECTOR_READOUTS` the readout carries
     -- so a pass over a forward that emits no attention writes the same ``per_sample.csv`` under
     the same identity columns, and simply carries fewer vectors in the sidecar.
+
+    Args:
+        plan: Which samples keep their heavy arrays.
+        model: The net, for its geometry; ``None`` leaves the contraction column NaN.
+        num_mc_samples: Latent draws per anchor, for the cost record.
+        device: The device the pass runs on, for the cost record.
+        ua_valid_events: Detect contractions under the batch's ``up_valid`` as well as its
+            ``weight``, as a run trained with ``event_weight_ua_valid`` did.
     """
 
     def __init__(
@@ -539,8 +548,10 @@ class Collector:
         model: Any = None,
         num_mc_samples: Optional[int] = None,
         device: Any = None,
+        ua_valid_events: bool = False,
     ) -> None:
         self._plan = plan
+        self._ua_valid_events = bool(ua_valid_events)
         self._model = model
         self._num_mc_samples = num_mc_samples
         self._device = device
@@ -746,8 +757,13 @@ class Collector:
 
         The onset is taken on the stored timeline, the one every other number in the run is on.
 
+        When the run trained with ``event_weight_ua_valid``, the detector also reads the batch's
+        ``up_valid``: an invalid UA sample is a gap, as it was for the training weight. A batch
+        without ``up_valid`` then gives NaN throughout, so a missing mask reads as "not measured".
+
         Args:
-            batch: The batch, for its raw ``up`` and its ``weight``.
+            batch: The batch, for its raw ``up``, its ``weight`` and, under the UA switch, its
+                ``up_valid``.
             batch_size: Samples in the batch.
             anchor_index: $(B, A_{\max})$ decimated steps the forward decoded.
 
@@ -768,6 +784,16 @@ class Collector:
             None if not isinstance(weight, torch.Tensor)
             else weight.detach().cpu().to(torch.float64).numpy().reshape(batch_size, -1)
         )
+        ua_valid = None
+        if self._ua_valid_events:
+            mask = batch_field(batch, "up_valid")
+            if not isinstance(mask, torch.Tensor):
+                return ages
+            given = mask.detach().cpu().to(torch.bool).numpy().reshape(batch_size, -1)[:, :raw_len]
+            # A short mask leaves its tail invalid, as traces.up_event_validity does for the
+            # retained traces, so the two readers of one batch find the same contractions.
+            ua_valid = np.zeros((batch_size, raw_len), dtype=bool)
+            ua_valid[:, : given.shape[1]] = given
         # Each anchor's causal endpoint on the raw grid; a contraction at or before it is one the
         # anchor could have read.
         endpoints = decimation * (anchor_index.astype(np.float64) + 1.0) - 1.0
@@ -776,6 +802,8 @@ class Collector:
                 None if weights is None
                 else events.raw_validity(weights[index], decimation=decimation, raw_len=raw_len)
             )
+            if ua_valid is not None:
+                valid = ua_valid[index] if valid is None else (valid & ua_valid[index])
             onsets = np.sort(events.detect_contractions(up_np[index], valid=valid)["onset_raw"])
             if onsets.size == 0:
                 continue
@@ -1229,6 +1257,9 @@ def collect_tables(
         # From the model rather than from a caller's argument, so the cost record names the device
         # the pass actually ran on rather than the one it was asked for.
         device=next(model.parameters()).device,
+        # The training detector's own validity, read off the run's hparams, so a table bin and a
+        # training weight name one event.
+        ua_valid_events=bool(getattr(task, "hparams", {}).get("event_weight_ua_valid", False)),
     )
     results = evaluate(
         task,

@@ -327,6 +327,33 @@ def raw_validity_of(weight: Any, raw_len: int) -> Optional[np.ndarray]:
     return events.raw_validity(step, decimation=raw_len // step.size, raw_len=raw_len)
 
 
+def up_event_validity(retained: Mapping[str, Any], row: int, raw_len: int) -> Optional[np.ndarray]:
+    """The raw-grid validity the contraction detector reads for one retained UP trace.
+
+    This is the validity the training detector used: the expanded ``weight`` of
+    :func:`raw_validity_of`, combined by AND with the retained loader mask ``up_valid`` when the
+    collection kept it. The collector keeps ``up_valid`` only for a run trained with
+    ``event_weight_ua_valid``, so a run without that switch sees the weight alone, as before.
+
+    Args:
+        retained: The collection's retained arrays, read for ``weight`` and ``up_valid``.
+        row: The retained row.
+        raw_len: The length $N$ of the raw UP trace.
+
+    Returns:
+        A boolean array of length $N$, or ``None`` when neither source gives a validity.
+    """
+    weight = retained.get("weight")
+    valid = None if weight is None else raw_validity_of(weight[row], raw_len)
+    up_valid = retained.get("up_valid")
+    if up_valid is not None and row < len(up_valid):
+        ua = np.zeros(raw_len, dtype=bool)
+        given = np.asarray(up_valid[row], dtype=bool).reshape(-1)[:raw_len]
+        ua[: given.size] = given
+        valid = ua if valid is None else (np.asarray(valid, dtype=bool) & ua)
+    return valid
+
+
 def attach_raw_signals(
     segments: Sequence["SegmentTrace"],
     batch: Any,

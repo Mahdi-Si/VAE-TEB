@@ -75,6 +75,7 @@ from __future__ import annotations
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from teb_vae.lag_attn.nets.delays import ChannelGate
 from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter
@@ -1074,6 +1075,14 @@ class CausalWarmupInputs:
 
         with $m_{b,s}$ false for $s < 0$, where the lag mask is already false.
 
+        **A key/value body with a reach widens the mask.** Under ``lag_kv_source='conv_stem'`` or
+        ``'encoder'``, the key at step $s$ is computed from steps $s - R + 1, \dots, s$, where $R$
+        is the body's ``receptive_field``. A key is usable only if every step it reads is, so
+        $m_{b,s}$ becomes $\bigwedge_{j=0}^{R-1} m_{b,s-j}$, and a bad step closes the $R - 1$
+        keys after it as well. Steps before $0$ count as usable: there the body reads its causal
+        padding, not recorded UA. An unbounded body (``receptive_field`` ``None``) has
+        $R = T$. The shipped ``'adapter'`` arm works step by step, so $R = 1$ and nothing changes.
+
         Args:
             source_valid: ``(B, T)`` or ``(B, T, c_u)`` boolean, ``True`` = usable.
             lag_mask: The lag-validity mask ``(T, L)`` from :meth:`build_lag_mask`.
@@ -1087,11 +1096,33 @@ class CausalWarmupInputs:
             if self.source_gate is not None:
                 valid = self.source_gate(valid.to(dtype)) > 0.5
             valid = valid.all(dim=-1)
+        reach = self._source_kv_reach(int(valid.shape[1]))
+        if reach > 1:
+            bad = (~valid).to(dtype)[:, None, :]
+            # A causal running maximum of the bad indicator over the body's reach.
+            spread = F.max_pool1d(F.pad(bad, (reach - 1, 0)), kernel_size=reach, stride=1)
+            valid = spread[:, 0, :] < 0.5
         num_lags = int(lag_mask.shape[-1])
         padded = torch.cat([valid.new_zeros(valid.shape[0], num_lags - 1), valid], dim=1)
         # Window j holds step t-(L-1-j), oldest first; flipped, index l holds step t-l.
         by_lag = padded.unfold(1, num_lags, 1).flip(-1)
         return lag_mask.to(torch.bool)[None] & by_lag
+
+    def _source_kv_reach(self, num_steps: int) -> int:
+        """The steps one source key reads: the K/V body's receptive field, capped at ``num_steps``.
+
+        Args:
+            num_steps: The sequence length $T$, which an unbounded body reaches in full.
+
+        Returns:
+            $R \\ge 1$; $1$ for a model with no K/V body (the per-step adapter).
+        """
+        body_of = getattr(self, "source_kv_body", None)
+        body = body_of() if callable(body_of) else None
+        if body is None:
+            return 1
+        reach = getattr(body, "receptive_field", 1)
+        return int(num_steps) if reach is None else max(1, min(int(reach), int(num_steps)))
 
     @staticmethod
     def _close_gate(

@@ -45,7 +45,9 @@ A rerun with the same inputs skips every file that is already complete. A file i
 With ``signal_quality`` (causal builds only) every file also carries the quality datasets of
 ``create_new_pipeline.attach_signal_quality``, and ``fhr``/``up`` hold the bridged signals. The
 build then ends with ``quality_report/`` beside the datasets: a summary per file and example pages
-read back from the files (``quality_report.py``). The pages hold clinical traces.
+read back from the files (``quality_report.py``). Each page also shows the UA coefficients of the
+raw signal before the mask and the bridge, computed with the build's own transform on the CPU.
+The pages hold clinical traces.
 
 On the production box this file, ``create_new_pipeline.py``, ``signal_quality.py``,
 ``quality_report.py`` and ``fold_eda_analysis.py`` may sit in one folder; each import tries that
@@ -995,7 +997,7 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     check_files_agree(sorted(finals))
     report: Dict[str, Any] = {}
     if signal_quality:
-        report = _run_quality_report(out, finals, quality_examples, seed)
+        report = _run_quality_report(out, finals, quality_examples, seed, settings)
 
     manifest["results"] = {"transform": results, "assembly": assembled, "quality_report": report}
     with open(out / MANIFEST_NAME, "w", encoding="utf-8") as f:
@@ -1014,19 +1016,60 @@ def _run_fold_eda(kfold: Path, test_mode: str) -> None:
         logger.error(f"Fold EDA failed: {e}")
 
 
+def _report_transform(settings: Mapping[str, Any]) -> Optional[Callable[..., Any]]:
+    """The build's causal transform on the CPU, for the raw-coefficient panel of the report.
+
+    It reuses the masks of this process (:func:`_prepare_state`), or computes them once when the
+    transform ran in worker processes, so its bank, channel plan, phase pairs, leg alignment and
+    phase operator are the ones the files were written with. A failure is logged, and the pages
+    are then drawn without the panel.
+
+    Args:
+        settings: The build settings of :func:`main`.
+
+    Returns:
+        ``transform(fhr, up)`` on ``(B, N)`` ``float32`` signals, returning one ``{block: (C, T)}``
+        per row (``None`` for a row that failed); or ``None``.
+    """
+    try:
+        import torch
+
+        if "masks" not in _STATE:
+            _prepare_state(None, settings)
+        cnp, masks = _STATE["cnp"], _STATE["masks"]
+        bank = cnp.CausalTorchBank(masks["causal_bank"], torch.device("cpu"),
+                                   n_signal=cnp.SIGNAL_LENGTH)
+        target_pairs = cnp._selection_pairs(masks["fhr_ph_selection"])
+        source_pairs = cnp._selection_pairs(masks["up_ph_selection"])
+    except Exception:  # noqa: BLE001 -- the report draws its pages without the panel
+        logger.exception("quality report: no transform for the raw-coefficient panel")
+        return None
+
+    def transform(fhr: np.ndarray, up: np.ndarray) -> List[Optional[Dict[str, np.ndarray]]]:
+        blocks, _ = cnp._transform_causal_record(
+            bank, fhr, up, target_pairs, source_pairs, masks["channel_plan"], len(fhr),
+            masks["causal_leg_alignment"], masks["causal_phase_operator"])
+        return blocks
+
+    return transform
+
+
 def _run_quality_report(out: Path, finals: Sequence[str], n_examples: int,
-                        seed: int) -> Dict[str, Any]:
+                        seed: int, settings: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Write ``quality_report/`` from the pretraining shards and the files of one fold.
 
     Each segment of the build is read once: every pool GUID sits in exactly one partition of
     ``fold_1``, and the holdout test set, if any, in ``k_fold_cross_validation_dataset/test``.
-    A failure is logged and does not fail the build, whose files are complete by then.
+    A failure is logged and does not fail the build, whose files are complete by then. With
+    *settings*, the pages also show the UA coefficients of ``up_raw`` before the mask and the
+    bridge (:func:`_report_transform`).
 
     Args:
         out: The output directory.
         finals: Every final file of the build.
         n_examples: Example pages per category.
         seed: Seed of the row sample and of the random examples.
+        settings: The build settings; ``None`` leaves out the raw-coefficient panel.
 
     Returns:
         The report's summary, or ``{"error": ...}``.
@@ -1037,9 +1080,11 @@ def _run_quality_report(out: Path, finals: Sequence[str], n_examples: int,
         p = Path(path)
         if PRETRAIN_DIR in p.parts or "fold_1" in p.parts or p.parent == kfold / "test":
             files.append((path, p.relative_to(out).as_posix()))
+    transform = _report_transform(settings) if settings is not None and n_examples > 0 else None
     try:
         return _sibling("quality_report").write_quality_report(
-            files, str(out / "quality_report"), n_examples=n_examples, seed=seed)
+            files, str(out / "quality_report"), n_examples=n_examples, seed=seed,
+            transform=transform)
     except Exception as e:  # noqa: BLE001 -- a report, written after every file is complete
         logger.exception("quality report failed")
         return {"error": repr(e)}
@@ -1126,7 +1171,7 @@ RUN_ARGS: Dict[str, Any] = {
 
     # str -- a NEW directory for the whole build. Required. A rerun into the same directory
     #        with the same fold folder skips every finished file.
-    "output_base_path": r"/data/deid/isilon/MS_model/new_ph_dataset/minimization_folds_quality_v3",
+    "output_base_path": r"/data/deid/isilon/MS_model/new_ph_dataset/minimization_folds_quality_v4",
 
     # ============================= The variant to build =============================
     # Same values and meanings as RUN_ARGS in create_new_pipeline.py.

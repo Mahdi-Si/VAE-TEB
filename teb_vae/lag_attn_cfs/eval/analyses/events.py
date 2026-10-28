@@ -301,7 +301,8 @@ def detection_rows(
     the per-anchor table -- so these are the events every conditioned number is measured from.
 
     Args:
-        retained: The collection's retained arrays: ``up_raw``, ``weight`` and the sample index.
+        retained: The collection's retained arrays: ``up_raw``, ``weight``, ``up_valid`` when
+            kept, and the sample index.
         per_sample: The per-sample table, for each segment's identity.
         scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, for the peak's
             physical amplitude.
@@ -314,7 +315,6 @@ def detection_rows(
     up = retained.get("up_raw")
     if up is None or len(up) == 0:
         return pd.DataFrame()
-    weight = retained.get("weight")
     index = np.asarray(retained.get("waveforms_sample_index", np.arange(len(up))), dtype=np.int64)
     table = (
         per_sample.set_index("sample_index", drop=False)
@@ -323,7 +323,7 @@ def detection_rows(
     rows: List[Dict[str, Any]] = []
     for row in range(len(up)):
         raw = np.asarray(up[row], dtype=np.float64).reshape(-1)
-        valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+        valid = traces.up_event_validity(retained, row, raw.size)
         found = events.detect_contractions(raw, valid=valid)
         physical, unit = traces.physical_raw(raw, "up", scales, valid)
         key = int(index[row]) if row < index.size else row
@@ -378,7 +378,6 @@ def build_detection_figure(
     up = retained.get("up_raw")
     if up is None or len(up) == 0:
         return None
-    weight = retained.get("weight")
     index = np.asarray(retained.get("waveforms_sample_index", np.arange(len(up))), dtype=np.int64)
     table = (
         per_sample.set_index("sample_index", drop=False)
@@ -398,7 +397,7 @@ def build_detection_figure(
     figure, axes = figures.new_figure(len(chosen), height_per_row=1.3)
     for axis, row in zip(axes[:, 0], chosen):
         raw = np.asarray(up[row], dtype=np.float64).reshape(-1)
-        valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+        valid = traces.up_event_validity(retained, row, raw.size)
         physical, unit = traces.physical_raw(raw, "up", scales, valid)
         seconds = (np.arange(raw.size) + 1.0) / events.FS_RAW
         axis.axvspan(0.0, first_anchor_s, color=figures.COLOR_LIGHT_GRAY, alpha=0.6, linewidth=0, zorder=0)

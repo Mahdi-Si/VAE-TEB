@@ -11,17 +11,26 @@ asserted here is the *on*-state's contract:
 * its sparsity term is refused on a model that built no gate, and rides $\beta$;
 * the contraction weight marks the reach after each detected onset and nothing else;
 * the weight moves only the full-branch term that enters the total, leaving ``nll_full_block``
-  and ``pred_gap`` the unweighted quantities, and the task builds it from the batch's raw UP.
+  and ``pred_gap`` the unweighted quantities, and the task builds it from the batch's raw UP;
+* the UA mask ``raw_valid`` drops a contraction it touches and, all valid, changes nothing;
+* the source-side span mask is ``True`` exactly on each detected ``[onset, end]`` and reads its
+  cache back by key.
 """
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from teb_vae.lag_attn.nets.heads import EVENT_GATE_BIAS_INIT
-from teb_vae.lag_attn_rws.event_weight import contraction_anchor_weight
+from teb_vae.lag_attn_rws.event_weight import (
+    contraction_anchor_weight,
+    contraction_onset_steps,
+    contraction_source_mask,
+    contraction_span_steps,
+)
 from teb_vae.lag_attn_rws.seed_event_gate_checkpoint import seed_event_gate
 from train.graph_models_utils import load_checkpoint_strict
 
@@ -256,3 +265,101 @@ def test_the_task_builds_the_weight_from_the_batch_only_when_a_floor_is_set(task
 
     assert on._event_detector() is cfs_events.detect_contractions
     assert on._event_detector() is not rws_events.detect_contractions
+
+
+# ---------------------------------------------------------------------------------------
+# The UA mask of the detector, and the source-side span mask
+# ---------------------------------------------------------------------------------------
+#: Two planted contractions on a 300-step trace, as in the weight test above.
+_STEPS, _ONSETS = 300, (100, 200)
+
+
+def _peak_raw(onset: int, width_steps: int = 15) -> int:
+    """The raw index at which :func:`_bumped_up`'s bump for ``onset`` peaks."""
+    return (onset + width_steps) * DECIMATION
+
+
+def test_the_ua_mask_drops_the_contraction_it_touches_and_all_valid_is_the_weight_alone():
+    """An invalid UA sample at the second peak removes that event and keeps the first; an
+    all-valid mask is bitwise the call without one."""
+    reach, floor = 10, 0.0
+    up = _bumped_up(1, _STEPS, _ONSETS)
+    weight = torch.ones(1, _STEPS)
+    plain = contraction_anchor_weight(up, weight, decimation=DECIMATION, reach_steps=reach, floor=floor)
+
+    all_valid = torch.ones(up.shape, dtype=torch.bool)
+    same = contraction_anchor_weight(
+        up, weight, decimation=DECIMATION, reach_steps=reach, floor=floor, raw_valid=all_valid
+    )
+    assert torch.equal(same, plain)
+
+    holed = all_valid.clone()
+    peak = _peak_raw(_ONSETS[1])
+    holed[0, peak - DECIMATION : peak + DECIMATION] = False
+    masked = contraction_anchor_weight(
+        up, weight, decimation=DECIMATION, reach_steps=reach, floor=floor, raw_valid=holed
+    )
+    first, second = slice(_ONSETS[0] - 16, _ONSETS[0] + reach + 16), slice(_ONSETS[1] - 16, None)
+    assert float(plain[0, second].max()) == 1.0, "the planted second contraction was not detected"
+    assert torch.equal(masked[0, first], plain[0, first])
+    assert bool((masked[0, second] == floor).all())
+
+    # The numpy path agrees: one onset fewer, and the survivor is the first one.
+    onsets = contraction_onset_steps(up[0].numpy(), weight[0].numpy(), decimation=DECIMATION)
+    kept = contraction_onset_steps(
+        up[0].numpy(), weight[0].numpy(), decimation=DECIMATION, raw_valid=holed[0].numpy()
+    )
+    assert len(kept) == len(onsets) - 1 and int(kept[0]) == int(onsets[0])
+
+
+def test_a_short_ua_mask_is_refused_rather_than_padded():
+    """A mask shorter than the grid would leave uncovered samples to a default; it raises."""
+    up, weight = _bumped_up(1, _STEPS, _ONSETS), torch.ones(1, _STEPS)
+    short = torch.ones(1, _STEPS * DECIMATION - 1, dtype=torch.bool)
+    with pytest.raises(ValueError, match="raw_valid"):
+        contraction_anchor_weight(
+            up, weight, decimation=DECIMATION, reach_steps=1, floor=0.0, raw_valid=short
+        )
+    with pytest.raises(ValueError, match="raw_valid has batch"):
+        contraction_source_mask(
+            up, weight, decimation=DECIMATION, raw_valid=torch.ones(2, _STEPS * DECIMATION, dtype=torch.bool)
+        )
+
+
+def test_the_span_mask_is_true_exactly_on_each_detected_span():
+    r"""``contraction_source_mask`` marks $o \le k \le e$ for every span the detector returns,
+    nothing else, and the spans start at the onsets the weight uses."""
+    up = _bumped_up(2, _STEPS, _ONSETS)
+    weight = torch.ones(2, _STEPS)
+    spans = contraction_span_steps(up[0].numpy(), weight[0].numpy(), decimation=DECIMATION)
+    onsets = contraction_onset_steps(up[0].numpy(), weight[0].numpy(), decimation=DECIMATION)
+
+    assert spans.dtype == np.int16 and spans.shape == (len(onsets), 2)
+    assert np.array_equal(spans[:, 0], onsets)
+    assert bool((spans[:, 1] >= spans[:, 0]).all())
+    for onset in _ONSETS:
+        peak_step = _peak_raw(onset) // DECIMATION
+        assert any(start <= peak_step <= end for start, end in spans.tolist()), onset
+
+    mask = contraction_source_mask(up, weight, decimation=DECIMATION)
+    assert mask.dtype == torch.bool and mask.shape == (2, _STEPS)
+    expected = np.zeros(_STEPS, dtype=bool)
+    for start, end in spans.tolist():
+        expected[start : end + 1] = True
+    assert np.array_equal(mask[0].numpy(), expected)
+
+
+def test_the_span_mask_reads_its_cache_back_by_key():
+    """A keyed second call does not run the detector: a zeroed trace still returns the cached
+    spans, and the cache holds ``(n, 2)`` span arrays rather than onsets."""
+    up = _bumped_up(2, _STEPS, _ONSETS)
+    weight = torch.ones(2, _STEPS)
+    cache: dict = {}
+    first = contraction_source_mask(up, weight, decimation=DECIMATION, keys=["a", "b"], cache=cache)
+    again = contraction_source_mask(
+        torch.zeros_like(up), weight, decimation=DECIMATION, keys=["a", "b"], cache=cache
+    )
+    assert set(cache) == {"a", "b"} and all(value.shape[-1] == 2 for value in cache.values())
+    assert bool(first.any()) and torch.equal(again, first)
+    # Without a cache the zeroed trace has no contraction at all.
+    assert not bool(contraction_source_mask(torch.zeros_like(up), weight, decimation=DECIMATION).any())

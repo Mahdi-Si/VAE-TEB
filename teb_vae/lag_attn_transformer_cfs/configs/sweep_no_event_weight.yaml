@@ -31,6 +31,9 @@ base: default.yaml
 model_config:
   VAE_model:
     event_weight_floor: null
+    # No floor runs no detector, so the detector's UA mask has nothing to act on; the pre-flight
+    # refuses it without a floor.
+    event_weight_ua_valid: false
 
 advanced_config:
   tracking:
