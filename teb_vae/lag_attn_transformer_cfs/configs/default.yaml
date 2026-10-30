@@ -14,8 +14,8 @@
 # configuration is preserved as `sweep_legacy_dualref_physclock.yaml`. Prose below that describes
 # the reference clocks and the physical clock describes those mechanisms as they are still
 # available through the sweep arms; the shipped leaves are the ones set at each key. Shards for
-# this config are built with `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`;
-# see REPOINT_ME_causal_int.
+# this config are built with `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`
+# with signal-quality profiling on; `dataset_config` names the 2026-10-27 build.
 #
 # GEOMETRY IS STATED SYMBOLICALLY BELOW. Every number that follows from `horizon`, `anchor_stride`,
 # `warmup_period`, `sequence_length` and the resolved channel budget is written as a formula; where
@@ -315,7 +315,18 @@ model_config:
     decoder_hidden: 256
     # Watched through logvar_full_floor_frac and logvar_full_ceil_frac, which are per-COEFFICIENT
     # here because block_width is C_keep and not the raw grid's R.
-    logvar_clamp: [-5.0, 3.0]
+    #
+    # [-6, 3] SINCE 2026-10-29, widened at the floor only. The two 30-epoch quality-mask runs on the
+    # 2026-10-27 build pressed the decoder log-variance against the old floor of -5: on the held-out
+    # evaluation 0.45 of the scored coefficients sat inside the clamp margin in BOTH arms, the
+    # 0.001-quantile was -4.9997, and the validation `logvar_full_floor_frac` still rose at the last
+    # epoch (0.06 at epoch 0, 0.46 at epoch 27). The calibration agrees: 0.80 central coverage at
+    # 1 sigma against the nominal 0.68, so for those coefficients the bounded variance is wider than
+    # the residuals. A longer run would push past the 0.5 limit of `decoder_variance_not_pinned`. The
+    # evaluation's own recommendation (calibration.recommendation) is this value. The ceiling never
+    # binds (fraction 1e-7) and stays. The bound applies to every log-variance in the model, so the
+    # latent heads' calibrated initial constant moves with it; the KL is still exactly 0 at step 0.
+    logvar_clamp: [-6.0, 3.0]
     # Latent stabilisers: saturation magnitudes of the tanh-bounded latent heads.
     mu_scale: 5.0
     delta_mu_scale: 3.0
@@ -1017,19 +1028,48 @@ dataset_config:
   # with this config's c_y would fail the width check -- but a rebuilt two-sided dataset at 102
   # channels would not, and it would train to completion on coefficients containing their own
   # future while every number below reported a causal model.
+  #
+  # THE 2026-10-27 QUALITY-VERSION-4 BUILD (since 2026-10-29): every healthy pretraining subgroup,
+  # BG and no-BG, 20 train shards and 5 test shards. `source_quality_mask`, `event_weight_ua_valid`
+  # and `target_quality_mask` need its quality datasets. Compare the list with
+  # pre_training_dataset/dataset_files.yaml on the box before a run.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
   # It must be generated from the SAME causal shards: the statistics exclude the warm-up region, and
   # a two-sided stats file would both mis-normalise the target and destroy the source-null control's
   # premise that zero is the channel mean over the region the model reads.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/stats.hdf5
+  # Computed by hdf5_dataset/calculate_dataset_stats.py over ALL 25 shards above at trim_minutes
+  # 1.0; it records quality_version 4 and rho epsilon 0.1, and the loader refuses a statistics file
+  # whose quality attributes differ from the shards'.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/stats.hdf5
 
   dataloader_config:
     # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
@@ -1240,9 +1280,10 @@ advanced_config:
     warmup_batches: 100    # priming window before gating activates
     comparison_metric: main_loss
     # >> any reachable loss: relative detection off. The per-coefficient Gaussian NLL is bounded
-    # below by 0.5*(log 2pi + logvar_clamp_lo) ~ -1.58 at the shipped floor of -5, so the two
-    # reconstruction terms cannot reach beyond ~2 * H * C_keep * 1.58 in magnitude (worked example
-    # at the 30 x 76 block: ~7.2e+3), and the KL and the prior anchor are both nonnegative. The
+    # below by 0.5*(log 2pi + logvar_clamp_lo) ~ -2.08 at the shipped floor of -6 (-1.58 at the
+    # floor of -5 before 2026-10-29), so the two reconstruction terms cannot reach beyond
+    # ~2 * H * C_keep * 2.08 in magnitude (worked example at the 30 x 76 block: ~9.5e+3; ~7.2e+3 at
+    # the old floor), and the KL and the prior anchor are both nonnegative. The
     # AR(1) innovation keeps the same per-cell floor, since the log-variance clamp is unchanged,
     # and the scored-horizon mask only lowers the bound. The instrumented
     # run at the 2940-coefficient block (bound ~9.3e+3) observed main_loss inside [-7464, +8498],
@@ -1257,8 +1298,9 @@ advanced_config:
     # 6.6e+3 SINCE 2026-09-23, SCALED BY THE BLOCK RATIO FROM THE PREVIOUS VALUE, NOT RE-MEASURED.
     # The margin is in nats of the summed block, and the block moved from 10 x 76 = 760 to
     # 30 x 76 = 2280 coefficients, a factor of 3: 3 x 2.2e+3 = 6.6e+3. The two constraints that
-    # fix it still hold: it sits UNDER the ~7.2e+3 magnitude the objective can reach at this block
-    # (see `ema_floor` above), or no finite loss could exceed EMA + margin and the additive test
+    # fix it still hold: it sits UNDER the ~9.5e+3 magnitude the objective can reach at this block
+    # (~7.2e+3 before the floor moved to -6; see `ema_floor` above), or no finite loss could exceed
+    # EMA + margin and the additive test
     # would be decoration, and it clears the scaled worst excursion (~3.0e+3 for this cell, ~3.9e+3
     # for the conv-LSTM cell, from the H = 30 measurement below scaled by 2280 / 2940). NO LONGER
     # EQUAL to the conv-LSTM causal cell's, which did not take the final revision. MUST be
