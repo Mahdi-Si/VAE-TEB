@@ -174,6 +174,21 @@ EVENT_KEYS = (
     "event_weight_reach_steps",
 )
 
+#: The two divergences the 2026-10-29 headline-run decision added to BOTH edges: this cell trains on
+#: the quality-version-4 build, and its decoder log-variance floor moved from -5 to -6 because the
+#: 30-epoch quality-mask runs pinned 0.45 of the coefficients against the old floor.
+Q4_HEADLINE_PATHS: Dict[str, str] = {
+    f"{_VAE}.logvar_clamp": (
+        "the floor moved to -6 after 0.45 of the decoder's log-variances sat on -5 in both "
+        "quality-mask arms; the rationale is in the config"
+    ),
+}
+Q4_DATASET_PATHS: Dict[str, str] = {
+    "dataset_config.vae_train_datasets": "the 2026-10-27 quality-version-4 build",
+    "dataset_config.vae_test_datasets": "the 2026-10-27 quality-version-4 build",
+    "dataset_config.stat_path": "the statistics of the 2026-10-27 quality-version-4 build",
+}
+
 #: The ENCODER edge: what may differ from the conv-LSTM causal cell, and why. Anything not here must
 #: be identical, because a difference outside this list would be attributed to the encoder by every
 #: reading of the two runs.
@@ -193,6 +208,8 @@ ENCODER_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     # so the encoder edge no longer differs in the encoder alone: every final-revision leaf is
     # declared here rather than the conv-LSTM config being edited to follow.
     **FINAL_REVISION_PATHS,
+    **Q4_HEADLINE_PATHS,
+    **Q4_DATASET_PATHS,
 }
 
 #: The TARGET edge: what may differ from the conv-Transformer two-sided cell.
@@ -241,6 +258,8 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
         "the second half of the control above, in validation epochs; inheriting the comparison "
         "model's value would make the flag above inert rather than merely different"
     ),
+    # The dataset paths are already declared above, as causal shards.
+    **Q4_HEADLINE_PATHS,
 }
 
 #: Surviving target channels at the shipped warm-up budget, on the committed integer-operator

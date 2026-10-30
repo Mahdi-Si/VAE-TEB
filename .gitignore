@@ -24,3 +24,6 @@ documents/
 mlruns/
 mlartifacts/
 mlflow.db
+
+# Scratch work, never tracked
+tmp/

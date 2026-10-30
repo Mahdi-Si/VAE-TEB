@@ -822,7 +822,9 @@ def _mark_transients(
             end = _box_end(x, data, jump, i, sign, level, cfg)
             if end is not None:
                 q[start:end] |= UA_DTYPE(UaBit.TRANSIENT)
-                resume = end
+                # The closing jump at `end - 1` shows at `lag` consecutive samples. Skip the rest
+                # of it: each of them would open a new box that a later jump could close.
+                resume = end - 1 + lag
                 continue
             step = _step_after(x, data, ceiling, q, start, i, sign, level, cfg)
             if step is not None:
