@@ -646,8 +646,8 @@ def test_the_page_title_names_the_segment_its_cohort_and_its_epoch() -> None:
 
 
 def test_the_shared_limits_come_from_the_whole_split() -> None:
-    """One set per run, so a colour means one value on every page; the $K_t$ line takes the
-    maximum (a percentile would clip it) and a quantity the tables lack is simply absent."""
+    """One set per run, so a colour means one value on every page; the $K_t$ line takes none,
+    because its y-axis is fitted per page, and a quantity the tables lack is simply absent."""
     per_anchor = pd.DataFrame({"kld_per_t": np.linspace(0.0, 2.0, 201)})
     per_sample = pd.DataFrame({"mu_prior_rms": [1.0, 1.0], "delta_mu_rms": [0.01, 0.02]})
     attention = np.full((201, 4), 0.25)
@@ -657,8 +657,8 @@ def test_the_shared_limits_come_from_the_whole_split() -> None:
     )
     limits = samples_analysis.shared_row_limits(collection)
 
-    assert limits["kld_total"] == pytest.approx(2.0 * 1.05)
-    assert limits["kld_dims"] < limits["kld_total"]
+    assert "kld_total" not in limits
+    assert 0.0 < limits["kld_dims"] < 2.0
     assert limits["lag_attn"] == pytest.approx(0.25)
     assert limits["latent"] == pytest.approx(samples_analysis.LATENT_RMS_MULTIPLE)
     assert 0.0 < limits["latent_shift"] < limits["latent"]

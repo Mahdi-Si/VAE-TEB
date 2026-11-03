@@ -5,8 +5,9 @@ One figure per sample, from a single forward pass:
 1. The raw target FHR **in bpm** and the raw source UP **in mmHg**, on one time axis with one
    y-axis each. UP shares the row rather than getting one of its own because rows 6 and 7 are
    statements *about* this trace: a contraction has to be findable in the same column of the page
-   as the response it is claimed to drive. Both y-axes are pinned to :data:`RAW_TRACE_LIMITS`,
-   the paper chart's physiological ranges, so two pages are read against one scale.
+   as the response it is claimed to drive. Each y-axis is fitted to the sample drawn, inside
+   :data:`RAW_TRACE_LIMITS` and never narrower than :data:`MIN_TRACE_SPAN`; see
+   :func:`fitted_limits`.
 2. The forecast over the whole recording, tiled into **consecutive non-overlapping** windows: the
    true future against the base ($z^p$) and full ($z^q$) forecasts and their $\mu \pm 2\sigma$
    bands, with a thin dashed vertical at every window edge. This is the panel the whole model
@@ -50,12 +51,14 @@ Both lag panels carry a secondary axis in seconds, $\Delta(\ell + \delta)$. The 
 delay $\delta$ is added only when the model has one, and the label says *compensated* only then;
 at $\delta = 0$ the axis is the plain $\Delta\ell$ and is labelled so.
 
-**Pages of different samples are comparable by construction.** The raw traces sit on fixed
-physiological ranges, every normalised coefficient heatmap on the fixed symmetric
-:data:`NORMALISED_LIMITS`, and the latent, KL and attention rows on the limits a caller passes in
-``row_limits`` -- the evaluation computes one set per run from its tables before the first page is
-drawn -- so the same colour is the same value on every page of a run. Every model row is drawn at
-its step index and only the raw row is physical time; each x label states which.
+**Colour scales are shared across pages; y-axes are fitted to the page.** Every normalised
+coefficient heatmap sits on the fixed symmetric :data:`NORMALISED_LIMITS`, and the latent, KL and
+attention heatmaps on the colour limits a caller passes in ``row_limits`` -- the evaluation
+computes one set per run from its tables before the first page is drawn -- so the same colour is
+the same value on every page of a run. A line row's y-axis is different: the raw traces and $K_t$
+are fitted to the sample drawn (:func:`fitted_limits`), so a quiet segment is not flattened onto
+the floor of a scale set by the loudest one. Every model row is drawn at its step index and only
+the raw row is physical time; each x label states which.
 
 **Why this lives at the package root.** Two consumers draw this page and they sit on opposite
 sides of the layering: the training callback in :mod:`~teb_vae.lag_attn_rws.plotting`, which is a
@@ -99,7 +102,6 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     concat_single_forecasts,
     safe_vabs,
     sample_cell_edges,
-    shade_warmup,
     time_axes,
     to_numpy,
 )
@@ -114,15 +116,18 @@ from utils.style import style_axes  # noqa: E402
 __all__ = [
     "BAND_SIGMAS",
     "DELAY_STAIRCASE_LABEL",
+    "FIT_PAD_FRACTION",
     "ForecastRowInputs",
     "InputStreamPanel",
     "LAG_SECONDS_LABEL",
+    "MIN_TRACE_SPAN",
     "NORMALISED_LIMITS",
     "RAW_TIME_LABEL",
     "RAW_TRACE_LIMITS",
     "STEP_TIME_LABEL",
     "annotate_channel_frequencies",
     "build_diagnostic_figure",
+    "fitted_limits",
     "log_attention_norm",
     "raw_context_row",
     "raw_forecast_rows",
@@ -150,11 +155,21 @@ BAND_SIGMAS = 2.0
 #: than putting one of these on an axis it cannot honour.
 _SIGNAL_UNITS = {"fhr": "bpm", "up": "mmHg"}
 
-#: The fixed y-range of each raw signal in its physical unit: the international paper chart's FHR
-#: scale in bpm and its full UP scale in mmHg. Fixed rather than autoscaled so every page of a run
-#: -- and of every run -- draws one bpm at one height; a sample outside the range is clipped at
-#: the frame. Applied only when the loader's statistics put the trace in that unit.
+#: The physiological range of each raw signal in its physical unit: the international paper
+#: chart's FHR scale in bpm and its full UP scale in mmHg. A raw y-axis is fitted to the sample
+#: **inside** this range: a value outside it is not a reading the fit should follow -- the stored
+#: FHR gap sentinel is $0$ bpm -- so it is left out of the fit and clipped at the frame. Applied
+#: only when the loader's statistics put the trace in that unit.
 RAW_TRACE_LIMITS: Mapping[str, Tuple[float, float]] = {"fhr": (50.0, 210.0), "up": (0.0, 100.0)}
+
+#: The narrowest y span a raw trace is drawn over, in its physical unit. Without a floor, a flat
+#: stretch of FHR with $2$ bpm of sensor noise fills the whole row and reads as marked
+#: variability; $30$ bpm and $20$ mmHg keep a baseline and a weak contraction recognisable.
+MIN_TRACE_SPAN: Mapping[str, float] = {"fhr": 30.0, "up": 20.0}
+
+#: Head room added above and below a fitted y range, as a fraction of the data's own span, so the
+#: extreme sample of a line does not sit on the frame.
+FIT_PAD_FRACTION = 0.05
 
 #: Colour range of every heatmap of **normalised** coefficients -- the input rows, and the
 #: truth and forecast fields a forecast seam draws. The stored blocks are z-scored per channel,
@@ -431,9 +446,12 @@ def _input_stream_row(
     # have no source and are emitted as zero, and the whole staircase must sit inside the shaded
     # warm-up -- that requirement is what `resolve_channel_budget` enforces, and this is where a
     # reader can see that it holds.
+    # Drawn on the cell edge $(\delta_c - \tfrac12)\Delta$ between the last masked step and the
+    # first live one: the heatmap's cell for step $t$ is centred at $t\Delta$, so $\delta_c\Delta$
+    # itself is the middle of the first live cell.
     if n_channels and int(np.max(panel.delays)) > 0:
         ax.step(
-            np.asarray(panel.delays, dtype=float) * seconds_per_step,
+            (np.asarray(panel.delays, dtype=float) - 0.5) * seconds_per_step,
             np.arange(n_channels), where="mid",
             color=COLOR_ORANGE, linewidth=0.9,
             label=panel.delay_label,
@@ -457,7 +475,7 @@ def _input_stream_row(
         twin.tick_params(axis="y", labelsize=6)
         twin.grid(False)
         twin.set_xlim(0.0, t_max)
-        _pin_trace_limits(twin, str(panel.raw_field), unit)
+        _fit_trace_limits(twin, str(panel.raw_field), unit, raw_values)
     # Labelled artists only: the block divider is an unlabelled ``axhline`` on the same axes and
     # would otherwise appear as ``_child1``. Lower *left*, inside the warm-up prefix, which is the
     # one span of the row the overlay never reaches.
@@ -478,18 +496,85 @@ def _input_stream_row(
     return image
 
 
-def _pin_trace_limits(ax: Any, field: str, unit: str) -> None:
-    """Pin a raw trace's y-axis to :data:`RAW_TRACE_LIMITS` when it is drawn in that unit.
+def fitted_limits(
+    values: Any,
+    *,
+    pad_fraction: float = FIT_PAD_FRACTION,
+    min_span: float = 0.0,
+    bounds: Optional[Tuple[float, float]] = None,
+    floor: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
+    r"""Return a y range fitted to the finite values of the one sample being drawn.
+
+    For a trace whose finite values run from $a$ to $b$ the range is
+    $[a - p(b - a),\ b + p(b - a)]$ with $p$ = ``pad_fraction``. It is then widened about its
+    centre to at least ``min_span``, and moved (not shrunk) to lie inside ``bounds``.
+
+    Args:
+        values: The values drawn on the axis, any shape. Non-finite entries are ignored.
+        pad_fraction: Head room on each side, as a fraction of the data's span.
+        min_span: The narrowest range returned, in the values' unit.
+        bounds: ``(low, high)``. Values outside it are left out of the fit, and the returned range
+            lies inside it. ``None`` sets no bound.
+        floor: A fixed lower edge, for a non-negative quantity such as $K_t$; the upper edge is
+            then the padded maximum. ``None`` fits the lower edge too.
+
+    Returns:
+        ``(low, high)`` with ``high > low``, or ``None`` when no value is left to fit, in which
+        case the caller keeps matplotlib's autoscale.
+    """
+    data = np.asarray(values, dtype=float).ravel()
+    data = data[np.isfinite(data)]
+    if bounds is not None:
+        data = data[(data >= bounds[0]) & (data <= bounds[1])]
+    if not data.size:
+        return None
+    low = float(data.min()) if floor is None else float(floor)
+    high = float(data.max())
+    if high < low:
+        return None
+    pad = float(pad_fraction) * (high - low)
+    low, high = (low if floor is not None else low - pad), high + pad
+    span = max(float(min_span), high - low)
+    if not span > 0.0:
+        # A constant trace with no span floor has no range to pad. It gets a span of one unit,
+        # or a tenth of its own magnitude when that is larger, so the line is visible.
+        span = max(1.0, 0.1 * abs(high))
+    if high - low < span:
+        if floor is not None:
+            high = low + span
+        else:
+            centre = 0.5 * (low + high)
+            low, high = centre - 0.5 * span, centre + 0.5 * span
+    if bounds is not None:
+        if low < bounds[0]:
+            low, high = bounds[0], min(bounds[1], high + (bounds[0] - low))
+        if high > bounds[1]:
+            low, high = max(bounds[0], low - (high - bounds[1])), bounds[1]
+    return (low, high) if high > low else None
+
+
+def _fit_trace_limits(ax: Any, field: str, unit: str, values: Any) -> None:
+    """Fit a raw trace's y-axis to the sample drawn.
+
+    In the field's physical unit the fit is bounded by :data:`RAW_TRACE_LIMITS` and widened to
+    :data:`MIN_TRACE_SPAN`. In loader units -- no statistics were found -- neither applies, since
+    both are in bpm or mmHg, and the fit is the plain padded range.
 
     Args:
         ax: The axes the trace is drawn on.
         field: The loader field, ``'fhr'`` or ``'up'``.
-        unit: The unit the trace was drawn in; anything but the field's physical unit -- a trace
-            left in loader units because no statistics were found -- keeps its autoscale, since a
-            bpm range would put a z-scored trace flat on the floor of the axis.
+        unit: The unit the trace was drawn in.
+        values: The values drawn on this axis.
     """
     if field in RAW_TRACE_LIMITS and unit == _SIGNAL_UNITS.get(field):
-        ax.set_ylim(*RAW_TRACE_LIMITS[field])
+        limits = fitted_limits(
+            values, min_span=MIN_TRACE_SPAN.get(field, 0.0), bounds=RAW_TRACE_LIMITS[field]
+        )
+    else:
+        limits = fitted_limits(values)
+    if limits is not None:
+        ax.set_ylim(*limits)
 
 
 def _raw_overlay(
@@ -660,7 +745,7 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
     ax.set_title("Raw target FHR and source UP", fontsize=9, pad=6)
     ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
-    _pin_trace_limits(ax, "fhr", unit)
+    _fit_trace_limits(ax, "fhr", unit, fhr_np)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
     if up_np is not None:
@@ -673,7 +758,7 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
         twin.tick_params(axis="y", labelsize=7, colors=COLOR_GREEN)
         twin.grid(False)
         twin.set_xlim(0.0, rows.t_max)
-        _pin_trace_limits(twin, "up", up_unit)
+        _fit_trace_limits(twin, "up", up_unit, up_np)
         handles = list(ax.get_lines()) + list(twin.get_lines())
         ax.legend(
             handles, [handle.get_label() for handle in handles],
@@ -818,7 +903,11 @@ def raw_forecast_rows(rows: ForecastRowInputs) -> None:
     ax.set_title(f"Forecast, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$", fontsize=9, pad=6)
     ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8)
-    _pin_trace_limits(ax, "fhr", unit)
+    # Fitted to the truth and the two means. The bands are left out of the fit: an early, wide
+    # $2\sigma$ band would otherwise set the range and flatten the curves it surrounds.
+    _fit_trace_limits(
+        ax, "fhr", unit, np.concatenate([truth_tiled, base_mean, full_mean])
+    )
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
@@ -917,10 +1006,10 @@ def build_diagnostic_figure(
         log_lag_attention: Whether to draw the lag-attention row on a logarithmic colour
             scale. ``False`` -- the default -- keeps the linear scale every existing page has.
             The lag axis is unaffected either way; this is the colour normalisation alone.
-        row_limits: Colour (or, for ``kld_total``, y) limits shared by every page of a run, keyed
-            by row name: ``latent`` and ``latent_shift`` are the half-widths of the symmetric
-            $\mu^p$ and $\mu^q-\mu^p$ scales, ``kld_dims``, ``kld_total``, ``lag_attn`` and
-            ``kl_lag_map`` the upper edges of non-negative ones, ``lag_attn_floor`` the lower
+        row_limits: Colour limits shared by every page of a run, keyed by row name: ``latent``
+            and ``latent_shift`` are the half-widths of the symmetric $\mu^p$ and $\mu^q-\mu^p$
+            scales, ``kld_dims``, ``lag_attn`` and ``kl_lag_map`` the upper edges of
+            non-negative ones, ``lag_attn_floor`` the lower
             edge of the log attention scale, and any other key is handed to the forecast seam
             through :attr:`ForecastRowInputs.row_limits`. ``None`` or a missing
             key scales that row to this page alone, which is right for a training callback and
@@ -947,6 +1036,12 @@ def build_diagnostic_figure(
     # decoded or inside the KL support, so a latent there carries no gradient at all.
     warmup_sec = float(warmup) * seconds_per_step
     tail_sec = float(t_valid) * seconds_per_step
+    # The same two boundaries as drawn: step $t$ is the cell centred at $t\Delta$, so the edge
+    # between step $t - 1$ and step $t$ is $(t - \tfrac12)\Delta$. A shade that ended at
+    # ``warmup_sec`` itself would cover half of the first trained cell, and one that started at
+    # ``tail_sec`` would leave half a cell unshaded after the last one.
+    warmup_edge = (float(warmup) - 0.5) * seconds_per_step
+    tail_edge = (float(t_valid) - 0.5) * seconds_per_step
 
     mu_prior_np = to_numpy(outs["mu_prior"][i])                       # (T, d_z)
     delta_mu_np = to_numpy(outs["mu_post"][i] - outs["mu_prior"][i])  # (T, d_z)
@@ -1047,9 +1142,13 @@ def build_diagnostic_figure(
             # Every row spans the whole recording whatever it draws, so a column of the page is the
             # same instant on all seven of them.
             ax.set_xlim(0.0, t_max)
-            shade_warmup(ax, warmup, t_max, t_steps)
+            # On cell edges rather than through ``shade_warmup``, which ends at $w\Delta$: every
+            # step row of this page is cell-centred, so $w\Delta$ is the middle of the first
+            # trained column. The span starts at $0$ because the axis does.
+            if warmup > 0:
+                ax.axvspan(0.0, warmup_edge, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
             if tail:
-                ax.axvspan(tail_sec, t_max, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
+                ax.axvspan(tail_edge, t_max, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
         def trained_columns(values: np.ndarray, *, drop_tail: bool) -> Tuple[np.ndarray, float]:
             """Cut a time-first array down to the anchors the objective actually scored.
@@ -1246,8 +1345,11 @@ def build_diagnostic_figure(
             kld_trained, _ = trained_columns(kld_total_np, drop_tail=True)
             kld_time, _ = trained_columns(time_dec, drop_tail=True)
             ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
-            if limits.get("kld_total"):
-                ax.set_ylim(0.0, float(limits["kld_total"]))
+            # Fitted to this sample's trained anchors, from $0$: $K_t \ge 0$, and a run-wide top
+            # flattened every quiet segment onto the floor of the row.
+            kld_range = fitted_limits(kld_trained, floor=0.0)
+            if kld_range is not None:
+                ax.set_ylim(*kld_range)
             ax.set_title("$K_t$, source-conditioned KL", fontsize=9, pad=6)
             ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("nats", fontsize=8)

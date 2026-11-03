@@ -294,9 +294,10 @@ def test_the_staircase_is_the_warm_up_and_says_so(task, stub_batch):
 
         assert len(steps) == 1
         assert steps[0].get_ydata().tolist() == list(range(model.target_gate.out_channels))
+        # On the cell edge before the first live step, $(W'_c - \tfrac12)\Delta$.
         assert np.allclose(
             steps[0].get_xdata(),
-            np.asarray(model.target_warmup_steps, dtype=float) * 4.0,
+            (np.asarray(model.target_warmup_steps, dtype=float) - 0.5) * 4.0,
         )
         # The shipped label is not what is drawn here, and the shipped default is untouched.
         assert sample_page.WARMUP_STAIRCASE_LABEL != shared_page.DELAY_STAIRCASE_LABEL
@@ -551,10 +552,11 @@ def test_the_error_map_describes_the_anchor_the_row_shades(task, stub_batch):
             if patch.get_x() > 0.0
         ]
         assert len(spans) == 1, "one shaded window, marking the anchor the error map draws"
+        # The outer cell edges of steps $t+1 .. t+H$, each cell centred at its own $u\Delta$.
         assert spans[0] == pytest.approx(
             (
-                (anchor + 1) * seconds_per_step,
-                (anchor + 1 + geometry.horizon) * seconds_per_step,
+                (anchor + 0.5) * seconds_per_step,
+                (anchor + 0.5 + geometry.horizon) * seconds_per_step,
             )
         )
 
