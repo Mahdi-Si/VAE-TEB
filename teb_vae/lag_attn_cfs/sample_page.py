@@ -1231,10 +1231,12 @@ def _draw_gap_row(
         return
 
     horizon = int(rows.geometry.horizon)
-    # A window's mark sits at the centre of the span it scores, $[t+1, t+H]$, so it lands over
-    # the same columns the field rows above drew it in.
+    # A window's mark sits at the centre of the span it scores, steps $[t+1, t+H]$, so it lands
+    # over the same columns the field rows above drew it in. Those cells are centred at
+    # $(t+1)\Delta, \ldots, (t+H)\Delta$, so the span runs from $(t+\tfrac12)\Delta$ to
+    # $(t+H+\tfrac12)\Delta$ and its centre is $(t + \tfrac12 + \tfrac{H}{2})\Delta$.
     centres = np.asarray(
-        [(int(stitched.anchors[p]) + 1 + 0.5 * horizon) * seconds_per_step
+        [(int(stitched.anchors[p]) + 0.5 + 0.5 * horizon) * seconds_per_step
          for p in stitched.positions],
         dtype=float,
     )
@@ -1419,7 +1421,10 @@ def _draw_lane_row(
     # best or worst the run happens to contain.
     position = positions[len(positions) // 2] if positions else 0
     anchor = int(anchors[position])
-    anchor_start = float(anchor + 1) * seconds_per_step
+    # The outer edges of the window's cells, steps $t+1$ to $t+H$, each centred at its own
+    # $u\Delta$: the span starts half a step before $(t+1)\Delta$, exactly where the field rows
+    # below start drawing the same window.
+    anchor_start = (float(anchor) + 0.5) * seconds_per_step
     ax.axvspan(
         anchor_start, anchor_start + geometry.horizon * seconds_per_step,
         color=COLOR_ORANGE, alpha=0.14, zorder=0,
@@ -1447,7 +1452,9 @@ def _draw_lane_row(
         cax,
         np.abs(anchor_truth - anchor_mean).T,
         first_block_channels=stitched.block_split,
-        anchor_seconds=anchor_start,
+        # The first forecast step's own instant, $(t+1)\Delta$, not the span's cell edge: the
+        # label names a sample of the recording.
+        anchor_seconds=float(anchor + 1) * seconds_per_step,
         # Not the two-sided page's right margin: this tiling runs to the end of the recording, so
         # an inset there covers the last windows of the very forecast it is a detail of. The blank
         # span here is the prefix below the anchor floor.
