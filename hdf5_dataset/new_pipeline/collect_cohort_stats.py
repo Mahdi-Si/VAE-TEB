@@ -1008,9 +1008,6 @@ def main(build_dir: str, output_dir: Optional[str] = None,
         screen = pd.read_csv(screening_p, dtype={"guid": str, "record_path": str,
                                                  "subgroup": str})
         screen["guid"] = screen["record_path"].map(_stem)
-        screen_table = screening_tables(screen, healthy_eligibility)
-        screen_table.to_csv(out / "tables" / "screening.csv", index=False)
-        report["screening"] = screen_table
         sel_path = screening_p.parent / SELECTION_SUMMARY_NAME
         if sel_path.exists():
             with open(sel_path, encoding="utf-8") as f:
@@ -1019,6 +1016,16 @@ def main(build_dir: str, output_dir: Optional[str] = None,
                 "test_mode": sel.get("test_mode"), "stats": sel.get("stats"),
                 **{pool: {sg: v.get("count") for sg, v in sel.get(pool, {}).items()}
                    for pool in ("trainval", "test", "pretraining")}}
+            # The selection run records the healthy gate it applied; it overrides RUN_ARGS.
+            recorded = (sel.get("stats") or {}).get("healthy_eligibility")
+            if recorded and recorded != healthy_eligibility:
+                warnings.append(f"healthy_eligibility={healthy_eligibility!r} replaced by "
+                                f"{recorded!r}, the gate the selection run recorded")
+                healthy_eligibility = recorded
+        report["healthy_eligibility"] = healthy_eligibility
+        screen_table = screening_tables(screen, healthy_eligibility)
+        screen_table.to_csv(out / "tables" / "screening.csv", index=False)
+        report["screening"] = screen_table
     pretrain_csv = None
     if (build / "pretraining_guids.csv").exists():
         pretrain_csv = pd.read_csv(build / "pretraining_guids.csv",

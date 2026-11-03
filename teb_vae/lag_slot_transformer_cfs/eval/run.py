@@ -222,6 +222,15 @@ RUN_ARGS: Dict[str, Any] = {
     # runs regardless and is not selectable by either key. An unknown name raises at startup,
     # before the checkpoint is loaded, so a misspelling costs a parse rather than a first pass
     # over the shards.
+    #
+    # Valid names for both keys, in registry order (a snapshot of ``ANALYSES``; ``--help`` prints
+    # the live list if the registry changes):
+    #   forecast, coupling, perm_control, latent, calibration, residual, distributions,
+    #   trajectory, time_to_delivery, second_stage, events, sufficiency, arms, lag_suppression,
+    #   resolved_axes, proposal_profile, proposal_clocks, band_clocks, high_kl_anchors, warmup,
+    #   source_null, spectral_skill, samples, recording_traces, attribution, cross_subgroup
+    # Not valid for either key: band_partition (always runs).
+    # Example: "only": "samples,recording_traces"  or  "skip": "attribution,cross_subgroup"
     "only": None,
     "skip": None,
 }

@@ -17,11 +17,14 @@ forecast lanes (truth against both branches, their bands, the scored-horizon mas
 streams, the latent state and its shift, $K_t$, and both lag maps -- the whole segment at a
 glance, without the per-channel field rows.
 
-**Pages are comparable across segments.** The raw traces sit on fixed physiological ranges and
-the normalised coefficient maps on one fixed range, both set by the page builder; the latent, KL,
-attention, skill and $\sigma$ rows take the limits :func:`shared_row_limits` computes **once per
+**Colours are comparable across segments; y-axes are fitted to the segment.** The normalised
+coefficient maps sit on one fixed range set by the page builder, and the latent, KL, attention,
+skill and $\sigma$ heatmaps take the colour limits :func:`shared_row_limits` computes **once per
 run**, from the collection's own tables, before the first page is drawn -- so one colour is one
-value on every page of the run, whichever selection it sits in.
+value on every page of the run, whichever selection it sits in. Every line row -- the raw FHR and
+UP, the forecast lanes, $K_t$ and the per-window score -- is instead fitted to the segment it
+draws, so a quiet segment is read at its own scale; the raw traces stay inside the paper chart's
+physiological ranges.
 
 Three draws, and they answer different questions:
 
@@ -234,9 +237,10 @@ def shared_row_limits(collection: Any) -> Dict[str, float]:
     pages: the pages are a handful of extremes and a draw, and a scale fitted to them would move
     with the draw. Each limit is the :data:`SHARED_LIMIT_PERCENTILE` percentile of its quantity:
 
-    * ``kld_total`` and ``kld_dims`` -- $K_t$ per anchor (``per_anchor.kld_per_t``); the
-      per-dimension map shares it, so one dimension carrying all of $K_t$ reads at full colour.
-      ``kld_total`` is a line, which a percentile would clip, so it takes the run's **maximum**;
+    * ``kld_dims`` -- $K_t$ per anchor (``per_anchor.kld_per_t``), so one dimension carrying all
+      of $K_t$ reads at full colour. The $K_t$ line row takes no shared limit: like every line
+      row of the page, its y-axis is fitted to the sample drawn
+      (:func:`~teb_vae.lag_attn_rws.sample_page.fitted_limits`);
     * ``kl_lag_map`` and ``lag_attn`` -- the per-anchor lag maps' cells, and ``lag_attn_floor``
       the low percentile of the positive attention weights, the bottom of the log scale;
     * ``latent`` and ``latent_shift`` -- :data:`LATENT_RMS_MULTIPLE` times the per-segment RMS of
@@ -268,7 +272,6 @@ def shared_row_limits(collection: Any) -> Dict[str, float]:
     top, bottom = SHARED_LIMIT_PERCENTILE, 100.0 - SHARED_LIMIT_PERCENTILE
     # Row name to (values, multiple, percentile).
     sources: Dict[str, Tuple[Any, float, float]] = {
-        "kld_total": (kl, 1.05, 100.0),
         "kld_dims": (kl, 1.0, top),
         "kl_lag_map": (vectors.get("kl_lag_map"), 1.0, top),
         "lag_attn": (attention, 1.0, top),
