@@ -23,7 +23,7 @@ from teb_vae.lag_attn_rws.eval.launch import (  # noqa: E402
     missing_required,
     resolve_launch_args,
 )
-from hdf5_dataset.hdf5_dataset import (  # noqa: E402
+from hdf5_dataset import (  # noqa: E402
     LEG_ALIGNMENT_NONE,
     PHASE_OPERATOR_LEGACY,
     TWO_SIDED,
@@ -1737,33 +1737,26 @@ RUN_ARGS: Dict[str, Any] = {
     #        Statistics computed over a subset normalise the rest with constants they never
     #        contributed to, and nothing downstream says so. One entry per file.
     "input_files": [
-        # The 2026-10-27 quality-version-4 build: the 20 train and 5 test pretraining shards that
-        # configs/prod_q4_*.yaml train on. Compare with pre_training_dataset/dataset_files.yaml.
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5",
-        r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5",
+  r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5",
     ],
 
     # str -- path for the output statistics HDF5. Required. Overwritten if it exists.

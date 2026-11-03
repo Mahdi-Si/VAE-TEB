@@ -1674,10 +1674,10 @@ def _finished_run(output_dir: Optional[Any]) -> bool:
 #: delta, which is dumped into the run directory as the durable record; a value injected from
 #: Python would appear in no artifact.
 RUN_ARGS: Dict[str, Any] = {
-    "checkpoint": None,
-    "output_dir": None,
+    "checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_rws/2026-07-24--[20-05]-lag_attn_rws_baseline/model_checkpoints/lag-attn-rws-epoch=1324.ckpt",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_rws/2026-07-24--[20-05]-lag_attn_rws_baseline/test_results",
     "overrides": None,
-    "device": None,
+    "device": "cuda:0",
     "num_samples": None,
     "max_batches": None,
     # Which analyses run. Both keys take a comma-separated string of the names below --

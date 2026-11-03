@@ -1085,7 +1085,7 @@ RUN_ARGS: Dict[str, Any] = {
     #   verify    the pass/fail gate over the evaluation
     #   all       every stage in that order; a stage already done in `run_dir` is skipped, so "all" also resumes
     # Naming evaluate, report or verify re-runs it even when done; any stage that runs marks the later ones pending.
-    "stage": "cohort",
+    "stage": "all",
     # None or a list of "classifier.<path>=<value>" strings; each value is parsed as YAML, so numbers, lists and
     # dicts work. Anything in the config can be set this way. The ones a real run needs:
     #   ["classifier.data.kfold_root=/data/.../k_fold_cross_validation_dataset",
@@ -1111,7 +1111,7 @@ RUN_ARGS: Dict[str, Any] = {
     #   "cpu,cpu"                                                   2 folds at once on CPU
     # Each fold process starts run.num_workers loader workers (Linux only when > 0). Not part of the digest, so a run
     # can resume on other GPUs or serially.
-    "devices": None,
+    "devices": "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7",
     # evaluate only: None runs every analysis. A comma-separated subset of analysis ids runs only those, as a
     # partial look in evaluation/partial_<stamp>/ (the full evaluation, report and verify are left as they were).
     # Ids (SPEC §11.12): C cohort, metrics, R1 R2 R5 R8 R9 R10 R11 R12 ROC/PR, T1-T4 thresholds, B1 baselines,

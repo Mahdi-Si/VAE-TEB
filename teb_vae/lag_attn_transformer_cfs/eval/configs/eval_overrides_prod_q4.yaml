@@ -81,15 +81,20 @@ dataset_config:
   # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
   # instead of this `test/` directory. If it is absent, that is the reason.
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
     - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
     - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
-
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
   # `stat_path` is NOT OVERRIDDEN, deliberately, exactly as in the raw cells' delta. The
   # evaluation normalises with the statistics file the checkpoint was trained with, inherited from
   # its own resolved config, because the normalisation constants are part of the fitted model. A

@@ -1857,12 +1857,12 @@ RUN_ARGS: Dict[str, Any] = {
     "config_path": DEFAULT_CONFIG_PATH,
     # One of: tests, smoke, preflight, extract, baseline, finetune, control, evaluate, report, all.
     # Start with "tests", then "smoke", then "preflight" on real data, then "all".
-    "stage": "all",
+    "stage": "report",
     # None uses the config's device; e.g. "cuda:0" or "cpu".
-    "device": None,
+    "device": "cuda:0",
     # None creates a new run under the configured run root. Name an existing directory to resume it
     # or to regenerate its report from saved artifacts.
-    "run_dir": None,
+    "run_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs/2026-09-06--[09-34]-lag_attn_trf_cfs_baseline/test_results/latent_pilot/fold_1/seed_42/2026-09-07--[21-08-18]-43a6c35a",
     # Only meaningful together with run_dir.
     "resume": False,
     "overrides": {

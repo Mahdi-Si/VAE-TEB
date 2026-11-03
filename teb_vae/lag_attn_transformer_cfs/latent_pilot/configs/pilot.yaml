@@ -31,30 +31,57 @@ latent_pilot:
   seed: 42
 
   # null chooses cuda:0 when available and cpu otherwise. RUN_ARGS["device"] overrides this.
-  device: null
+  device: 'cuda:0'
 
   paths:
     # REPOINT_ME: the pretrained checkpoint to adapt. It is opened read-only and never rewritten;
     # the adapted weights are saved separately inside the run directory.
-    checkpoint: null
+    checkpoint: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs/2026-09-06--[09-34]-lag_attn_trf_cfs_baseline/model_checkpoints/lag-attn-trf-cfs-epoch=524 - Copy.ckpt
     # REPOINT_ME: the statistics file the checkpoint was trained under. A different one mis-scales
     # every input and invalidates the comparison, so it is a required setting rather than a default.
-    statistics: null
+    statistics: /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/stats.hdf5
     # REPOINT_ME: the fold's three splits, as lists of HDF5 shards. They are fixed splits and must
     # be disjoint -- a shard in two lists is refused. Keep the canonical subgroup basenames
     # (healthy_bg_cs, acidosis_no_cs, hie_cs, ...), which is how each shard's subgroup is recovered.
-    train_shards: []
-    val_shards: []
-    test_shards: []
+    train_shards:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+
+    val_shards:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+
+    test_shards:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-aligned-phase-2026-09-05/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+
     # Where runs are written. Any writable location: a path relative to the repository root,
     # or an absolute one on a scratch disk or results share. The only refusal is a root that
     # *contains* an input of this run (the checkpoint, the statistics file or a shard), since a
     # run creates and on resume rewrites directories underneath it. The default below is the
     # one location .gitignore already covers; point it elsewhere and the artifacts are yours to
     # keep out of the repository.
-    run_root: teb_vae/lag_attn_transformer_cfs/latent_pilot/runs
+    run_root: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs/2026-09-06--[09-34]-lag_attn_trf_cfs_baseline/test_results/latent_pilot
 
-  optim:
+#  optim:
     # DEPARTURE FROM THE DECLARED PROTOCOL, on the operator's instruction: the protocol's budget is
     # 10 epochs with patience 3, and this is 200 with patience 50. Selection is unchanged -- gates
     # first, then highest validation AUROC, ties to the lower BCE and then the earlier epoch -- so a
@@ -63,8 +90,8 @@ latent_pilot:
     # subset, so wall-clock scales with this number; and patience 50 means the run stops early only
     # after fifty consecutive epochs with no gate-eligible improvement, which on a small validation
     # split is closer to "run the budget" than to early stopping.
-    max_epochs: 200
-    patience: 50
+#    max_epochs: 200
+#    patience: 50
 
   provenance:
     # Optional, and worth supplying if they exist: text files listing the GUIDs the checkpoint was
@@ -89,45 +116,45 @@ latent_pilot:
 # The rest of the protocol, shown at its default value. These lines are COMMENTED OUT on purpose:
 # the defaults live in config.py, and a copy of them here would go stale the day one changed while
 # still looking authoritative. Uncomment a key only to depart from the declared protocol.
-#
-#   figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
-#   windows:
-#     supervised_hours: 1.0            # the supervised bag: the final hour before delivery
-#     preservation_hours: 3.0          # TRAINING: the teacher term and the forecast gate
-#     analysis_hours: null             # ANALYSIS: extraction, bins and every figure axis;
-#                                      # null means the same as preservation_hours
-#     bin_hours: 0.5                   # half-hour trajectory bins, tiling the analysis window
-#     early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
-#     segment_span_seconds: null       # null derives the stored segment span from the shards
-#   eligibility:
-#     min_late_segments: 2             # contributing segments required inside the final hour
-#     final_anchor_within_minutes: 30.0
-#   bag:
-#     halflife_hours: 0.5              # recency weighting inside the supervised hour
-#   optim:
-#     mean_head_lr: 0.0001             # posterior mean-output layers
-#     classifier_lr: 0.001             # the linear binary classifier
-#     weight_decay: 0.0001
-#     grad_clip: 1.0
-#     recordings_per_class: 4          # the batch is twice this: 4 per binary class
-#     max_epochs: 10
-#     patience: 3                      # epochs without improved eligible validation AUROC
-#     classification_weight: 1.0
-#     preservation_weight: 0.1
-#   baseline:
-#     lr: 0.001
-#     max_steps: 2000                  # a finite, logged budget for the cached-vector fit
-#     patience: 20
-#   gates:
-#     forecast_mse_max_increase: 0.10  # at most +10% full-branch forecast MSE over baseline
-#     saturation_max_increase_pp: 5.0  # at most +5 percentage points of posterior-delta saturation
-#     subset_recordings: 24            # validation recordings the gate is measured on, drawn once
-#   bootstrap:
-#     resamples: 1000                  # outcome-stratified GUID resamples
-#   mc:
-#     draws: 8                         # common random draws for the matched-policy NLL
-#     large_draws: null                # null skips the larger-draw convergence check
-#   prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
+
+  figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
+  windows:
+   supervised_hours: 1.0            # the supervised bag: the final hour before delivery
+   preservation_hours: 3.0          # TRAINING: the teacher term and the forecast gate
+   analysis_hours: null             # ANALYSIS: extraction, bins and every figure axis;
+                                    # null means the same as preservation_hours
+   bin_hours: 0.5                   # half-hour trajectory bins, tiling the analysis window
+   early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
+   segment_span_seconds: null       # null derives the stored segment span from the shards
+  eligibility:
+   min_late_segments: 2             # contributing segments required inside the final hour
+   final_anchor_within_minutes: 30.0
+  bag:
+   halflife_hours: 0.5              # recency weighting inside the supervised hour
+  optim:
+   mean_head_lr: 0.0001             # posterior mean-output layers
+   classifier_lr: 0.001             # the linear binary classifier
+   weight_decay: 0.0001
+   grad_clip: 1.0
+   recordings_per_class: 4          # the batch is twice this: 4 per binary class
+   max_epochs: 200
+   patience: 50                      # epochs without improved eligible validation AUROC
+   classification_weight: 1.0
+   preservation_weight: 0.1
+  baseline:
+   lr: 0.001
+   max_steps: 200                  # a finite, logged budget for the cached-vector fit
+   patience: 50
+  gates:
+   forecast_mse_max_increase: 0.10  # at most +10% full-branch forecast MSE over baseline
+   saturation_max_increase_pp: 5.0  # at most +5 percentage points of posterior-delta saturation
+   subset_recordings: 24            # validation recordings the gate is measured on, drawn once
+  bootstrap:
+   resamples: 1000                  # outcome-stratified GUID resamples
+  mc:
+   draws: 8                         # common random draws for the matched-policy NLL
+   large_draws: null                # null skips the larger-draw convergence check
+  prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
 #                                      # combined branch helps, so switching it off drops that claim
 #
 # ---------------------------------------------------------------------------------------------

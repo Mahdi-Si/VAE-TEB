@@ -657,16 +657,16 @@ def main(
 #: appear in neither that dump nor MLflow.
 RUN_ARGS: Dict[str, Any] = {
     "config": "teb_vae/lag_attn/eval/configs/eval.yaml",
-    "checkpoint": None,
-    "output_dir": None,
-    "device": None,
+    "checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn/2026-07-20--[11-48]-lag_attn_baseline/model_checkpoints/lag-attn-epoch=239.ckpt",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn/2026-07-22--[11-11]-lag_attn_baseline/test_results",
+    "device": "cuda:0",
     "max_samples": None,
     # Comma-separated analysis names, or None for all. Valid names are the keys of
     # ANALYSIS_FUNCTIONS: forecast, frequency_band, uplift, residual, scalars, attention, te_lag,
     # latent, kld_time_to_delivery, calibration, perm_control, lag_ablation, samples,
     # cross_subgroup. Several may be listed (e.g. "latent,kld_time_to_delivery"); `probe` and
     # `band_partition` always run and are not selectable.
-    "only": None,
+    "only": "kld_time_to_delivery",
     "skip": None,
 }
 

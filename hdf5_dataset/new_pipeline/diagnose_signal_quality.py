@@ -1221,7 +1221,7 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 RUN_ARGS: Dict[str, Any] = {
     # str -- the output_base_path of build_fold_datasets.py, built with signal_quality=True.
     #        Required.
-    "build_dir": r"/data/deid/isilon/MS_model/new_ph_dataset/minimization_folds_quality_v3",
+    "build_dir": r"/data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-50-overlap-ua-masked-2026-10-25",
     # str | None -- where the diagnosis goes.  (None -> <build_dir>/quality_diagnosis)
     "output_dir": None,
     # int | None -- the fold whose partition files are read.  (None -> 1)

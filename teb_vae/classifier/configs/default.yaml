@@ -3,7 +3,7 @@
 classifier:
   run:
     name: trf_cfs_adverse_seq
-    out_root: runs/classifier
+    out_root: /data/deid/isilon/MS_model/q3_2026/classifier
     seeds: [42]
     folds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     device: cuda:0                  # cohort, extract, evaluate; train and predict too while `devices` is empty
@@ -16,13 +16,13 @@ classifier:
     plot_frequency: 5               # → general_config.plot_frequency (ClassifierPlotCallback cadence)
 
   data:
-    kfold_root: /path/to/k_fold_cross_validation_dataset   # [OPEN] placeholder
+    kfold_root: /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset   # [OPEN] placeholder
     fold_dir: "fold_{k}"
     split_dirs: {train: train, val: val, test: test}
     subgroups: all                  # or list of shard basenames
     stride_s: auto                  # inferred; error if multimodal
     epoch_min_s: -44640             # evaluation window, s before delivery (segment start): val and test share it (L6)
-    train_epoch_min_s: null         # training window; null = epoch_min_s (e.g. -21600: train on the last 6 h only)
+    train_epoch_min_s: -44640         # training window; null = epoch_min_s (e.g. -21600: train on the last 6 h only)
     min_valid_frac: 0.1
     patient_map: null               # JSON guid -> patient id
     shared_test_policy: first_fold  # first_fold | exclude
@@ -43,7 +43,7 @@ classifier:
     task: adverse_vs_healthy
     head: binary                    # binary | multiclass | ordinal
     aux_3class_weight: 0.3          # λ3; 0 disables
-    strategy: propagate             # propagate | horizon | horizon_decay | final_only | mil
+    strategy: horizon_decay             # propagate | horizon | horizon_decay | final_only | mil
     horizon_h: 1.0                  # horizon* strategies and eval_window: horizon only
     decay_halflife_h: 0.5           # horizon_decay only
     k_warm: 0                       # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
@@ -55,7 +55,7 @@ classifier:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # signed: pre-onset time until onset (ablation)
     stage: {enabled: true}          # one flag in_ss: the segment is wholly or partly in second stage
     time_in_ss: {enabled: true}
-    delta_t: {enabled: true}
+    delta_t: {enabled: false}
     elapsed: {enabled: false}       # ablation only (§7.1)
     valid_frac: {enabled: false}    # not a model input
     covariates:
@@ -75,7 +75,7 @@ classifier:
     kind: vae                       # vae | hdf5
     vae:
       package: lag_attn_transformer_cfs
-      checkpoint: /path/to/best.ckpt
+      checkpoint: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs/2026-10-13--[21-06]-lag_attn_trf_cfs_revised/model_checkpoints/lag-attn-trf-cfs-epoch=1492.ckpt
       keys:
         - {name: mu_prior}
         - {name: delta_mu}
@@ -85,7 +85,7 @@ classifier:
       sample_z_train: false         # frozen_online only
     hdf5:
       fields: [fhr_st, fhr_ph, up_st, up_ph]
-      stats_path: /path/to/stats.hdf5
+      stats_path: /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/stats.hdf5
       trim_minutes: 1.0
       min_step: auto
     time_pool: 1
@@ -108,7 +108,7 @@ classifier:
   train:
     regime: frozen_cached           # frozen_cached | frozen_online | partial | lpft | cotrain
     unfreeze: []
-    backbone_lr: 1.0e-5
+    backbone_lr: 1.0e-3
     lpft_head_epochs: 30
     loss: {name: bce, weighting: none, beta_en: 0.999, focal_gamma: 2.0, focal_alpha: null,
            logit_adjust_tau: 1.0, label_smoothing: 0.0}
@@ -117,9 +117,9 @@ classifier:
     batch_guids: 16
     batch_segments: 256
     segment_dropout: 0.1
-    optimizer: {lr: 1.0e-3, weight_decay: 1.0e-2, betas: [0.9, 0.999]}
+    optimizer: {lr: 1.0e-4, weight_decay: 1.0e-2, betas: [0.9, 0.999]}
     schedule: {warmup_steps: 200, kind: cosine, min_lr_frac: 0.05}
-    max_epochs: 150
+    max_epochs: 1000
     ema: 0.999                      # EMAWeightAveraging; null disables
     # grad clip, early stopping, checkpointing, MLflow: advanced_config (§13.1)
     cotrain:

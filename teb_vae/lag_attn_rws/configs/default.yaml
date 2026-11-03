@@ -21,7 +21,7 @@ general_config:
   tag: lag_attn_rws_baseline
 
   seed: 42
-  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6, 7]
   # Adam's per-parameter normalisation makes the step size invariant to the ~480x loss-scale
   # change from the summed raw NLL, so the sibling's stability-tuned value transfers; the clip
   # threshold below does NOT and is scaled instead.
@@ -47,7 +47,7 @@ general_config:
     test: 128
 
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_rws
+    out_dir_base: /data/deid/isilon/MS_model/q3_2026/lag_attn_rws
 
 model_config:
   VAE_model:
@@ -350,15 +350,15 @@ dataset_config:
   # `stat_path` must be regenerated from the SAME rebuilt dataset with trim_minutes=1.0. The raw
   # fhr statistics matter here more than for the feature-target sibling: fhr is the target.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/train_dataset_no_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/test_dataset_no_cs.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/stats.hdf5
 
   dataloader_config:
     # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the

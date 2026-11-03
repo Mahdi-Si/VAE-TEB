@@ -257,21 +257,21 @@ RUN_ARGS: Dict[str, Any] = {
     # str -- each arm's best val/total_loss checkpoint, the full path. Each run directory is
     #        <out_dir_base>/<stamp>-<tag>/; the file is model_checkpoints/lag-attn-trf-cfs-epoch=NN.ckpt.
     #        The arm each checkpoint trained as is read from its own resolved config and checked.
-    "masked_checkpoint": None,
-    "control_checkpoint": None,
+    "masked_checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_masked/model_checkpoints/lag-attn-trf-cfs-epoch=29.ckpt",
+    "control_checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_no_quality_mask/model_checkpoints/lag-attn-trf-cfs-epoch=29.ckpt",
 
     # ============================== The output folders ==============================
     # str -- one folder per arm and one for the comparison; three different paths.
-    "masked_output_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_masked",
-    "control_output_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_no_quality_mask",
-    "comparison_output_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_quality_arms_comparison",
+    "masked_output_dir": r"//data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_masked",
+    "control_output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_no_quality_mask",
+    "comparison_output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/comparison",
 
     # ========================= Everything below has a default =========================
     # str | None -- the evaluation override file both arms use.  (None -> eval_overrides_prod_q4.yaml)
     "overrides": None,
     # str | None -- one device per arm.  (None -> "cuda:0" and "cuda:1")
-    "masked_device": None,
-    "control_device": None,
+    "masked_device": "cuda:0",
+    "control_device": "cuda:1",
     # bool | None -- True evaluates one arm after the other on its own device.  (None -> parallel)
     "sequential": None,
     # str | None -- e.g. "compare" to re-run only the comparison on finished evaluations, or

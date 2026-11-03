@@ -19,7 +19,7 @@
 general_config:
   tag: lag_attn_trf_patch_baseline
   seed: 42
-  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  cuda_devices: [1, 2, 3, 4, 5, 6, 7]
   lr: 0.0003
   lr_milestone: [80, 110]  # epochs; x0.1 each. The first run plateaued at epoch ~60 on a flat LR.
   lr_warmup_steps: 2000
@@ -30,7 +30,7 @@ general_config:
     train: 128
     test: 128
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_patch
+    out_dir_base: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_patch
 
 model_config:
   VAE_model:
@@ -113,12 +113,13 @@ model_config:
 dataset_config:
   # The CFS shard paths: any existing build works, since only fhr, up and weight are read.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/pre_training_dataset/train_dataset_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_no_cs.hdf5
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/stats.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/pre_training_dataset/test_dataset_cs.hdf5
+
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/stats.hdf5
   dataloader_config:
     num_workers: 8
     prefetch_factor: 4

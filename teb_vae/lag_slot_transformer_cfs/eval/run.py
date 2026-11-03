@@ -211,10 +211,10 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: durable record; a value injected from Python would appear in no artifact and could not be
 #: recovered from the output afterwards.
 RUN_ARGS: Dict[str, Any] = {
-    "checkpoint": None,
-    "output_dir": None,
+    "checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_slot_transformer_cfs/2026-09-20--[19-50]-lag_residual_trf_cfs_baseline_lag_100/model_checkpoints/lag-residual-trf-cfs-epoch=385 - Copy.ckpt",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_slot_transformer_cfs/2026-09-20--[19-50]-lag_residual_trf_cfs_baseline_lag_100/test_results/midcheck",
     "overrides": None,
-    "device": None,
+    "device": 'cuda:0',
     "num_samples": None,
     "max_batches": None,
     # Which analyses run. Both keys take a comma-separated string of registered names and both

@@ -1161,17 +1161,17 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 RUN_ARGS: Dict[str, Any] = {
     # ================================ FILL IN: the paths ================================
     # str -- the output_dir of build_minimization_folds.py (fold_partitions.csv, ...). Required.
-    "fold_dir": r"/path/to/minimization_folds_k10",
+    "fold_dir": r"/data/deid/isilon/MS_model/new-pickles",
 
     # str -- guid_screening_results.csv of the pipeline run the pool came from. Required.
-    "screening_csv_path": r"/data/deid/isilon/MS_model/new_ph_dataset/guid_screening_results.csv",
+    "screening_csv_path": r"/data/deid/isilon/MS_model/new-pickles/guid_screening_results.csv",
 
     # str -- CSV with the labour-onset and second-stage columns. Required.
-    "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
+    "tlo_csv_path": r"/data/deid/datafabric/fetal-heart-tracing/processing/labor_onset/labor_onset_by_dataset.csv",
 
     # str -- a NEW directory for the whole build. Required. A rerun into the same directory
     #        with the same fold folder skips every finished file.
-    "output_base_path": r"/data/deid/isilon/MS_model/new_ph_dataset/minimization_folds_quality_v4",
+    "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27",
 
     # ============================= The variant to build =============================
     # Same values and meanings as RUN_ARGS in create_new_pipeline.py.
@@ -1188,7 +1188,7 @@ RUN_ARGS: Dict[str, Any] = {
     #          on this box). Needs its OWN output_base_path and statistics file.
     "signal_quality": True,
     # int | None -- example pages per category in quality_report/; 0 draws none.  (None -> 4)
-    "quality_examples": 4,
+    "quality_examples": 100,
 
     # ================================ What to build ================================
     # list[str] | None -- any of "pretraining", "kfold".  (None -> both)
@@ -1197,7 +1197,7 @@ RUN_ARGS: Dict[str, Any] = {
     # list[str] | None -- one transform process per entry, e.g. ["cuda:0", "cuda:1", "cuda:2"].
     #        A device may repeat, which runs two processes on it.
     #        (None -> one process on the first CUDA device, else the CPU)
-    "devices": None,
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5","cuda:6", "cuda:7"],
 
     # "eligible_3h" | "screened"    (None -> "eligible_3h")
     #   "eligible_3h" : >= 3 h valid signal in the last 6 h, the classification pool's rule.
@@ -1224,7 +1224,7 @@ RUN_ARGS: Dict[str, Any] = {
     #        (None -> False)
     "keep_units": None,
     # bool | None -- plan only: pickle, manifest and GUID lists, no transform.  (None -> False)
-    "dry_run": True,
+    "dry_run": False,
 }
 
 

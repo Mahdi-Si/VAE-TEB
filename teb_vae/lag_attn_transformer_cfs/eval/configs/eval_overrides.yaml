@@ -74,14 +74,20 @@ dataset_config:
   # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
   # instead of this `test/` directory. If it is absent, that is the reason.
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
 
   # `stat_path` is NOT OVERRIDDEN, deliberately, exactly as in the raw cells' delta. The
   # evaluation normalises with the statistics file the checkpoint was trained with, inherited from
@@ -158,7 +164,7 @@ dataset_config:
       # looks for it and because the reason is different under evaluation. Under training the cache
       # is per-worker; at num_workers: 0 it becomes main-process RAM, and it is FIFO with no reuse
       # policy, so against a test split larger than the cache it thrashes and buys nothing.
-      cache_size: 0
+      cache_size: 10000
 
       # Not restated, deliberately. `num_workers` is forced to 0 in code with a warning (spawn
       # workers over a multi-file HDF5 dataset silently truncate every pass after the first).
@@ -294,8 +300,8 @@ eval_config:
     waveforms: 64
     attention: 64
     pages: 24
-    pages_per_class: 10
-    traces_per_class: 10
+    pages_per_class: 20
+    traces_per_class: 20
     attribution_segments: 144
     attribution_segments_per_recording: 4
     attribution_cohort_segments: 150
@@ -429,7 +435,7 @@ eval_config:
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;
   # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the
   # heatmap-bearing pages stay raster inside an `svg` and those files get large.
-  figure_format: null
+  figure_format: pdf
 
   # How far before delivery a segment may be recorded and still be evaluated, in hours. `4.0`
   # keeps only the last four hours of each recording; `null` -- the shipped setting -- evaluates
@@ -449,4 +455,4 @@ eval_config:
   # and to the per-recording traces (recording_traces and the attribution traces), which then
   # trace, count and rank only the segments recorded inside the window. Analyses with no
   # time-before-delivery axis -- forecast, calibration, latent -- are unaffected.
-  max_hours_before_delivery: null
+  max_hours_before_delivery: 12

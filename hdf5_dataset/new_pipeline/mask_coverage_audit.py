@@ -1480,7 +1480,7 @@ RUN_ARGS: Dict[str, Any] = {
 
     # str -- a folder for mask_coverage_audit.json and mask_coverage_audit.md; created if absent.
     #        A relative path resolves against the repository root. Required.
-    "output_dir": r"output/mask_coverage_audit",
+    "output_dir": r"/data/deid/isilon/MS_model/new-pickles/mask-audit",
 
     # str | None -- the model config whose geometry, channels and masks are audited.
     #        (None -> teb_vae/lag_attn_transformer_cfs/configs/default.yaml)
