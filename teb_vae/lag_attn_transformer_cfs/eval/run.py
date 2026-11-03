@@ -218,6 +218,15 @@ RUN_ARGS: Dict[str, Any] = {
     # because replacing both history encoders changes what produces the numbers and not which
     # numbers there are. ``teb_vae/lag_attn_cfs/eval/run.py`` documents what each one answers, and
     # a second gloss here would be a second thing to keep true.
+    #
+    # Valid names for both keys, in registry order (a snapshot of ``ANALYSES``; ``--help`` prints
+    # the live list if the registry changes):
+    #   forecast, coupling, perm_control, latent, lag_kl, attention, calibration, residual,
+    #   distributions, trajectory, time_to_delivery, second_stage, events, sufficiency, samples,
+    #   recording_traces, warmup, source_null, time_shift, occlusion, lag_clocks, lag_kld_scaled,
+    #   lag_high_kl, spectral_skill, attribution, cross_subgroup
+    # Not valid for either key: band_partition (always runs).
+    # Example: "only": "samples,recording_traces"  or  "skip": "attribution,occlusion"
     "only": None,
     "skip": None,
 }
