@@ -200,8 +200,8 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 RUN_ARGS: Dict[str, Any] = {
     # The quality-mask experiment: use eval/run_quality_arms.py instead. It takes both arms'
     # checkpoints and output folders by exact path and runs this module once per arm.
-    "checkpoint": None,
-    "output_dir": None,
+    "checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-29--[20-54]-lag_attn_trf_cfs_revised/model_checkpoints/lag-attn-trf-cfs-epoch=376 - Copy.ckpt",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-29--[20-54]-lag_attn_trf_cfs_revised/test_results/376",
     # The 2026-10-27 build's fold-1 test files and the loader masks that give every arm the
     # per-anchor quality labels. Both arms use this file.
     "overrides": "teb_vae/lag_attn_transformer_cfs/eval/configs/eval_overrides_prod_q4.yaml",

@@ -44,14 +44,18 @@ dataset_config:
   # all eight subgroups and all three clinical classes, not healthy-only. The pretraining split
   # remains usable -- override `vae_test_datasets` back to it in a variant config.
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
 
   dataloader_config:
     # Forced to 0, and re-forced in code with a warning if a variant config raises it.

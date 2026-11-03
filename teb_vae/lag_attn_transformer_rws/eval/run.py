@@ -185,10 +185,10 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: record; a value injected from Python would appear in no artifact. In particular
 #: ``caps.encoder_attention`` lives there -- absent, this model's own analysis records a skip.
 RUN_ARGS: Dict[str, Any] = {
-    "checkpoint": None,
-    "output_dir": None,
+    "checkpoint": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_rws/lag_attn_transformer_rws/2026-07-30--[20-00]-lag_attn_trf_rws_baseline/model_checkpoints/lag-attn-trf-rws-epoch=1004-Copy.ckpt",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_rws/lag_attn_transformer_rws/2026-07-30--[20-00]-lag_attn_trf_rws_baseline/test_results",
     "overrides": None,
-    "device": None,
+    "device": "cuda:0",
     "num_samples": None,
     "max_batches": None,
     # Which analyses run. Both keys take a comma-separated string of the names below --

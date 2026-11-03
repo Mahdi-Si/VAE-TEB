@@ -63,11 +63,11 @@ general_config:
   tag: lag_attn_trf_crws_baseline
 
   seed: 42
-  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  cuda_devices: [1, 2, 3, 4, 5, 6, 7]
   # Adam's per-parameter normalisation makes the step size invariant to the ~480x loss-scale
   # change from the summed raw NLL, so the comparison models' stability-tuned value transfers; the
   # clip threshold below does NOT and is re-derived for this encoder.
-  lr: 0.0003
+  lr: 0.000003
   # Singular; the experiment driver reads this exact key. Decay is x0.1 per milestone.
   #
   # Deliberately LATER than the raw-signal siblings' [60, 120], and the reason is the beta ramp
@@ -94,13 +94,13 @@ general_config:
   epochs: 5000
   accumulate_grad_batches: 1
   batch_size:
-    train: 128
-    test: 128
+    train: 328
+    test: 328
 
   folders_config:
     # IDENTITY, not a preference: a shared output tree makes two models' runs indistinguishable by
     # the only field anything indexes on.
-    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_crws
+    out_dir_base: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_crws
 
 model_config:
   VAE_model:
@@ -114,7 +114,7 @@ model_config:
     beta_schedule:
       kind: linear_warmup
       start: 0.0
-      end: 1.0
+      end: 15.0
       warmup_epochs: 50
     # nats per latent dim per step; 0.0 disables the floor. Deliberately zero: a positive floor
     # is a laundering subsidy the raw-signal sibling measured (KL filled whether or not it is
@@ -153,7 +153,7 @@ model_config:
 
     # Reconstruction weighting: base and full at unit weight, per the objective's definition.
     lambda_full: 1.0
-    lambda_base: 1.0
+    lambda_base: 0.1
 
     # --- Auxiliary shape terms --------------------------------------------------
     # Three shape penalties on the forecast MEANS of both branches, added to the criterion beside
@@ -485,7 +485,7 @@ model_config:
     # a training-cost change that belongs with a run rather than with this key.
     #
     # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
-    causal_align_reference: 42.21
+    causal_align_reference: null # 42.21
 
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.
@@ -722,18 +722,18 @@ dataset_config:
   # channels would not, and it would train to completion on inputs containing their own future
   # while every number below reported a model whose inputs do not.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_12h_causal_aligned/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_12h_causal_aligned/pre_training_dataset/train_dataset_no_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_12h_causal_aligned/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_12h_causal_aligned/pre_training_dataset/test_dataset_no_cs.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
   # It must be generated from the SAME causal shards: the feature statistics exclude the warm-up
   # region, and a two-sided stats file would both mis-normalise the inputs and destroy the
   # source-null control's premise that zero is the channel mean over the region the model reads.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_12h_causal_aligned/stat.hdf5
 
   dataloader_config:
     # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
@@ -781,7 +781,7 @@ dataset_config:
       # 0: the FIFO cache stores fully processed samples (~240 KB each, so 10000 held ~2.4 GB
       # PER WORKER), and under the DistributedSampler's per-epoch reshuffle a worker almost
       # never re-sees a cached index -- the RAM bought near-zero hits.
-      cache_size: 0
+      cache_size: 10000
       # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only
       # warns. The whole raw-index geometry (forecast of anchor t starts at 16*(t+1)) assumes
       # this trimmed grid.

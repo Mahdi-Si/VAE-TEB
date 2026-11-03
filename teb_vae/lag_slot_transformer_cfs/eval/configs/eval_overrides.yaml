@@ -49,14 +49,20 @@ dataset_config:
   # contrast is an out-of-distribution comparison rather than held-out discrimination. Both facts
   # are recorded in every summary's cohort block.
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
 
   # REPOINTED, and this one is load-bearing rather than a convenience. The causal statistics are
   # accumulated EXCLUDING each channel's warm-up region, so a standardized zero is the channel mean
@@ -69,7 +75,7 @@ dataset_config:
   # Regenerate it with `hdf5_dataset/calculate_dataset_stats.py` from THESE shards at the run's own
   # `trim_minutes`. Note the key is `stat_path` while the loader parameter is `stats_path`: a
   # typo'd `stats_path:` here yields None and silently disables normalization.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/one-sided-causal-p5-overlap-aligned-phase-2026-09-15/stats.hdf5
 
   dataloader_config:
     dataset_kwargs:

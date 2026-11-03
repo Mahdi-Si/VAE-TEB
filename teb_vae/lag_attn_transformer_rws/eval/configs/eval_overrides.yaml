@@ -61,14 +61,19 @@ dataset_config:
   # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
   # instead of this `test/` directory. If it is absent, that is the reason.
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+
 
   dataloader_config:
     dataset_kwargs:

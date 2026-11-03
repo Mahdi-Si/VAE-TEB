@@ -1246,7 +1246,7 @@ RUN_ARGS: Dict[str, Any] = {
     "build_dir": r"/data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27",
 
     # str | None -- where the report goes.  (None -> <build_dir>/paper_cohort_stats)
-    "output_dir": None,
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/cohort",
 
     # str | None -- the inputs; None takes each path from build_manifest.json. Set one when
     #        the build was moved and the manifest path no longer exists.

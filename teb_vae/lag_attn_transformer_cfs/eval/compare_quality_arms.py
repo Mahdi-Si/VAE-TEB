@@ -315,11 +315,11 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
 RUN_ARGS: Dict[str, Any] = {
     # ================================ FILL IN: the paths ================================
     # str -- the masked arm's eval output directory (the --output-dir given to eval/run.py).
-    "masked_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_masked",
+    "masked_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_masked",
     # str -- the control arm's eval output directory.
-    "control_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_eval_no_quality_mask",
+    "control_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_no_quality_mask",
     # str -- where quality_arms_comparison.json and .md go. Aggregates only: safe to send.
-    "output_dir": r"/data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_transformer_cfs/q4_quality_arms_comparison",
+    "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/comparison",
     # ========================= Everything below has a default =========================
     # float | None -- seconds after a contraction onset that count as `event`.  (None -> 220)
     "event_window_s": None,

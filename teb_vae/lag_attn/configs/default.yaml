@@ -43,11 +43,11 @@ general_config:
   epochs: 5000
   accumulate_grad_batches: 1
   batch_size:
-    train: 128
-    test: 128
+    train: 40
+    test: 40
 
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn
+    out_dir_base: /data/deid/isilon/MS_model/q3_2026/lag_attn
 
 model_config:
   VAE_model:
@@ -71,7 +71,7 @@ model_config:
     beta_schedule:
       kind: linear_warmup
       start: 1.0e-4
-      end: 0.1
+      end: 0.001
       warmup_epochs: 50
     kld_beta: 0.001        # fallback when beta_schedule.kind == constant
     # nats per latent dim per step; 0.0 disables. Lowered 0.1 -> 0.01 after the 2026-07 baseline:
@@ -82,7 +82,7 @@ model_config:
     # against total early collapse (with the zero-KL-at-init design and the beta warmup, collapse
     # risk is low) without subsidising 2.4 nats of source-agnostic KL. Retune against kld_raw and
     # the prediction-space control (feat_loss < base_loss < feat_loss_shuffled).
-    free_bits: 0.01
+    free_bits: 0.1
 
     # --- Reconstruction likelihood --------------------------------------------
     # `sigma_obs: learned` makes the loss consume the decoder logvar_full/logvar_base heads, giving
@@ -276,7 +276,7 @@ model_config:
     encoder:
       extra_dilations: [8, 16]
 
-  core_model_checkpoint: null
+  core_model_checkpoint: /data/deid/isilon/MS_model/q3_2026/lag_attn/2026-07-20--[11-48]-lag_attn_baseline/model_checkpoints/lag-attn-epoch=238.ckpt # /data/deid/isilon/MS_model/q3_2026/lag_attn/2026-07-19--[10-05]-lag_attn_baseline/model_checkpoints/lag-attn-epoch=25.ckpt
 
 
 dataset_config:
@@ -290,15 +290,15 @@ dataset_config:
   # an old one fails deep inside normalize_tensor_data (IndexError when the stats are wider than
   # the data, a broadcast RuntimeError when narrower), naming neither the field nor the cause.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/train_dataset_no_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/pre_training_dataset/test_dataset_no_cs.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/stats.hdf5
 
   dataloader_config:
     # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
