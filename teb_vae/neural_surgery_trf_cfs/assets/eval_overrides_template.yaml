@@ -1,0 +1,70 @@
+general_config:
+  batch_size:
+    test: 32
+dataset_config:
+  vae_test_datasets:
+  - <DATA>
+  dataloader_config:
+    dataset_kwargs:
+      load_fields:
+      - fhr
+      - up
+      - fhr_st
+      - fhr_ph
+      - up_ph
+      - up_st
+      - weight
+      - guid
+      - epoch
+      - target
+      - cs_label
+      - bg_label
+      - time_from_labor_onset
+      - second_stage_onset
+      cache_size: 0
+      emit_quality_mask: true
+      ua_step_mask:
+        bits: invalid
+        rho_epsilon: 0.1
+        hold_steps: 0
+      fhr_step_mask:
+        bits: invalid
+        rho_epsilon: null
+        hold_steps: 0
+  stat_path: <STATS>
+eval_config:
+  seed: 42
+  num_mc_samples: 8
+  max_samples: null
+  caps:
+    waveforms: 64
+    attention: 64
+    pages: 24
+    pages_per_class: 10
+    traces_per_class: 10
+    attribution_segments: 144
+    attribution_segments_per_recording: 4
+    attribution_cohort_segments: 150
+    attribution_strata_segments: 72
+    occlusion: 512
+    time_shift: 512
+  prior_shuffle_min_nats: 1.0
+  min_active_dims: 2
+  event_lag_window_s: null
+  bootstrap_resamples: 2000
+  clock_margin_min_nats: null
+  occlusion_bands:
+    anchor:
+    - 0
+    - 4
+    near:
+    - 5
+    - 14
+    mid:
+    - 15
+    - 24
+    far:
+    - 25
+    - 37
+  figure_format: null
+  max_hours_before_delivery: null
