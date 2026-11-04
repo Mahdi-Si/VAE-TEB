@@ -3,7 +3,7 @@
 :class:`PatchSummaryTarget` sets the decoder width to 2, owns ``compute_loss`` (the shared raw
 objective at ``block_width=2``) and admits the persistence residual. The loss target and the
 persistence input both go through :meth:`PatchSummaryTarget._standardized_summaries`, so the model
-has one definition of the target (B.10 item 7). The AR(1) parameter and three helpers are bound by
+has one definition of the target. The AR(1) parameter and three helpers are bound by
 reference from the feature-target mixins; none of them reads a feature-specific attribute here.
 """
 from __future__ import annotations

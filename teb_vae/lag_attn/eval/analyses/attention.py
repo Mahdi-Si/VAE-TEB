@@ -27,7 +27,7 @@ offset term.
 
 **The figures carry no caption prose.** A title names what is drawn, the axis labels carry the
 quantity and its unit, and the one caveat a reader needs to read the argmax panel is a single
-footnote line. The reading guide is ``FIGURE_GUIDE.md``.
+footnote line.
 """
 from __future__ import annotations
 
@@ -232,7 +232,7 @@ def _write_summary_figure(frame: pd.DataFrame, lag_columns: list, directory: Pat
             reference_label="identical heads",
         )
         # The one reading a reader of the argmax panel must not get wrong; the entropy that
-        # decides it is in ``per_sample.csv`` and the full argument is in ``FIGURE_GUIDE.md``.
+        # decides it is in ``per_sample.csv``.
         figures.footnote(figure, ARGMAX_NOTE)
         return str(figures.render_figure(figure, directory / "attention"))
     finally:

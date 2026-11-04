@@ -1,4 +1,4 @@
-r"""Per-channel spread and effective rank of a frozen feature cache (SPEC §8.4, §8.5; the 2026-10-07 diagnosis).
+r"""Per-channel spread and effective rank of a frozen feature cache.
 
     python -m teb_vae.classifier.feature_rank --cache-dir runs/classifier_cache/<hash> \
         [--sample-segments 4096] [--sample-steps 200000] [--seed 0] [--out report.json]
@@ -8,8 +8,7 @@ or edit :data:`RUN_ARGS` at the bottom and press Run. Reads ``features.h5`` (``v
 of valid steps:
 
 * the per-channel standard deviation (min, median, max) and how many channels sit under the scale floor the scaler
-  would use, ``max(1e-3, 0.1 x median positive std over every channel)`` (§8.5): the 2026-10-07 cache had 60 of 64
-  ``delta_mu`` channels there;
+  would use, ``max(1e-3, 0.1 x median positive std over every channel)``;
 * the effective rank of the key's block, ``exp(entropy)`` of the normalised eigenvalues of its correlation matrix
   (channels z-scored) and of its raw covariance, and the components that carry 90 % and 99 % of the variance.
 
@@ -117,7 +116,7 @@ def main(*, cache_dir: str, sample_segments: int = 4096, sample_steps: int = 200
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Per-channel spread and effective rank of a feature cache (SPEC §8.5).")
+    parser = argparse.ArgumentParser(description="Per-channel spread and effective rank of a feature cache.")
     parser.add_argument("--cache-dir", dest="cache_dir", help="the <cache_root>/<fingerprint hash>/ directory")
     parser.add_argument("--sample-segments", dest="sample_segments", type=int)
     parser.add_argument("--sample-steps", dest="sample_steps", type=int)

@@ -2,8 +2,9 @@
 #
 # The budget the design was costed against: its maximum delay is exactly 30 steps, which is
 # exactly the shipped warmup_period, so this is the largest finite budget that fits the shipped
-# warm-up. Everything else is inherited from default.yaml, so this arm differs from the shipped
-# configuration in exactly one resolved key.
+# warm-up. Restates the shipped value on purpose: the arm stays pinned at 120 even if default.yaml
+# is later revised. While default.yaml still ships 120, the arm resolves to an empty delta and the
+# baseline run stands in for it.
 #
 # Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
 #

@@ -1,4 +1,4 @@
-# Source ablation (SPEC §17 item 1): the ST/PH coefficients and mu_prior side by side (source.kind vae+hdf5, §8.2).
+# Source ablation: the ST/PH coefficients and mu_prior side by side (source.kind vae+hdf5).
 # Both sides must read one stats file: source.hdf5.stats_path is the checkpoint's own; the source refuses otherwise.
 base: regularised.yaml
 

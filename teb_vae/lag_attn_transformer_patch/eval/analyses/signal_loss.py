@@ -1,4 +1,4 @@
-r"""``signal_loss`` -- how FHR signal loss (``missing`` tokens) moves the latent and the forecast (E1-L).
+r"""``signal_loss`` -- how FHR signal loss (``missing`` tokens) moves the latent and the forecast.
 
 **Question.** Observational gap fraction against KL, logvar and NLL, plus an interventional
 gap-injection sweep: across a gap, does the model fall back to the prior (KL down) or inflate its
@@ -14,7 +14,7 @@ variance?
   ``logvar_prior``/``logvar_post`` at ``a`` (this forward), and ``nll_full_block``/``pred_gap`` joined
   from ``per_anchor.parquet`` by ``(guid, epoch, anchor)``. Binned curves (median, IQR; a bin with
   fewer than :data:`MIN_BIN_ANCHORS` anchors is blank) and pooled Spearman ρ. ``missing_occurrence``
-  says how often ``missing`` appears in the draw: the embedding is rarely trained (DESIGN.md §4).
+  says how often ``missing`` appears in the draw, which bounds how often its embedding is trained.
 * **Interventional.** On the drawn segments with no ``missing`` token at all (cap
   ``signal_loss_inject_segments``, default :data:`DEFAULT_INJECT_SEGMENTS`), at :data:`ANCHORS_PER_SEGMENT`
   anchors spread over the segment, ``weight`` is set to 0 over a contiguous FHR span of

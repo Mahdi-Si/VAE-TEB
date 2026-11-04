@@ -624,10 +624,6 @@ class _Collector:
         load-bearing column -- restricting the coupling readout to anchors a contraction could
         still be influencing is a comparison a per-segment mean cannot express.
 
-        The onset is taken on the **stored** timeline, which the preprocessing has already
-        advanced UP by $20\,$s on. Adding that back would double-count a correction that was made
-        once, deliberately, upstream.
-
         Args:
             batch: The batch, for its raw ``up`` and its ``weight``.
             batch_size: Samples in the batch.

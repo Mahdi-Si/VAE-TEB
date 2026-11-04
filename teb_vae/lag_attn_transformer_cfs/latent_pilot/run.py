@@ -1405,7 +1405,7 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
         "checkpoint": dict(preflight.get("checkpoint") or {}),
         # Deliberately NOT filed under `geometry` as "invariants": this is `apply_adapted`'s
         # record of which tensors were copied into the bundle -- names, count, selected epoch,
-        # source digest -- and not a measurement of the section 5.1 invariance of `mu_prior`, the
+        # source digest -- and not a measurement of the invariance of `mu_prior`, the
         # two log-variances and the attention weights. Those are checked by
         # `model.assert_invariants` in the contract tests; no stage of a run measures them, and a
         # key named for them here would imply one did.

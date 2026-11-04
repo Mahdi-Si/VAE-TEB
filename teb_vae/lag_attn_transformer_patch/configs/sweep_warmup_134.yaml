@@ -1,4 +1,4 @@
-# Arm (plan B.9): Is any gain from the representation, or from 76% more anchors?
+# Arm: Is any gain from the representation, or from 76% more anchors?
 base: default.yaml
 
 general_config:

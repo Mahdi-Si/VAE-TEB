@@ -359,7 +359,7 @@ _SOURCE_REFERENCE = 288.2672
 
 @pytest.fixture
 def dual_reference_kwargs() -> Dict[str, Any]:
-    """The constructor kwargs the shipped dual-clock configuration produces."""
+    """The constructor kwargs the dual-clock configuration produces."""
     return _StubTrainer(
         causal_config(
             causal_align_reference="target_max",

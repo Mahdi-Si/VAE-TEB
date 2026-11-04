@@ -23,11 +23,10 @@ against ``lag_attn_fs`` is attributable to the encoder alone and a difference ag
 can be read at a fixed value of the other, which is what neither of the two three-cell
 configurations allowed.
 
-**What it is not.** ``lag_attn_rws/PRIOR_SCALE_AND_PREDICTIVE_GAP.md`` section 5 establishes that
-the raw models' held-out predictive gain is negative because the source pathway does not generalise
--- a failure living in the source encoder, the lag attention and the posterior fusion, none of
-which an encoder swap of this kind touches. This model is expected to reproduce it. Its value is
-that it removes a confound, and it must not be read as a fix for one.
+**What it is not.** A source pathway that does not generalise is a failure that lives in the
+source encoder, the lag attention and the posterior fusion. This encoder swap leaves the source
+pathway's role unchanged, so it cannot fix such a failure. Its value is that it removes a
+confound, and it must not be read as a fix for one.
 
 Layout::
 

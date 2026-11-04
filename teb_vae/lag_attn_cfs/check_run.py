@@ -1,10 +1,10 @@
-r"""Score a finished run against the criteria its record registered, by code rather than by eye.
+r"""Score a finished run against its pre-registered criteria, by code rather than by eye.
 
-``RESULTS.md`` registers its criteria **before** the run, in two tiers, and the distinction is the
-whole point of the document: tier 1 asks whether the machinery did what it was built to do and a
-failure there voids the run; tier 2 is the science, has no prior against which a threshold could
-have been calibrated, and is therefore *reported and interpreted* rather than passed or failed. This
-module is that reading, executed.
+The criteria are fixed **before** the run, in two tiers, and the distinction is the whole point:
+tier 1 asks whether the machinery did what it was built to do and a failure there voids the run;
+tier 2 is the science, has no prior against which a threshold could have been calibrated, and is
+therefore *reported and interpreted* rather than passed or failed. This module is that reading,
+executed.
 
 .. code-block:: bash
 
@@ -31,17 +31,16 @@ value outside any of them means the run measured something other than what its c
 or cannot be attributed to a configuration at all, so no tier-2 number from it is worth reading --
 which is why the exit code follows tier 1 alone and never a tier-2 value.
 
-**The arm criterion exists because the failure it catches has happened.** The driver builds a run's
-model kwargs by sweeping ``inspect.signature(MODEL_CLS.__init__)`` and silently drops any key the
-class does not re-list, and a run whose config named one arm has already been read afterwards as
-another. Nothing in a metric history distinguishes the two, so the only defence is that the resolved
+**The arm criterion catches a silent failure.** The driver builds a run's model kwargs by
+sweeping ``inspect.signature(MODEL_CLS.__init__)`` and silently drops any key the class does not
+re-list, so a run whose config named one arm can train another. Nothing in a metric history distinguishes the two, so the only defence is that the resolved
 configuration state every switch and that the run's identity keys name the arm -- which is what this
 criterion asserts, and it asserts it while the run is still going, when relaunching is still cheap.
 
 **The anchor band is derived, never assumed.** ``anchors_per_sample`` is compared against
 $\lceil (T_{\mathrm{valid}} - F)/S \rceil$ and its phase-dependent floor, computed from the run's
-own ``resolved_config.yaml``. Hard-coding one geometry's $[4, 5]$ and $136$ would make the checker
-pass a run at another horizon, floor or stride for the wrong reason -- and the arms that move all
+own ``resolved_config.yaml``. Hard-coding one geometry's band and dense anchor count would make
+the checker pass a run at another horizon, floor or stride for the wrong reason -- and the arms that move all
 three ship in ``configs/``.
 
 **This module is not the evaluation, and the two answer different questions.**
@@ -52,9 +51,8 @@ bootstrap intervals and ten pre-registered verdicts. This module reads
 configured dataset, as per-epoch means with no denominator and no interval on anything. The
 difference that matters operationally is when each can be run: this one needs no checkpoint, no
 shard and no ``torch``, so it works **while a run is still in flight**, which is what it was built
-for; the gate needs a finished checkpoint and a completed evaluation pass. Two green checks that
-answer two questions are only confusing if nothing says so, so both ``DESIGN.md`` §16 and
-``eval/EVAL.md`` carry the same pairing in the other direction.
+for; the gate needs a finished checkpoint and a completed evaluation pass. A green result here
+does not imply a green gate, and the reverse holds too.
 """
 from __future__ import annotations
 
@@ -124,7 +122,7 @@ TIER_TWO_METRICS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("shuffle_penalty", ("val",)),
     ("source_lag_warmth_frac_st", STAGES),
     ("source_lag_warmth_frac_ph", STAGES),
-    # The two event mechanisms' readouts (2026-10-13). Their *bands* are criterion 7; what they
+    # The two event mechanisms' readouts. Their *bands* are criterion 7; what they
     # read inside the band -- how much of the timeline the detector calls active, and how far the
     # gate has closed from its open seed -- is a reading rather than a gate.
     ("event_anchor_frac", STAGES),
@@ -135,9 +133,7 @@ TIER_TWO_METRICS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 #: ``event_weight_floor``. Below the floor of the band the contraction detector found (almost) no
 #: contraction on these shards, so the full branch is being trained on (almost) nothing and the
 #: run should be stopped and the UP traces inspected; above its ceiling the detector called
-#: (almost) every anchor active and the weight is inert. On the committed causal fixture the
-#: shipped reach gives $0.41$ to $0.95$ per segment; a production batch of 128 segments averages
-#: well inside. Not a tier-2 reading: a value outside this band means the mechanism the
+#: (almost) every anchor active and the weight is inert. Not a tier-2 reading: a value outside this band means the mechanism the
 #: configuration states is not the one that trained.
 EVENT_ACTIVE_BAND: Tuple[float, float] = (0.05, 0.95)
 
@@ -149,8 +145,7 @@ EVENT_WEIGHT_FLOOR_PATH = "model_config.VAE_model.event_weight_floor"
 EVENT_GATE_PATH = "model_config.VAE_model.posterior_event_gate"
 
 #: The two checkpoint criteria, by the metric each selects on. The composite optimum and the best
-#: conditioned forecast are different epochs -- $336$ against $278$ on the diagnosed run -- so a run
-#: that writes only one of them is keeping the wrong weights for one of the two questions. Reported
+#: conditioned forecast can fall on different epochs, so a run that writes only one of them is keeping the wrong weights for one of the two questions. Reported
 #: as the epoch each is minimised at, which is what says whether the two really did diverge and by
 #: how much; not gated, because how far apart they *should* sit is exactly what has no prior.
 CHECKPOINT_MONITORS: Tuple[str, ...] = (
@@ -462,8 +457,8 @@ def check_gap_recomposition(rows: Sequence[Dict[str, str]]) -> Verdict:
     r"""Criterion 4: the two channel-axis splits of the forecast gap agree with each other.
 
     Compared **split against split** rather than either against ``pred_gap``, deliberately.
-    ``pred_gap`` is ``nll_base_block - nll_full_block``, a difference of two order-$10^{3}$ sums over
-    $2940$ coefficients, so it loses several decimal digits to cancellation *before* any split is
+    ``pred_gap`` is ``nll_base_block - nll_full_block``, a difference of two large sums over
+    $H \cdot C_{\mathrm{keep}}$ coefficients ($760$ at the shipped geometry), so it loses several decimal digits to cancellation *before* any split is
     formed; the two splits difference the same per-element scores elementwise and agree to float32
     noise, while neither agrees with ``pred_gap`` to $10^{-6}$.
 

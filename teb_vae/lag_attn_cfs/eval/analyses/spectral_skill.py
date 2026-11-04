@@ -513,7 +513,7 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    figure, axes = figures.new_figure(2, height_per_row=figures.PANEL_HEIGHT + 0.3)
     # The band KEY stays in the column names and the summary rows; only the drawn label changes.
     labelled = {
         f"{shared.band_display_label(row['band'])} ({int(row['n_channels'])} ch)": finite_column(

@@ -1,6 +1,5 @@
-"""P4-06: every shipped config reaches the model or the task, the pre-flight refuses the removed
-keys by name, and no config drifts from its reference beyond its declared delta (plan B.5, B.8,
-B.9).
+"""Every shipped config reaches the model or the task, the pre-flight refuses the removed keys by
+name, and no config drifts from its reference beyond its declared delta.
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ _CFS_DEFAULT = (
 _VAE = "model_config.VAE_model"
 _ABSENT = "<absent>"
 
-#: B.5's removed constructor keys, plus one key of each causal-feature family the CFS config
+#: The ST/PH constructor keys the patch model removes, plus one key of each causal-feature family the CFS config
 #: carries. Written out, not imported from the trainer: the trainer's list is what is under test.
 REFUSED_KEYS = (
     "c_y", "c_u", "use_up_st",
@@ -40,7 +39,7 @@ ARM_IDENTITY = {
     "advanced_config.tracking.mlflow.tags.variant",
 }
 
-#: B.9 arms: file -> the one leaf it moves.
+#: The arms: file -> the one leaf it moves.
 ARMS = {
     "sweep_warmup_134.yaml": {f"{_VAE}.warmup_period": 134},
     "sweep_lag_kv_encoder.yaml": {f"{_VAE}.lag_kv_source": "adapter"},
@@ -53,22 +52,20 @@ CFS_IDENTITY = ARM_IDENTITY | {
     "advanced_config.tracking.mlflow.experiment_name",
 }
 
-#: The B.9 delta against the CFS default: leaf -> this package's value. Anything else differing is
-#: drift, and the two cells would no longer differ in the representation alone.
+#: The declared delta against the CFS default: leaf -> this package's value. Any other leaf that
+#: differs is drift.
 CFS_DELTA = {
     f"{_VAE}.warmup_period": 30,
     f"{_VAE}.persistence_residual": False,
     f"{_VAE}.prior_availability_input": False,
     f"{_VAE}.horizon_weight_halflife_steps": None,
     f"{_VAE}.source_validity": "finite",
-    # 2026-10-04, after the first production run closed the source path (RESULTS.md).
     f"{_VAE}.forecast_ar_residual": False,
-    # 2026-10-11: the CFS default names the 42 source channels whose warm-up fits its anchor floor;
-    # this cell has no such key.
+    # The CFS default names the source channels whose warm-up fits its anchor floor; this cell has
+    # no such key.
     f"{_VAE}.causal_source_channels": _ABSENT,
-    # 2026-10-13: the event mechanisms (posterior event gate, its sparsity weight, and the
-    # contraction weighting of the full branch) exist in the CFS config, shipped on there, and
-    # not here, so each reads as absent on this side rather than as a value that differs.
+    # The event mechanisms (posterior event gate, its sparsity weight, and the contraction
+    # weighting of the full branch) exist in the CFS config, switched on there, and not here, so each reads as absent on this side rather than as a value that differs.
     **{
         f"{_VAE}.{key}": _ABSENT
         for key in (
@@ -83,7 +80,7 @@ CFS_DELTA = {
     f"{_VAE}.free_bits": 0.02,
     f"{_VAE}.beta_schedule.warmup_epochs": 100,
     "general_config.lr_milestone": [80, 110],
-    # C12: identity placeholders until summary_stats.py runs on the production shards.
+    # Identity placeholders until summary_stats.py runs on the production shards.
     f"{_VAE}.target_summary_loc": [0.0, 0.0],
     f"{_VAE}.target_summary_scale": [1.0, 1.0],
     f"{_VAE}.variability_eps": 0.01,

@@ -1,20 +1,20 @@
-r"""Datasets, collates and loaders of the neural classifier (SPEC §7.1-7.2, §8.4-8.5, §10.4, §10.9.3).
+r"""Datasets, collates and loaders of the neural classifier.
 
 :func:`build_unit` builds one :class:`UnitData` per fold (and per shuffled-label seed): the fold's retained
 cohort rows joined to the frozen feature cache by ``baselines.fold_frame`` and projected at once onto
-:data:`ALLOWED_COLUMNS` (L1); the train-only scaler over ``[values || attn]`` (§8.5, L4); the train-fold
+:data:`ALLOWED_COLUMNS` (L1); the train-only scaler over ``[values || attn]`` (L4); the train-fold
 GUID-level class counts and priors (L4). :class:`SegmentDataset` (segment scope) and :class:`GuidDataset`
 (sequence scope) turn it into the batch dicts of the P3/P4 contract; :func:`make_loader` wraps either in a
 seeded :class:`EpochBatches` batch sampler.
 
-**Covariates (§7.3).** The cohort's raw ``cov:<name>`` / ``cov_age_h:<name>`` columns ride along with the frame
+**Covariates.** The cohort's raw ``cov:<name>`` / ``cov_age_h:<name>`` columns ride along with the frame
 (observation times never get here: the as-of join returns value and age only);
 :func:`fit_covariates` fits their encoding on train only (L4) and every dataset delivers it as ``batch["cov"]``
 (``(B, D_cov)`` or ``(B, N, D_cov)``, padded with 0), with ModDrop covariate dropout on train loaders only
 (``default_rng([seed, epoch, i, 1])``). :func:`covariates_off` and :func:`without_indicators` make the
 ``eval.covariates_off`` pass and the ``noind`` ablation unit.
 
-**Online regimes (§10.1).** With an :class:`OnlineReader` (``make_loader(..., reader=)``) every batch also carries
+**Online regimes.** With an :class:`OnlineReader` (``make_loader(..., reader=)``) every batch also carries
 ``vae``: the collated raw HDF5 rows of its real segments, which the classifier's backbone turns into ``x``/``attn``
 (``sources.OnlineFeatures``); the cached tensors ride along and keep the step mask.
 
@@ -55,7 +55,7 @@ from teb_vae.classifier.config import Classifier, CovariatesCfg
 from teb_vae.classifier.sources import Scaler, fit_scaler, open_cache
 
 #: The only cohort columns data.py keeps (L1), besides the declared covariates' raw ``cov:``/``cov_age_h:`` columns.
-#: Identity and cache row; targets and loss weights; §7.1 context sources. The three clocks enter tensors only as
+#: Identity and cache row; targets and loss weights; context sources. The three clocks enter tensors only as
 #: described in the module docstring.
 ALLOWED_COLUMNS = ["fold", "split", "guid", "seg_pos", "row", "y", "class_code", "label_weight",
                    "tlo_end_s", "stage", "valid_frac", "ss_rel_s", "epoch_s", "t_end_s"]
@@ -64,7 +64,7 @@ _PAD = {"x": 0, "step_mask": False, "attn": 0, "ctx": 0, "cov": 0, "t_h": 0, "w"
 
 
 def CONTEXT_COLUMNS(cfg: Any) -> List[str]:  # noqa: N802 (named as in the contract)
-    """The §7.1 context vector of ``cfg`` (``Config`` or its ``classifier`` block), in batch ``ctx`` order."""
+    """The context vector of ``cfg`` (``Config`` or its ``classifier`` block), in batch ``ctx`` order."""
     c = getattr(cfg, "classifier", cfg)
     x = c.context
     wanted = {"tlo_psi": x.tlo.enabled, "tlo_missing": x.tlo.enabled and x.tlo.missing == "indicator",
@@ -86,17 +86,17 @@ def context_matrix(frame: pd.DataFrame, columns: Sequence[str], *, tlo_pre_onset
 
 
 def without_indicators(c: Classifier) -> Classifier:
-    """``c`` with ``missing: no_indicator`` for TLO and the covariates: the ``noind`` unit of the §7.3.4 ablation."""
+    """``c`` with ``missing: no_indicator`` for TLO and the covariates: the ``noind`` unit of the ablation."""
     x = c.context
     return c.model_copy(update={"context": x.model_copy(update={
         "tlo": x.tlo.model_copy(update={"missing": "no_indicator"}),
         "covariates": x.covariates.model_copy(update={"missing": "no_indicator"})})})
 
 
-# ---- covariates (§7.3) -------------------------------------------------------------------------
+# ---- covariates -------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Covariates:
-    """The train-fold covariate encoding (§7.3, L4). Per variable: the standardised value (numeric) or a one-hot over
+    """The train-fold covariate encoding (L4). Per variable: the standardised value (numeric) or a one-hot over
     the train vocabulary (categorical; unseen or missing = all 0), then ``<name>:missing`` (``missing: indicator``)
     and ``<name>:age_h`` = ``log1p`` age (a timed variable with ``age_feature``). Every missing entry is 0 after
     standardising. ``variables``: the fitted record per variable; ``sources``: the raw frame columns read;
@@ -125,7 +125,7 @@ class Covariates:
         return np.concatenate(cols, 1).astype(np.float32)
 
     def drop(self, cov: np.ndarray, cfg: CovariatesCfg, rng: np.random.Generator) -> np.ndarray:
-        """ModDrop (§7.3.5): each variable set missing with ``dropout_p``, the whole block with ``block_dropout_p``;
+        """ModDrop: each variable set missing with ``dropout_p``, the whole block with ``block_dropout_p``;
         ``cov`` is one item's ``(D_cov,)`` or ``(N, D_cov)``."""
         drop = rng.random(len(self.variables)) < cfg.dropout_p
         drop |= rng.random() < cfg.block_dropout_p
@@ -273,11 +273,10 @@ def train_counts(train: pd.DataFrame, k: int) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def shuffle_labels(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
-    """§10.9.3: GUID labels (``y`` with its ``class_code``) permuted within one train or val split; every segment
+    """GUID labels (``y`` with its ``class_code``) permuted within one train or val split; every segment
     keeps the cohort's ``label_weight``. Rebuilt for the permuted targets, a time-dependent strategy would move each
     positive-labelled GUID's weight onto its late segments, so late-looking inputs would earn the positive label
-    under any permutation and the control would beat 0.5 whenever the true signal is late (on the fixture:
-    per-fold test AUROC 0.83-0.91). With ω fixed, the weighted label expectation of every segment is the split
+    under any permutation and the control would beat 0.5 whenever the true signal is late. With ω fixed, the weighted label expectation of every segment is the split
     prevalence."""
     splits = sorted(set(frame["split"]))
     if splits not in (["train"], ["val"]):
@@ -289,7 +288,7 @@ def shuffle_labels(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
 
 def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
                shuffle_seed: Optional[int] = None) -> UnitData:
-    """The fold's :class:`UnitData`; ``shuffle_seed`` makes the §10.9.3 shuffled-label control.
+    """The fold's :class:`UnitData`; ``shuffle_seed`` makes the shuffled-label control.
 
     Args:
         cfg: ``Config`` or its ``classifier`` block.
@@ -299,8 +298,7 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
         shuffle_seed: Permute the train GUID labels with this seed and the val GUID labels with ``shuffle_seed + 1``;
             test is untouched. The permuted val labels only reach the control's own training (val loss, early
             stopping, ``best.ckpt``): with the real ones, selection keeps the epoch whose near-random function best
-            matches the real signal, and that match carries over to test (run 2026-10-07--17-52: shuffled val/test
-            fold AUROCs moved together, pooled test 0.524 [0.510, 0.539]). Calibration, thresholds and every
+            matches the real signal, and that match carries over to test. Calibration, thresholds and every
             prediction row read the fold's plain unit and the cohort labels (``run.py``).
     """
     c = getattr(cfg, "classifier", cfg)
@@ -340,7 +338,7 @@ def build_unit(cfg: Any, run_dir: Any, cache: Mapping[str, Any], fold: int, *,
 
 
 def covariates_off(unit: UnitData) -> UnitData:
-    """``unit`` with every covariate missing (the ``eval.covariates_off`` pass, §7.3.5): same fitted encoding, so
+    """``unit`` with every covariate missing (the ``eval.covariates_off`` pass): same fitted encoding, so
     ``batch["cov"]`` is its all-missing row."""
     if unit.covariates is None:
         return unit
@@ -350,7 +348,7 @@ def covariates_off(unit: UnitData) -> UnitData:
 
 # ---- online regimes (P7) -----------------------------------------------------------------------
 class OnlineReader:
-    """The raw HDF5 rows behind a unit's cached segments, for a source run online (§10.1).
+    """The raw HDF5 rows behind a unit's cached segments, for a source run online.
 
     The cache index maps ``(fold, split, row)`` to the ``ds_index`` the cohort stage read, over the same shards
     (``cohort.fold_shards``); ``ds_index`` never enters a frame (it encodes shard order, L1). :meth:`bind` returns a
@@ -425,7 +423,7 @@ class _CovItems:
 
 
 class SegmentDataset(Dataset):
-    """Segment scope (§10.4): one item per retained segment of ``split``; ``w`` is ω over its GUID's Σω
+    """Segment scope: one item per retained segment of ``split``; ``w`` is ω over its GUID's Σω
     (0 when Σω = 0). ``guids[guid]`` names the batch's GUID index. ``cov_dropout``: covariate ModDrop (train).
     ``read`` (:meth:`OnlineReader.bind`): each item also carries its raw HDF5 row as ``vae`` (online regimes)."""
 
@@ -458,9 +456,9 @@ class SegmentDataset(Dataset):
 
 
 class GuidDataset(Dataset):
-    """Sequence scope (§10.4): one item per GUID, its retained segments by ``seg_pos``; ``w`` is raw ω (the
-    segment-local term's weight), ``w_pos`` the per-position term's: ω with ``labels.k_warm`` (§6.5,
-    :func:`~teb_vae.classifier.cohort.warm_positions`) zeroing positions ``seg_pos < k_warm``.
+    """Sequence scope: one item per GUID, its retained segments by ``seg_pos``; ``w`` is raw ω (the
+    segment-local term's weight), ``w_pos`` the per-position term's: ω with ``labels.k_warm``
+    (:func:`~teb_vae.classifier.cohort.warm_positions`) zeroing positions ``seg_pos < k_warm``.
 
     With ``dropout > 0`` and a key ``(i, epoch)``, non-final segments are dropped with probability
     ``dropout`` (``default_rng([seed, epoch, i])``) before ``t_h`` (hours since the first kept segment's
@@ -544,7 +542,7 @@ def bucket_sizes(base: int) -> List[Tuple[Tuple[int, int], int]]:
 
 
 class EpochBatches(Sampler):
-    """Seeded batch sampler of ``(item, epoch)`` keys (§10.4).
+    """Seeded batch sampler of ``(item, epoch)`` keys.
 
     Epoch ``e`` draws from ``default_rng([seed, e])``: all items (permuted iff ``shuffle``), or with
     ``balanced`` as many GUID-level class-balanced draws with replacement (each class equally likely,
@@ -614,7 +612,7 @@ def make_loader(unit: UnitData, split: str, *, train: bool, seed: int, reader: O
     balanced = train and c.train.sampler == "class_balanced"
     if balanced and c.train.loss.weighting != "none":
         logger.warning(f"train.sampler=class_balanced with train.loss.weighting={c.train.loss.weighting}: "
-                       f"the class imbalance is corrected twice (§10.4)")
+                       f"the class imbalance is corrected twice")
     if c.model.scope == "sequence":
         dataset = GuidDataset(unit, split, dropout=c.train.segment_dropout if train else 0.0, seed=seed,
                               cov_dropout=train, read=read)

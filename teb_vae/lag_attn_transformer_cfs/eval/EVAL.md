@@ -12,7 +12,8 @@ true of this package. The pipeline is documented in three companion files, none 
 
 ## What this package supplies
 
-Four files, and each holds a fact the shared pipeline cannot derive:
+Four files hold the facts that the shared pipeline cannot derive. Three more files run the
+quality-mask experiment.
 
 | File | What it carries |
 |---|---|
@@ -20,6 +21,9 @@ Four files, and each holds a fact the shared pipeline cannot derive:
 | `configs/eval_overrides.yaml` | The causal holdout split and the evaluation-only settings. It is the cfs cell's file key for key, and value for value **except where a value is a function of the lag window**: `occlusion_bands` is cut to this cell's own `max_lag`, because a band reaching past the window is refused at config load. |
 | `run.py` | The command line. It supplies the binding, a `prog=` string, and enumerates its own flags for one reason: `--only` and `--skip` must name *this* model's registry (`--help` lists it). |
 | `verify.py` | The acceptance gate, delegated in full, beside the tables for the sweep arms this cell ships and the cross-cell table the two cfs cells are read down. |
+| `configs/eval_overrides_prod_q4.yaml` | The override delta for the quality-version-4 build. It labels every dense anchor with `ua_key_open` and `target_bad_steps`. |
+| `run_quality_arms.py` | Runs `run.py`, then `verify.py`, then `compare_quality_arms.py` on the two arms of the quality-mask experiment (`configs/prod_q4_masked.yaml` and `configs/prod_q4_no_quality_mask.yaml`). It reads each checkpoint's resolved config and refuses unless the masked arm trained with `source_quality_mask`, `event_weight_ua_valid` and `target_quality_mask` on and the control with all three off. |
+| `compare_quality_arms.py` | Joins the two arms' `per_anchor.parquet` on `(guid, epoch, anchor)` and reports per stratum (`clean`: `ua_key_open == 1` and `target_bad_steps == 0`; `bad_ua`: `ua_key_open == 0`; `all`), split into `event`, `quiet` and `any`. Each statistic is a mean over recordings of the recording's anchor mean, with a bootstrap interval over recordings; the paired difference is taken per recording. The output holds counts, means and intervals only. |
 
 Launch from the repository root:
 
@@ -27,11 +31,19 @@ Launch from the repository root:
 python -m teb_vae.lag_attn_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt
 python -m teb_vae.lag_attn_transformer_cfs.eval.verify <run>/eval_results/summary.json
 python -m teb_vae.lag_attn_transformer_cfs.eval.verify --runs <dir-of-runs> --out RESULTS_arms.md
+python -m teb_vae.lag_attn_transformer_cfs.eval.run_quality_arms \
+    --masked-checkpoint <masked run>/model_checkpoints/<best>.ckpt \
+    --control-checkpoint <control run>/model_checkpoints/<best>.ckpt \
+    --masked-output-dir <dir> --control-output-dir <dir> --comparison-output-dir <dir>
+python -m teb_vae.lag_attn_transformer_cfs.eval.compare_quality_arms \
+    --masked-dir <masked eval output dir> --control-dir <control eval output dir> \
+    --output-dir <dir>
 ```
 
-Or with no command line at all: `run.py` and `verify.py` each carry a `RUN_ARGS` dictionary at the
-bottom of the file. Edit the values there and press the IDE's Run button; a flag given on the
-command line wins over the dictionary, and the console line prints where each value came from.
+Or with no command line at all: `run.py`, `verify.py`, `run_quality_arms.py` and
+`compare_quality_arms.py` each carry a `RUN_ARGS` dictionary at the bottom of the file. Edit the
+values there and press the IDE's Run button; a flag given on the command line wins over the
+dictionary, and the console line prints where each value came from.
 
 ## What resolves to the parent
 
@@ -60,27 +72,29 @@ The implementation is shared, so the two cfs cells' band deltas are computed ide
 different lags in the two cells. Compare the band deltas across cells by the lag spans the
 occlusion table records, never by band name.
 
-**This package defines no numeric function.** Not "few": none. `binding.py` is a frozen record,
-`run.py` and `verify.py` delegate to the shared implementations, and there is no module here that
-computes a quantity a summary reports. That is asserted about the code in
-`tests/test_eval_binding.py` and `tests/test_eval_run.py` rather than promised by this paragraph,
-because a prose claim of delegation is exactly the claim that decays first.
+**The evaluation proper defines no numeric function.** `binding.py` is a frozen record, and
+`run.py` and `verify.py` delegate to the shared implementations, so no module of the evaluation
+computes a quantity that `summary.json` reports. `tests/test_eval_binding.py` and
+`tests/test_eval_run.py` assert this. `compare_quality_arms.py` is the exception: it computes the
+aggregates of the quality-mask comparison from two finished evaluations.
 
 `geometry_keys` is the one declaration that differs and it is written out rather than derived. It is
 the cfs cell's tuple **minus** `causal_norm` (not a constructor parameter of this model, because
 these encoders carry no time-pooling normaliser to causalise) **plus** this architecture's encoder
 keys (`encoder_conv_kernels`, `encoder_conv_dilations`, `encoder_num_heads`, `encoder_d_ff`,
 `target_attention_blocks`, `source_attention_blocks`, `source_attention_window`) **plus**
-`forecast_ar_residual`, which only this cell configures. Each must be both a constructor parameter
+`forecast_ar_residual`, `posterior_event_gate` and `source_quality_mask`, which only this cell's
+config declares. Each must be both a constructor parameter
 and a config key, because `preflight.reconcile` silently skips any key absent from either, so a key
 that is only one of the two is a reconciliation that never happens and never says so. The count is
 left to the code, which is where a reader can check it.
 
-**Four switches that change what a number means are reconciled, and one is deliberately not.**
-`prior_availability_input`, `lag_kv_source`, `persistence_residual` and `forecast_ar_residual` are
-in the tuple, because the evaluation rebuilds the architecture from the checkpoint's own
-`model_kwargs`: a config disagreeing about one of them would not fail, it would report one
-architecture's (or one likelihood's) numbers under another's stated name. The other density term,
+**Six switches that change what a number means are reconciled, and one is deliberately not.**
+`prior_availability_input`, `lag_kv_source`, `persistence_residual`, `posterior_event_gate`,
+`source_quality_mask` and `forecast_ar_residual` are in the tuple, because the evaluation rebuilds
+the architecture from the checkpoint's own `model_kwargs`: a config disagreeing about one of them
+would not fail, it would report one architecture's (or one likelihood's) numbers under another's
+stated name. The other density term,
 the per-channel scored horizon `target_scored_horizon`, is a resolved vector with no config key, so
 the preflight re-resolves it from the config and compares it instead. `horizon_weight_halflife_steps`
 is **absent**, on the same ground as the objective weights: it re-weights the *training* criterion's
@@ -102,13 +116,13 @@ The cohort is a class-balanced draw of `caps.attribution_cohort_segments` segmen
 
 ## What the scored likelihood is
 
-Since the final revision (`DESIGN.md`, amendment of 2026-09-23) this cell scores a forecast cell
+This cell scores a forecast cell
 $(\tau, c)$ only while $\tau < H_c$, the channel's own scored horizon, and scores its residual
 under an AR(1) innovation with the per-channel coefficient $\phi_c$ when `forecast_ar_residual` is
-on. Every density readout (block NLLs, `pred_gap`, the matched Monte Carlo gap, the splits and both
+on (`DESIGN.md` §8.3 and §8.4). Every density readout (block NLLs, `pred_gap`, the matched Monte Carlo gap, the splits and both
 baselines) is scored under the checkpoint's own $H_c$ and $\phi_c$, read from the model rather than
 configured, and `summary.json` states both under `likelihood_structure`. The `sweep_all_cells_scored`
-and `sweep_factorised_likelihood` arms restore the previous choice of each.
+and `sweep_factorised_likelihood` arms turn each term off.
 
 ## What the cross-cell table can and cannot say
 
@@ -124,12 +138,11 @@ other depends on the two runs, not on the two cells, and the test is mechanical:
   (`likelihood_structure`) between the two runs. Only when they match does a difference in
   `d_base_mc_nats`, `pred_gap_mc_nats`, `source_conditioned_kl_raw_nats` or
   `coupling_minus_clock_nats` measure the encoder.
-* **At the shipped leaves they do not match.** The final revision changed this cell's horizon,
-  stride, lag window, K/V arm and likelihood; the conv-LSTM cell was not revised. The shipped pair is
-  therefore two different predictors scored on two different blocks, and the cross-cell table reads
-  as signs and orderings only (does `pred_gap` have the same sign, does the verdict agree), with the
-  level columns ignored. Rebuilding the level comparison needs a run of one cell at the other's
-  geometry and likelihood.
+* **At the shipped configs they do not match.** The two cells' `default.yaml` files differ in the
+  horizon, the stride, the lag window, the K/V arm and the likelihood. For the shipped pair the
+  cross-cell table therefore reads as signs and orderings only (does `pred_gap` have the same sign,
+  does the verdict agree). A level comparison needs a run of one cell at the other's geometry and
+  likelihood.
 * The *lag* readouts compare less still: the two cells search different lag windows through
   different K/V representations, so a lag-profile difference is about the K/V arm and the window as
   much as about the encoders.

@@ -1,5 +1,4 @@
-r"""``event_locked`` -- contraction-locked lag maps and attribution (plan §2, E1-E; EVAL_MAP_LAG N2,
-EVAL_MAP_CAPTUM P4).
+r"""``event_locked`` -- contraction-locked lag maps and attribution.
 
 **Question.** Does the attention follow a contraction as it recedes into the past (a diagonal
 $\ell = s/4$ on a lag × time-since-peak map) or sit at fixed lags? Do $K_t$, the forecast gap and the
@@ -32,9 +31,8 @@ peak at $d$ whatever anchor saw it (``gain_peak_target_s``).
 
 Caps (``eval_config.caps``): ``event_locked_segments`` (256), ``event_locked_ig_events`` (64),
 ``event_locked_ig_offsets`` (6), ``event_locked_ig_steps`` (module default 128; the overrides ship 512,
-because the tone path is rougher than the zero one: on the planted model 128 steps left 140 of 396 rows over
-the 1e-2 completeness tolerance and 512 left 5, max 0.136; read ``ig_completeness.n_rows_over_tolerance``).
-Production cost at 512 steps: 256 dense forwards plus 64 × 6 × 2 = 768 IG rows, about 20 min on a GTX 1660 Ti.
+because the resting-tone path is rougher than the zero one; read ``ig_completeness.n_rows_over_tolerance``).
+Production cost at 512 steps: 256 dense forwards plus 64 × 6 × 2 = 768 IG rows.
 """
 from __future__ import annotations
 
@@ -71,7 +69,7 @@ from teb_vae.lag_attn_transformer_patch.eval.analyses import skip_record
 NAME = "event_locked"
 PRE_TOKENS = 8                      # k < 0 bins: 32 s before the peak
 DIAGONAL_HALF_WIDTH = 1             # tokens either side of l = k
-DEFAULT_IG_STEPS = 128              # the plan's; caps.event_locked_ig_steps raises it (the tone path is rougher than the zero one)
+DEFAULT_IG_STEPS = 128              # caps.event_locked_ig_steps raises it (the tone path is rougher than the zero one)
 IG_READOUTS = ("kld", "pred_gap")
 IG_ROWS_PER_CALL = 16
 X_BIN_S = 1.0                       # raw-time bin of the attribution map and the UP waveform

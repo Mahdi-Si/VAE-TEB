@@ -1,4 +1,4 @@
-"""P7 adaptation regimes (SPEC §10.1, §8.2, §16 P7 accept): the trainable VaeSource contract on the tiny trf_cfs
+"""P7 adaptation regimes (P7 acceptance): the trainable VaeSource contract on the tiny trf_cfs
 checkpoint (gradient reach inside ``train.unfreeze``, none outside, frozen modules in eval whatever ``train()`` does),
 the backbone's optimiser group, the LPFT stage transition, the regime schema, and one online run through predict."""
 from __future__ import annotations
@@ -96,7 +96,7 @@ def _task(c, features):
 
 
 # ---- one online run --------------------------------------------------------------------------------------------------
-# ---- co-training (§10.6) and the preservation gate (§10.10.2 #12) ------------------------------------------------------
+# ---- co-training and the preservation gate ------------------------------------------------------
 COTRAIN = ("classifier.train.regime=cotrain", f"classifier.train.unfreeze=[{ALLOW}]")
 
 

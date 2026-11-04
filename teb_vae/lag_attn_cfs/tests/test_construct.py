@@ -411,7 +411,7 @@ def test_the_anchor_floor_rises_to_the_shifted_warmth(tiny_align) -> None:
     The scored target is never shifted, so its half stays at $F \ge B - 1$. The *inputs* are, and an
     aligned channel vector at step $t$ asserts one physical instant -- an assertion that is false,
     not partially true, while any entry has not arrived. So the floor must clear
-    $\max_c(W'_c + d_c)$, which costs exactly one anchor here as it does at the shipped reference.
+    $\max_c(W'_c + d_c)$, which costs exactly one anchor here as it does at the target_max reference.
     """
     floor = int(tiny_align["warmup_period"])
     assert floor == max(TINY_TARGET_WARMUP_STEPS), "the flat combined vector is what this pins"

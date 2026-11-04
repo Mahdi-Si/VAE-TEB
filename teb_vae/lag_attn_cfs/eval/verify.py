@@ -67,8 +67,8 @@ proportionally wider block and its nats are larger for that reason alone.
 
 There is deliberately **no cross-target table against** ``lag_attn_fs``. The blocks differ (a
 budget-gated $H \cdot C_{\mathrm{keep}}$ against the two-sided cell's full channel set, and the
-horizons may differ as well), so a level comparison would invite
-exactly the reading both ``DESIGN.md`` records forbid.
+horizons may differ as well), so a level comparison would compare two different sums of
+coefficients.
 """
 from __future__ import annotations
 

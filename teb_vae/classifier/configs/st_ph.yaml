@@ -1,4 +1,4 @@
-# ST/PH features straight from the HDF5 shards instead of the VAE (SPEC §8.3, §13.3).
+# ST/PH features straight from the HDF5 shards instead of the VAE.
 base: default.yaml
 
 classifier:

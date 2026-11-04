@@ -12,10 +12,10 @@
 # over, and the decoded anchor count is what it is averaged over. Only the run's *scale* is local:
 # one device, one shard, hundreds of epochs instead of thousands.
 #
-# PREREQUISITE, AND IT IS NOW SATISFIED. The shard below was built through the causal variant of
-# the pipeline AT `--leg-alignment envelope`, which is what the inherited `causal_leg_alignment`
-# declares and what makes the inherited `causal_align_reference` resolve its shifts against delays
-# the phase blocks actually have. Verified from its own root attributes: `transform: causal`,
+# PREREQUISITE, AND IT IS SATISFIED. The shard below was built through the causal variant of the
+# pipeline AT `--leg-alignment envelope`, which is what the inherited `causal_leg_alignment`
+# declares and what makes an aligned arm resolve its shifts against delays the phase blocks
+# actually have. Verified from its own root attributes: `transform: causal`,
 # `causal_leg_alignment: envelope`, 2617 segments, block widths 36/66/36/15.
 #
 # Two files on disk look like candidates and are not. The two-sided `output/hie_cs.hdf5` carries no

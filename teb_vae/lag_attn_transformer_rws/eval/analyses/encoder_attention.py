@@ -75,7 +75,7 @@ DISTANCE_FILENAME = "encoder_attention_distance.csv"
 REACH_FILENAME = "encoder_attention_reach.csv"
 PER_RECORDING_FILENAME = "encoder_attention_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them. The two class-resolved ones are drawn
+#: The figures, by their output file stems. The two class-resolved ones are drawn
 #: here rather than by the runner's violin fan-out: that fan-out resolves per-*recording* scalars,
 #: and these two are per-head and per-distance fields, which a violin cannot carry. The fan-out
 #: still runs, over :data:`PER_RECORDING_FILENAME`, and writes its own files beside these.

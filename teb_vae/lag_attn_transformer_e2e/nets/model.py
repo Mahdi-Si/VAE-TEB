@@ -128,7 +128,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         decoder_hidden: int = 128,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -527,11 +527,10 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             # window off an exactly zero token. Every other front-end operator is bias-free, so a
             # zeroed projection makes the whole cascade homogeneous: featurise gives the zero
             # vector, RMSNorm(0) = 0, LayerScale(0) = 0, and the emitted token is exactly zero.
-            # A zero token entering repeated pre-normalisation is the accident the sibling's input
-            # adapter records reaching gradient norms around 1e26; measured here, a 26-step gap
-            # takes the global norm from 2.5e4 to 2.1e17, all of it on stage 0's bias, which under
-            # gradient_clip_val rescales the whole batch's gradient to nothing without the loss
-            # ever spiking. Tied to `init_weights` for the same reason the depthwise repair is:
+            # A zero token entering repeated pre-normalisation is the same accident the sibling's
+            # input adapter guards against: a long validity gap can raise the global norm by many
+            # orders of magnitude, all of it on stage 0's bias, which under gradient_clip_val
+            # rescales the whole batch's gradient to nothing without the loss ever spiking. Tied to `init_weights` for the same reason the depthwise repair is:
             # torch's own Linear default is already non-zero, so with no generic pass there is
             # nothing to repair.
             self._restore_frontend_stage_bias()
@@ -656,9 +655,9 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         the learnable "this window is empty" constant the stage was given a bias to provide.
 
         The consequence is not a small one. An exactly zero token entering repeated
-        pre-normalisation produces derivatives of order $1/\sqrt{\epsilon}$; measured on this model,
-        a $26$-step ($104$ s) validity gap takes the global gradient norm from $2.5 \times 10^4$ to
-        $2.1 \times 10^{17}$, entirely on the first stage's bias. Under a global-norm clip that
+        pre-normalisation produces derivatives of order $1/\sqrt{\epsilon}$, so a long validity gap
+        can raise the global gradient norm by many orders of magnitude, entirely on the first
+        stage's bias. Under a global-norm clip that
         rescales *every* parameter's gradient for that batch to nothing, while the loss itself moves
         too little for the spike breaker to fire -- so the run silently learns from a fraction of
         its data. Gaps of that length are routine in this dataset.

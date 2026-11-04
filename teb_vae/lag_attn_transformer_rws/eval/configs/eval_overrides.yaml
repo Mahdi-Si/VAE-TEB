@@ -13,7 +13,7 @@
 #
 # This is the conv-Transformer model's delta. It is deliberately the sibling's, key for key and
 # value for value, and a test asserts that: the two models are compared against each other, so a
-# holdout split or a Monte Carlo draw count that differed between them would make every
+# evaluation split or a Monte Carlo draw count that differed between them would make every
 # side-by-side number a comparison of two protocols rather than of two architectures. Only the
 # comments below differ, where a value needed re-justifying against this architecture's costs.
 #
@@ -22,7 +22,7 @@
 #   python -m teb_vae.lag_attn_transformer_rws.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt
 general_config:
   batch_size:
-    # 32, not the training 128. Under no_grad the activation retention that dominates training is
+    # 32, not the training 64. Under no_grad the activation retention that dominates training is
     # gone, but the transients are not: the decoder runs four branches over 480 raw samples per
     # anchor at K Monte Carlo draws, and the attention weights alone are (B, T, 4, 91).
     #
@@ -39,27 +39,22 @@ general_config:
     # its own retention cap and its own bounded pass rather than riding on the loader.
     #
     # `test` is the key GraphDataModule actually reads for the eval loader. A batch size placed
-    # under `eval_config` would be a dead key and the loader would quietly run at 128, which is
-    # the exact configuration this bound exists to avoid. Results are batch-size-invariant — the
+    # under `eval_config` would be a dead key and the loader would quietly run at the training
+    # value, which is the exact configuration this bound exists to avoid. Results are batch-size-invariant — the
     # model uses GroupNorm and LayerNorm, no BatchNorm — so this costs only time.
     test: 32
 
 dataset_config:
-  # REPOINT THESE, exactly as in default.yaml and for the same reason: the placeholder paths do
-  # not exist, so a run fails on a missing file rather than on a width mismatch someone might
-  # "fix" by reverting c_y/c_u. Preflight additionally refuses any path still containing
-  # REPOINT_ME, so the failure names the real cause.
+  # Preflight refuses any path still containing REPOINT_ME, so a placeholder path fails with that
+  # cause named.
   #
-  # This is the shared k-fold HOLDOUT split — one HDF5 per canonical subgroup, all eight, all
-  # three clinical classes — rather than the healthy-only pretraining test files default.yaml
-  # points at. One pool, no fold loop, no double counting. Two consequences travel with it and
-  # are recorded in every summary: the checkpoint trains on `pre_training_dataset/*`, which is
-  # disjoint from this cohort, so evaluation is leakage-free; and the model has never seen
-  # ACIDOSIS or HIE, so every class contrast is an out-of-distribution comparison rather than
-  # held-out discrimination.
-  #
-  # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
-  # instead of this `test/` directory. If it is absent, that is the reason.
+  # This is fold 1 of the k-fold cross-validation dataset, all three clinical classes, rather than
+  # the healthy-only pretraining test files default.yaml points at. The healthy and acidosis
+  # subgroups come from fold_1/test only. The two HIE subgroups take all three fold_1 splits
+  # (test, val and train), which puts every fold_1 HIE recording in the pool. One pool, no fold
+  # loop, no double counting. The checkpoint trains on `pre_training_dataset/*`, and the model has
+  # never seen ACIDOSIS or HIE, so every class contrast is an out-of-distribution comparison rather
+  # than held-out discrimination.
   vae_test_datasets:
     - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
     - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
@@ -149,7 +144,7 @@ eval_config:
   num_mc_samples: 8
 
   # Global cap on the samples any analysis sees. null evaluates the whole split. A cap is drawn
-  # STRATIFIED, never as a prefix: the loader is unshuffled over eight concatenated per-subgroup
+  # STRATIFIED, never as a prefix: the loader is unshuffled over twelve concatenated per-subgroup
   # files, so a prefix cap yields one subgroup and one class.
   max_samples: null
 
@@ -248,9 +243,9 @@ eval_config:
   # a typo is refused at config load with the supported set named, before the model is built.
   #
   # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
-  # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
-  # `.pdf` filenames, so a run that changes this writes filenames those files do not list. Change
-  # it for a one-off export, not as the committed setting, unless you also update the manifest.
+  # default is load-bearing: the committed `figure_manifest.json` records `.pdf` filenames, so a
+  # run that changes this writes filenames the manifest does not list. Change it for a one-off
+  # export, not as the committed setting, unless you also update the manifest.
   #
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;
   # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the

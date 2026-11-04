@@ -329,8 +329,8 @@ def _write_figures(
             ax.axvspan(0, warmup, color=figures.COLOR_LIGHT_GRAY, alpha=0.6, zorder=0)
         ax.legend(fontsize=7, loc="best")
         # The one line that mitigates a high-likelihood misreading stays on the figure, as a
-        # footnote; the argument (a mismatched source is out of distribution, and specificity is
-        # decided in prediction space) is trap 1.1 of ``FIGURE_GUIDE.md``.
+        # footnote. The argument: a mismatched source is out of distribution, and specificity is
+        # decided in prediction space.
         figures.footnote(figure, KL_OVERLAY_NOTE)
         figures.style_axes(ax)
         paths.append(str(figures.render_figure(figure, directory / "kl_overlay")))

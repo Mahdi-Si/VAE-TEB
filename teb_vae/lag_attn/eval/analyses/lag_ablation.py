@@ -403,7 +403,7 @@ def _write_figures(frame: pd.DataFrame, directory: Path) -> list:
 
     paths = []
     # "Kept alone" is the load-bearing phrase: the mask keeps a band rather than removing it, so a
-    # short bar means the band alone suffices (``FIGURE_GUIDE.md``).
+    # short bar means the band alone suffices.
     for filename, column, title, ylabel, color in (
         (
             "forecast_degradation", "feat_mse_delta",

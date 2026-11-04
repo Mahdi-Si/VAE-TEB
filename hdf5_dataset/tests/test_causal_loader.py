@@ -1103,7 +1103,7 @@ def test_the_comparison_tool_still_reads_a_two_sided_shard(
     two_sided_shard: Path, causal_bank: Any, bank: Any, phase_pairs: Dict[str, np.ndarray],
     channel_plan: Dict[str, Any]
 ) -> None:
-    """The arm the study was built on, unchanged: arm B, with the S15.3 diagnostics."""
+    """The arm the study was built on, unchanged: arm B, with the phase-smoothing diagnostics."""
     compare = _compare_module()
     assert compare.resolve_shard_variant(str(two_sided_shard)) == TWO_SIDED
 

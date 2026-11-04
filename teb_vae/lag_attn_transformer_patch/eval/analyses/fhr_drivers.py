@@ -1,7 +1,5 @@
 r"""``fhr_drivers`` -- what in the raw FHR history drives the prior, and the FHR context of the UP effect.
 
-Owner E1-C (``notes/EVAL_PLAN.md`` §2; proposals P3 and P8 of ``notes/EVAL_MAP_CAPTUM.md``).
-
 **Question.** At the shared high-KL clean anchors, how far back, and where, does the raw FHR history
 drive the target-only branch: the base forecast's level and variability
 (``base_level`` / ``base_var`` = the mean over the horizon of ``mu_base`` per channel, standardized

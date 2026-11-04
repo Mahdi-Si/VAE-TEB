@@ -1,4 +1,4 @@
-# Label ablation (SPEC §17 item 3): horizon_decay with a 2 h full-weight horizon (baseline 1 h), half-life unchanged.
+# Label ablation: horizon_decay with a 2 h full-weight horizon (baseline 1 h), half-life unchanged.
 base: regularised.yaml
 
 classifier:

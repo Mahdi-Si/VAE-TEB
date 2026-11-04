@@ -120,12 +120,11 @@ STEP_SECONDS = float(DECIMATION) / float(RAW_SAMPLING_HZ)
 #:
 #: ``causal_delay_s`` ships $\tau_g = \gamma/(2\pi b)$, the number to REPORT as a channel's
 #: staleness; the alignment shift and the physical forecast clock scale DIFFERENCES of delays by
-#: this factor. It is a convention rather than a measured universal (2026-09-05 review, CFS-05):
-#: a ramp through the actual low-pass realises the mean delay, and a slow narrowband modulation
-#: through the slow wavelet realises the full composed group delay, $49.5$ s later than
-#: $\kappa\tau_g$ -- both pinned in ``hdf5_dataset/tests/test_phase_operator.py``. The
-#: $0.903$ median realised/reported ratio once measured on 30 aligned-shard segments is an
-#: empirical average over that content, not a property of every channel or input. Every
+#: this factor. It is a convention rather than a universal: a ramp through the actual low-pass
+#: realises the mean delay, and a slow narrowband modulation through the slow wavelet realises
+#: the full composed group delay, $49.5$ s later than $\kappa\tau_g$ -- both pinned in
+#: ``hdf5_dataset/tests/test_phase_operator.py``. The realised delay depends on the signal
+#: content, so it is not a property of every channel or input. Every
 #: consumer therefore states the results as approximate content leads, never as exact
 #: physiological timestamps.
 #:
@@ -1143,16 +1142,16 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     **The alignment drops for a different reason, and it is not a policy.** A channel whose composed
     delay exceeds $\tau_{\mathrm{ref}}$ can only be brought onto that clock by a negative shift,
     i.e. by being read from a later stored step, which reads raw signal after the anchor. Those
-    channels are refused rather than advanced -- four of the $51$ source channels on the target's
-    own clock, all fifteen ``up_ph`` surviving -- and the distinction from the paragraph above is
+    channels are refused rather than advanced -- the four slowest ``up_st`` channels on the
+    target's own clock, every ``up_ph`` surviving -- and the distinction from the paragraph above is
     load-bearing: the budget's drops are how much of a segment this design is willing to spend
     waiting, and these are a correctness requirement.
 
     **Which clock the source reads on is the one thing that is a decision**, and it is priced rather
     than picked: ``causal_align_reference_source`` moves the source onto a faster reference than the
     target's, which lifts a $20$-$60$ s physiological delay off the near censoring edge of the lag
-    window and pays for it in exactly the channels above it -- twelve of $51$ at the shipped
-    $288.2672$ s, nine of fifteen ``up_ph`` surviving. Null keeps the single clock and resolves
+    window and pays for it in exactly the channels above it -- at the legacy arm's $288.2672$ s
+    those include the slowest ``up_ph`` siblings. Null keeps the single clock and resolves
     byte-for-byte what it did before the key existed.
 
     Args:
@@ -1298,7 +1297,7 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     # correctness requirement rather than a warm-up policy.
     #
     # WHICH reference is the dual scheme's one decision, and it is priced in exactly this line. On
-    # the target's clock all fifteen ``up_ph`` channels survive and four of 51 source channels drop;
+    # the target's clock every ``up_ph`` channel survives and the four slowest ``up_st`` drop;
     # on a faster source clock the survivors fall and the readable lag band lifts off the near
     # censoring edge. The drop is logged per channel below either way.
     source_keep, source_align = _align_stream(

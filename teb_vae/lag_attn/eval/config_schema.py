@@ -2,8 +2,7 @@ r"""Validation of the ``eval_config`` block, run before anything is built.
 
 YAML has no schema, and a mapping silently absorbs whatever it is given: ``max_sample``
 instead of ``max_samples`` parses cleanly, is never read, and means "no cap" -- a run that
-took four hours instead of twenty minutes and reported nothing about why. The same class of
-failure the model's documentation records for misspelled constructor kwargs.
+took four hours instead of twenty minutes and reported nothing about why.
 
 So the block is validated at load, before the model, the loader or the output directory
 exist, and a rejection names both the offending key and the valid set.
@@ -25,9 +24,6 @@ VALID_KEYS = frozenset(
         "max_samples",
         "caps",
         "bands",
-        # ``up_shift_secs`` was REMOVED, not defaulted: the stored UP/FHR timeline is canonical
-        # and the dataset builder's shift is never undone downstream, so a config naming the
-        # key is refused as unknown rather than quietly honoured.
         "health_probe_floor",
         "saturation_flag_threshold",
         "ablation_batch_size",

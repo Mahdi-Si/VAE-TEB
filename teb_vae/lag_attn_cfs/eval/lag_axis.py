@@ -15,8 +15,8 @@ delay. A coefficient stored at step $t$ therefore summarises signal content cent
 :data:`MAX_MEASURED_GROUP_DELAY_SECONDS` on the committed causal fixture. Nothing in this pipeline
 corrects for it, deliberately: the
 correction is per channel *pair* while the lag map is per head over a pooled source state, so the
-mapping would itself be an unvalidated construction (both ``DESIGN.md`` records carry the
-``lean-limit:`` for it).
+mapping would itself be an unvalidated construction (the :mod:`teb_vae.lag_attn_cfs` docstring
+carries the ``lean-limit:`` for it).
 
 **This module needs the stale-step number and only that one.** A run may additionally align its
 input channels onto a common reference $\tau_{\mathrm{ref}}$, at which point two quantities exist
@@ -94,7 +94,7 @@ GROUP_DELAY_CAVEAT = (
 
 #: The one line a **figure** carries in place of :data:`GROUP_DELAY_CAVEAT`. A journal figure holds
 #: a short note and leaves the argument to its caption, so the full sentence stays in the records
-#: (``axis_caveat``), ``preflight.json`` and ``FIGURE_GUIDE.md`` and the image keeps only the claim
+#: (``axis_caveat``) and ``preflight.json``, and the image keeps only the claim
 #: a reader must not make from it. The axis label already says "stored-coefficient time".
 GROUP_DELAY_NOTE = "Lag is stored-coefficient time, not a physiological latency."
 

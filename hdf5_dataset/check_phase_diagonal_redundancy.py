@@ -1,9 +1,8 @@
 r"""Measure how redundant the diagonal phase-harmonic channels are.
 
-Settles open item 1 of ``PHASE_HARMONIC_CHANNEL_SELECTION.md`` §12: the
-recommendation to drop the diagonal ($k = 0$) rests on a correlation measured
-on a *synthetic* FHR-like signal, and the document asks for it to be repeated
-on a real shard before committing.
+The recommendation to drop the diagonal ($k = 0$) rests on a correlation
+measured on a *synthetic* FHR-like signal. This script repeats that measurement
+on a real shard.
 
 For $i = j$ and $p = 1$ the phase-harmonic operator is the identity, so
 

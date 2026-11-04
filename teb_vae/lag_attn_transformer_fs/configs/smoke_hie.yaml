@@ -1,7 +1,7 @@
 # Development validation config: the production model over the committed HIE sample shard.
 #
 # NOT a sweep arm and not a result config -- it is the dev-box run that reads this objective's
-# pre-registered acceptance criteria, and the instrumented run the two loss-scale constants are
+# acceptance criteria, and the instrumented run the two loss-scale constants are
 # re-derived from, before any production time is spent on it. It shares the shipped model geometry
 # with default.yaml on purpose: what is read here (the four-term recomposition, whether the KL opens
 # off zero, whether the conditional prior stays off its clamp floor, where the decoder's

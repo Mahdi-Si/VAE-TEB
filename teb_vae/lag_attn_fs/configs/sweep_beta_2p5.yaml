@@ -2,7 +2,7 @@
 #
 # Half the scale-matched value, and the arm that says whether the bracket has a floor inside it: if
 # 2.5 and 5.0 read the same, the scale-matching argument is coarser than the difference it predicts
-# and the shipped value is not worth defending to one significant figure.
+# and the scale-matched value is not worth defending to one significant figure.
 #
 # beta_prior moves with beta, holding beta_prior/beta = 0.1. The anchor's restoring force saturates
 # at beta_prior/2 per dimension while the reconstruction it opposes is what grew, so freezing it

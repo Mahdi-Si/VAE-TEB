@@ -244,7 +244,7 @@ def test_the_source_warmth_split_is_taken_at_the_resolved_block_boundary() -> No
 
     The waits are $W'_c + d_c$, not $W'_c$. A gated channel is read from stored step $t - d_c$, so
     the shift postpones the whole pattern; taking the unshifted vector here is what made
-    ``source_lag_warmth_frac_st`` identically $1.0$ on the shipped aligned configuration, because
+    ``source_lag_warmth_frac_st`` identically $1.0$ on an aligned configuration, because
     the fastest ``up_st`` channel has $W'_c = 0$ and announced itself warm at step $0$ while the
     gate was still reading before the start of the record.
     """

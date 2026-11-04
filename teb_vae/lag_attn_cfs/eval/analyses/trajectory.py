@@ -72,7 +72,7 @@ WHOLE_DELIVERY_FILENAME = "whole_delivery.parquet"
 BOUNDARIES_FILENAME = "whole_delivery_boundaries.csv"
 SUMMARY_FILENAME = "whole_delivery_summary.csv"
 
-#: The figure **stem**, named as ``FIGURE_GUIDE.md`` names it. Not a filename: each readout gets
+#: The figure **stem**. Not a filename: each readout gets
 #: a page to itself, written as ``<stem>_<slug>``, because the whole-delivery panel overlays the
 #: readouts on one axis and the two are routinely orders of magnitude apart -- so the smaller of
 #: them is drawn as a flat line at the bottom of a range the larger set, which is the one reading

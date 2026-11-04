@@ -1,30 +1,30 @@
-"""Classifier network (SPEC §9): step encoder -> segment pooling -> token (+ context) -> [sequence
+"""Classifier network: step encoder -> segment pooling -> token (+ context) -> [sequence
 aggregator] -> heads. Pure torch; the Lightning wrapper lives in ``train.py``.
 
-Batch and output keys follow the P3/P4 contract (CONTRACT.md). One option per config string:
+Batch and output keys follow the P3/P4 contract. One option per config string:
 
-* Step encoder (§9.2): Linear + LayerNorm + GELU + Dropout, then ``temporal`` = ``none`` |
+* Step encoder: Linear + LayerNorm + GELU + Dropout, then ``temporal`` = ``none`` |
   ``causal_conv`` (depthwise-separable, k 5, dilations 1/2/4, residual) | ``transformer`` (1 causal
   masked layer, 2 heads). Masked steps are zeroed after every stage.
-* Pooling (§9.3): ``mean`` | ``mean_max`` | ``gated_attention`` (Ilse; ``u_t = [x_t || cues_t]``: the
+* Pooling: ``mean`` | ``mean_max`` | ``gated_attention`` (Ilse; ``u_t = [x_t || cues_t]``: the
   ``role: attention`` cues shape the weights, only ``x_t`` is pooled) | ``query`` (PMA k 1; cues enter
   the keys only) | ``conjunctive`` (MILLET, segment scope: per-step head logits pooled by the gated
   attention, exposed as ``step_<key>``). A segment with no valid step raises (excluded upstream).
-* Token (§9.4): ``token_mlp([e || ctx])``. The optional covariate block ``batch["cov"]`` (P5; only read
+* Token: ``token_mlp([e || ctx])``. The optional covariate block ``batch["cov"]`` (P5; only read
   when ``n_cov > 0``) enters by ``fusion``: ``concat`` (with ctx), ``film`` (``z(1+γ)+β``, identity at
   init), ``token`` (sequence scope: added to the token), ``late`` (concatenated at every head input).
-* Aggregator (§9.5): ``causal_transformer`` (pre-norm; causal + key-padding mask; per-head learned
+* Aggregator: ``causal_transformer`` (pre-norm; causal + key-padding mask; per-head learned
   bias over log-bucketed |Δt| in minutes, saturating at ``time_bias_max_h``; relative times only),
   ``gru`` (input ``[z || log1p Δt]``, GRU-D decay ``h·exp(-relu(w)Δt)``; always causal), and
   ``attention_mil`` (gated attention with a cumulative masked softmax). No softmax row is ever empty
   (the diagonal is never masked; masked_softmax zeroes empty rows), so padding never yields NaN.
-* Heads (§9.6): MLP(d -> hidden -> K_out), zero last layer, prior bias (``logit π`` / ``log π_k`` /
+* Heads: MLP(d -> hidden -> K_out), zero last layer, prior bias (``logit π`` / ``log π_k`` /
   CORAL cumulative logits with ordered biases ``b_k = b_1 - Σ_{j<k} softplus(δ_j)`` / CORN conditional logits
   ``o_k = logit P(Y > k | Y > k-1)``, K-1 free logits, Shi 2023). Each output ``X`` comes with ``X_score``: binary
   logit | ``log Σ_{k≥1} p_k - log p_0`` | CORAL ``g + b_1`` | CORN ``o_1``, the last two ``= logit P(Y ≥ 1)``
   (every consumer reads ``σ(score)`` as P(adverse)).
 
-:func:`aggregate` / :func:`running_aggregate` give the post-hoc segment-scope GUID scores (§11.2).
+:func:`aggregate` / :func:`running_aggregate` give the post-hoc segment-scope GUID scores.
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ class _Block(nn.Module):
 
 
 class GatedAttention(nn.Module):
-    """Ilse 2018 attention logits ``wᵀ[tanh(V u) ⊙ σ(U u)]`` (Appendix B); the softmax is the caller's."""
+    """Ilse 2018 attention logits ``wᵀ[tanh(V u) ⊙ σ(U u)]``; the softmax is the caller's."""
 
     def __init__(self, n_in: int, d_attn: int) -> None:
         super().__init__()
@@ -93,7 +93,7 @@ class GatedAttention(nn.Module):
         return self.w(torch.tanh(self.V(u)) * torch.sigmoid(self.U(u))).squeeze(-1)
 
 
-# ---- step encoder (§9.2) -----------------------------------------------------------------------
+# ---- step encoder -----------------------------------------------------------------------
 class StepEncoder(nn.Module):
     def __init__(self, n_values: int, cfg: StepCfg) -> None:
         super().__init__()
@@ -119,7 +119,7 @@ class StepEncoder(nn.Module):
         return h
 
 
-# ---- pooling (§9.3) ----------------------------------------------------------------------------
+# ---- pooling ----------------------------------------------------------------------------
 class Pooling(nn.Module):
     def __init__(self, kind: str, d: int, n_attn: int, d_attn: int) -> None:
         super().__init__()
@@ -135,7 +135,7 @@ class Pooling(nn.Module):
         """(M, T, d), (M, T), cues (M, T, C_a) | None -> pooled (M, d_out), step weights (M, T)."""
         if not bool(valid.any(-1).all()):
             raise ValueError("a segment with no valid step reached the model; it must be excluded "
-                             "upstream (low_valid_frac, SPEC §9.3)")
+                             "upstream (low_valid_frac)")
         u = x if cues is None else torch.cat([x, cues], -1)
         if self.kind == "query":
             e, a = self.attn(self.query.expand(len(x), -1, -1), u, x, key_padding_mask=~valid)
@@ -150,7 +150,7 @@ class Pooling(nn.Module):
         return e, a
 
 
-# ---- sequence aggregator (§9.5) ----------------------------------------------------------------
+# ---- sequence aggregator ----------------------------------------------------------------
 class Aggregator(nn.Module):
     def __init__(self, cfg: SequenceCfg, d: int, d_attn: int) -> None:
         super().__init__()
@@ -196,7 +196,7 @@ class Aggregator(nn.Module):
         return self.norm(z), None
 
 
-# ---- heads (§9.6) ------------------------------------------------------------------------------
+# ---- heads ------------------------------------------------------------------------------
 class Head(nn.Module):
     """MLP(d -> hidden -> K_out): 1 logit (binary), K logits (multiclass), K-1 CORAL cumulative logits (ordinal) or
     K-1 CORN conditional logits (corn: ``o_k = logit P(Y > k | Y > k-1)``, each cut-point ranked on its own)."""
@@ -232,7 +232,7 @@ class Head(nn.Module):
         return o + self.biases() if self.kind == "ordinal" else o
 
     def score(self, o: Tensor) -> Tensor:
-        """Scalar alarm logit from the head's raw output (CONTRACT)."""
+        """Scalar alarm logit from the head's raw output."""
         if self.kind == "binary":
             return o[..., 0]
         if self.kind == "multiclass":
@@ -242,7 +242,7 @@ class Head(nn.Module):
 
 # ---- the network -------------------------------------------------------------------------------
 class ClassifierNet(nn.Module):
-    """Segment- or sequence-scope classifier (SPEC §9); ``forward(batch) -> dict`` per the contract.
+    """Segment- or sequence-scope classifier; ``forward(batch) -> dict`` per the contract.
 
     Args:
         n_values: value channels C; ``n_attn``: attention-cue channels C_a; ``n_ctx``: context width.
@@ -257,11 +257,11 @@ class ClassifierNet(nn.Module):
         super().__init__()
         m, lab = ModelCfg.model_validate(model_cfg), LabelsCfg.model_validate(labels_cfg)
         if not m.sequence.causal and lab.strategy not in ("final_only", "mil"):
-            raise ValueError("model.sequence.causal: false requires labels.strategy final_only|mil (§9.1)")
+            raise ValueError("model.sequence.causal: false requires labels.strategy final_only|mil")
         if m.pooling.kind == "conjunctive" and m.scope != "segment":
-            raise ValueError("model.pooling.kind: conjunctive is segment scope only (§9.3)")
+            raise ValueError("model.pooling.kind: conjunctive is segment scope only")
         if n_cov and fusion == "token" and m.scope != "sequence":
-            raise ValueError("context.fusion: token is sequence scope only (§9.4)")
+            raise ValueError("context.fusion: token is sequence scope only")
         self.scope, self.n_ctx, self.n_cov, self.fusion = m.scope, n_ctx, n_cov, fusion
         seq, dt = m.scope == "sequence", m.token.d
 
@@ -290,7 +290,7 @@ class ClassifierNet(nn.Module):
 
     @property
     def causal(self) -> bool:
-        """Every per-position output sees only its prefix (§9.1): segment scope, ``causal: true`` or ``gru``."""
+        """Every per-position output sees only its prefix: segment scope, ``causal: true`` or ``gru``."""
         return self.aggregator is None or self.aggregator.causal or self.aggregator.kind == "gru"
 
     def _token(self, e: Tensor, ctx: Optional[Tensor], cov: Optional[Tensor]) -> Tensor:
@@ -355,11 +355,11 @@ class ClassifierNet(nn.Module):
         return out
 
 
-# ---- post-hoc GUID aggregators (§11.2) ---------------------------------------------------------
+# ---- post-hoc GUID aggregators ---------------------------------------------------------
 def aggregate(scores: Any, kind: str, tau: float = 1.0) -> Any:
     """Aggregate segment logits along the last axis: ``max | mean | lse | last | topk_mean`` (k 3).
 
-    ``lse`` = τ·log mean exp(s/τ). ``noisy_or`` is deliberately absent (§11.2). Torch in -> torch out;
+    ``lse`` = τ·log mean exp(s/τ). ``noisy_or`` is deliberately absent. Torch in -> torch out;
     anything else (numpy, list) -> numpy (a scalar for 1-D input).
     """
     s = torch.as_tensor(scores)

@@ -1,8 +1,7 @@
 # Horizon arm: forecast one minute instead of the shipped 40 seconds, and pay for it in anchors.
 #
-# The shipped horizon moved 30 -> 10 on 2026-09-05 (see default.yaml's `horizon` key); this arm
-# restores the one-minute horizon the cell originally shipped at, so the two runs bracket the horizon
-# question from both sides of it.
+# The shipped horizon is H = 10 (see default.yaml's `horizon` key); this arm forecasts one minute,
+# so the two runs bracket the horizon question from both sides of it.
 #
 # WHAT IT MEASURES. Anchors live in [F, T - H), so lengthening H from 10 to 15 shortens T_valid from
 # 290 to 285 and the dense anchor count from 156 to 151; with the stride following the shipped

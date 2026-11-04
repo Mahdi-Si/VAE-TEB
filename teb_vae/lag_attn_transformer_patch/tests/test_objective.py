@@ -1,4 +1,4 @@
-"""P4-04: the objective's target gather, its AR(1) wiring, and its forecast mask.
+"""The objective's target gather, its AR(1) wiring, and its forecast mask.
 
 The shared objective itself is pinned in the sibling suites; these tests pin only what this
 package's ``compute_loss`` adds in front of it: which token each cell is scored against, that the
@@ -34,7 +34,7 @@ def _total(model, fo, fhr, weight) -> torch.Tensor:
 
 def test_target_and_persistence_are_standardized_summaries_of_the_right_tokens(monkeypatch):
     """Cell ``(a, tau)`` is scored against token ``a + 1 + tau`` and the persistence input is token
-    ``a`` (B.10.7: one target definition), both standardized; tiled (stride 15) and dense (stride 1)
+    ``a`` (one target definition), both standardized; tiled (stride 15) and dense (stride 1)
     alike. Non-identity loc/scale/eps, so a dropped affine or eps is caught."""
     loc, scale, eps = (0.3, -1.2), (2.0, 0.5), 0.05
     model = build(

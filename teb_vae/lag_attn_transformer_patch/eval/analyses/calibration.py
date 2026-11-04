@@ -1,6 +1,6 @@
-r"""``calibration`` -- per-channel calibration and variability against raw STV; port, owner E1-F.
+r"""``calibration`` -- per-channel calibration and variability against raw STV; port.
 
-**Question** (``notes/EVAL_PLAN.md`` §2). Is the decoder's predicted uncertainty right **per
+**Question.** Is the decoder's predicted uncertainty right **per
 channel**? Level and log-variability have different error shapes, and one pooled PIT hides which
 of the two is miscalibrated. Does the variability channel track a clinical variability measured on
 the raw trace?

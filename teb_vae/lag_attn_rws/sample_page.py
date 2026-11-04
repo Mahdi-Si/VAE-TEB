@@ -65,7 +65,7 @@ sides of the layering: the training callback in :mod:`~teb_vae.lag_attn_rws.plot
 Lightning callback, and the evaluation's per-sample pages, which may import neither Lightning nor
 ``plotting``. A home under ``eval/`` would make the *training* path import the evaluation package,
 inverting the dependency; a home in ``plotting.py`` puts Lightning in the evaluation's import
-graph. At the root, beside ``channel_reach.py``, both reach it and neither reaches the other.
+graph. At the package root, both reach it and neither reaches the other.
 ``plotting.py`` re-exports the name, so the callback and the tests that monkeypatch it are
 unchanged.
 

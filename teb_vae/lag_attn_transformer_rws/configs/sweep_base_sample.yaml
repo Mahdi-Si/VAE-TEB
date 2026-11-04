@@ -9,9 +9,8 @@
 # term is gone and the prior's scale is left to KL(q||p), which pulls it up, and to the anchor.
 #
 # What to read. `logvar_prior_floor_frac` and `mean_logvar_prior` against the default's, at matched
-# epochs. The 125-epoch reference climbed 0.017 -> 0.496 and was still rising; if this arm
-# reproduces that trajectory and the default does not, the mechanism is confirmed. Read
-# `kld_active_frac` beside it: a prior held off its floor should keep more dimensions alive.
+# epochs: if the floor fraction climbs here and not under the default, the mechanism is confirmed.
+# Read `kld_active_frac` beside it: a prior held off its floor should keep more dimensions alive.
 #
 # Costs. None in parameters -- this changes no shape, so it shares a checkpoint geometry with the
 # default. It does change the init contract: under 'sample' base and full are bitwise identical at

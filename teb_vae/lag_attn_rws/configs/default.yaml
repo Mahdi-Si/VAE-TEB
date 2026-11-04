@@ -64,32 +64,18 @@ model_config:
       end: 1.0
       warmup_epochs: 50
     # nats per latent dim per step; 0.0 disables the floor. Deliberately zero: a positive floor
-    # is a laundering subsidy the sibling measured (KL filled whether or not it is source-driven),
-    # and with the zero-KL start plus the beta warm-up, collapse is guarded structurally.
+    # fills the KL whether or not the source drives it, and with the zero-KL start plus the beta
+    # warm-up, collapse is guarded structurally.
     free_bits: 0.0
     # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
     # conditional prior's log-variance off its clamp floor: nothing else in the objective
-    # penalises a NARROW prior, and the first production run pinned 99.2% of prior coordinates on
-    # the -5 floor within one epoch (0.118 at epoch 0, 0.812 at epoch 1). Constant, not a
-    # schedule -- the collapse completes between epoch 0 and epoch 1, so any warm-up would arrive
-    # after the damage.
+    # penalises a NARROW prior. Constant, not a schedule: the anchor acts from the first step.
     #
-    # 0.1, not the 1.0e-2 this shipped at first. That value was a guess, and the dev-box arms on
-    # the committed HIE shard (RESULTS.md) measured it on the wrong side of a threshold: at
-    # 1.0e-2 the prior still finished on its floor (logvar_prior_floor_frac 0.955 against an
-    # unanchored 0.978) having only been delayed 6.7x in optimizer steps, while at 0.1 it held at
-    # 0.046 with kld_active_frac 0.69 against 0.25 in every collapsed arm.
-    #
-    # A threshold rather than a dial, and that is why the bracket matters more than the midpoint:
-    # the restoring force d/dlv_p is 0.5*(exp(lv_p) - 1), which SATURATES at 0.5*beta_prior as the
-    # log-variance falls, while the reconstruction's opposing pressure GROWS as the decoder
-    # sharpens. So a weight either exceeds that pressure or is eventually overrun by it, and no
-    # weight merely slows the descent to an acceptable rate.
-    #
-    # Still provisional in one respect the comment must not hide: that measurement is one shard,
-    # in-sample, on the convolutional-recurrent architecture. The transformer package's
-    # sweep_beta_prior_* arms bracket this value on both sides and are what confirm or revise it
-    # on the architecture the collapse was actually measured on.
+    # A threshold rather than a dial: the restoring force d/dlv_p is 0.5*(exp(lv_p) - 1), which
+    # SATURATES at 0.5*beta_prior as the log-variance falls, while the reconstruction's opposing
+    # pressure GROWS as the decoder sharpens. So a weight either exceeds that pressure or is
+    # eventually overrun by it, and no weight merely slows the descent to an acceptable rate. The
+    # transformer package's sweep_beta_prior_* arms bracket this value on both sides.
     beta_prior: 0.1
 
     # --- Reconstruction likelihood --------------------------------------------
@@ -141,9 +127,7 @@ model_config:
     d_model: 128
     # The latent must carry the whole FHR predictive state, and it is the decoder's ONLY input --
     # there is no state bypass here -- so it is the model's narrowest point. 64 = 4 groups of 16,
-    # divisible by num_heads as the head-structured posterior requires. Raised from 48 with the
-    # decoder widths below: the first production run's forecasts were judged over-smoothed, and the
-    # encoders held 1.35 M parameters against a 0.3 M decoder reading a 48-vector. Sweep axis.
+    # divisible by num_heads as the head-structured posterior requires. Sweep axis.
     d_z: 64
     horizon: 30            # H = 30 decimated steps = 2 min forecast
     raw_per_step: 16       # R raw samples per horizon token; horizon * R = 480 per anchor
@@ -163,21 +147,16 @@ model_config:
     # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
     # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
     #
-    # This exists because the measured failure is specific to the source pathway: over epochs
-    # 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent displacement at 0.084,
-    # both unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
-    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
-    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    # This regularises the map from the source to delta_mu directly. A rate-based lever (beta)
+    # cannot reach a failure in which that map memorises at a constant KL rate.
     #
-    # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
-    # particular rate here, and putting an unvalidated one in the headline run would confound it.
-    # The mechanism ships; the strength is measured by arms that set this key to 0.2 and 0.3.
+    # Shipped null, NOT an elevated value: an unvalidated rate in the headline run would confound
+    # it. The mechanism ships; arms that set this key to 0.2 and 0.3 measure the strength.
     # Those arms exist as files only in teb_vae/lag_attn_transformer_rws/configs/ -- for this
     # package the arm is a one-key override of this file, not a config that is already here.
     source_dropout: null
-    # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
-    # decoder is the only thing standing between one latent vector and 480 raw samples, and at 128
-    # it held roughly a fifth of the parameters the two encoders did.
+    # Hidden width of the shared horizon decoder core: the decoder is the only thing standing
+    # between one latent vector and 480 raw samples.
     decoder_hidden: 256
     # Inherited from a decoder that emitted feature coefficients; the right bounds for a
     # z-scored raw FHR target are unknown until the first run's log-variance distributions
@@ -200,10 +179,9 @@ model_config:
     # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
     # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast,
     # so its gradient on the prior log-variance points down without limit and nothing opposes it
-    # from below. The 125-epoch anchored run has logvar_prior_floor_frac climbing 0.017 -> 0.496
-    # and still rising at epoch 125; the beta_prior anchor slowed that and did not stop it,
-    # because the anchor's restoring force saturates at beta_prior/2 per dimension while the
-    # reconstruction's opposing pressure grows as the decoder sharpens.
+    # from below. The beta_prior anchor alone cannot hold it, because the anchor's restoring force
+    # saturates at beta_prior/2 per dimension while the reconstruction's opposing pressure grows as
+    # the decoder sharpens.
     #
     # Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p), which
     # pulls the prior out to cover the posterior, and the scale anchor. Note this does NOT make
@@ -233,9 +211,8 @@ model_config:
     # This is the second of the two paths that collapse the prior's scale, and the one that
     # survives base_decode: mean. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior +
     # delta), so the full branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor:
-    # D_1 drags the prior's log-variance down alongside its own. Measured on the tiny model, the
-    # full branch's reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head
-    # under 'residual' and exactly 0 under 'independent'.
+    # D_1 drags the prior's log-variance down alongside its own. Under 'independent' the full
+    # branch's reconstruction puts exactly zero gradient on the prior log-variance head.
     #
     # With both keys shipped, the prior's log-variance receives gradient from KL(q||p) -- which
     # pulls it UP, to cover the posterior -- and from the beta_prior anchor, and from nothing that
@@ -246,9 +223,9 @@ model_config:
     # constant the independent head is seeded at, so the KL is still exactly 0 at step 0.
     #
     # With head_init_calibration FALSE the init KL is not small: two independently initialised
-    # heads disagree by whatever their init happens to give, measured on the tiny model at 54
-    # nats/step mean and 142 nats/step max, against exactly 0 under 'residual' with or without the
-    # calibration. That matters because the readout rests on K_t == 0 at init -- unearned
+    # heads disagree by whatever their init happens to give, against exactly 0 under 'residual'
+    # with or without the calibration. That matters because the readout rests on K_t == 0 at
+    # init -- unearned
     # divergence on that scale is indistinguishable from coupling in every downstream figure. Any
     # arm that sets head_init_calibration: false therefore inherits a broken zero-KL start from
     # this key and should pin posterior_logvar_mode: residual unless the arm is about that start.
@@ -273,10 +250,9 @@ model_config:
     # encoder schema, because a difference in a non-encoder key would be attributed to the encoder
     # by the comparison these two models exist to make.
     #
-    # This was unusable before the adapters carried availability terms: a finite budget zero-fills
-    # the first max_c delta_c steps of every surviving channel, and a zero token entering repeated
-    # normalisation layers drove the global gradient norm to ~1e26 at EVERY finite budget. The
-    # adapters are now AvailabilityInputAdapter, which is what makes this value trainable here.
+    # A finite budget zero-fills the first max_c delta_c steps of every surviving channel. The
+    # adapters are AvailabilityInputAdapter, whose availability terms keep those zero tokens from
+    # destabilising the repeated normalisation layers.
     causal_reach_budget_s: 120
 
     # --- Attention -------------------------------------------------------------
@@ -308,19 +284,16 @@ model_config:
 
     # --- Initialisation policies (zero-parameter; the init-off arm varies all three) -------
     # Applied after the generic init; each is a no-op at the constructor default, so the sweep's
-    # init-off arm reverts the bundle with a config edit and no code change. Backed by
-    # synthetic-data training probes only (see the reach/beta study's init-off arm on prod data).
+    # init-off arm reverts the bundle with a config edit and no code change.
     #
     # Break the near-degeneracy of the 30 horizon tokens at init (~0.999 correlated at std 0.02),
     # so per-block FiLM has token-specific structure to modulate. 0.02 = the core's untouched seed.
     horizon_embed_std: 0.8
     # Calibrate BOTH distribution heads onto their trivial starting points at init. One key, two
     # halves, and setting it false reverts both:
-    #   * the shared decoder output heads onto mu=0/sigma=1 -- without it the raw-target NLL
-    #     starts ~15 nats/sample above that predictor's ~1.4 level;
+    #   * the shared decoder output heads onto mu=0/sigma=1, the trivial unit-variance predictor;
     #   * the prior head's log-variance onto exactly 0, i.e. sigma_p = 1, which is the scale
-    #     anchor's optimum -- without it the prior starts about 3 nats below it and, at
-    #     beta_prior: 0.0, reaches its clamp floor 3.3x sooner in optimizer steps.
+    #     anchor's optimum.
     # There is deliberately no key for one half alone: an arm reverting the prior calibration to
     # reproduce the pre-anchor start reverts the decoder calibration with it.
     head_init_calibration: true
@@ -336,7 +309,7 @@ model_config:
     # Group count for every encoder conv pre-norm. null = each block's min(8, d_model). The null
     # is dropped by _build_model_kwargs' None-filter and never reaches the constructor (the default
     # min(8, C) governs); it is present only so the norm-groups sweep arm differs in exactly one
-    # resolved key, the same pattern as causal_reach_budget_s: null.
+    # resolved key.
     conv_norm_groups: null
 
   core_model_checkpoint: null
@@ -361,7 +334,7 @@ dataset_config:
   stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/stats.hdf5
 
   dataloader_config:
-    # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
+    # 8 per rank: the prod box has 128 cores against 8 ranks (64 persistent workers), so the
     # extra workers still leave headroom; revisit against the profiler's dataloader-next timing.
     num_workers: 8
     prefetch_factor: 4
@@ -406,26 +379,20 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # MEASURED, replacing a 250.0 that was scaled from the feature-target sibling's 0.5 rather
-    # than derived. The first 1018-epoch production run of this objective logged `train/grad_norm`
-    # PRE-clip; its recorded percentiles are q50 2775, q90 3613, q95 3876, q99 4681, q99.9 5866,
-    # max 7313, min 703. Every recorded value exceeded 250, so the clip was rescaling essentially
-    # every step and the run was really training at roughly a eleventh of its configured learning
-    # rate. 5000 is the smallest round value above q99: the healthy tail passes and roughly the
-    # top one percent still clips.
+    # Set from the PRE-clip `train/grad_norm` distribution: the smallest round value above its
+    # q99, so the healthy tail passes and roughly the top one percent still clips. A threshold
+    # below the bulk of that distribution rescales every step and cuts the effective learning rate.
     #
     # What that sample is: metrics_history.csv records ONE optimizer step per epoch for this
     # metric, not the epoch's aggregate (the metrics collector reads callback_metrics at
-    # validation end, before the training epoch is reduced), so the percentiles above are per-STEP
-    # percentiles over 1,019 steps thinned from 452,250 -- which is the right distribution to set a
-    # per-step threshold from. `train/grad_clip_frac` is the same one-step-per-epoch sample of the
-    # exceedance indicator, so read it as a mean over epochs rather than per row.
+    # validation end, before the training epoch is reduced), so its percentiles are per-STEP
+    # percentiles -- which is the right distribution to set a per-step threshold from.
+    # `train/grad_clip_frac` is the same one-step-per-epoch sample of the exceedance indicator, so
+    # read it as a mean over epochs rather than per row.
     #
-    # PROVISIONAL AT THIS CAPACITY: that measurement predates the wider latent, the wider and deeper
-    # decoder, the horizon attention and the three auxiliary shape terms, each of which moves the
-    # gradient this threshold is set against. Ships unchanged because a guessed rescaling would be
-    # worse than a measured value carried across; re-derive it from the first run at this geometry
-    # by the five-step procedure in RESULTS.md.
+    # PROVISIONAL: the latent width, the decoder, the horizon attention and the three auxiliary
+    # shape terms each move the gradient this threshold is set against. Re-derive it from the
+    # pre-clip grad_norm of a run at this geometry.
     gradient_clip_val: 5000.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
@@ -467,9 +434,9 @@ advanced_config:
   # additive_margin carries the finite-blow-up detection: skip when watched > EMA + margin,
   # against the RAW EMA, so it works in the negative-loss regime.
   #
-  # The margin is in nats of the summed block NLL. The sibling's calibrated 3.0 was ~10x its
-  # healthy epoch-to-epoch fluctuation at a per-anchor loss of order 3.5; this objective's scale
-  # is ~2 * 480 larger, and a correlated-noise scaling of the same headroom lands near 1e+3.
+  # The margin is in nats of the summed block NLL. The sibling ships 3.0 on a per-anchor loss;
+  # this objective's scale is ~2 * 480 larger, and a correlated-noise scaling of the same headroom
+  # lands near 1e+3.
   # PROVISIONAL: re-derive from the first real run's observed main_loss fluctuation; until then
   # the non-finite guard is the hard protection and the margin errs loose rather than tight.
   #

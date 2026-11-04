@@ -18,9 +18,9 @@
 #   then report a failure that is a property of the window rather than of the architecture. The lag
 #   window is the one width that may not shrink here.
 #
-#   `anchor_stride: 1` -- every valid anchor decoded at every step, rather than one tile grid of
-#   five. Eight segments at ~4.5 tiles apiece is a few dozen supervised anchors per epoch, which is
-#   not enough for a lag to form in the minutes this check is allowed; densely it is ~1088. The
+#   `anchor_stride: 1` -- every valid anchor decoded at every step, rather than one tile grid at
+#   the inherited stride 5. Densely it is ~1088 supervised anchors per epoch over the eight
+#   segments, against ~218 at stride 5, and the check must form a lag in minutes. The
 #   evaluation pass decodes densely regardless, so this also removes the training/evaluation stride
 #   difference from the reading.
 #
@@ -65,8 +65,8 @@ model_config:
     causal_source_channels: null
     # The three pinned deltas. See the header.
     max_lag: 90
-    # The horizon and its half-life, PINNED at the values every recorded gate was measured under.
-    # default.yaml moved to H = 10 on 2026-09-05; the shard's planted delay of 45 stored steps
+    # The horizon and its half-life, PINNED. default.yaml ships H = 10; the shard's planted delay
+    # of 45 stored steps
     # makes the readable band [delta - H, delta - 1] = [15, 44] only at H = 30, so a horizon that
     # followed the default would move the band this check scores against while the stamp stayed
     # put. Both twins pin the pair; tests/test_lag_recovery.py asserts it.
@@ -85,8 +85,8 @@ model_config:
     causal_align_reference: target_max
 
     # ONE clock for both streams, PINNED, and this null is load-bearing rather than inherited. The
-    # shipped configuration moves the source onto a faster reference of its own, which subtracts a
-    # constant from every lag the source reports: at the shipped 288.2672 s the source content
+    # legacy sweep arm moves the source onto a faster reference of its own, which subtracts a
+    # constant from every lag the source reports: at that arm's 288.2672 s the source content
     # shifts 25 stored steps earlier, so the plant's readable band [15, 44] would become [-10, 19]
     # and half of it would fall off the near edge of the window. The check would then report a
     # failure that is a property of the instrument's alignment rather than of the architecture --
@@ -94,8 +94,8 @@ model_config:
     # 45 STORED steps only while the two streams read on one clock.
     causal_align_reference_source: null
 
-    # The STORED forecast clock, PINNED, and against the shipped 'physical' default rather than
-    # inherited. The planted band's arithmetic is stated in stored steps -- the shard stamps a
+    # The STORED forecast clock, PINNED rather than inherited, so the instrument does not move when
+    # the default's clock does. The planted band's arithmetic is stated in stored steps -- the shard stamps a
     # stored delay of 45 and `planted_band` reads the readable lags off it -- so a clock that
     # re-indexes the scored element per channel would move the band this check scores against
     # while the stamp stayed put. lag_recovery_check refuses any other clock by name.

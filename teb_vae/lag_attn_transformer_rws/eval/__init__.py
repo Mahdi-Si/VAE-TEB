@@ -28,7 +28,7 @@ Local, because each is a fact about *this* model that no shared module can compu
 * :mod:`.verify` -- the sibling's acceptance gate delegated to unchanged, plus what is genuinely
   local: the sweep axes *this* model ships arms for, and the cross-model table that puts runs of
   both architectures side by side under the selection rule they must be read with;
-* ``configs/eval_overrides.yaml`` -- the holdout split and the evaluation-only settings.
+* ``configs/eval_overrides.yaml`` -- the fold-1 evaluation shards and the evaluation-only settings.
 
 Launch from the repository root::
 

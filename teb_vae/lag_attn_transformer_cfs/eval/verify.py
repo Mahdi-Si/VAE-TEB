@@ -22,7 +22,9 @@ What is local is which leaves this cell was swept on, and the comparison the pac
 The ``anchor_stride`` arm gets the cfs cell's tiling table; every other ``sweep_*.yaml`` arm this
 cell's ``configs/`` ships is a single-leaf change restoring an earlier choice, and all of them are
 read off one **arm leaves** table (:data:`SWEPT_ARM_LEAVES`) that prints each run's value of every
-such leaf, so a row is identified by what it changed rather than by its directory name. Beside them
+such leaf, so a row is identified by what it changed rather than by its directory name. The
+cumulative ``sweep_next_s*`` rungs are read the same way, and a **coupling** table
+(:data:`COUPLING_COLUMNS`) prints the five headline numbers they are judged on. Beside them
 the cfs cell's cross-cell table puts runs of *both* architectures side by side, keyed by the
 ``model_class`` each run recorded in its own ``run_context``.
 
@@ -85,18 +87,42 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         "causal_align_reference",
         "causal_target_forecast_clock",
         "causal_phase_operator",
-        # The two event mechanisms (2026-10-13), shipped on; each ablation arm moves one of these.
+        # The two event mechanisms, shipped on; each ablation arm moves one of these.
         "posterior_event_gate",
         "event_weight_floor",
-        # The UA quality mask (2026-10-25), shipped on; `sweep_no_quality_mask.yaml` turns it off
+        # The UA quality mask, shipped on; `sweep_no_quality_mask.yaml` turns it off
         # with the other two quality switches. A run trained before the key reads ``(absent)``.
         "source_quality_mask",
-        # The three quality switches of 2026-10-28. The default turns on the first two;
+        # The three quality switches. The default turns on the first two;
         # `sweep_source_event_mask.yaml` moves the third.
         "event_weight_ua_valid",
         "target_quality_mask",
         "source_event_mask",
+        # The 2026-11-04 next-step ladder, `sweep_next_s1` to `sweep_next_s5`. The rungs are
+        # cumulative, so a rung's row departs from the shipped value in its own column and in every
+        # column of the rungs before it.
+        "persistence_lags",
+        "forecast_ar_max",
+        "target_min_novelty",
+        "lambda_source_null",
+        "base_decode",
+        "event_weight_reach_steps",
+        "target_weight_ph",
     )
+)
+
+#: The headline columns of the coupling table, in reading order. The Monte Carlo gap charges the
+#: full branch for its posterior's sampling noise; the mean-decoded gap decodes both branches at
+#: their latent means and so isolates the information the source adds. The clock margin is the KL
+#: the source values buy beyond the availability pattern, the deceleration-band gap is the forecast
+#: gain in the band where a contraction's effect on the FHR is expected, and the calibration column
+#: is the mean squared standardised residual, which is 1 for a calibrated forecast.
+COUPLING_COLUMNS: Tuple[str, ...] = (
+    shared.PRED_GAP_COLUMN,
+    "pred_gap_mean_nats",
+    CLOCK_MARGIN_COLUMN,
+    "spectral_gap_deceleration_nats",
+    "calibration_mean_standardised_sq",
 )
 
 
@@ -204,6 +230,22 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
             [arm["run"], arm["model_class"],
              *(shared._render(shared._dig_config(arm["config"], path))
                for _, path in SWEPT_ARM_LEAVES)]
+            for arm in sorted(arms, key=lambda record: record["run"])
+        ],
+    )
+
+    lines += ["", "## Coupling", ""]
+    lines += [
+        "One row per run, read from its headline block. Rank runs on the mean-decoded gap, the clock "
+        "margin and the deceleration-band gap together: a run can lower its Monte Carlo gap by "
+        "narrowing its posterior without gaining any source information, and a clock margin near "
+        "zero means the KL is paid for by the availability pattern rather than by the source.",
+        "",
+    ]
+    lines += shared._table(
+        ["Run", *(f"`{column}`" for column in COUPLING_COLUMNS)],
+        [
+            [arm["run"], *(shared._headline_cell(arm, column) for column in COUPLING_COLUMNS)]
             for arm in sorted(arms, key=lambda record: record["run"])
         ],
     )

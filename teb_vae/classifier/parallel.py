@@ -1,4 +1,4 @@
-r"""Fold-parallel execution (SPEC §14.4): one spawned process per fold, one device slot per process.
+r"""Fold-parallel execution: one spawned process per fold, one device slot per process.
 
 ``run.devices`` lists the slots, e.g. ``[cuda:0, cuda:1, …, cuda:7]``. :func:`run_folds` starts the next pending fold
 whenever a slot frees up, so $K$ folds on $G$ slots finish in $\lceil K/G \rceil$ rounds at most. A device may repeat

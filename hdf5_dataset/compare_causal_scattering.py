@@ -119,7 +119,7 @@ from teb_vae.lag_attn.eval.representation_capacity_probe import (
 logger = logging.getLogger(__name__)
 
 #: Blocks compared, in the order the model concatenates them. ``fhr_up_ph`` is deliberately absent:
-#: ``teb_vae/lag_attn_rws/DESIGN.md`` S2 records that it is never loaded, so covering it would
+#: no model loads it, so covering it would
 #: measure something no model reads -- and it comes from a different selector with no ``sel_*``
 #: attributes to cross-check channel identity against.
 BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
@@ -321,7 +321,7 @@ def measure_validation(
     causal: Optional[CausalBank] = None,
     plan: Optional[Dict[str, CausalChannelPlan]] = None,
 ) -> Dict[str, Any]:
-    r"""The correctness gate: does this module reproduce the shard, and by how much does S15.3 bite.
+    r"""The correctness gate: does this module reproduce the shard, and how large is the phase-smoothing deviation.
 
     Arm A *is* the shard, so which arm reproduces it follows from which transform wrote it. A
     two-sided shard is checked against arm B in production's own conventions; a causal shard
@@ -332,7 +332,7 @@ def measure_validation(
     the residual is concentrated at the segment start: quoting only the full-segment worst case
     would overstate the disagreement on the steps any model actually trains on.
 
-    The S15.3 ratio is measured between the two ``phi_mode`` variants of the *same* code on the
+    The phase-smoothing ratio is measured between the two ``phi_mode`` variants of the *same* code on the
     *same* product, so it isolates the smoothing operator. The ratio is not bounded by
     $[d/2, d]$: even for a real diagonal product it is
     $d(\mathrm{DC}+A)/(\mathrm{DC}+2A)$ and is unbounded where $A<0$. The exact diagnostic is
@@ -354,7 +354,7 @@ def measure_validation(
 
     Returns:
         Worst-case relative errors per block, which arm produced them, and -- on a two-sided
-        shard -- the S15.3 statistics.
+        shard -- the phase-smoothing statistics.
 
     Raises:
         ValueError: If a causal shard is passed without its bank and plan, or if a stored block is
@@ -397,8 +397,8 @@ def measure_validation(
         if not two_sided:
             continue
 
-        # The S15.3 deviation on the channels actually stored. Measured per channel, because the
-        # documented claim is that it is *not* a constant rescaling: the truncation keeps the
+        # The phase-smoothing deviation on the channels actually stored. Measured per channel,
+        # because it is *not* a constant rescaling: the truncation keeps the
         # positive-frequency half, which off the diagonal mixes the real part of the product with
         # the Hilbert transform of its imaginary part.
         exact = phase_block_two_sided(fhr[index], fhr[index], pairs["fhr_ph"], bank,
@@ -448,7 +448,7 @@ def _analytic_projection_error(
 ) -> float:
     r"""How far production's truncation is from $d \times$ the analytic projection.
 
-    ``SCATTERING_PHASE_HARMONIC_MATH_Complete.md`` S15.3 states what the deviation *is*: keeping
+    The phase-smoothing deviation works as follows. Keeping
     Fourier bins $0 \ldots M/d - 1$ drops the matching negative-frequency band, and $\hat\phi$ is
     already $\approx 2\times10^{-22}$ at that edge. The omitted positive bins are not algebraically
     zero, but the result equals $d$ times the analytic (positive-frequency) projection of the

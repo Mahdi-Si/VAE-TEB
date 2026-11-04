@@ -64,7 +64,7 @@ PER_RECORDING_FILENAME = "sufficiency_per_recording.csv"
 SUMMARY_FILENAME = "sufficiency_summary.csv"
 CURVE_FILENAME = "oracle_training_curve.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 SUFFICIENCY_FIGURE = "sufficiency"
 
 #: The block scores compared, as ``(column, label)``. The two branches are Monte Carlo
@@ -268,7 +268,7 @@ def build_sufficiency_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT)
     figures.violin_panel(
         axes[0, 0],
         {label: finite_column(per_guid, column) for column, label in SCORE_COLUMNS},
@@ -276,7 +276,7 @@ def build_sufficiency_figure(
         ylabel="nats per anchor",
     )
 
-    axis = axes[1, 0]
+    axis = axes[0, 1]
     if len(curve):
         widths = sorted({int(value) for value in curve["width_multiplier"]})
         # One x axis for every series, so the two probes' curves are read against the same steps
@@ -295,6 +295,19 @@ def build_sufficiency_figure(
             title="Oracle probe fit",
             xlabel="optimizer step", ylabel="nats per anchor",
         )
+        # Two factors, two channels: the width multiplier is the hue and held-out against fit is
+        # the line style, so a probe's two curves read as one pair rather than as four series.
+        for line in axis.get_lines():
+            label = str(line.get_label())
+            if not label.startswith("width x"):
+                continue
+            width = int(label.split(",")[0].removeprefix("width x"))
+            line.set_color(figures.LINE_PALETTE[widths.index(width) % len(figures.LINE_PALETTE)])
+            line.set_linestyle("--" if label.endswith("fit") else "-")
+        if len(axis.get_lines()) > 1:
+            # Re-drawn rather than re-placed: the panel already made its headroom, and the key it
+            # drew holds copies of the old styles.
+            axis.legend(loc="upper right", ncol=2)
     else:
         axis.text(0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center",
                   transform=axis.transAxes)

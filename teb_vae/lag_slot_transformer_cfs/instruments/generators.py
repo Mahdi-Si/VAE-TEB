@@ -106,11 +106,11 @@ class InstrumentGeometry:
     stopped at whichever step scored best on the set it is then reported on has had its stopping
     point chosen by the number it reports, and the rate would be a measurement of that choice.
 
-    **The fit split is the largest of the three, and its size was measured rather than chosen.**
-    At a third of it the fit memorises before its source pathway has learned anything: on a planted
-    generator the gap is positive early and then decays through zero as the decoder drives its
-    observation variance down, and the instrument has no power at all -- for a reason about the
-    data volume rather than about the readout it exists to measure.
+    **The fit split is the largest of the three.** A fit split that is too small memorises before
+    its source pathway has learned anything: on a planted generator the gap is positive early and
+    then decays through zero as the decoder drives its observation variance down, and the
+    instrument has no power at all -- for a reason about the data volume rather than about the
+    readout it exists to measure.
     """
 
     sequence_length: int = 96

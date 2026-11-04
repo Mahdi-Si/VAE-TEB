@@ -1,4 +1,4 @@
-r"""Offline acceptance gate over a classifier run (SPEC §11.15, criteria 1-12).
+r"""Offline acceptance gate over a classifier run (criteria 1-12).
 
     python -m teb_vae.classifier.verify RUN_DIR [--json-out PATH]
     python -m teb_vae.classifier.verify --runs RUN_A RUN_B ...
@@ -33,7 +33,7 @@ from teb_vae.lag_attn_cfs.eval.verify import (
 #: The sanity checks criteria 3 and 9 re-read (written by the ``C`` and ``M`` analyses).
 COHORT_CHECKS = ("cohort_disjoint", "cohort_exposure")
 M7_CHECKS = ("m7_committed_overall_monotone", "m7_end_equals_running_max", "m7_last_equals_final")
-#: The §11.11 section numbers ``summary.md`` must carry as ``## <n>. `` headings, in this order (criterion 12).
+#: The section numbers ``summary.md`` must carry as ``## <n>. `` headings, in this order (criterion 12).
 SUMMARY_SECTIONS = list(range(1, 13))
 
 
@@ -214,7 +214,7 @@ def check_expected_outputs(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def check_summary_sections(summary: Dict[str, Any]) -> Dict[str, Any]:
-    """12: ``summary.md`` carries the §11.11 sections 1-12 as ``## <n>. `` headings, in order
+    """12: ``summary.md`` carries the sections 1-12 as ``## <n>. `` headings, in order
     (``on_disk.summary_md_headings``, which :func:`load_summary` reads)."""
     heads = _dig(summary, "on_disk", "summary_md_headings")
     if heads is None:
@@ -227,7 +227,7 @@ def check_summary_sections(summary: Dict[str, Any]) -> Dict[str, Any]:
     return _result(PASS, f"{SUMMARY_MD} carries sections 1-12 in order")
 
 
-#: The §11.15 criteria, in order.
+#: The criteria, in order.
 CRITERIA: Tuple[Tuple[str, Callable[[Dict[str, Any]], Dict[str, Any]]], ...] = (
     ("1_exit_code", check_exit_codes),
     ("1b_evaluation_current", check_evaluation_current),
@@ -314,7 +314,7 @@ def runs_table(run_dirs: Sequence[Any]) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry; returns 1 on any FAIL (or a missing summary), else 0. ``--runs`` prints :func:`runs_table`."""
-    parser = argparse.ArgumentParser(description="Classifier verify gate (SPEC §11.15).")
+    parser = argparse.ArgumentParser(description="Classifier verify gate.")
     parser.add_argument("run_dir", nargs="?")
     parser.add_argument("--json-out")
     parser.add_argument("--runs", nargs="+", metavar="RUN_DIR",

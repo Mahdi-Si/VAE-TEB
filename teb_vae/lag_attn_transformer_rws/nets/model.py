@@ -137,7 +137,7 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         decoder_hidden: int = 128,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -166,6 +166,7 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         coverage_floor: float = 0.9,
         base_decode: str = "sample",
         persistence_residual: bool = False,
+        persistence_lags: int = 1,
         horizon_weight_halflife_steps: Optional[float] = None,
         target_keep_index: Optional[Sequence[int]] = None,
         target_delays: Optional[Sequence[int]] = None,
@@ -318,6 +319,11 @@ class SeqVaeLagAttnTrfRws(nn.Module):
                 driver's ``inspect.signature`` sweep; :meth:`_check_persistence_target` is what such
                 a cell overrides and is what refuses the flag here, and the cell also decides what
                 $y_t$ is and gathers it.
+            persistence_lags: $P$, how many of the target's own most recent stored values the
+                persistence term reads, $\sum_{p<P} w_{\tau,p,c}\, y_{t-p,c}$. ``1`` -- the
+                default -- is the single-lag term above. Above ``1`` it needs
+                ``persistence_residual``; the extra-lag weights start at zero, so the model starts
+                at the single-lag forecast. The composing cell gathers the $P$ lags.
             horizon_weight_halflife_steps: Half-life $\lambda$, in horizon steps, of a decaying
                 weight $w_\tau \propto 2^{-\tau/\lambda}$ applied to **both** reconstruction terms
                 on the horizon axis, normalised to sum to $H$ so the block's scale is unchanged.
@@ -430,6 +436,8 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         self.persistence_residual = bool(persistence_residual)
         if self.persistence_residual:
             self._check_persistence_target()
+        # Stored before the decoder is built, because the composing cell's gather reads it.
+        self.persistence_lags = int(persistence_lags)
         # Init-policy bundle (zero-parameter, applied in the post-init block below). Each stores
         # its configured value here and re-initialises after the generic init; the recorded
         # defaults are exact no-ops.
@@ -615,6 +623,7 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             # Built here and refused above on this architecture, so the (H, C) weight exists only
             # where a forward supplies the anchor's own target vector to pair it with.
             persistence_residual=self.persistence_residual,
+            persistence_lags=self.persistence_lags,
         )
 
         # The posterior consumes the per-head summaries, so the attention's output projection W_o

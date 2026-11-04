@@ -5,7 +5,7 @@
 # `advanced_config.spike_breaker.additive_margin` -- are both stated in units of the summed block and
 # are properties of the *optimisation*, so neither transfers across an encoder change by argument.
 # The conv-LSTM cell of this row measured them on its own encoder over this same fixture; this file
-# re-measures them on this one. One moved and one did not, and only a measurement could say which.
+# re-measures them on this one, because only a measurement can say whether either one moves.
 #
 # WHY THE MODEL MAY NOT SHRINK. What is read here -- the pre-clip gradient-norm percentiles and the
 # breaker's own excursion of `main_loss` above its EMA -- is a property of the objective at the real

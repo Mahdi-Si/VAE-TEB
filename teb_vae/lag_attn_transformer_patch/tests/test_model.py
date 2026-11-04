@@ -1,5 +1,5 @@
-"""Model invariants of plan B.10 on this composition: raw causality (P4-02), source purity, zero KL,
-the single decoder and the lag attribution identity (P4-03), and DDP reachability (P4-05)."""
+"""Model invariants on this composition: raw causality, source purity, zero KL, the single decoder,
+the lag attribution identity, and DDP reachability."""
 from __future__ import annotations
 
 import math
@@ -21,7 +21,7 @@ from .conftest import MOVEMENT_TOL, build, make_stub_batch, relative_change
 STRIDE = 15
 PHASE = torch.tensor([0, 7])
 
-#: Keys that must not read the source (B.10.2), including the base decode (B.10.4: no bypass).
+#: Keys that must not read the source, including the base decode (no source bypass).
 SOURCE_FREE = ("mu_prior", "logvar_prior", "z_prior", "target_state", "mu_base", "logvar_base")
 
 
@@ -35,7 +35,7 @@ def _forward(model, fhr, up, weight):
 
 
 def test_states_at_token_t_read_no_raw_sample_after_16t_plus_15() -> None:
-    """B.10.1 in float64: resampling raw ``>= 16t + 16`` of either stream leaves every state at
+    """In float64: resampling raw ``>= 16t + 16`` of either stream leaves every state at
     ``<= t`` bitwise unchanged; resampling from ``16t + 15`` moves the stream's own state at ``t``.
     Plus the structural half: no history-path module normalizes over time or batch (a BatchNorm
     leaks only in train mode, which an eval-mode probe cannot see)."""
@@ -68,7 +68,7 @@ def test_states_at_token_t_read_no_raw_sample_after_16t_plus_15() -> None:
 
 
 def test_source_purity_and_one_decoder_invoked_twice(perturb_posterior) -> None:
-    """B.10.2 and B.10.4. Perturbed first: at init ``z_post == z_prior``, so a base decode wired
+    """Perturbed first: at init ``z_post == z_prior``, so a base decode wired
     to the posterior would pass the purity check vacuously. Each equality has its control."""
     model = build()
     perturb_posterior(model)
@@ -91,8 +91,7 @@ def test_source_purity_and_one_decoder_invoked_twice(perturb_posterior) -> None:
 
 
 def test_kl_is_exactly_zero_at_init_and_its_lag_map_sums_to_it(perturb_posterior) -> None:
-    """B.10.3 and B.10.6. The identity is asserted after the perturbation, where both sides are
-    non-zero."""
+    """The identity is asserted after the perturbation, where both sides are non-zero."""
     model = build()
     b = make_stub_batch(2, 300)
     with torch.no_grad():
@@ -109,7 +108,7 @@ def test_kl_is_exactly_zero_at_init_and_its_lag_map_sums_to_it(perturb_posterior
     "invalid", [slice(0, 0), slice(100, 101), slice(None)], ids=["valid", "gap", "all-invalid"]
 )
 def test_every_trainable_parameter_gets_a_gradient(invalid) -> None:
-    """B.10.5 under ``find_unused_parameters=False``, in train mode at stride 15. ``invalid``
+    """Under ``find_unused_parameters=False``, in train mode at stride 15. ``invalid``
     zeroes FHR's weight and NaNs UP over those tokens, so each adapter's ``missing`` is selected on
     some batches and not others; the loss and every gradient must also stay finite."""
     model = build().train()

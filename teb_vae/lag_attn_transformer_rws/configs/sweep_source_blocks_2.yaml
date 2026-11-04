@@ -8,7 +8,7 @@
 # The window is held at the shipped 16 so depth is the single variable; the window sweep prices
 # the other axis separately.
 #
-# -164,352 parameters, one attention block: 4*128^2 + 3*128*256 + 4*128.
+# -262,656 parameters, one attention block: 4*128^2 + 3*128*512 + 4*128.
 #
 # d_model stays 128 in every arm of this sweep: it is the width every downstream interface
 # assumes.

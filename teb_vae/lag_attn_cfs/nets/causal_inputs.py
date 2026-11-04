@@ -106,6 +106,8 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "target_forecast_shift",
     "target_scored_horizon",
     "forecast_ar_residual",
+    "forecast_ar_max",
+    "target_scored_start",
     "source_quality_mask",
 )
 
@@ -394,15 +396,11 @@ class CausalWarmupInputs:
         only once every source channel is warm by the floor: the floor refusal guarantees
         $F \ge \max_c (W'_c + d_c)$ for the **target** stream, and the source is not budget-gated,
         so a source channel slower than the floor keeps switching the staircase inside the scored
-        range -- four ``up_st`` channels did, at steps 162, 194, 233 and 278 on the integer
-        shards, until the shipped configs named the channels that fit the floor
+        range -- four ``up_st`` channels come warm at steps 162, 194, 233 and 278 on the integer
+        shards, which is why the shipped configs name the channels that fit the floor
         (``causal_source_channels``). With that in place **every scored anchor sees an all-ones
         vector** -- a constant, which a ``LayerNorm`` and a linear map turn into an offset the
-        prior head's biases already span. Measured on the planted fixture, whose source is
-        aligned and dropped above the reference: eighteen distinct rows over $t \in [0, 300)$ and
-        exactly one over the scored $[134, 270)$, with the resulting projection learning to a
-        weight RMS fifty times below every other matrix in the head and ``kld_source_null``
-        unmoved.
+        prior head's biases already span.
 
         What actually reaches the KL past the floor is the source **pathway's memory** of the
         warm-up transient: $h^u_t$ at $t \ge F$ still carries the pattern of channels arriving one
@@ -565,12 +563,11 @@ class CausalWarmupInputs:
         )
 
         # The source split is taken in DECLARED channel coordinates, through the gate's keep-index
-        # rather than positionally: the alignment drops the four source channels above the
-        # reference, so the survivors' vector is 47 long against a declared 51 and the two no longer
-        # agree. A split taken positionally at the boundary would put eleven channels of the
-        # second stored source block into the first and report both warmth fractions against the
-        # wrong denominators, with nothing failing -- which is the failure this indirection was
-        # written for before it could happen.
+        # rather than positionally: the gate (the keep-list or the alignment) drops source
+        # channels, so the survivors' vector is shorter than the declared width (42 against 46 at
+        # the shipped keep-list) and the two no longer agree. A split taken positionally at the
+        # boundary would move channels of the second stored source block into the first and report
+        # both warmth fractions against the wrong denominators, with nothing failing.
         declared = (
             torch.arange(self.c_u)
             if self.source_gate is None
@@ -581,14 +578,14 @@ class CausalWarmupInputs:
         # A channel is honest from step $W'_c + d_c$, not from $W'_c$, and that vector is now
         # resolved in one place -- see :meth:`_combined_source_steps`, which the availability
         # announcement reads too. Because $d_c \ge 0$ always, omitting the shift could only ever
-        # report the source as WARMER than it is: on the shipped aligned configuration it made
+        # report the source as WARMER than it is: on an aligned configuration it can make
         # ``source_lag_warmth_frac_st`` identically $1.0$ for any attention distribution, i.e. a
-        # column that could not vary and therefore measured nothing.
+        # column that cannot vary and therefore measures nothing.
         waits = self._combined_source_steps()
 
         # Refused rather than zipped: ``declared`` is the gate's keep-index when there is a gate
         # and the full declared range when there is not, so a stream carrying a warm-up without a
-        # gate would pair 47 waits against 51 indices and ``zip`` would silently drop the tail,
+        # gate would pair fewer waits than indices and ``zip`` would silently drop the tail,
         # reporting both fractions against the wrong denominators with every shape still correct.
         if waits is not None and len(waits) != int(declared.numel()):
             raise ValueError(

@@ -19,14 +19,13 @@ $\{x(s) : s \le t\}$ and of nothing else, and the forecast claim is exact.
 **Causality is bought with a warm-up.** A one-sided filter's output depends on assumed
 pre-recording history until $W_{0.95}$, the leading delay enclosing $95\%$ of its kernel energy,
 has passed. Because the transform runs per $22$-minute segment, that cost is paid once per segment
-rather than once per recording, and on the slowest surviving scattering channel it consumes $278$
+rather than once per recording, and on the slowest stored scattering channel it consumes $278$
 of the $300$ steps a sample spans. Two consequences have no analogue in the shipped four cells:
 the forecast cannot begin at the model's own $30$-step warm-up, and the set of usable channels is
 a feasibility requirement rather than a tuning knob.
 
 Layout::
 
-    DESIGN.md           the as-built record: the geometry, the objective, the readouts, the budget
     causal_warmup.py    the warm-up budget, resolved from the shards themselves
     model_kwargs.py     that budget as the constructor keywords it stamps into every checkpoint
     nets/               the network: two encoder-agnostic mixins over the raw-signal architecture
@@ -37,7 +36,7 @@ Layout::
     configs/            the shipped configuration and its arms
     sample_page.py      the diagnostic page rows the tiling and the warm-up make different
     warmup_budget.py    the run-level warm-up figure, and the tradeoff curve that chose the budget
-    check_run.py        scores a finished run directory against the criteria RESULTS.md registers
+    check_run.py        scores a finished run directory against its pre-registered criteria
     eval/               the evaluation pipeline: one checkpoint in, one reviewable directory out
     tests/              fast hermetic pytest
 
@@ -60,7 +59,7 @@ physical delay.
 denominator and no interval, and while the run is still going. ``eval/`` reads the finished
 checkpoint against the held-out causal split and says whether it is acceptable -- per recording,
 with bootstrap intervals, ten pre-registered verdicts and an offline gate that imports no ``torch``.
-Neither substitutes for the other; ``DESIGN.md`` §14 and ``eval/EVAL.md`` both carry the pairing.
+Neither substitutes for the other.
 
 lean-limit: the frequency-resolved readout is band-resolved skill and its timing half is unmeasured,
 because a stored coefficient is a modulus and the analysing filter's phase was discarded before the

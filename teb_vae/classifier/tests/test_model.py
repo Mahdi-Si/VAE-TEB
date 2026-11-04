@@ -1,4 +1,4 @@
-"""ClassifierNet (SPEC §9, §15 T-M1-T-M3) on synthetic contract batches."""
+"""ClassifierNet (T-M1-T-M3) on synthetic contract batches."""
 from __future__ import annotations
 
 

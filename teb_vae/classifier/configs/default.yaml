@@ -1,4 +1,4 @@
-# Classifier default configuration (SPEC §13 + §13.1). Every other config is `base: default.yaml` plus deltas.
+# Classifier default configuration. Every other config is `base: default.yaml` plus deltas.
 # Validated by teb_vae/classifier/config.py (pydantic, extra="forbid"); paths resolve against the repo root.
 classifier:
   run:
@@ -7,7 +7,7 @@ classifier:
     seeds: [42]
     folds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     device: cuda:0                  # cohort, extract, evaluate; train and predict too while `devices` is empty
-    devices: []                     # fold-parallel train + predict (SPEC §14.4): one fold process per slot, e.g.
+    devices: []                     # fold-parallel train + predict: one fold process per slot, e.g.
                                     # [cuda:0, cuda:1, cuda:2, cuda:3]; a repeated device runs two folds on it; not digested
     num_workers: 4
     report_workers: 4                # figure processes in `report`, each with its own copy of the tables
@@ -33,7 +33,7 @@ classifier:
     min_segments_per_guid: 1
 
   labels:
-    # task (§6.3), class codes 1 healthy / 2 acidosis / 3 HIE -> target; a code left out is excluded from the task:
+    # task, class codes 1 healthy / 2 acidosis / 3 HIE -> target; a code left out is excluded from the task:
     #   adverse_vs_healthy   1 -> 0, 2 -> 1, 3 -> 1   (binary; the primary task)
     #   hie_vs_rest          1 -> 0, 2 -> 0, 3 -> 1   (binary; rare positive, NP thresholds need enough negatives)
     #   hie_vs_healthy       1 -> 0, 3 -> 1, acidosis excluded   (binary)
@@ -48,15 +48,15 @@ classifier:
     decay_halflife_h: 0.5           # horizon_decay only
     k_warm: 0                       # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
     eval_window: all                # all | horizon | stage:first | stage:second
-    time_matched: false             # horizon* only: negatives take the positives' weight schedule too (§6.5);
-                                    # ablation lab_time_matched.yaml (the 2026-10-07 runs scored stage, not outcome)
+    time_matched: false             # horizon* only: negatives take the positives' weight schedule too;
+                                    # ablation lab_time_matched.yaml
 
   context:
     tlo: {enabled: true, missing: indicator, pre_onset: clip}   # signed: pre-onset time until onset (ablation)
     stage: {enabled: true}          # one flag in_ss: the segment is wholly or partly in second stage
     time_in_ss: {enabled: true}
     delta_t: {enabled: false}
-    elapsed: {enabled: false}       # ablation only (§7.1)
+    elapsed: {enabled: false}       # ablation only
     valid_frac: {enabled: false}    # not a model input
     covariates:
       static_csv: null
@@ -91,7 +91,7 @@ classifier:
     time_pool: 1
     cache_root: runs/classifier_cache
     cache_dtype: float16
-    drop_floor_channels: false      # §8.5: drop channels whose train std sits under the scale floor (near-constant)
+    drop_floor_channels: false      # Drop channels whose train std sits under the scale floor (near-constant)
 
   model:
     scope: sequence                 # segment | sequence
@@ -102,7 +102,7 @@ classifier:
                dropout: 0.1, time_bias_buckets: 32, time_bias_max_h: 12.0}
     segment_head: true
     head: {hidden: 64, dropout: 0.1, bias_init: prior}
-    segment_aggregators: [max, mean, lse, last, topk_mean]   # post-hoc GUID scores (§11.2)
+    segment_aggregators: [max, mean, lse, last, topk_mean]   # post-hoc GUID scores
     lse_tau: 1.0
 
   train:
@@ -121,7 +121,7 @@ classifier:
     schedule: {warmup_steps: 200, kind: cosine, min_lr_frac: 0.05}
     max_epochs: 1000
     ema: 0.999                      # EMAWeightAveraging; null disables
-    # grad clip, early stopping, checkpointing, MLflow: advanced_config (§13.1)
+    # grad clip, early stopping, checkpointing, MLflow: advanced_config
     cotrain:
       vae_weight: 1.0
       cls_weight: 1.0
@@ -141,7 +141,7 @@ classifier:
   eval:
     levels: [segment, guid, online]
     thresholds:
-      # basis: guid_final | instantaneous | committed_cumulative | committed_overall | segment (§11.3)
+      # basis: guid_final | instantaneous | committed_cumulative | committed_overall | segment
       - {id: np30, policy: fpr_cap, alpha: 0.30, method: np_umbrella, delta: 0.05, allow_fallback: false,
          basis: committed_overall, axis: to_delivery, at: end}
       - {id: emp30, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_overall, at: end}
@@ -176,7 +176,7 @@ classifier:
     error_analysis: {top_k: 10}
     attribution: {enabled: false, n_steps: 32}
     covariates_off: false
-    stage_offsets: false            # §11.3: adds the `<kind>_stage` view (per-stage offsets fitted on val negatives)
+    stage_offsets: false            # Adds the `<kind>_stage` view (per-stage offsets fitted on val negatives)
     bootstrap: {resamples: 2000, refit_threshold: false, seed: 0}
     reference_prevalence: null
     trajectory_pages: {per_class: 3, top_errors: 3}
@@ -202,9 +202,9 @@ advanced_config:
       log_config_artifact: true
       tags: {}
   callbacks:
-    # Ranking, not log loss: in run 2026-10-07--17-52 val/guid_logloss bottomed at epoch 0-2 in every fold, while
-    # val/guid_auroc kept rising to epoch 6-26 (+0.02 to +0.06); temperature calibration fixes the scale afterwards.
+    # Ranking, not log loss: best.ckpt is selected on val/guid_auroc; temperature calibration fixes the scale
+    # afterwards.
     early_stopping: {enabled: true, monitor: val/guid_auroc, mode: max, patience: 25, min_delta: 0.0}
-    model_checkpoint: {save_last: true}   # monitor/mode = early_stopping's (§10.10.2 #6)
+    model_checkpoint: {save_last: true}   # monitor/mode = early_stopping's
     classifier_plotting: {enabled: true, every_n_epochs: 5, file_format: pdf,
                           train_eval_every: 5, train_eval_guids: 256}

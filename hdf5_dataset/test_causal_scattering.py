@@ -331,7 +331,7 @@ def test_arm_b_reproduces_the_shard(bank, pairs):
 
 @requires_shard
 def test_production_phase_smoothing_is_the_analytic_projection(bank, pairs):
-    r"""S15.3, pinned as the exact identity it is rather than as an approximate ratio.
+    r"""The phase-smoothing deviation, pinned as the exact identity it is rather than as an approximate ratio.
 
     Production truncates the smoothed spectrum to its first $M/d$ bins. $\hat\phi$ is already
     $\approx 2\times10^{-22}$ at that edge, so the omitted positive bins are numerically negligible

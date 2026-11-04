@@ -1,6 +1,5 @@
-# Arm (plan B.9): Does lag locality matter?
-# Since 2026-10-04 the default reads the windowed source encoder, so this arm is the point-wise
-# adapter: the K/V the first production run used, under which the source path closed.
+# Arm: Does lag locality matter?
+# The default reads the windowed source encoder, so this arm is the point-wise adapter.
 base: default.yaml
 
 general_config:

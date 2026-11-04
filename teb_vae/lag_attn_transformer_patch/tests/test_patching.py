@@ -1,4 +1,4 @@
-"""P4-01: ``patchify``, ``patch_summaries`` and ``PatchEmbedding`` (plan B.3, B.4)."""
+"""``patchify``, ``patch_summaries`` and ``PatchEmbedding``."""
 from __future__ import annotations
 
 import math

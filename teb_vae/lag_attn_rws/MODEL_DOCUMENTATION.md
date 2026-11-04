@@ -4,8 +4,8 @@
 
 This document describes one model end to end: what it consumes, what it computes, every layer it
 is built from, the probability model it implements, the objective it optimises, how it is
-trained, what it reports, and what those reports may and may not be read as. It is written to be
-self-contained — every symbol used is defined here, and no external construction is assumed.
+trained, and what it reports. Every symbol used is defined here. The class is
+`SeqVaeLagAttnRws` in `nets/model.py`; the shipped configuration is `configs/default.yaml`.
 
 ---
 
@@ -85,8 +85,8 @@ Every symbol used anywhere in this document, with the shipped value where it is 
 | $\mu^p_t,\ \ell^p_t$ | prior mean and log-variance | $\mathbb{R}^{64}$ |
 | $\tilde\ell^p_t$ | prior **pre-bound** raw log-variance | $\mathbb{R}^{64}$ |
 | $\mu^q_t,\ \ell^q_t$ | posterior mean and log-variance | $\mathbb{R}^{64}$ |
-| $z^p_t,\ z^q_t$ | the two latent samples | $\mathbb{R}^{64}$ |
-| $\epsilon_t$ | the single shared noise draw | $\mathcal{N}(0,I)$ |
+| $z^p_t,\ z^q_t$ | the base and full latents (§4.4) | $\mathbb{R}^{64}$ |
+| $\epsilon_t$ | the single noise draw per anchor | $\mathcal{N}(0,I)$ |
 | $a_{t,m,\ell}$ | attention score before normalisation | — |
 | $\rho_{m,\ell}$ | learned per-lag key bias | $\mathbb{R}^{32}$ |
 | $b_{m,\ell}$ | learned per-(head, lag) scalar score bias | — |
@@ -130,9 +130,9 @@ Every symbol used anywhere in this document, with the shipped value where it is 
 | $\beta_p$ | prior-anchor weight — a constant, not a schedule | $0.1$ |
 | $\lambda_{\mathrm{full}},\ \lambda_{\mathrm{base}}$ | reconstruction weights | $1,\ 1$ |
 | $\mathcal{L}_{\mathrm{ms}},\ \mathcal{L}_{\mathrm{deriv}},\ \mathcal{L}_{\mathrm{boundary}}$ | auxiliary shape terms on the forecast mean | — |
-| $\lambda_{\mathrm{ms}},\ \lambda_{\mathrm{deriv}},\ \lambda_{\mathrm{boundary}}$ | their weights, all provisional | $0.1,\ 0.1,\ 0.05$ |
-| $\delta_c$ | causal input delay of channel $c$, in steps | $0$ by default |
-| $S$ | Monte Carlo latent draws at evaluation | $8$ |
+| $\lambda_{\mathrm{ms}},\ \lambda_{\mathrm{deriv}},\ \lambda_{\mathrm{boundary}}$ | their weights | $0.1,\ 0.1,\ 0.05$ |
+| $\delta_c$ | causal input delay of channel $c$, in steps | $\le 30$ at the shipped $120$ s budget |
+| $S$ | Monte Carlo latent draws at evaluation | `num_mc_samples` |
 
 Three conventions hold throughout.
 
@@ -245,16 +245,11 @@ module and pinned by a test:
 | Property | Statement | Mechanism |
 | --- | --- | --- |
 | **No decoder bypass** | Gradient reaches the decoder only through $z$ | the decoder's `forward` takes one tensor; no second decoder and no conditioning head exist |
-| **Source purity** | The source pathway never sees a target tensor; the prior never sees the source | separate adapters and encoders; the posterior is a residual on the prior |
-| **Exact zero at initialisation** | $K_t \equiv 0$ and the two forecasts are bitwise identical | posterior residual heads zeroed *after* generic initialisation; one shared noise draw; zero dropout in the decoder and in the attention probabilities |
+| **Source purity** | The source pathway never sees a target tensor; the prior never sees the source | separate adapters and encoders; the posterior mean is a residual on the prior mean |
+| **Exact zero at initialisation** | $K_t \equiv 0$ | posterior mean-delta heads zeroed *after* generic initialisation; the posterior log-variance seeded at the prior's initial value (§8); zero dropout in the decoder and in the attention probabilities |
 
-The third property is what makes every reported nat of coupling *earned*: the model starts from
-the assertion "the source says nothing", and any departure from it had to be produced by
-training against data.
-
-At the shipped configuration the model holds **5,088,186 parameters**, of which $16{,}512$ are
-frozen. The shipped `causal_reach_budget_s: 120` adds $6{,}272$ more for the two availability
-adapters, so the model as launched holds $5{,}094{,}458$.
+The third property means that the model starts from the assertion "the source says nothing".
+Any departure from it must come from training against data.
 
 ---
 
@@ -510,13 +505,15 @@ Three consequences follow, and each is load-bearing:
 * **The prior is not a regulariser; it is a forecaster.** $p_\theta$ must be good enough that
   $D_0$ is a strong forecast in its own right, which is why the objective trains it explicitly
   (§10.7). A weak prior would make any posterior look informative.
-* **The posterior must be a residual on the prior, in the prior's own coordinates.** Two
-  independently parameterised heads could place the "same" belief at different points of latent
-  space, and their divergence would then measure parameterisation mismatch rather than
-  information. §5.6 builds $q_\phi$ as $p_\theta$ plus a bounded delta for exactly this reason.
-* **There is no free lunch at initialisation.** With the delta at zero the two distributions
-  coincide and $K_t = 0$ exactly, so the model begins by asserting that the source is
-  uninformative and must be driven off that assertion by data.
+* **The posterior mean must be a residual on the prior mean, in the prior's own coordinates.**
+  Two independently parameterised mean heads could place the "same" belief at different points
+  of latent space, and their divergence would then measure parameterisation mismatch rather
+  than information. §5.6 builds $\mu^q$ as $\mu^p$ plus a bounded delta for this reason. The
+  posterior log-variance is either a residual on the prior's raw log-variance or its own head,
+  selected by `posterior_logvar_mode` (§5.6).
+* **The model starts at zero coupling.** At initialisation the two distributions coincide and
+  $K_t = 0$ exactly (§7.3), so the model begins by asserting that the source is uninformative
+  and must be driven off that assertion by data.
 
 ### 4.3 One decoder, two invocations
 
@@ -535,20 +532,29 @@ $\hat\mu_{\mathrm{full}} = \hat\mu_{\mathrm{base}} + \Delta\hat\mu$ anywhere in 
 the source's effect on the forecast is a *consequence* of moving the latent, not a separate
 output pathway.
 
-### 4.4 Common random numbers
+### 4.4 The two latents, and common random numbers
 
-One standard-normal tensor $\epsilon_t \sim \mathcal{N}(0, I)$ is drawn per anchor per forward
-and used for **both** samples:
+One standard-normal tensor $\epsilon_t \sim \mathcal{N}(0, I)$ is drawn per anchor per forward.
+The posterior latent is always sampled from it:
 
 $$
-z^p_t = \mu^p_t + e^{\ell^p_t/2}\odot\epsilon_t,
-\qquad
-z^q_t = \mu^q_t + e^{\ell^q_t/2}\odot\epsilon_t.
+z^q_t = \mu^q_t + e^{\ell^q_t/2}\odot\epsilon_t .
 $$
 
-This coupling has a precise consequence: if $p_t = q_t$ then $z^p_t = z^q_t$ *sample by sample*,
-not merely in distribution, so the base-minus-full readout carries no independent sampling noise
-and is exactly zero when the two distributions coincide.
+The key `base_decode` selects how the base branch gets its latent:
+
+| `base_decode` | Base latent | Consequence |
+| --- | --- | --- |
+| `sample` | $z^p_t = \mu^p_t + e^{\ell^p_t/2}\odot\epsilon_t$, the *same* $\epsilon_t$ | if $p_t = q_t$ then $z^p_t = z^q_t$ sample by sample, so the base-minus-full readout carries no independent sampling noise |
+| `mean` (shipped) | $z^p_t = \mu^p_t$ | the base reconstruction puts no gradient on $\ell^p$; the prior log-variance receives gradient only from the KL and the scale anchor (§10.5) |
+
+Under `mean`, the base and full forecasts are not bitwise equal at initialisation, because the
+full branch still carries the posterior's noise. The KL is still exactly zero there, because it
+depends on the two distributions and not on the samples. The training-path `pred_gap` under
+`mean` is not a common-random-numbers contrast. The offline evaluation (§13.1) rebuilds the
+pairing from the latent distributions and does not read `base_decode`.
+
+The draw is taken in both modes, so the RNG consumption of a run does not depend on the mode.
 
 ### 4.5 The two coupling quantities
 
@@ -659,10 +665,11 @@ x_{\,t - \delta_c,\ \pi(c)} & t \ge \delta_c,\\[2pt]
 \end{cases}
 $$
 
-where $\pi$ is the strictly ascending keep-index and $\delta_c$ the per-channel delay. With no
-budget configured, **no gate module is built at all**, so the default model is structurally
-identical to one that has no delay mechanism. The rationale and the resolution of $\delta_c$ are
-in [§14](#14-causal-reach-control-of-the-inputs).
+where $\pi$ is the strictly ascending keep-index and $\delta_c$ the per-channel delay. The gate
+is `ChannelGate` (`teb_vae/lag_attn/nets/delays.py`). With `causal_reach_budget_s: null`, **no
+gate module is built at all**, so that model is structurally identical to one that has no delay
+mechanism. The shipped budget is $120$ s, so the shipped model builds both gates. The rationale
+and the resolution of $\delta_c$ are in [§14](#14-causal-reach-control-of-the-inputs).
 
 ### 5.2 Input adapter
 
@@ -681,12 +688,26 @@ x^{\mathrm{adapt}}_t = \mathrm{ResMLP}_{128 \to 128}(u_t).
 $$
 
 **The seam is plain, not activated.** Neither the body's closing $\mathrm{LayerNorm}$ nor the
-post-sum $\mathrm{GELU}$ is present. A gate there attenuates the backward gradient flowing through
-the seam and leaves a fraction of the exported units persistently compressed on the forward side,
-for no measured benefit; removing it un-gates the seam and raises the effective rank of what it
-exports. **Six** seams are plain for this reason — the two input adapters, and inside each encoder
-the front MLP and the fusion — for $6 \times 256 = 1{,}536$ fewer parameters than the activated
-form.
+post-sum $\mathrm{GELU}$ is present. A post-sum GELU gates the backward gradient that flows
+through the seam; the plain seam removes that gate. **Six** seams are plain — the two input
+adapters, and inside each encoder the front MLP and the fusion — for $6 \times 256 = 1{,}536$
+fewer parameters than the activated form.
+
+**Availability terms under a reach budget.** When a gate is built, the adapter is
+`AvailabilityInputAdapter` (`teb_vae/lag_attn/nets/encoders.py`). It is the same stack, plus two
+terms on the first linear's output:
+
+$$
+e_t = W_x \left(x_t \odot m_t\right) + W_m\!\left(m_t - \mathbf 1\right)
+    + \mathbb 1\!\left[\textstyle\sum_c m_{t,c} = 0\right] e_{\mathrm{start}},
+\qquad m_{t,c} = \mathbb 1[t \ge \delta_c].
+$$
+
+The mask $m_t$ marks which channels are available at step $t$. The first $\max_c \delta_c$ steps
+of a delayed channel are exact zeros, and these terms tell the model which positions are empty.
+The term $W_m(m_t - \mathbf 1)$ is exactly zero wherever every channel is available. Without a
+gate, neither term is built, and the adapter is parameter-for-parameter the plain one. The source
+adapter runs at `source_dropout` when that key is set (§16).
 
 Two further residual MLPs are unactivated for an unrelated and more basic reason: the prior head's
 mean and log-variance branches (§5.4) emit distribution *parameters*, which must be free to take
@@ -758,7 +779,7 @@ $$
 
 It registers exactly the same parameters under the same names, so it is numerically a no-op for
 the affine transform and changes only which elements the statistics pool over. This is a
-**correctness requirement**, not a preference; the driver warns loudly when it is switched off.
+**correctness requirement**, not a preference; the driver warns when it is switched off.
 
 **Stage C — recurrent branch.** A two-layer **unidirectional** LSTM at hidden size $128$ over
 $x^{\mathrm{lin}}$, followed by LayerNorm. Bidirectionality would read the future. The recurrent
@@ -773,11 +794,14 @@ H_t = \mathrm{LayerNorm}\Big(\mathrm{ResMLP}_{256 \to 128}\big([\,x^{\mathrm{con
 $$
 
 through hidden widths $(215, 181, 152, 128)$, again a plain seam. The
-closing LayerNorm caps the encoder exit at roughly per-step $\mathcal{N}(0, I)$; without it the
-exit drifts unbounded, which surfaces downstream as a single latent dimension sitting at an
-absurd prior mean.
+closing LayerNorm keeps the encoder exit at roughly per-step $\mathcal{N}(0, I)$ scale.
 
 Output: $H^y, H^u \in \mathbb{R}^{B \times 300 \times 128}$.
+
+The source encoder runs its convolutions and LSTM at `source_dropout` when that key is set, and
+at `dropout` otherwise. The key `lag_kv_source` (default `encoder`) selects the source
+representation the attention reads; the two other values, `conv_stem` and `adapter`, build no deep
+source encoder.
 
 ### 5.4 Prior head — the complete target-only latent
 
@@ -880,11 +904,10 @@ b_{m,\ell}\big|_{\text{init}} = -\,\omega_m\,\ell,
 \qquad \omega = (0.25,\ 0.0625,\ 0.015625,\ 0.00390625)
 $$
 
-for $M = 4$, a geometric per-head schedule. The steepest head sees essentially only the current
-step, the shallowest is nearly flat across the window, and the set spans short, medium and long
-lags without any head being told which to take. Without this seeding a randomly initialised head
-can settle on spurious long-lag structure early and never leave it. The bias is a free parameter
-and can be learned away.
+for $M = 4$, a geometric per-head schedule (`lag_bias_init: alibi_decay`, scaled by
+`alibi_slope_scale`, default $1$). The steepest head sees essentially only the current step, the
+shallowest is nearly flat across the window, and the set spans short, medium and long lags
+without any head being told which to take. The bias is a free parameter and can be learned away.
 
 **Validity mask.** Lag $\ell$ at step $t$ refers to source step $t - \ell$, which does not exist
 for $\ell > t$:
@@ -937,7 +960,7 @@ times the activation memory. The result is numerically identical.
 **The output projection $W_o$ is frozen.** The head-structured posterior consumes the per-head
 summaries $A^{(m)}$ directly, so the fused projection feeds nothing and receives no gradient.
 Clearing `requires_grad` makes that explicit and removes it from the distributed reducer's
-expectation set. It accounts for the model's $16{,}512$ frozen parameters.
+expectation set. Its $128 \times 128 + 128 = 16{,}512$ parameters are frozen.
 
 ### 5.6 Posterior head — a head-structured bounded residual
 
@@ -959,12 +982,14 @@ F^{(m)}_t = \mathrm{ResMLP}^{(m)}\Big(\big[\ \mathrm{LayerNorm}(H^y_t)\ \Vert\ \
 $$
 
 an **activated** seam, where $\mathrm{LayerNorm}_{g_A}$ is a LayerNorm whose scale is initialised
-to the constant $g_A$ rather than to $1$. The group's two delta heads are then plain linear maps,
+to the constant $g_A$ rather than to $1$. When `source_dropout` is set, dropout at that rate is
+applied to the normalised attended summary; when it is `null` (shipped), this site has no
+dropout. The group's two output heads are then plain linear maps,
 
 $$
 \widetilde{\Delta\mu}^{(m)}_t = W^{(m)}_{\Delta\mu} F^{(m)}_t \in \mathbb{R}^{16},
 \qquad
-\widetilde{\Delta\ell}^{(m)}_t = W^{(m)}_{\Delta\ell} F^{(m)}_t \in \mathbb{R}^{16}.
+\tilde\ell^{q,(m)}_t = W^{(m)}_{\ell} F^{(m)}_t \in \mathbb{R}^{16}.
 $$
 
 The attended summary's LayerNorm carries a **gain**
@@ -975,20 +1000,40 @@ gradient while the bottleneck is open. The gain rescales it so both inputs enter
 comparable magnitude.
 
 Concatenating the groups gives
-$\widetilde{\Delta\mu}_t, \widetilde{\Delta\ell}_t \in \mathbb{R}^{64}$, and the posterior is
+$\widetilde{\Delta\mu}_t, \tilde\ell^q_t \in \mathbb{R}^{64}$. The posterior mean is
 
 $$
 \boxed{\;
-\mu^q_t = \mu^p_t + s_\mu \tanh\!\left(\frac{\widetilde{\Delta\mu}_t}{s_\mu}\right),
-\qquad
-\ell^q_t = \mathrm{sb}\!\left(\tilde\ell^p_t + s_\ell \tanh\!\left(\frac{\widetilde{\Delta\ell}_t}{s_\ell}\right)\right),\;}
+\mu^q_t = \mu^p_t + s_\mu \tanh\!\left(\frac{\widetilde{\Delta\mu}_t}{s_\mu}\right),\;}
+\qquad s_\mu = 3 .
 $$
 
-with $s_\mu = 3$ and $s_\ell = 2$. Note the log-variance residual is added to the prior's
-**pre-bound raw** value and the bound is applied once to the sum.
+The posterior log-variance depends on `posterior_logvar_mode`:
 
-Since $\tanh(0) = 0$ and both delta heads are zero-initialised, at initialisation
-$\mu^q_t = \mu^p_t$ and $\ell^q_t = \ell^p_t$ *exactly*, hence $K_t \equiv 0$.
+$$
+\ell^q_t =
+\begin{cases}
+\mathrm{sb}\!\left(\tilde\ell^q_t\right) & \texttt{independent}\ \text{(shipped)},\\[6pt]
+\mathrm{sb}\!\left(\tilde\ell^p_t + s_\ell \tanh\!\left(\dfrac{\tilde\ell^q_t}{s_\ell}\right)\right) & \texttt{residual},
+\end{cases}
+\qquad s_\ell = 2 .
+$$
+
+Under `residual`, the log-variance delta is added to the prior's **pre-bound raw** value and the
+bound is applied once to the sum. The full branch's pressure to sharpen $\sigma^q$ then also
+reaches the prior's log-variance tensor. Under `independent`, the posterior has its own head and
+no gradient from the full branch's reconstruction reaches $\ell^p$ through this head.
+
+At initialisation the mean-delta heads are zero, and $\tanh(0) = 0$, so $\mu^q_t = \mu^p_t$
+exactly. Under `residual` the log-variance delta head is also zero, so $\ell^q_t = \ell^p_t$
+exactly. Under `independent` the head is seeded at zero weight and bias $\log(5/3)$, so
+$\ell^q_t = 0$; with `head_init_calibration: true` the prior log-variance also starts at exactly
+$0$ (§8), so $\ell^q_t = \ell^p_t$. In both shipped cases $K_t \equiv 0$ at initialisation.
+
+An optional **event gate** (`posterior_event_gate`, default `false`) builds one scalar
+$g_t \in (0, 1)$ per step from the attended summaries. It multiplies both bounded residuals, so
+at $g_t = 0$ the posterior equals the prior. The forward then also returns `event_gate`
+$(B, 300, 1)$, and the objective term `lambda_event_gate` charges its mean.
 
 ### 5.7 Shared horizon decoder
 
@@ -1033,9 +1078,10 @@ $t$, so pooling across it cannot reach information the anchor did not already ha
 argument makes the group normalisers here safe to leave non-causal — they pool over the forecast
 axis of a single anchor, never across input time.
 
-Per-block FiLM is structural. The learned step embedding is roughly $2.4\%$ the magnitude of the
-broadcast latent, so the $30$ horizon tokens enter the stack nearly identical; with a single
-top-of-stack modulation the refine stack can synthesise the trajectory shape in a
+Per-block FiLM is structural (`film_per_block=True`, no config key); `horizon_film: false` fails
+at construction. At the core's own seed, $\mathcal{N}(0, 0.02^2)$, the learned step embedding is
+small beside the broadcast latent, so the $30$ horizon tokens enter the stack nearly identical;
+with a single top-of-stack modulation the refine stack can synthesise the trajectory shape in a
 $z$-independent direction and use the latent only for a coarse offset. Reading $h_t$ at every
 block forecloses that, while keeping the decoder's input set unchanged — every modulation is a
 function of the latent alone.
@@ -1056,8 +1102,9 @@ convolutions are: the horizon is not time. The convolutions mix through a fixed 
 schedule set at construction; these mix all $30$ at once with content-dependent weights, so a
 forecast is shaped as a whole rather than assembled from overlapping neighbourhoods. There is no
 positional encoding of their own — $e_\tau$ is already what tells the tokens apart.
-`horizon_attention_blocks: 0` constructs no module, leaving the core bitwise the one that existed
-before them, and `sweep_horizon_attn_off.yaml` is that arm.
+`horizon_attention_blocks: 0` constructs no module, leaving the core bitwise the one without
+them. Each block is four bias-free $256 \times 256$ projections, one `LayerNorm` and one scalar
+residual gain, so $4 d_{\mathrm{hidden}}^2 + 2 d_{\mathrm{hidden}} + 1$ parameters.
 
 The block is hand-rolled rather than `nn.MultiheadAttention` for two correctness reasons: MHA
 applies its attention dropout functionally, where the dropout-zero scans guarding the twice-invoked
@@ -1097,8 +1144,11 @@ complete future trajectory.
 
 ### 5.8 Forward return contract
 
-The forward returns exactly twenty tensors. There is deliberately no decoder-conditioning state
-and no source-correction tensor, because neither pathway exists.
+The forward returns twenty tensors, plus `event_gate` $(B, 300, 1)$ when the posterior event gate
+is built. There is deliberately no decoder-conditioning state and no source-correction tensor,
+because neither pathway exists. Under the shipped `base_decode: mean`, `z_prior` **is** the
+`mu_prior` tensor (the same object, not a copy). `source_state` is the representation the
+attention reads as keys and values, which depends on `lag_kv_source`.
 
 | Key | Shape |
 | --- | --- |
@@ -1126,10 +1176,13 @@ surface in a loss curve:
 | $c_y < 1$ or $c_u < 1$ | a zero-width linear layer is legal and simply returns its bias, so the model would train to completion having never read that stream |
 | $M \cdot d_{\mathrm{head}} \ne d_{\mathrm{model}}$ | the head reshape would silently mis-slice the projections |
 | $\mathrm{max\_lag} < 0$ | an empty attention window collapses the attended source to a bias — the model never reads the source, then reports its KL as a measurement of it |
-| $d_z \bmod M \ne 0$ | the per-group KL would no longer be an additive decomposition (§11.2) |
-| a keep-index that is empty, out of range, or not strictly ascending | the delay vector is positional *against* the keep-index, so a reordered index delays the wrong channels with no other failure signal |
-| $\max_c \delta_c > w$ | the zero-filled prefix of a delayed stream would reach the scored anchors |
+| $d_z \bmod M \ne 0$ | the per-group KL would no longer be an additive decomposition (§11.3) |
+| a keep-index that is empty, out of range, or not strictly ascending, or a delay vector that does not match it | the delay vector is positional *against* the keep-index, so a reordered index delays the wrong channels with no other failure signal |
 | a degenerate raw geometry | $T_{\mathrm{valid}} < 1$, a warm-up outside $[0, T-H)$, or a raw length not divisible by $D$ |
+| `prior_availability_input: true` or `persistence_residual: true` | these keys belong to sibling cells; this architecture has no input warm-up clock and no per-channel target level |
+
+The constraint $\max_c \delta_c \le w$ is checked when the reach budget is resolved (§14.2), not
+by the constructor.
 
 The geometry object additionally asserts its own index identities at construction —
 $\mathrm{start}(0) = D$, $n_{\mathrm{raw}}(0) = D - 1$, and that the last anchor's window ends
@@ -1140,43 +1193,18 @@ program.
 
 ## 6. Parameter budget
 
-Measured on the constructed model at the shipped configuration.
+Parameter counts follow from the widths of §5. A few counts are fixed by the architecture:
 
-| Component | Parameters | Share |
-| --- | ---: | ---: |
-| Horizon decoder core (shared) | 1,849,346 | 36.35% |
-| Target encoder | 1,344,999 | 26.43% |
-| Source encoder | 1,312,231 | 25.79% |
-| Posterior head | 116,484 | 2.29% |
-| Decoder projection + output heads | 113,936 | 2.24% |
-| Prior head | 108,010 | 2.12% |
-| Target input adapter | 81,408 | 1.60% |
-| Lag cross-attention | 78,572 | 1.54% |
-| Source input adapter | 74,880 | 1.47% |
-| Attention query projection | 8,320 | 0.16% |
-| **Total** | **5,088,186** | 100% |
-| — of which frozen (attention $W_o$) | 16,512 | 0.32% |
-| — trainable | 5,071,674 | 99.68% |
+* The frozen attention output projection $W_o$ holds $128 \times 128 + 128 = 16{,}512$
+  parameters (§5.5).
+* Each horizon self-attention block holds $4 d_{\mathrm{hidden}}^2 + 2 d_{\mathrm{hidden}} + 1$
+  parameters (§5.7). `horizon_attention_blocks: 0` builds none of them.
+* A plain residual seam holds $2d$ fewer parameters than an activated one (§0).
+* A configured reach budget adds the availability terms of the two `AvailabilityInputAdapter`
+  modules (§5.2). An unguarded build has none.
 
-The shipped `causal_reach_budget_s: 120` adds $6{,}272$ more for the two availability adapters, so
-the model as launched holds $5{,}094{,}458$; the table is the unguarded build, which is the number
-the design records quote.
-
-**The capacity revision reordered this table.** The two history encoders were nearly $79\%$ of the
-model and are now $52.2\%$, because the decoder went from $128$ wide and three refine blocks to
-$256$ and four, and gained the horizon self-attention — it is now the single largest component. That
-was the point: the decoder was the only thing standing between one latent vector and $480$ raw
-samples, and at $128$ it held roughly a fifth of what the encoders did. Within each encoder the
-convolution stack still dominates: the five blocks cost $49{,}408$, $114{,}944$, $180{,}480$,
-$246{,}016$ and $246{,}016$ parameters respectively, and the two-layer LSTM $264{,}192$.
-
-The horizon core's $1{,}849{,}346$ parameters break down as four horizon convolutions
-($4 \times 196{,}864$), their group norms ($4 \times 512$), four FiLM generators
-($4 \times 131{,}584$), two horizon self-attention blocks ($2 \times 262{,}657$), the horizon-step
-embedding ($30 \times 256 = 7{,}680$) and the output LayerNorm ($512$). Each attention block is four
-bias-free $256 \times 256$ projections, one `LayerNorm` and one scalar residual gain, so
-$4 d_{\mathrm{hidden}}^2 + 2 d_{\mathrm{hidden}} + 1$; `horizon_attention_blocks: 0` builds none of
-it rather than building it inert.
+To read the count of a configuration, construct the model and sum `p.numel()` over its
+parameters.
 
 ---
 
@@ -1187,8 +1215,10 @@ construction and pinned by a test.
 
 ### 7.1 No decoder bypass
 
-The decoder's `forward` signature accepts exactly one tensor. There is no second decoder, no
-conditioning head, and no path from either encoder state to the decoder. Formally, for the
+The decoder's `forward` accepts the latent and an optional `persistence` tensor; this
+architecture refuses `persistence_residual: true` at construction, so the latent is the only
+input. There is no second decoder, no conditioning head, and no path from either encoder state
+to the decoder. Formally, for the
 decoder parameters $\psi$,
 
 $$
@@ -1214,25 +1244,24 @@ signals is ever loaded. Without this, $K_t$ would not measure what the source ad
 
 ### 7.3 Exact zero at initialisation
 
-At construction, in training mode,
+At construction, in training mode, $K_t \equiv 0$. Two mechanisms produce this: the posterior
+mean-delta heads are zeroed, and the posterior log-variance starts at the prior's initial value
+(§5.6). Under `posterior_logvar_mode: independent` that second condition needs
+`head_init_calibration: true`, which is shipped.
 
-$$
-K_t \equiv 0 \quad\text{and}\quad
-\hat\mu^{\mathrm{base}} = \hat\mu^{\mathrm{full}},\quad
-\hat\ell^{\mathrm{base}} = \hat\ell^{\mathrm{full}}
-\quad\text{bitwise.}
-$$
-
-Three mechanisms together produce this: the posterior residual heads are zeroed (so $q \equiv p$
-exactly), one shared $\epsilon$ makes $z^q = z^p$ sample by sample rather than merely in
-distribution, and the twice-invoked decoder and the attention probabilities carry no dropout.
+Under `base_decode: sample`, the base and full forecasts are also bitwise identical at
+initialisation, because one shared $\epsilon$ makes $z^q = z^p$ sample by sample and the
+twice-invoked decoder and the attention probabilities carry no dropout. Under the shipped
+`base_decode: mean`, the two forecasts differ at initialisation by the posterior's sampling noise
+(§4.4).
 
 A corollary worth stating explicitly: **any KL assertion on a freshly constructed model passes
 vacuously.** Tests that claim to check KL behaviour must first perturb the posterior.
 
 ### 7.4 Zero dropout where it would corrupt a readout
 
-Dropout is $0.1$ in the adapters, encoders and latent heads. It is exactly $0$ in the decoder
+Dropout is `dropout` ($0.1$) in the adapters, encoders and latent heads; the source pathway uses
+`source_dropout` instead when that key is set. It is exactly $0$ in the decoder
 (§5.7) and in the attention probabilities (§5.5). Both zeros are correctness requirements with
 named failure modes, not stylistic choices.
 
@@ -1249,7 +1278,10 @@ gradients survive the early steps of a long sequence instead of decaying through
 gate.
 
 **Step 2 — zero the posterior residual heads.** *After* step 1, never before: the generic
-initialisation would otherwise Xavier-refill them and destroy the exact zero-KL start.
+initialisation would otherwise Xavier-refill them and destroy the exact zero-KL start. Under
+`posterior_logvar_mode: independent` the log-variance head is not zeroed; it is seeded at zero
+weight and bias $\log(5/3)$, the pre-image of log-variance $0$, so $\sigma_q = 1$ at step $0$. The
+event gate, when built, is re-seeded open at this point for the same reason.
 
 **Step 3 — zero the FiLM generators.** Same reasoning. The horizon core zero-initialises its
 generators for an identity at construction, and step 1 undoes it; re-zeroing here is what makes
@@ -1261,15 +1293,14 @@ zero.
 configured value departs from a no-op default, so a default-flag model is bitwise the pre-policy
 one. None adds a parameter.
 
-* **Horizon-embedding rescale.** The core seeds $e_\tau \sim \mathcal{N}(0, 0.02^2)$, roughly
-  $2.4\%$ of the broadcast latent's magnitude, leaving the $30$ horizon tokens $\approx 0.999$
-  correlated at initialisation and per-block FiLM with almost no token-specific structure to
-  modulate. Re-seeding at $\mathcal{N}(0, 0.8^2)$ drops the token correlation to $\approx 0.45$
-  and raises the token-specific variance fraction from $\approx 0.06\%$ to $\approx 48\%$,
-  giving every block distinct per-step offsets to shape from step $0$. The posterior deltas are
-  untouched, so the exact zero-KL start survives.
+* **Horizon-embedding rescale** (`horizon_embed_std`). The core seeds
+  $e_\tau \sim \mathcal{N}(0, 0.02^2)$, small beside the broadcast latent, so the $30$ horizon
+  tokens are nearly identical at initialisation and per-block FiLM has little token-specific
+  structure to modulate. Re-seeding at $\mathcal{N}(0, 0.8^2)$ gives every block distinct
+  per-step offsets to shape from step $0$. The posterior deltas are untouched, so the exact
+  zero-KL start survives.
 
-* **Output-head calibration.** Xavier-filled output heads emit a high-variance mean and an
+* **Output-head calibration** (`head_init_calibration`). Xavier-filled output heads emit a high-variance mean and an
   over-confident low log-variance, so the initial factorised Gaussian NLL of a z-scored target
   sits far above the trivial $\mu = 0, \sigma = 1$ predictor's. Three edits move the decoder onto
   that predictor at step $0$: scale the mean head's weight by $0.02$ so $\hat\mu \approx 0$
@@ -1282,7 +1313,7 @@ one. None adds a parameter.
 
   i.e. $\sigma = 1$ exactly, and scale the log-variance weight by $0.1$ so the initial spread
   around that centre is small. Both forecasts share this one decoder, so both stay calibrated
-  identically and every bitwise-at-initialisation contract is preserved.
+  identically.
 
   The same key calibrates the **prior head's log-variance** onto unit scale ($\sigma_p = 1$, the
   scale-anchor term's optimum) — the same trivial-predictor policy, applied to the other
@@ -1290,13 +1321,12 @@ one. None adds a parameter.
   shrink: the head is a residual MLP with no single bias governing its output level, so the final
   body layer's weight and the whole skip projection are zeroed and the final bias set to the
   pre-image of log-variance $0$ under the bound — $\log(5/3)$ at the shipped $(-5, 3)$ — making
-  the raw output input-independent and the bounded output exactly $0$. The posterior's residual
-  is built on that same raw tensor, so the exact zero-KL start is untouched, and the zeroed
-  layers still receive gradient, so the head trains off the constant like the posterior deltas
-  do. Without this half, nothing in the initialisation places the prior's scale, and the first
-  production run measured it collapsing onto the clamp floor within one epoch.
+  the raw output input-independent and the bounded output exactly $0$. This matches the
+  independent posterior log-variance head's seed, so the KL is exactly zero at step $0$. The
+  zeroed layers still receive gradient, so the head trains off the constant like the posterior
+  deltas do. Without this half, nothing in the initialisation places the prior's scale.
 
-* **Attended-source gain.** Set the posterior fusion's attended-source LayerNorm gain to
+* **Attended-source gain** (`a_head_gain`). Set the posterior fusion's attended-source LayerNorm gain to
   $\sqrt{d_{\mathrm{model}}/d_{\mathrm{head}}} = 2$ (see §5.6). The deltas are still zero, so the
   KL is still exactly zero.
 
@@ -1326,8 +1356,8 @@ is the fraction of an anchor's forecast window that is observed. An anchor below
 $c_{\min} = 0.9$ is zeroed *entirely* rather than partially scored. The reason is arithmetic: a
 half-masked anchor's *summed* block NLL covers half a window, so the base-minus-full gap read off
 it is spuriously small, and mixing such anchors into the average biases the coupling readout
-downward. The pre-floor distribution of $\bar c_t$ is logged so the threshold can be re-derived
-from data.
+downward. The pre-floor mean of $\bar c_t$ over the trained anchors is logged as
+`anchor_coverage_frac`.
 
 ### 9.3 Contributing anchors and the KL support
 
@@ -1545,9 +1575,21 @@ $$
 **The total is mixed-unit, and §10.1 does not extend to it.** The first four terms are nats per
 anchor; the last three are $L_1$ and Huber quantities on z-scored raw samples. So `total_loss`'s
 *level* is not readable as nats, and comparing it across arms carrying different $\lambda$ weights
-compares two different quantities. Its direction is still the training signal, `nll_full_block` and
-`nll_base_block` remain the pure-nats readouts every comparison uses, and the three `aux_*` metrics
-carry each shape term on its own.
+compares two different quantities. `nll_full_block` and `nll_base_block` are the pure-nats
+readouts, and the three `aux_*` metrics carry each shape term on its own.
+
+**Optional terms, off in `default.yaml`.** The objective has three further mechanisms, each
+bitwise absent at its default:
+
+* `lambda_event_gate` adds $\lambda_g\,\beta\,\mathbb{E}_t[g_t]$ and needs
+  `posterior_event_gate: true` (§5.6).
+* `event_weight_floor` replaces $D_1$ by a contraction-weighted block NLL: anchors within
+  `event_weight_reach_steps` (default `max_lag`) after a detected contraction onset weigh $1$,
+  other anchors weigh $w_{\min}$. It needs `'up'` in `load_fields`; see `event_weight.py`. The
+  term enters the total as `nll_full_event_block`.
+* `horizon_weight_halflife_steps` weights both reconstruction terms on the horizon axis by
+  $w_\tau \propto 2^{-\tau/\lambda}$, normalised to sum to $H$. A weighted block score is not a
+  log-density, so $\beta = 1$ is then no longer the exact ELBO.
 
 Four remarks make the rest of the objective readable.
 
@@ -1577,21 +1619,13 @@ different objective than the configuration describes is worse than failing.
 
 **Why $\beta_p$ does *not* warm up.** The incentive $R_p$ opposes is one-sided and immediate: the
 reconstruction strictly prefers a deterministic latent, since sampling noise can only degrade a
-forecast, and $K$ measures $q$ *against* $p$ without constraining $p$'s own scale. Unweighted, the
-first production run of this objective drove `logvar_prior_floor_frac` from $0.118$ at epoch $0$ to
-$0.812$ at epoch $1$ and finished at $0.992$ — the collapse completes inside one epoch, so any
-warm-up would arrive after the damage. $\beta_p$ is therefore a constant.
+forecast, and $K$ measures $q$ *against* $p$ without constraining $p$'s own scale. $\beta_p$ is
+therefore a constant from epoch $0$.
 
-It is also a **threshold rather than a dial**, which is why the shipped value is bracketed by a
-sweep rather than tuned by interpolation. The weighted restoring force
-$\beta_p\,\partial\rho/\partial\ell^p = \tfrac12\beta_p(e^{\ell^p} - 1)$ saturates at
-$-\tfrac12\beta_p$ per
-dimension as $\ell^p \to -\infty$, while the reconstruction's opposing pressure *grows* as the
-decoder sharpens: below the crossing weight the prior still pins, only later. Measured on the
-committed HIE shard, $\beta_p = 10^{-2}$ delayed the collapse $6.7\times$ in optimizer steps and
-finished at $0.955$ anyway, while $\beta_p = 0.1$ held at $0.046$ with `kld_active_frac` at $0.69$
-against $0.24$–$0.25$ in every collapsed arm. $0.1$ ships; the four `sweep_beta_prior_*` arms of the
-transformer package bracket it on the architecture the collapse was first measured on.
+The weighted restoring force $\beta_p\,\partial\rho/\partial\ell^p = \tfrac12\beta_p(e^{\ell^p} - 1)$
+saturates at $-\tfrac12\beta_p$ per dimension as $\ell^p \to -\infty$, while the reconstruction's
+opposing pressure grows as the decoder sharpens. So a given weight either exceeds that pressure or
+is eventually overrun by it. The shipped value is $\beta_p = 0.1$.
 
 $R_p$ is computed and logged **unconditionally** — under every likelihood, whatever $\beta_p$ is —
 so a collapsing prior is visible in any run's metrics whether or not that run paid for the anchor.
@@ -1655,22 +1689,21 @@ This identity is the reason the attention is constructed at zero dropout.
 
 ### 11.5 From a lag index to seconds
 
-Two different quantities can be computed from a lag index $\ell$, and conflating them is a real
-reporting error rather than a hypothetical one.
+A lag index $\ell$ is converted to seconds with the feature grid and the causal input delay only:
 
 $$
 \boxed{\;\tau_{\mathrm{compensated}} = \Delta\,(\ell + \delta) = 4(\ell + \delta)\ \mathrm{s}.\;}
 $$
 
-* $\delta$ is the causal input delay applied to the source channels ([§14](#14-causal-reach-control-of-the-inputs)); it is $0$ when no reach budget is configured.
-* There is **no dataset-shift term**. The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it.
-  An earlier revision of `lag_report.py` subtracted $20$ s to reach a "sensor timeline"; that
-  helper was removed on 2026-09-05.
+* $\delta$ is the causal input delay of the source channels
+  ([§14](#14-causal-reach-control-of-the-inputs)), read from the model's
+  `source_delay_steps()` accessor. It is $0$ when no reach budget is configured.
+* The conversion is `lag_compensated_seconds` in `teb_vae/lag_attn/nets/lag_report.py`, with
+  $\Delta$ = `SECONDS_PER_STEP` = $4$.
 
-**$\tau_{\mathrm{compensated}}$ is the quantity to report as *the* lag.** Figure axes use a shared label constant so a plot and the
-number beside it cannot disagree about which is shown, and every consumer reads $\delta$ from one
-accessor on the model — because the model is what was trained, and two consumers each guessing
-the delay is how two reports of the same run came to disagree by two minutes with nothing raising.
+Figure axes use the shared label constant `COMPENSATED_LAG_AXIS_LABEL`, so a plot and the number
+beside it cannot disagree about which quantity is shown. Every consumer reads $\delta$ from the
+one accessor on the model, because the model is what was trained.
 
 ### 11.6 Health diagnostics
 
@@ -1679,15 +1712,15 @@ These exist because specific failure modes are invisible in a loss curve.
 | Metric | Watches for |
 | --- | --- |
 | `mean_logvar_prior`, `logvar_prior_floor_frac` | **A prior variance pinned on its lower clamp.** The KL carries $(\mu^q - \mu^p)^2/\sigma_p^2$, so a floored $\sigma_p^2$ inflates the coupling readout by orders of magnitude while every decoder-side diagnostic looks healthy. Logged from epoch $0$. |
-| `prior_rate` | **The same pathology as a distance rather than a fraction**, and the objective term itself: $R_p$ in nats per anchor (§10.5). Zero means $\sigma_p = 1$ exactly; it is the *only* one of these that is bounded below by its own optimum, so a **rising** `prior_rate` is the prior's scale walking away from unit scale in either direction — downward towards the clamp in every case observed so far, which the floor fraction then confirms. It leads that fraction: $R_p$ grows continuously from the first step, while `logvar_prior_floor_frac` reads $0$ until the mass actually reaches the margin. Logged whatever `beta_prior` is, so it diagnoses unanchored runs too. |
+| `prior_rate` | **The same pathology as a distance rather than a fraction**, and the objective term itself: $R_p$ in nats per anchor (§10.5). Zero means $\sigma_p = 1$ exactly; it is the *only* one of these that is bounded below by its own optimum, so a **rising** `prior_rate` is the prior's scale moving away from unit scale in either direction. It moves continuously, while `logvar_prior_floor_frac` reads $0$ until the mass actually reaches the margin. Logged whatever `beta_prior` is. |
 | `beta_prior` | The weight in force, echoed like `kld_beta` so a `metrics_history.csv` identifies its own arm and every weighted term can be recomposed from the file alone. |
-| `aux_multiscale`, `aux_derivative`, `aux_boundary` | The three shape terms of §10.6, each on its own, and what the three provisional weights are re-derived from — read them against `main_loss` to see what fraction of the criterion each is buying. Their weights `lambda_ms`, `lambda_deriv` and `lambda_boundary` are echoed beside them on the same recomposition principle. A term whose weight is $0.0$ reports exact $0.0$ because it is **not computed**, so a zero column means the term was off, not that the forecast satisfied it. |
-| `grad_clip_frac` | **Whether the clip threshold is binding.** `grad_norm` gives the norm; whether it exceeded `gradient_clip_val` on a given step is not recoverable from an epoch aggregate. $1.0$ is normalised-gradient descent in disguise — the first production run recorded exactly that — and $0.0$ is a clip that never fires. Omitted entirely when the trainer configures no clipping. |
+| `aux_multiscale`, `aux_derivative`, `aux_boundary` | The three shape terms of §10.6, each on its own. Their weights `lambda_ms`, `lambda_deriv` and `lambda_boundary` are echoed beside them on the same recomposition principle. A term whose weight is $0.0$ reports exact $0.0$ because it is **not computed**, so a zero column means the term was off, not that the forecast satisfied it. |
+| `grad_clip_frac` | **Whether the clip threshold is binding.** `grad_norm` gives the norm; whether it exceeded `gradient_clip_val` on a given step is not recoverable from an epoch aggregate. $1.0$ is normalised-gradient descent in disguise, and $0.0$ is a clip that never fires. Omitted entirely when the trainer configures no clipping. |
 | `logvar_full_floor_frac`, `logvar_full_ceil_frac` | **A binding decoder variance bound**, at each end separately. Pinned at the floor the decoder is over-confident and the NLL's squared term explodes — this is what a loss spike looks like from the inside. Pinned at the ceiling it has given up and is predicting noise, which reads as a healthy falling NLL while `pred_gap` goes to zero. A single mean cannot distinguish either from a well-spread distribution. |
 | `kld_active_frac` | Collapse onto one or two latent dimensions. |
 | `mu_prior_sat_frac`, `delta_mu_sat_frac` | Fraction of the tanh-bounded means within $1\%$ of their bound. A bound that is always active is a silently mis-set hyperparameter. |
 | `delta_mu_rms`, `mu_post_prior_gap_rms` | The size of the source-induced belief shift, per coordinate and per step respectively. |
-| `anchor_coverage_frac` | The pre-floor distribution the coverage floor is re-derived from. |
+| `anchor_coverage_frac` | The pre-floor forecast-window coverage over the trained anchors (§9.2). |
 | `grad_norm` | The **pre-clip** global gradient $L_2$ norm, the only quantity the clip threshold can be derived from. |
 
 **The two gradient columns are sampled, not reduced.** Every other column here is a true epoch
@@ -1750,8 +1783,8 @@ One figure per selected validation sample, from a single forward pass, in seven 
 2. the forecast over the whole recording, tiled into **consecutive non-overlapping** windows: the
    true future against the base and full forecasts with their $\hat\mu \pm 2\hat\sigma$ bands and a
    thin dashed vertical at every window edge — the panel the model exists to produce;
-3. $\mu^p_t$ over $\mu^q_t - \mu^p_t$ on one colour scale, so their relative size is visible (a
-   delta as large as the state itself means the posterior is doing the prior's job);
+3. $\mu^p_t$ over $\mu^q_t - \mu^p_t$, each on its own symmetric colour scale with its own colour
+   bar, so the two bars' ranges state their relative size;
 4. the per-step per-dimension KL, where a collapse onto one or two dimensions shows up;
 5. the total per-step $K_t$;
 6. the head-averaged lag-attention matrix with its per-step argmax overlaid;
@@ -1780,7 +1813,15 @@ removed from the *data of the panel* rather than shaded over it; every axes stil
 recording, so the rows stay column-aligned with rows 1 and 2, and the empty margins are marked in
 grey.
 
-Both lag panels carry a secondary axis in **compensated** seconds and say so in the label.
+Both lag panels carry a secondary axis in seconds, $\Delta(\ell + \delta)$. The label says
+*compensated* only when the model has a nonzero $\delta$.
+
+When a reach budget is configured, the page also draws one row per gated input stream between
+rows 2 and 3: the target and the source as the encoders receive them, surviving channels only,
+each shifted by its own delay. The callback also writes the run-level input-budget figure
+(`input_budget.py`, file stem `causal_input_budget`) once per run. The page itself is
+`build_diagnostic_figure` in `sample_page.py`; `plotting.py` holds the callback
+`LagAttnRwsPlotCallback`.
 
 ---
 
@@ -1802,6 +1843,9 @@ doomed launch leaves nothing behind:
 4. the causal reach budget resolves to a non-empty channel set with a delay that fits inside the
    warm-up.
 
+After these four, the driver calls its `preflight` hook, which a sibling architecture may override
+with its own guards.
+
 ### 12.2 Optimiser and schedule
 
 | Setting | Value |
@@ -1819,24 +1863,19 @@ doomed launch leaves nothing behind:
 | Gradient clipping | global norm, threshold $5000$ |
 | Seed | $42$ |
 
-Adam's per-parameter normalisation makes the step size largely invariant to the loss scale, so
-the learning rate transfers across objective magnitudes; the **clip threshold does not**. It began
-scaled with the objective, at $250$, and has since been re-derived from the first production run's
-logged pre-clip `grad_norm`: $q_{50} = 2775$, $q_{99} = 4681$, $q_{99.9} = 5866$, maximum $7313$,
-minimum $703$ — **every** recorded step above $250$, so that run performed normalised-gradient
-descent at roughly an eleventh of its configured learning rate. $5000$ is the smallest round value
-above $q_{99}$, which leaves the top percent of steps clipping and the rest stepping at the
-learning rate they were configured with.
+The optimiser and the multi-step scheduler come from `train/pl_model_base.py`. Adam's
+per-parameter normalisation makes the step size largely invariant to the loss scale; the clip
+threshold is not, so `gradient_clip_val` is stated on the scale of the pre-clip global norm that
+`train/grad_norm` logs (§11.6).
 
-The milestones are deliberately late relative to the $\beta$ ramp. The source pathway starts at
-exactly zero KL and can only earn coupling once $\beta$ is on, which is epoch $50$. Milestones at
-$\{400, 800\}$ leave $400$ epochs at full learning rate with $\beta$ at its endpoint; decaying
-earlier would measure the coupling readout on a model that was effectively frozen before the
-bottleneck could open.
+The milestones are late relative to the $\beta$ ramp. The source pathway starts at exactly zero KL
+and can only earn coupling once $\beta$ is on, which is fully the case from epoch $50$. Milestones
+at $\{400, 800\}$ leave $350$ epochs at full learning rate with $\beta$ at its endpoint.
 
 ### 12.3 Distributed training
 
-Seven devices under distributed data-parallel, one process per device. The plain strategy —
+Distributed data-parallel, one process per entry of `general_config.cuda_devices` (eight in
+`default.yaml`). The plain strategy —
 which asserts that *every* parameter is marked ready in every backward pass — is selected
 whenever the Gaussian likelihood is in use, because that likelihood consumes the decoder's
 log-variance heads. Under the squared-error likelihood those heads starve, and the
@@ -1847,10 +1886,11 @@ The framework injects the distributed sampler and calls its epoch hook; no sampl
 Sanity validation steps are disabled, because a sanity pass would shift every epoch number
 against the tracking store and the checkpoint filenames.
 
-**Graph compilation is permanently off.** Three independent constructs defeat the compiler: the
-LSTM encoders, the optionally checkpointed attention region, and the data-dependent boolean mask
-indexing behind the active-dimension count. This is forced in the task's constructor rather than
-defaulted.
+**Graph compilation is off.** The task's `compile_model` defaults to `False`, and
+`advanced_config.trainer.compile` is `false`. Two constructs of this net defeat TorchInductor: the
+LSTM encoders, and the attention region when `attention_grad_checkpoint` is set. Only the forward
+would ever be compiled; the objective runs through the eager module, so the data-dependent mask
+indexing behind `kld_active_frac` stays eager.
 
 ### 12.4 Loss-spike circuit breaker
 
@@ -1885,7 +1925,7 @@ agree), so optimiser steps stay in lockstep.
 | Multiplier | $5.0$ |
 | EMA decay | $0.02$ |
 | EMA floor | $10^{9}$ — relative test off |
-| Additive margin | $10^{3}$ nats |
+| Additive margin | $10^{3}$, in units of `main_loss` |
 | Warm-up batches | $100$ |
 | Max consecutive skips | $25$ |
 
@@ -1919,19 +1959,23 @@ the very ordering the control exists to check.
 * Every checkpoint carries the model class name **and** the exact constructor kwargs, so the
   architecture is rebuildable with no configuration file, and a blob written by a different model
   is refused before any load is attempted.
-* Peak device memory after the first training step — the honest high-water mark, covering
-  weights, optimiser state and one full forward/backward at the configured batch.
+* Peak device memory (`torch.cuda.max_memory_allocated` and `max_memory_reserved`) after the
+  first training step, covering weights, optimiser state and one full forward/backward at the
+  configured batch.
 
 ---
 
 ## 13. Evaluation protocol
 
-Training reports single-draw quantities. The offline evaluation is a separate pass with a
-different estimator and an explicit acceptance gate.
+Training reports single-draw quantities. The offline evaluation (`eval/`, entry point
+`python -m teb_vae.lag_attn_rws.eval.run`) is a separate pass with a different estimator and an
+explicit acceptance gate. `eval/EVAL.md` is its full contract.
 
 ### 13.1 Monte Carlo predictive likelihood
 
-Every branch is scored with $S = 8$ latent draws under **common random numbers**: one $\epsilon$
+Every branch is scored with $S$ latent draws under **common random numbers**. $S$ is
+`eval_config.num_mc_samples` ($5$ in `eval/configs/eval_overrides.yaml`; the module default
+`DEFAULT_NUM_SAMPLES` is $8$). one $\epsilon$
 per replicate, reused by *every* branch, so two branches with identical latent parameters produce
 bitwise identical scores and the base-versus-full difference is a difference of predictions rather
 than of noise. The estimator draws from an explicit generator rather than the global stream, so
@@ -1948,8 +1992,9 @@ $$
 the log of the *average likelihood*. By Jensen this is strictly smaller than the average of the
 log scores whenever the draws disagree, and that gap is the entire point of marginalising rather
 than averaging. Under the squared-error likelihood a block score is not a log-density and its
-exponential means nothing, so the marginal is the plain mean over draws instead. At $S = 1$ the
-estimator reduces exactly to the training-path per-anchor score.
+exponential means nothing, so the marginal is the plain mean over draws instead. The estimator
+samples every branch, including the base branch, so at $S = 1$ it is one draw of the same
+estimator and not the training-path score under `base_decode: mean`.
 
 ### 13.2 Trivial baselines
 
@@ -1998,17 +2043,14 @@ only whether the matched source beat a stranger's — the one comparison in whic
 latent geometry are held fixed and *only the source changes*. So `predictive_improvement: FAIL`
 beside `source_margin_positive: PASS` and `source_specificity: FAIL` is a real state rather than a
 contradiction: the forecast did not improve, and the source pathway is still specific to this
-recording. That is exactly what the first production run of this objective reported, at $-7.37$
-nats of gain and $+1.06$ nats of margin, and the third verdict exists so a run in that state says
-so instead of reading as a flat negative.
+recording.
 
 **The prior-shuffle criterion is the check that the model is what it claims to be.** It replaces
 each recording's prior latent with a stranger's and re-scores the *base* forecast. If a stranger's
 prior forecasts this recording as well as its own, the prior is not carrying the target's
 predictive state — and then every readout built on the base-versus-full comparison is unsupported,
 because the thing the source is supposedly adding to is not there. A degradation below the margin
-but above zero is reported inconclusive: it costs something, but less than the stated margin, and
-the measured number is what revises that margin.
+but above zero is reported inconclusive.
 
 **The variance criteria check that the numbers mean what they say.** A prior variance pinned on
 its lower clamp multiplies every coupling readout by an arbitrary factor while every
@@ -2026,8 +2068,9 @@ tolerance loose enough to admit sampling noise at one sigma would accept a fifty
 three. An observation model whose coverage misses these nominals is one whose NLL is not a log
 density of anything, which makes every nats-per-anchor number in the run uninterpretable.
 
-A structural safeguard applies to the whole set: the verdict list is validated against a registry
-that refuses an unregistered name, a duplicate, or a *missing* entry. All three are the same
+A structural safeguard applies to the whole set: the verdict list is validated against
+`VERDICT_REGISTRY` in `eval/metrics.py`, which refuses an unregistered name, a duplicate, or a
+*missing* entry. All three are the same
 failure seen from different sides — a silent gap in the list reads as a criterion that passed.
 
 **The specificity criterion reads three losses and no KL, and that is its content rather than a
@@ -2037,12 +2080,14 @@ routinely moves it *more*. A healthy model therefore has $K_{\mathrm{shuffled}} 
 so a criterion phrased on the KL would fail exactly the models it should pass. The discriminating
 comparison lives in prediction space: a wrong source must be worse than no source at all.
 
-Additional controls available beyond the derangement: circularly shifted source, time-reversed
-source, and lag-band exclusions.
+`nets/controls.py` provides two further source interventions beside the derangement:
+`source_null_forward_outputs` rebuilds the posterior against a zeroed source stream, and
+`occluded_forward_outputs` zeroes a chosen slice of the source's steps and rebuilds the forecast.
 
 ### 13.4 Collapse criterion
 
-A completed run is **collapsed** when either
+`collapse.py` holds the criterion (`is_collapsed`) and its constants. A completed run is
+**collapsed** when either
 
 1. `val/source_conditioned_kl_raw` is below $0.02$ nats per anchor at every one of its final
    $5$ epochs, or
@@ -2057,11 +2102,10 @@ healthy run as collapsed.
 
 ### 13.5 Analyses
 
-Twelve analyses run off a single shared collection pass, so no analysis touches the model and any
-one of them can be re-run against a finished run directory with no checkpoint and no accelerator:
-forecast quality, coupling, permutation control, latent health, lag-resolved KL, attention
-structure, calibration, residual structure, trajectory over time, band partition, time to
-delivery, and cross-subgroup comparison.
+The analyses live in `eval/analyses/`: attention, band_partition, calibration, coherence,
+coupling, cross_subgroup, distributions, events, forecast, lag_kl, latent, perm_control,
+residual, samples, second_stage, sufficiency, time_to_delivery and trajectory. They run off a
+shared collection pass; `eval/EVAL.md` states which of them also read the model.
 
 Because forecast windows overlap heavily between adjacent anchors, statistical uncertainty is
 estimated by bootstrapping **recordings**, never by treating every anchor as an independent
@@ -2131,9 +2175,9 @@ discards. This is checked at resolution time and raises with both numbers named.
 
 | Budget | Target channels $c_y$ | Source channels $c_u$ | $\max_c \delta_c$ |
 | --- | ---: | ---: | ---: |
-| none (default) | 109 | 58 | 0 |
+| none (`null`) | 109 | 58 | 0 |
 | 240 s | 94 | 43 | 57 |
-| 120 s | 78 | 29 | 30 |
+| 120 s (shipped) | 78 | 29 | 30 |
 | 60 s | 59 | 23 | 14 |
 | 32 s | 43 | 19 | 8 |
 
@@ -2161,16 +2205,14 @@ a single key.
   them.
 * Arms at different budgets build different adapter widths and therefore **cannot share
   checkpoints**.
-* The unguarded default builds **no gather and no delay at all**.
+* An unguarded build (`causal_reach_budget_s: null`) has **no gather and no delay at all**.
+* The resolved keep-indices and delays are also written into `resolved_config.yaml` beside the
+  checkpoints, as a record (§12.6).
 
 ### 14.5 What the guard does and does not achieve
 
 $L_{95}$ is an energy *quantile*, not a support: $5\%$ of every filter's energy lies beyond its
-stated reach. Measured against a severe perturbation, the $120$ s budget suppresses the movement
-of the read features by roughly a factor of $20$ rather than to numerical noise. The residual is
-larger on the phase-harmonic block than on the scattering block, consistent with a phase
-coefficient normalising by its own envelope and so amplifying exactly the low-energy tail the
-quantile discounts.
+stated reach, so a channel at its budget still reads that tail of its future.
 
 **The guard bounds the leak; it does not remove it.** Only genuinely causal transforms would.
 
@@ -2182,41 +2224,40 @@ Stated plainly, because each one bounds what the numbers may be read as.
 
 **The KL is a source-conditioned rate, not a transfer entropy.** The name used throughout is
 `source_conditioned_kl`, and the lag decomposition is `source_kl_lag_map`. Reading $K_t$ as a
-transfer entropy would require, at minimum: strictly causal inputs (§14 — not currently
-achieved at the default budget), a bottleneck at its conditional minimum-necessary-information
+transfer entropy would require, at minimum: strictly causal inputs (§14 — the reach guard bounds
+the leak but does not remove it), a bottleneck at its conditional minimum-necessary-information
 point, a decoder that accurately represents the future conditional distribution, and treatment of
 confounding. The label would assert a property the input construction does not have.
 
 **A factorised likelihood.** The decoder's Gaussian is factorised over the $480$ future raw
 samples, so it ignores conditional correlation among them. Its predictive log-score difference
 therefore estimates a directed information quantity *within that model family*, not the
-data-generating one. Upgrading the covariance (low-rank plus diagonal, banded Cholesky, or a
-conditional flow over residuals) is the natural next step once calibration diagnostics show the
-factorised form is the binding error.
+data-generating one. A richer covariance (low-rank plus diagonal, banded Cholesky, or a
+conditional flow over residuals) is not implemented.
 
-**The three shape weights are provisional single points, and the objective is mixed-unit.** No run
-has measured $\mathcal{L}_{\mathrm{ms}}$, $\mathcal{L}_{\mathrm{deriv}}$ or
-$\mathcal{L}_{\mathrm{boundary}}$ against the reconstruction at this scale, so $0.1 / 0.1 / 0.05$ are
-the smallest weights that make the terms visible without letting them dominate rather than a derived
-balance. Three consequences bound what may be read: `total_loss` is not in nats and its *level* is
-not comparable across arms with different weights (§10.7); an arm that turns a term off loses that
-term's readout by design, because a zero-weighted term is not computed; and the boundary term ships
-in its **level** form only, without the slope variant, so a forecast whose opening level is right and
-whose opening slope is wrong is not penalised for it. Re-derive all three from the first production
-run's `aux_*` columns against `main_loss`. `MS_RATES = (1, 4, 16)` is likewise a module constant
-rather than a config key, because no arm sweeps pooling rates.
+**The objective is mixed-unit.** Three consequences bound what may be read: `total_loss` is not
+in nats and its *level* is not comparable across arms with different shape weights (§10.7); an arm
+that turns a term off loses that term's readout by design, because a zero-weighted term is not
+computed; and the boundary term has a **level** form only, without a slope variant, so a forecast
+whose opening level is right and whose opening slope is wrong is not penalised for it.
+`MS_RATES = (1, 4, 16)` is a module constant in `nets/losses.py` rather than a config key.
 
-**Context sufficiency is assumed, not shown.** The quantity one would like to condition on is the
-full target history $Y^-_t$; the model conditions on $z_t$. These agree only when $z_t$ is
-predictively sufficient, i.e. $X^+_t \perp Y^-_t \mid z_t$. Measuring the gap requires an
-evaluation-only oracle decoder conditioned on the full target history, compared against the
-latent-conditioned decoder:
+**Context sufficiency is estimated, not guaranteed.** The quantity one would like to condition on
+is the full target history $Y^-_t$; the model conditions on $z_t$. These agree only when $z_t$ is
+predictively sufficient, i.e. $X^+_t \perp Y^-_t \mid z_t$. The evaluation estimates the gap with
+an evaluation-only oracle decoder (`eval/oracle.py`, analysis `sufficiency`): the same decoder at
+the same capacity, reading the target encoder state $H^y_t$ instead of $z_t$, fitted on one half
+of the evaluation recordings and scored on the other:
 
 $$
-\Delta_{\mathrm{suff}} = -\log p\big(X^+_t \mid z_t\big) + \log p\big(X^+_t \mid H^y_t\big).
+\Delta_{\mathrm{suff}} = D_{\mathrm{base}} - D_{\mathrm{oracle}}
+= -\log p\big(X^+_t \mid z_t\big) + \log p\big(X^+_t \mid H^y_t\big).
 $$
 
-That probe is not currently run, so the sufficiency assumption stands as an assumption.
+It is an estimate, not a bound. Conditioning on $H^y_t$ rather than on $Y^-_t$ omits the
+encoder's own information loss, which biases the gap down. Fitting the probe on the evaluation
+population while $D_{\mathrm{base}}$ comes from a model trained on the pretraining cohort can bias
+it up.
 
 **Directed predictive information is not interventional causality.** Hidden common causes,
 unobserved clinical interventions and higher-order interactions can all produce directed
@@ -2228,8 +2269,7 @@ synthetic known-lag data, lag-band masking, leave-one-band-out prediction change
 alignment and source circular shifts.
 
 **With per-channel delays there is no single $\delta$.** The reported lag uses
-$\max_c \delta_c$, which makes it an **upper bound**; the fact is recorded in the run summary
-beside the number it produced.
+$\max_c \delta_c$, which makes it an **upper bound**.
 
 **Every valid anchor is decoded in every batch.** No anchor subsampling is implemented, so
 activation memory scales with $T_{\mathrm{valid}}$; the documented memory levers are reduced
@@ -2242,31 +2282,19 @@ $R_p + \tfrac12\sum_d (\mu^p_{t,d})^2$ (§10.5), and only the first half is weig
 compresses the prior *mean*, which is the entire content of the base forecast: adopting it trades
 $D_0$ away and turns a scale pathology into a target-side rate–distortion question — how much of
 the target's own predictive state the latent is permitted to carry — which this model does not
-attempt to answer. The half that ships is also the half the failure demanded; the collapse was in
-$\sigma_p$, at a mean nothing complained about. The scale half is a strict subset of the full rate,
-so adopting the rest later is an addition rather than a revision.
+attempt to answer. The scale half is a strict subset of the full rate, so adopting the rest later
+is an addition rather than a revision.
 
-**Both run-measured constants ship provisional at this capacity.** The spike breaker's
-additive margin was never measured at all — it is scaled, and is re-derived from an observed
-`main_loss` fluctuation distribution; the first production run bounds it as loose-but-working, with
-zero skips and a maximum loss-to-EMA distance of $669$ nats against its $1000$ nat margin, and it
-now watches a **mixed-unit** `main_loss` (§10.7) rather than a pure-nats one. The gradient clip
-**was** re-derived, from that run's logged pre-clip `grad_norm` (§12.2) — but that run predates the
-wider latent, the wider and deeper decoder, its horizon attention and the three shape terms, each of
-which moves the gradient the threshold is set against, so both values ship unchanged and marked
-`PROVISIONAL AT THIS CAPACITY` in `configs/default.yaml` and are re-derived from the first run at
-this geometry. Carrying a measured value across a scale change is a known quantity; rescaling it by
-a guess is not. The decoder
-log-variance clamp $[-5, 3]$ remains inherited and is re-derived from the logged floor/ceiling
-fractions — it shares one constant with the latent heads today, which the measurements now pull in
-opposite directions: the prior sat on its floor for $99.2\%$ of coordinates while the decoder sat on
-its for $22.5\%$ and never reached its ceiling.
+**One clamp serves every log-variance.** The prior, the posterior and the decoder all use
+`logvar_clamp` $[-5, 3]$. The spike breaker's `additive_margin` is in units of the watched
+`main_loss`, which is the mixed-unit total (§10.7).
 
 ---
 
 ## 16. Configuration reference
 
-The complete shipped configuration, grouped by what it controls.
+The model keys of `configs/default.yaml` (`model_config.VAE_model`), grouped by what they
+control, followed by the trainer keys this document refers to.
 
 ### Geometry and widths
 
@@ -2292,6 +2320,7 @@ The complete shipped configuration, grouped by what it controls.
 | `encoder_extra_kernel` | 15 |
 | `conv_norm_groups` | null (each block's $\min(8, C)$) |
 | `causal_norm` | **true** — a correctness requirement |
+| `source_dropout` | null — the source pathway uses `dropout`, and the posterior's attended-summary site has no dropout (§5.6) |
 
 ### Latent heads
 
@@ -2301,6 +2330,8 @@ The complete shipped configuration, grouped by what it controls.
 | `mu_scale` | 5.0 |
 | `delta_mu_scale` | 3.0 |
 | `delta_logvar_scale` | 2.0 |
+| `posterior_logvar_mode` | `independent` (§5.6) |
+| `base_decode` | `mean` (§4.4) |
 
 ### Attention
 
@@ -2333,17 +2364,11 @@ The complete shipped configuration, grouped by what it controls.
 | `lambda_base` | 1.0 |
 | `beta_schedule` | linear warm-up, $0 \to 1$ over 50 epochs |
 | `beta_prior` | 0.1 — a constant, never a schedule (§10.7) |
-| `lambda_ms` | 0.1 — PROVISIONAL; multiscale L1 on the forecast mean |
-| `lambda_deriv` | 0.1 — PROVISIONAL; derivative Huber |
-| `lambda_boundary` | 0.05 — PROVISIONAL; boundary continuity, half the others (one sample against 480) |
+| `lambda_ms` | 0.1 — multiscale L1 on the forecast mean |
+| `lambda_deriv` | 0.1 — derivative Huber |
+| `lambda_boundary` | 0.05 — boundary continuity, half the others (one sample against 480) |
 | `free_bits` | 0.0 |
 | `coverage_floor` | 0.9 |
-
-### Trainer
-
-| Key | Value |
-| --- | --- |
-| `gradient_clip_val` | 5000.0 — re-derived from the first production run's pre-clip `grad_norm` (§12.2) |
 
 ### Initialisation policies
 
@@ -2357,14 +2382,40 @@ The complete shipped configuration, grouped by what it controls.
 
 | Key | Value |
 | --- | --- |
-| `causal_reach_budget_s` | null (unguarded; sweep axis 240 / 120 / 60 / 32) |
+| `causal_reach_budget_s` | 120 (sweep arms: null / 240 / 120 / 60 / 32) |
+
+### Optional keys, absent from `default.yaml`
+
+Each of these keeps the model or the objective bitwise unchanged at its default.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `lag_kv_source` | `encoder` | source representation for keys and values (§5.3) |
+| `alibi_slope_scale` | 1.0 | multiplier on the `alibi_decay` slopes (§5.5) |
+| `posterior_event_gate` | false | builds the posterior event gate (§5.6) |
+| `lambda_event_gate` | 0.0 | weight of the event-gate sparsity term (§10.7) |
+| `event_weight_floor`, `event_weight_reach_steps` | null | contraction-weighted full-branch reconstruction (§10.7) |
+| `horizon_weight_halflife_steps` | null | horizon-axis weighting of both reconstruction terms (§10.7) |
+
+### Trainer and spike breaker
+
+| Key | Value |
+| --- | --- |
+| `general_config.lr` | 0.0003 |
+| `general_config.lr_milestone` | $[400, 800]$ |
+| `general_config.epochs` | 5000 |
+| `general_config.plot_frequency` | 5 — cadence of the loss-curve HTML and the diagnostic figure |
+| `advanced_config.trainer.gradient_clip_val` | 5000.0, global norm |
+| `advanced_config.trainer.precision` | `32-true` |
+| `advanced_config.trainer.compile` | false |
+| `advanced_config.trainer.num_sanity_val_steps` | 0 |
+| `advanced_config.spike_breaker` | §12.4 |
 
 ### Keys deliberately absent
 
 No configuration key exists for the observation noise, the head-structured latent, the frozen
 attention projection, the plain convolution stack, per-block FiLM, or the plain residual seams.
-All six are **structural facts** of this architecture; a key would read to a maintainer as a
-control that exists.
+All six are **structural facts** of this architecture.
 
 ---
 
@@ -2374,29 +2425,36 @@ control that exists.
 
 ```
 nets/                  framework-free torch: no config, no I/O, no logging
-  model.py             the network, its KL, and compute_loss
-  heads.py             the full-latent target-only prior head
-  losses.py            objective terms in nats per anchor
-  geometry.py          the validated anchor-to-raw index map
+  model.py             SeqVaeLagAttnRws: the network, its KL, and compute_loss
+  heads.py             FullLatentPriorHead, the full-latent target-only prior head
+  losses.py            objective terms in nats per anchor, and the shape terms
+  geometry.py          TrimmedRawGeometry, the validated anchor-to-raw index map
   raw_targets.py       future-target index grid and gather
   raw_masks.py         forecast mask, contributing anchors, KL support
-  delays.py            per-channel gather + delay (the causal input guard)
-  controls.py          the source-permutation control
-  lag_report.py        lag index -> compensated / sensor seconds
-task.py                the training task: loss, metrics, permutation control
+  controls.py          source permutation, source-null and occlusion controls
+task.py                SeqVaeLagAttnRwsTask: loss, metrics, permutation control
 trainer.py             the experiment driver: config -> model -> fit
-channel_reach.py       forward reach per channel; budget resolution
 collapse.py            the numeric collapse criterion (no torch dependency)
-plotting.py            the per-epoch diagnostic figure
-configs/               default.yaml + one file per sweep arm
-eval/                  the offline evaluation pipeline and its analyses
+event_weight.py        contraction detection and the contraction anchor weight
+input_budget.py        the gated-input rows and the causal input-budget figure
+sample_page.py         the seven-row per-sample diagnostic page
+plotting.py            LagAttnRwsPlotCallback, the per-epoch figure callback
+seed_event_gate_checkpoint.py   seeds an event-gate model from a checkpoint
+configs/               default.yaml, tiny.yaml, smoke configs and one file per sweep arm
+eval/                  the offline evaluation pipeline and its analyses (eval/EVAL.md)
 tests/                 the invariants above, each pinned
 ```
+
+Shared modules come from the sibling package `teb_vae/lag_attn/`: the attention, encoders,
+decoder core, posterior head, `ChannelGate` (`nets/delays.py`), the lag-to-seconds conversion
+(`nets/lag_report.py`) and the reach arithmetic (`channel_reach.py`).
 
 The network layer is enforced framework-free by test: nothing under `nets/` may import the
 training framework, the configuration layer, or the evaluation package.
 
 ### Commands
+
+Run every command from the repository root.
 
 Training, single device (smoke):
 
@@ -2404,18 +2462,29 @@ Training, single device (smoke):
 python -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/tiny.yaml
 ```
 
-Training, production (rank count must equal the configured device count):
+Training, production. The rank count must equal `len(general_config.cuda_devices)`:
 
 ```bash
-TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=<N> \
     -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/default.yaml
 ```
 
-Derived tables, printed from the code that produces them:
+From the IDE Run button, with no command line, `trainer.py` uses the config named by `RUN_CONFIG`
+near the bottom of the file. Edit that value to choose a config.
+
+Offline evaluation:
+
+```bash
+python -m teb_vae.lag_attn_rws.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt
+python -m teb_vae.lag_attn_rws.eval.verify <eval-output-dir>/summary.json
+```
+
+Derived tables and figures, printed from the code that produces them:
 
 ```bash
 python -m teb_vae.lag_attn_rws.nets.geometry     # the anchor-to-raw index table
-python -m teb_vae.lag_attn.channel_reach     # per-channel reach and the budget table
+python -m teb_vae.lag_attn.channel_reach         # per-channel reach and the budget table
+python -m teb_vae.lag_attn_rws.input_budget      # the input-budget figure at the 120 s budget
 ```
 
 Test gate:

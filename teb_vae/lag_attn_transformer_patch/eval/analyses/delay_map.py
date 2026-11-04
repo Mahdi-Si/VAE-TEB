@@ -1,4 +1,4 @@
-r"""``delay_map`` -- new; owner E1-O (``notes/EVAL_PLAN.md`` §2, ``EVAL_MAP_LAG.md`` N4).
+r"""``delay_map`` -- the UP-to-FHR delay curve from single-lag occlusion; new.
 
 **Question.** At which UP→FHR delay does removing UP cost the forecast? The lag map cannot answer
 this. A delay of ``d`` tokens is informative at every lag in ``[d − H, d − 1]``, one horizon step
@@ -7,7 +7,7 @@ lives on the diagonals of the lag × horizon plane.
 
 **Computation.**
 * For every single lag ``ℓ ∈ [0, L − 1]`` (bands of width one), apply the ``baseline`` arm of
-  ``occlusion`` (D5). The raw UP of token ``a − ℓ`` is set to the segment's resting tone and the
+  ``occlusion``. The raw UP of token ``a − ℓ`` is set to the segment's resting tone and the
   stream is re-patchified.
 * Score the block at the scored anchor ``a``, resolved by horizon step ``τ``, against an untouched
   reference under the same latent noise. These are the shared occlusion's anchor seeds, pairing and

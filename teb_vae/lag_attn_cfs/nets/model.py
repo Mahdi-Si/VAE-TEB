@@ -72,7 +72,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         decoder_out_channels: Optional[int] = None,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -122,7 +122,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         this target domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The defaults that differ
         from the base's -- ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ -- are this target
         domain's geometry rather than a preference, and a run that leaves them at the base's values
-        would be describing a dataset that does not exist. ``horizon`` is **no longer** among them:
+        would be describing a dataset that does not exist. ``horizon`` is not among them:
         at $30$ it agrees with the base and with every other cell of the grid.
 
         Args:

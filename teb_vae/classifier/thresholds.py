@@ -1,4 +1,4 @@
-"""Threshold policies chosen on validation, and the basis populations they are chosen on (SPEC §11.3).
+"""Threshold policies chosen on validation, and the basis populations they are chosen on.
 
 Scores are calibrated logits; the decision rule is **alarm iff score > thr** (strict). Every basis
 reduces to one score vector per class, and every FPR-cap policy to :func:`fpr_threshold` on the
@@ -142,11 +142,11 @@ def apply_threshold(score: Any, thr: float) -> np.ndarray:
     return _clean(score) > float(thr)
 
 
-#: Evaluation time axes (SPEC §11.5; CONTRACT "Evaluation time axes"), and why a GUID drops off one.
+#: Evaluation time axes, and why a GUID drops off one.
 AXES = ("to_delivery", "from_onset", "rel_second_stage", "rel_second_stage_norm", "position", "elapsed")
 AXIS_REASON = {"from_onset": "no_tlo", "rel_second_stage": "unknown_second_stage",
                "rel_second_stage_norm": "no_landmarks"}
-#: The landmark-registered second-stage axis (SPEC §11.5): labour onset at -1, second-stage onset at 0, delivery at +1.
+#: The landmark-registered second-stage axis: labour onset at -1, second-stage onset at 0, delivery at +1.
 #: Evaluation only: its clock needs both stage durations, which are known only after delivery, so it is never a
 #: threshold basis (``config.ThresholdCfg`` refuses it).
 NORM_AXIS = "rel_second_stage_norm"
@@ -206,7 +206,7 @@ def clock(segments: pd.DataFrame, axis: str) -> pd.Series:
 
 
 def snapshot_window(axis: str, *, bin_h: float, staleness_h: Optional[float]) -> float:
-    """Width ``w`` of the instantaneous population at a point ``c*`` of ``axis`` (§11.5.1): a GUID's snapshot is its
+    """Width ``w`` of the instantaneous population at a point ``c*`` of ``axis``: a GUID's snapshot is its
     last segment with clock <= c*, kept iff its clock > c* - w. On ``to_delivery`` a point is a checkpoint, so w is
     ``eval.snapshot_max_staleness_h``; the other axes are read on the bin grid, w = ``bin_h`` (``position``: 1).
     Threshold selection (:func:`basis_frame`) and the evaluation's checkpoints (``metrics._points``) both take w here,
@@ -224,7 +224,7 @@ def snapshot_window(axis: str, *, bin_h: float, staleness_h: Optional[float]) ->
         return float(bin_h)
     if staleness_h is None:
         raise ValueError("an instantaneous point on to_delivery is a checkpoint: pass eval.snapshot_max_staleness_h "
-                         "(staleness_h), the window its evaluation uses (§11.5.1)")
+                         "(staleness_h), the window its evaluation uses")
     return float(staleness_h)
 
 
@@ -254,7 +254,7 @@ def _online(segments: pd.DataFrame, axis: str = "to_delivery") -> pd.DataFrame:
     """Segments sorted by (guid, seg_pos) with clock ``c`` (:func:`clock`), online score ``s`` and running max ``r``.
 
     ``s`` is ``logit_online_cal``; a model without an online score (column absent or all NaN) uses
-    the running max of ``logit_seg_cal`` (§11.2 running aggregator). Partial NaN raises.
+    the running max of ``logit_seg_cal`` (running aggregator). Partial NaN raises.
     """
     seg = segments.sort_values(["guid", "seg_pos"], kind="stable")
     if "logit_online_cal" in seg and seg["logit_online_cal"].notna().any():
@@ -277,7 +277,7 @@ def basis_frame(
     segments: pd.DataFrame, guids: pd.DataFrame, basis: str, *, at: Any = "end", bin_h: float = 0.5,
     axis: str = "to_delivery", staleness_h: Optional[float] = None,
 ) -> pd.DataFrame:
-    """``(unit, guid, y, score)`` of the basis population for one model/seed/fold/split group (§11.3).
+    """``(unit, guid, y, score)`` of the basis population for one model/seed/fold/split group.
 
     ``unit`` is the counting unit: the GUID, or ``guid@seg_pos`` for the ``segment`` basis.
     Clock: :func:`clock` on ``axis``; ``at='end'`` counts every segment, otherwise ``c* = cstar(at, axis)``
@@ -334,7 +334,7 @@ def basis_scores(
 
 
 def drop_last_minutes(segments: pd.DataFrame, minutes: float) -> pd.DataFrame:
-    """Segments ending more than ``minutes`` before delivery (``eval.exclude_last_min``, §11.5.1).
+    """Segments ending more than ``minutes`` before delivery (``eval.exclude_last_min``).
 
     The one filter threshold selection and every evaluation population share, so the population a
     threshold is chosen on is the population it is evaluated on.
@@ -345,7 +345,7 @@ def drop_last_minutes(segments: pd.DataFrame, minutes: float) -> pd.DataFrame:
 def guid_level_policies(policies: Sequence[Mapping[str, Any]]) -> Tuple[list, list]:
     """``(policies, skipped_ids)`` for a model with no causal per-position score (the shortcut, a
     non-causal sequence model): the ``at: end`` policies on basis ``guid_final`` (identical at end),
-    the others skipped (CONTRACT)."""
+    the others skipped."""
     kept = [dict(p) | {"basis": "guid_final"} for p in policies if p.get("at", "end") == "end"]
     return kept, [p["id"] for p in policies if p.get("at", "end") != "end"]
 
@@ -370,7 +370,7 @@ def select_thresholds(
     val_segments: pd.DataFrame, val_guids: pd.DataFrame, policies: Sequence[Mapping[str, Any]], *, bin_h: float,
     exclude_last_min: float = 0.0, staleness_h: Optional[float] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Every policy's threshold on validation, in the CONTRACT ``thresholds.json`` shape.
+    """Every policy's threshold on validation, in the ``thresholds.json`` shape.
 
     A policy is ``{id, policy: fpr_cap|youden|sens_target|fixed, basis, axis, at, alpha, method,
     delta, allow_fallback, beta (sens_target), value (fixed)}``. Level is ``segment`` for the segment
@@ -406,7 +406,7 @@ def ovr_thresholds(
     val_segments: pd.DataFrame, val_guids: pd.DataFrame, policies: Sequence[Mapping[str, Any]], *, bin_h: float,
     exclude_last_min: float = 0.0, staleness_h: Optional[float] = None,
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
-    """Per-class one-vs-rest thresholds of a 3-class model (§11.3 T5): ``{str(k): select_thresholds(...)}`` for class
+    """Per-class one-vs-rest thresholds of a 3-class model (T5): ``{str(k): select_thresholds(...)}`` for class
     k = 0 healthy, 1 acidosis, 2 hie (``class_code - 1``), every policy on its own basis.
 
     Class k's rows are :func:`ovr_view`'s. A model with no causal per-segment class probability (a non-causal
@@ -432,12 +432,12 @@ OVR_SEGMENT_SCORES = ("logit_online_cal", "logit_seg_cal")
 
 
 def ovr_view(frame: pd.DataFrame, k: int, cols: Sequence[str]) -> pd.DataFrame:
-    """Class k's one-vs-rest view of prediction rows (§11.3 T5), shared by selection and evaluation: target
+    """Class k's one-vs-rest view of prediction rows (T5), shared by selection and evaluation: target
     ``class_code - 1 == k``, and ``cols`` (where scored) replaced by ``logit(p_c<k>_cal)``: per GUID
     ``score_final_cal``, per segment row :data:`OVR_SEGMENT_SCORES`. A segment row's ``p_c<k>_cal`` is the class probability after segment n
     (the online output; in segment scope segment n's own, whose running max the committed bases latch), so a row with
-    no causal online score (``logit_online_cal`` NaN: a non-causal sequence model, whose positions saw later segments,
-    §9.1) gets no OvR score at all."""
+    no causal online score (``logit_online_cal`` NaN: a non-causal sequence model, whose positions saw later segments)
+    gets no OvR score at all."""
     x = logit(frame[f"p_c{k}_cal"].to_numpy(np.float64))
     if "logit_online_cal" in cols:
         x = np.where(frame["logit_online_cal"].isna(), np.nan, x)
@@ -445,8 +445,8 @@ def ovr_view(frame: pd.DataFrame, k: int, cols: Sequence[str]) -> pd.DataFrame:
                         **{c: np.where(frame[c].isna(), np.nan, x) for c in cols})
 
 
-# ---- stage offsets (§11.3: the `<kind>_stage` decision view) -------------------------------------
-#: The causal second-stage strata of a segment row (the §7.1 ``in_ss`` flag: first and unknown look alike).
+# ---- stage offsets (the `<kind>_stage` decision view) -------------------------------------
+#: The causal second-stage strata of a segment row (the ``in_ss`` flag: first and unknown look alike).
 IN_SS_STAGES = ("straddle", "second")
 STAGE_STRATA = ("not_in_ss", "in_ss")
 
@@ -460,9 +460,8 @@ def fit_stage_offsets(val_segments: pd.DataFrame) -> Dict[str, Any]:
     """Per-stratum offsets δ_s of the calibrated online logit, fitted on the VALIDATION negatives only (L5).
 
     δ_s = mean healthy ``logit_online_cal`` in stratum s minus the overall healthy mean, so ``s - δ_s`` has one
-    healthy centre in and out of second stage and one threshold then caps the FPR about equally in both; the
-    2026-10-07 run scored healthy second-stage segments 0.3 logits above first-stage ones, which made the single
-    threshold a second-stage detector (sensitivity 0.55 vs 0.22). A stratum without healthy rows gets 0.
+    healthy centre in and out of second stage and one threshold then caps the FPR about equally in both.
+    Without it, a healthy offset between the strata turns the single threshold into a stage detector. A stratum without healthy rows gets 0.
 
     Returns:
         ``{"offsets": {stratum: δ}, "n_neg": {stratum: n}, "score": "logit_online_cal", "population": ...}``.

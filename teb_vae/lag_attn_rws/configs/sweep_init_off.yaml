@@ -7,13 +7,11 @@
 # time. The three keys move together because they are one design decision -- start the model near
 # the trivial predictor with symmetry-broken horizon tokens and a balanced fusion -- not three
 # independent knobs. Note head_init_calibration: false also restores the uncalibrated prior
-# start, the configuration in which the prior-variance collapse was measured. Everything else is
-# inherited from default.yaml.
+# start. Everything else is inherited from default.yaml.
 #
-# One inherited interaction, which is now the largest single effect in this arm: default.yaml
-# ships posterior_logvar_mode: independent, whose q == p at init is recovered ONLY through
-# head_init_calibration. Turning that key off therefore also turns off the exact-zero-KL start --
-# measured on the tiny model at 54 nats/step mean, 142 max, against exactly 0 in the default. That
+# One inherited interaction: default.yaml ships posterior_logvar_mode: independent, whose
+# q == p at init is recovered ONLY through head_init_calibration. Turning that key off therefore
+# also turns off the exact-zero-KL start, against exactly 0 in the default. That
 # is a legitimate part of what the init bundle buys, so it stays in the arm, but it means this
 # arm's kld_raw and every per-lag KL attribution read off it START from a large unearned
 # divergence and are not comparable in absolute terms with the default's. Read them as

@@ -1,4 +1,4 @@
-# Segment scope (SPEC §9.1, §13.3): one item per segment; GUID scores are post-hoc aggregators (§11.2).
+# Segment scope: one item per segment; GUID scores are post-hoc aggregators.
 base: default.yaml
 
 classifier:

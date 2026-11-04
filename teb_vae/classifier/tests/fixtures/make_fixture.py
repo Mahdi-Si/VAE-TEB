@@ -1,4 +1,4 @@
-r"""Generate the classifier's tiny k-fold fixture tree (SPEC §15).
+r"""Generate the classifier's tiny k-fold fixture tree.
 
 Layout, under ``--out``::
 
@@ -25,7 +25,7 @@ crossing delivery, low valid fraction).
 1 h of delivery are multiplied by ``exp(PLANT_LOG_SHIFT[class])``. Coefficients are the real ones,
 coarse-grained to 30-step blocks so lzf keeps the tree small (~25 MB); none of it is clinical.
 
-**Covariates** (§7.3, class-independent, their own RNG so the shards are unchanged).
+**Covariates** (class-independent, their own RNG so the shards are unchanged).
 ``static_covariates.csv``: ``guid, parity`` (categorical ``0 | 1 | 2+``, ~15% empty, a few GUIDs absent; odd
 GUIDs written in their ``guid_norm`` spelling). ``timed_covariates.csv``: long ``guid, time_s, variable, value`` of
 ``temp_c`` for ~75% of GUIDs, every 0.75-2.5 h from 3 h before the first segment (gaps beyond ``max_age_h``), some
@@ -54,7 +54,7 @@ SPLITS = ("train", "val", "test")
 SEQ_LEN = 330
 STRIDE_S = 660.0
 GUIDS_PER_SUBGROUP = 15
-#: (class code, cs, bg) per subgroup shard, as SPEC §2.3.
+#: (class code, cs, bg) per subgroup shard.
 SUBGROUPS: Dict[str, tuple] = {
     "healthy_bg_no_cs": (1, 0, 1),
     "healthy_no_bg_no_cs": (1, 0, 0),

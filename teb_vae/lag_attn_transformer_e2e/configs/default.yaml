@@ -92,10 +92,8 @@ model_config:
     free_bits: 0.0
     # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
     # conditional prior's log-variance off its clamp floor: nothing else in the objective
-    # penalises a NARROW prior, and the first production run of this family pinned 99.2% of prior
-    # coordinates on the -5 floor within one epoch (0.118 at epoch 0, 0.812 at epoch 1).
-    # Constant, not a schedule -- the collapse completes between epoch 0 and epoch 1, so any
-    # warm-up would arrive after the damage.
+    # penalises a NARROW prior. Constant, not a schedule: the prior can reach its floor within the
+    # first epoch, so any warm-up would arrive after the damage.
     #
     # 0.1, the value the comparison model ships, and identical to it on purpose: the prior-collapse
     # threshold is a property of the objective and the decoder, both of which are shared code here,
@@ -175,15 +173,12 @@ model_config:
     # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
     # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
     #
-    # This exists because the measured failure is specific to the source pathway: over epochs
-    # 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent displacement at 0.084,
-    # both unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
-    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
-    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    # This targets a failure specific to the source pathway: the map from the source to delta_mu
+    # can memorise while the KL and the latent displacement stay constant, and a rate-based lever
+    # (beta) cannot reach a failure that happens at constant rate.
     #
-    # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
-    # particular rate here, and putting an unvalidated one in the headline run would confound it.
-    # The mechanism ships; the strength is measured by arms that set this key to 0.2 and 0.3.
+    # Shipped null, NOT an elevated value, and that is deliberate: putting an unvalidated rate in
+    # the headline run would confound it. The mechanism ships; arms set this key to 0.2 and 0.3.
     # Those arms exist as files only in teb_vae/lag_attn_transformer_rws/configs/ -- for this
     # package the arm is a one-key override of this file, not a config that is already here.
     source_dropout: null
@@ -211,10 +206,9 @@ model_config:
     # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
     # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast,
     # so its gradient on the prior log-variance points down without limit and nothing opposes it
-    # from below. The 125-epoch anchored run has logvar_prior_floor_frac climbing 0.017 -> 0.496
-    # and still rising at epoch 125; the beta_prior anchor slowed that and did not stop it,
-    # because the anchor's restoring force saturates at beta_prior/2 per dimension while the
-    # reconstruction's opposing pressure grows as the decoder sharpens.
+    # from below. The beta_prior anchor alone cannot stop that descent, because the anchor's
+    # restoring force saturates at beta_prior/2 per dimension while the reconstruction's opposing
+    # pressure grows as the decoder sharpens.
     #
     # Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p), which
     # pulls the prior out to cover the posterior, and the scale anchor. Note this does NOT make
@@ -244,9 +238,8 @@ model_config:
     # This is the second of the two paths that collapse the prior's scale, and the one that
     # survives base_decode: mean. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior +
     # delta), so the full branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor:
-    # D_1 drags the prior's log-variance down alongside its own. Measured on the tiny model, the
-    # full branch's reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head
-    # under 'residual' and exactly 0 under 'independent'.
+    # D_1 drags the prior's log-variance down alongside its own. Under 'independent' the full
+    # branch's reconstruction puts exactly 0 gradient on the prior log-variance head.
     #
     # With both keys shipped, the prior's log-variance receives gradient from KL(q||p) -- which
     # pulls it UP, to cover the posterior -- and from the beta_prior anchor, and from nothing that
@@ -257,9 +250,8 @@ model_config:
     # constant the independent head is seeded at, so the KL is still exactly 0 at step 0.
     #
     # With head_init_calibration FALSE the init KL is not small: two independently initialised
-    # heads disagree by whatever their init happens to give, measured on the tiny model at 54
-    # nats/step mean and 142 nats/step max, against exactly 0 under 'residual' with or without the
-    # calibration. That matters because the readout rests on K_t == 0 at init -- unearned
+    # heads disagree by whatever their init happens to give, against exactly 0 under 'residual'
+    # with or without the calibration. That matters because the readout rests on K_t == 0 at init -- unearned
     # divergence on that scale is indistinguishable from coupling in every downstream figure. Any
     # arm that sets head_init_calibration: false therefore inherits a broken zero-KL start from
     # this key and should pin posterior_logvar_mode: residual unless the arm is about that start.
@@ -335,10 +327,10 @@ model_config:
     # Calibrate BOTH distribution heads onto their trivial starting points at init. One key, two
     # halves, and setting it false reverts both:
     #   * the shared decoder output heads onto mu=0/sigma=1 -- without it the raw-target NLL
-    #     starts ~15 nats/sample above that predictor's ~1.4 level;
+    #     starts far above that trivial predictor's level;
     #   * the prior head's log-variance onto exactly 0, i.e. sigma_p = 1, which is the scale
-    #     anchor's optimum -- without it the prior starts about 3 nats below it and, at
-    #     beta_prior: 0.0, reaches its clamp floor 3.3x sooner in optimizer steps.
+    #     anchor's optimum -- without it the prior starts below that optimum and reaches its
+    #     clamp floor sooner.
     head_init_calibration: true
     # LayerNorm gain on the attended source summary in the posterior fusion: sqrt(d_model/d_head)
     # = sqrt(128/32) = 2, so the 32-wide source summary is not out-columned by the 128-wide state.
@@ -420,14 +412,13 @@ advanced_config:
     # those moving is a difference this comparison would attribute to the input representation.
     precision: "32-true"
     # PROVISIONAL FOR THIS ARCHITECTURE. Carried over unchanged from the model this one is compared
-    # against, where it was MEASURED: that model's 1018-epoch baseline logged `train/grad_norm`
-    # PRE-clip at q50 2775, q90 3613, q95 3876, q99 4681, and 5000 is the smallest round value
-    # above its q99.
+    # against, where it was set as a round value above the upper tail of that model's pre-clip
+    # `train/grad_norm`.
     #
     # Why it may not transfer: the objective, its reduction and its units are identical, so the
     # gradient scale should still be dominated by the summed 480-sample Gaussian NLL -- but the two
     # front ends are a new gradient path that model does not have. RE-DERIVE from this
-    # architecture's own first production run: `train/grad_norm` percentiles, read as ONE optimizer
+    # architecture's own run: `train/grad_norm` percentiles, read as ONE optimizer
     # step per epoch rather than an epoch aggregate (the metrics collector reads callback_metrics
     # at validation end, before the training epoch is reduced), with `train/grad_clip_frac` read as
     # a mean over epochs to say how often the threshold actually bound.
@@ -476,9 +467,8 @@ advanced_config:
   # the relative test off, and additive_margin carries the finite-blow-up detection: skip when
   # watched > EMA + margin, against the RAW EMA, so it works in the negative-loss regime.
   #
-  # This exact configuration has already cost this repository a run: a breaker that trains
-  # normally for eighty epochs and then skips every batch forever leaves a frozen validation
-  # number and nothing else.
+  # A relative test left on here can train normally for many epochs and then skip every batch
+  # forever, which leaves a frozen validation number and nothing else.
   #
   # `main_loss` IS the optimised total, so the three auxiliary shape terms are inside the watched
   # quantity and the margin now bounds the movement of a mixed-unit criterion rather than of a pure
@@ -486,8 +476,7 @@ advanced_config:
   # so the margin is not rescaled for it -- an expectation rather than a measurement, and one more
   # thing the re-derivation below settles.
   #
-  # PROVISIONAL margin -- re-derive from the first real run's observed
-  # main_loss fluctuation; until then the non-finite guard is the hard protection.
+  # PROVISIONAL margin -- re-derive from a real run's main_loss fluctuation; until then the non-finite guard is the hard protection.
   spike_breaker:
     enabled: true
     multiplier: 5.0

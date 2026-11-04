@@ -19,7 +19,7 @@ analysis returns ``{"headline": {key: float, ...}}``. Names must be unique and m
 headline name. Nothing else about a module is read by the binding, so no analysis author edits
 ``binding.py``.
 
-Layering (plan D7): no Lightning, no ``model/*``, no ``teb_vae.lag_attn_rws.eval``, and no import of
+Layering: no Lightning, no ``model/*``, no ``teb_vae.lag_attn_rws.eval``, and no import of
 another patch analysis module (a port may call its shared namesake). Shared helpers come from
 ``teb_vae.lag_attn_cfs.eval`` layers 0-1 and :mod:`..raw`.
 """

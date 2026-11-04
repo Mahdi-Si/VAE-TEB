@@ -64,7 +64,7 @@ PER_HEAD_FILENAME = "attention_per_head.csv"
 ENTROPY_FILENAME = "attention_entropy.csv"
 PER_RECORDING_FILENAME = "attention_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 PROFILE_FIGURE = "attention_profile"
 HEATMAP_FIGURE = "lag_heatmap"
 

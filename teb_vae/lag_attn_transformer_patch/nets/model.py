@@ -2,9 +2,9 @@
 
 ``SeqVaeLagAttnTrfRws`` supplies the network; :class:`PatchStreamInputs` the patch adapters and the
 tiled-anchor forward; :class:`PatchSummaryTarget` the 2-channel summary target and the objective.
-The mixins come first in the bases, and that order is load-bearing: reversed, the architecture's
-dense forward, raw decoder width and raw ``compute_loss`` win (``lag_attn_transformer_cfs/DESIGN.md``
-§6).
+The mixins come first in the bases, and that order is load-bearing: the method resolution order
+picks the first base that defines a member, so reversed, the architecture's dense forward, raw
+decoder width and raw ``compute_loss`` win.
 """
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from teb_vae.lag_attn_transformer_patch.nets.patch_inputs import PatchStreamInpu
 from teb_vae.lag_attn_transformer_patch.nets.patch_target import PatchSummaryTarget
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
-#: This model's own keywords, kept out of the base's ``**forwarded`` (C4).
+#: This model's own keywords. The base constructor does not take them, so ``__init__`` keeps them
+#: out of the base's ``**forwarded``.
 PATCH_ONLY: Tuple[str, ...] = (
     "target_summary_loc",
     "target_summary_scale",

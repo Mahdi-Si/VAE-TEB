@@ -113,7 +113,7 @@ PER_RECORDING_FILENAME = "lag_kl_per_recording.csv"
 STRATIFIED_PROFILE_FILENAME = "lag_kl_stratified_profile.csv"
 STRATIFIED_PEAKS_FILENAME = "lag_kl_stratified_peaks.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 PROFILE_FIGURE = "lag_kl_profile"
 
 #: The per-sample columns this analysis reduces per recording -- the identity residual, so a
@@ -709,7 +709,7 @@ def build_profile_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT)
     seconds = compensated_seconds_axis(n_lags, delay_steps)
     axis = axes[0, 0]
     figures.multi_line_panel(
@@ -739,7 +739,7 @@ def build_profile_figure(
         axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
 
     figures.multi_line_panel(
-        axes[1, 0], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],
+        axes[0, 1], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],
         ["contributing anchors"],
         title="Contributing anchors",
         xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL,

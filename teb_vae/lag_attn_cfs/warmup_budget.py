@@ -457,7 +457,7 @@ MIN_UP_PH_KEPT = 8
 #: unrecorded at the anchor, for every reference; what past UP can carry about future FHR is the
 #: contraction cycle's phase, and the recurrence band is where that lives. Priced like the
 #: proximate band -- same table, same two criteria -- and read with
-#: :func:`readable_window_seconds` beside it, because at $H = 30$ the band slides $116$ s across
+#: :func:`readable_window_seconds` beside it, because at $H = 10$ the band slides $36$ s across
 #: the horizon and the every-step window is the honest statement of what a candidate covers.
 RECURRENCE_BAND_SECONDS: Tuple[float, float] = (120.0, 300.0)
 
@@ -502,7 +502,7 @@ def readable_window_seconds(
 
 
 class ContentLagSummary(NamedTuple):
-    r"""What the actual gathers put on the lag axis, in seconds, on the canonical stored timeline.
+    r"""What the actual gathers put on the lag axis, in seconds, on the stored timeline.
 
     Attributes:
         nearest_s: The smallest source-to-label content separation any (source channel, target
@@ -531,7 +531,7 @@ def content_lag_seconds(
     r"""The source-to-label content separation from the ACTUAL gathers, per channel pair.
 
     $$L_{j,c}(\ell, h) \;=\; \Delta\,(\ell + 1 + h + s_c + d^u_j) \;+\; \delta^u_j - \delta^y_c,
-      \qquad \delta = \kappa\,	au ,$$
+      \qquad \delta = \kappa\,\tau ,$$
 
     with $s_c$ the scored target channel's forecast shift (zero under the stored clock), $d^u_j$
     the source channel's input shift (zero unaligned), and $\delta$ the explicitly approximate
@@ -539,8 +539,8 @@ def content_lag_seconds(
     reference-based
     :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` reduces to on an aligned run,
     computed here from the gathers themselves rather than from the two references, so the target
-    side is automatically the SCORED clock -- $	au_{\min}$ under ``'physical'``, each channel's
-    own $	au_c$ under ``'stored'`` -- and the per-channel rounding is visible rather than
+    side is automatically the SCORED clock -- $\tau_{\min}$ under ``'physical'``, each channel's
+    own $\tau_c$ under ``'stored'`` -- and the per-channel rounding is visible rather than
     assumed away.
 
     Args:

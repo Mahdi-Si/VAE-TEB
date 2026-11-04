@@ -1,6 +1,6 @@
 # Prior-anchor arm: beta_prior = 1.0e-3, two orders BELOW the shipped 0.1.
 #
-# The weakest anchor in the sweep, one order below the shipped weight. The failure mode this arm
+# The weakest anchor in the sweep, two orders below the shipped weight. The failure mode this arm
 # watches for is re-pinning: an anchor too weak to hold the prior's log-variance off the clamp
 # floor leaves the collapse intact and the sweep's lower bracket established. Read it on
 # logvar_prior_floor_frac and mean_logvar_prior first; a floor fraction that climbs back toward

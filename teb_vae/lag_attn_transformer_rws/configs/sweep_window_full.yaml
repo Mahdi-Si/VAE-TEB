@@ -9,7 +9,7 @@
 # The rest of the sweep, with the predicted bound against the 90-step / 360 s lag search range:
 # window 8 -> 42 steps / 168 s, 16 (shipped) -> 66 / 264, 32 -> 114 / 456, 64 -> 210 / 840.
 #
-# Not the same arm as sweep_arch_a2.yaml, which *also* gives the source a fourth attention block:
+# Not the same arm as sweep_arch_a2.yaml, which *also* raises the source to six attention blocks:
 # this one holds the depth at the shipped three so the window is the single variable.
 #
 # Zero parameter change: the window is a mask, not a width.

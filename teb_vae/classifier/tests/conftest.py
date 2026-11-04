@@ -9,7 +9,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SMOKE_CONFIG = REPO_ROOT / "teb_vae" / "classifier" / "configs" / "smoke.yaml"
-#: The fixture's two covariates (§7.3), as a ``classifier.context.covariates.variables`` override value.
+#: The fixture's two covariates, as a ``classifier.context.covariates.variables`` override value.
 COVARIATES = ("[{name: parity, kind: categorical, available_at: prospective}, "
               "{name: temp_c, kind: numeric, available_at: prospective}]")
 #: The tiny ``lag_attn_transformer_cfs`` VAE of :func:`vae_checkpoint`: d_z, lag-attention heads, lag bins (max_lag 8
@@ -26,7 +26,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.fixture(scope="session")
 def fixture_tree(tmp_path_factory) -> Dict[str, Any]:
-    """The §15 k-fold fixture tree (3 folds, 4 subgroups, 60 GUIDs) and its stats file."""
+    """The k-fold fixture tree (3 folds, 4 subgroups, 60 GUIDs) and its stats file."""
     from teb_vae.classifier.tests.fixtures.make_fixture import generate
 
     return generate(tmp_path_factory.mktemp("classifier_fixture"))

@@ -22,8 +22,7 @@ the segments a model was fitted to measures memorisation, and the source branch 
 memorise with than the target-only branch -- so an in-sample instrument reports a gain on a
 generator whose source carries nothing. A fit stopped at whichever step scored best on the split it
 is then reported on has had its stopping point chosen by the number it reports. Neither is a subtle
-effect at this scale: both were measured here before the splits existed, and the first turned every
-control into a detection.
+effect at this scale: without the holdout split, a control generator reads as a detection.
 
 **The fit is deliberately reduced, and that is the honest limitation.** The forward, the objective,
 its global reduction, the paired sampling, the shared decoder and every readout are the production

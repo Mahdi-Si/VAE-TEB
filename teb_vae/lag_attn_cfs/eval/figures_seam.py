@@ -8,7 +8,7 @@ rather than taken on trust:
 **One thing here is this package's own rather than the sibling's**, and it is stated where it
 is defined: the cohort palette (:data:`CLINICAL_CLASS_COLORS` -- green, amber, red by severity, not
 ``utils.style``'s blue-first mapping). The publication style itself -- the open frame, the type
-scale, the unframed legends, the double-column width, the footnote layout -- is the shared layer's
+scale, the borderless legends, the double-column width, the footnote layout -- is the shared layer's
 :data:`~teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT`, bound here as :data:`STYLE_REFINEMENT` so
 the name every analysis reads keeps resolving; the weight and type constants beside it are named
 steps on that scale, kept here because the analyses draw with them by name.
@@ -60,28 +60,29 @@ EMPTY_NOTE = figures.EMPTY_NOTE
 #: more than a handful of distinct weights reads as accidental: the eye takes a change of weight
 #: as a change of meaning, so every weight has to mean something.
 #:
-#: Calibrated against the refined ``axes.linewidth`` of $0.4$: the frame is the lightest mark on
-#: the page, a hairline sits at it, and the emphasis weight is roughly twice it. Nothing here is
-#: heavier than :data:`LINE_HEAVY`, which exists for the one mark that is a *bar* rather than a
-#: line -- the inter-quartile span of a per-recording strip.
-LINE_HAIRLINE = 0.4
-LINE_THIN = 0.5
-LINE_REGULAR = 0.7
-LINE_EMPHASIS = 0.85
-LINE_HEAVY = 2.0
+#: Calibrated against the refined ``axes.linewidth`` of $0.6$ and ``lines.linewidth`` of $1.1$:
+#: the frame is the lightest structural mark, a hairline sits at it, the regular data weight is
+#: the rcParam default, and the emphasis weight is a step above it. Nothing here is heavier than
+#: :data:`LINE_HEAVY`, which exists for the one mark that is a *bar* rather than a line -- the
+#: inter-quartile span of a per-recording strip.
+LINE_HAIRLINE = 0.6
+LINE_THIN = 0.8
+LINE_REGULAR = 1.1
+LINE_EMPHASIS = 1.4
+LINE_HEAVY = 2.6
 
 #: Marker diameter in points of a point estimate drawn on a curve or a strip: small enough that
 #: a dense trajectory reads as a line with points on it rather than as a string of beads.
-MARKER_SMALL = 2.5
+MARKER_SMALL = 3.5
 
 #: Type sizes for text that is deliberately smaller than the axis labels: four steps, each with a
 #: job. The body size comes from ``rcParams`` and is not restated here. Nothing sits below the
-#: 5 pt floor a per-cell count or a band name is still legible at when the figure is read at its
-#: designed width.
-FONT_TINY = 5.0
-FONT_SMALL = 5.5
-FONT_LABEL = 6.0
-FONT_NOTE = 7.0
+#: 5.5 pt floor a per-cell count or a band name is still legible at when the figure is read at
+#: its designed width.
+FONT_TINY = 5.5
+FONT_SMALL = 6.0
+FONT_LABEL = 6.5
+FONT_NOTE = 7.5
 
 #: The publication style, bound from the shared layer rather than owned: one open frame, one type
 #: scale and one legend convention across every evaluation package, so two figures of the same
@@ -101,7 +102,16 @@ style_axes = figures.style_axes
 
 #: Figure construction and output. ``render_figure`` letters the panels, tight-layouts, saves at
 #: the evaluation's own ``EVAL_SAVE_DPI``, closes the figure and returns the path it wrote.
+#: ``panel_grid`` wraps a set of independent panels two to a row; ``integer_counts`` puts a count
+#: axis on whole numbers.
 new_figure = figures.new_figure
+panel_grid = figures.panel_grid
+integer_counts = figures.integer_counts
+PANEL_HEIGHT = figures.PANEL_HEIGHT
+FIGURE_WIDTH = figures.FIGURE_WIDTH
+SERIES_STYLES = figures.SERIES_STYLES
+LINE_PALETTE = figures.LINE_PALETTE
+BODY_ALPHA = figures.BODY_ALPHA
 render_figure = figures.render_figure
 figure_filename = figures.figure_filename
 
@@ -113,6 +123,10 @@ mark_laid_out = figures.mark_laid_out
 #: A legend placed in headroom made above (or below) the data, for a curve that spans the whole
 #: axis and leaves ``loc="best"`` no corner to find.
 legend_with_headroom = figures.legend_with_headroom
+
+#: A one-column key in headroom sized to its entry count, re-sized rather than stacked when a
+#: builder adds an entry after the panel drew its own.
+legend_strip = figures.legend_strip
 
 
 def caveat_note(figure, text: str = GROUP_DELAY_NOTE) -> float:
@@ -165,6 +179,7 @@ COLOR_BLUE = figures.COLOR_BLUE
 COLOR_GRAY = figures.COLOR_GRAY
 COLOR_GREEN = figures.COLOR_GREEN
 COLOR_LIGHT_GRAY = figures.COLOR_LIGHT_GRAY
+COLOR_MAGENTA = figures.COLOR_MAGENTA
 COLOR_ORANGE = figures.COLOR_ORANGE
 COLOR_PURPLE = figures.COLOR_PURPLE
 COLOR_VERMILLION = figures.COLOR_VERMILLION
@@ -183,10 +198,15 @@ COLOR_VERMILLION = figures.COLOR_VERMILLION
 #: **not** the same colour as a training-callback figure of that cohort, and a reader putting the
 #: two side by side must read the legend rather than the hue.
 #:
-#: The three are ordered by luminance as well as by hue ($0.42$ / $0.70$ / $0.36$), so the
-#: severity axis survives a greyscale print, which a pure hue triple does not.
+#: The three differ in relative luminance as well as in hue ($0.26$ / $0.44$ / $0.14$), so the
+#: classes stay apart in a greyscale print, which a pure hue triple does not. Checked as a set,
+#: since all three pairs appear side by side on every cohort figure: the closest pair under
+#: simulated deuteranopia (HIE against healthy) keeps an OKLab distance of $8.8 \times 10^{-2}$,
+#: and the closest pair for normal vision (acidosis against healthy) keeps $0.24$. The healthy
+#: green is a step brighter and bluer than a forest green, which is what lifts the HIE pair clear
+#: of the deutan confusion line.
 CLINICAL_CLASS_COLORS: Dict[str, str] = {
-    "healthy": "#2E8B57",
+    "healthy": "#1F9D6B",
     "acidosis": "#E8A33D",
     "hie": "#C0392B",
 }
@@ -302,9 +322,19 @@ def group_colors(groups: Sequence[str]) -> Dict[str, str]:
 #: them, and the page stops being a distribution figure at all.
 WINDOWS_FIGURE_WIDTH = 13.0
 
-#: Height per row of that page. Every row is the same height because ``new_figure`` allots one, and
-#: the significance strips are the rows that would be thinner if it did not.
-WINDOWS_ROW_HEIGHT = 3.0
+#: Height in inches of one violin row of that page. The other two row kinds are fractions of it
+#: (:data:`WINDOWS_ROW_RATIOS`), because a significance strip carries one bar per window and an
+#: effect heatmap a few rows of cells, and drawn at a violin row's height both were mostly empty.
+WINDOWS_ROW_HEIGHT = 2.7
+
+#: Height of a significance strip and of the effect heatmap, as fractions of a violin row.
+WINDOWS_ROW_RATIOS = {"violins": 1.0, "strip": 0.42, "effects": 0.8}
+
+#: Width in inches of the windowed comparison page itself, narrower than
+#: :data:`WINDOWS_FIGURE_WIDTH`, which the multi-column attribution pages still use: at
+#: $13$ in the page's $6.5$ pt type read as a caption under a poster, and $11$ in still leaves
+#: every body of a twenty-five-window profile wider than the box drawn inside it.
+WINDOWS_PAGE_WIDTH = 11.0
 
 
 def windowed_comparison_figure(
@@ -360,11 +390,15 @@ def windowed_comparison_figure(
         ValueError: If a readout's cells and its record's windows are of different lengths, which
             would draw one window's distribution under another window's $p$-value.
     """
+    ratios = [
+        WINDOWS_ROW_RATIOS["violins"], WINDOWS_ROW_RATIOS["strip"]
+    ] * max(len(readouts), 1) + [WINDOWS_ROW_RATIOS["effects"]]
     figure, axes = new_figure(
-        2 * max(len(readouts), 1) + 1,
-        height_per_row=WINDOWS_ROW_HEIGHT,
-        width=WINDOWS_FIGURE_WIDTH,
+        len(ratios),
+        height_per_row=WINDOWS_ROW_HEIGHT * sum(ratios) / len(ratios),
+        width=WINDOWS_PAGE_WIDTH,
     )
+    axes[0, 0].get_gridspec().set_height_ratios(ratios)
     order = list(groups)
     colours = group_colors(order)
     # Where each cohort sits on the axis. The effect rows below are laid out by it rather than by
@@ -517,7 +551,14 @@ def _draw_effect_heatmap(
 
 
 __all__ = [
+    "BODY_ALPHA",
     "CLINICAL_CLASS_COLORS",
+    "COLOR_MAGENTA",
+    "FIGURE_WIDTH",
+    "PANEL_HEIGHT",
+    "SERIES_STYLES",
+    "integer_counts",
+    "panel_grid",
     "COEFFICIENT_LAG_AXIS_LABEL",
     "GROUP_DELAY_CAVEAT",
     "GROUP_DELAY_NOTE",
@@ -543,9 +584,12 @@ __all__ = [
     "SUBGROUP_COLORS",
     "SUBGROUP_TINT_RANGE",
     "WINDOWS_FIGURE_WIDTH",
+    "WINDOWS_PAGE_WIDTH",
     "WINDOWS_ROW_HEIGHT",
+    "WINDOWS_ROW_RATIOS",
     "binned_violin_panel",
     "caveat_note",
+    "legend_strip",
     "legend_with_headroom",
     "mark_laid_out",
     "configure_figure_style",

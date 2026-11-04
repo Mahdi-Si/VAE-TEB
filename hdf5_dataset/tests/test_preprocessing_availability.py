@@ -1,10 +1,10 @@
 r"""Availability of the builder's remaining repair operations on the canonical dataset timeline.
 
-CFS-04 asks which of the operations between the adaptor's output and the causal transform are
+These tests ask which of the operations between the adaptor's output and the causal transform are
 retrospective (read samples after an issue time) and which are online (a prefix of the record
-produces a prefix of the output). The dataset-creation UP shift is the canonical timeline and is
-outside this audit by the project rule; what is left in :mod:`create_new_pipeline` between the
-adaptor and :func:`transform_sample` is ``_sanitize_signals``, which is
+produces a prefix of the output). The audit starts from the stored timeline. What is left in
+:mod:`create_new_pipeline` between the adaptor and :func:`transform_sample` is
+``_sanitize_signals``, which is
 ``interpolate_bad_values`` followed by a pointwise clip and a denormal flush.
 
 What these tests establish, on synthetic rows through the executable functions:
@@ -26,7 +26,7 @@ pad, so no NaN survives the adaptor and ``weight`` is $0$ where the raw trace wa
 sanitiser then sees finite rows and the interior branch is dead on that path. The adaptor's
 whole-block Fourier ``scipy.signal.resample`` runs only when a record's own sampling rate exceeds
 the $4$ Hz base rate, and the adaptor retains neither the raw rate nor a flag, so whether it ran
-for a given shard is not recoverable from the shard and needs the raw records (open in CFS-04).
+for a given shard is not recoverable from the shard and needs the raw records.
 """
 from __future__ import annotations
 

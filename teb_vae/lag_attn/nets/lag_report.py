@@ -1,16 +1,7 @@
 r"""Turning an attention lag index into the seconds figures that may be reported.
 
-**The stored timeline is canonical.** The dataset builder shifts the uterine-pressure channel
-when it creates the HDF5 shards. That shift is part of how the stored signals *are*: every
-downstream consumer -- this module, every lag figure, every evaluation record, every simulation --
-treats the stored UP and FHR traces as if they had been recorded exactly as they sit on disk. There
-is no "sensor timeline", no "mechanical correction" and no "acquisition shift" to add back, subtract,
-budget or interpret anywhere downstream. Earlier revisions of this module carried a
-``MECHANICAL_SHIFT_SECONDS`` constant and a ``lag_original_sensor_seconds`` helper that undid the
-builder's shift; both were removed on purpose, and neither must return under another name.
-
-An attention peak at lag index $\ell$ is still not by itself a physiological delay, for two
-reasons that are easy to conflate.
+Every lag figure is on the stored UP and FHR timeline. An attention peak at lag index $\ell$ is
+not by itself a physiological delay, for two reasons that are easy to conflate.
 
 **The causal input delay.** When a channel is read at $t - \delta$ rather than at $t$ (the guard
 that bounds how far an input feature reads into its own future), the source memory the attention
@@ -55,8 +46,7 @@ SECONDS_PER_STEP = 4.0
 
 #: Axis label for a lag axis drawn in seconds with the causal input delay $\delta$ added back. A
 #: constant rather than a string in each figure, so a plot and the number beside it cannot disagree
-#: about which quantity is shown. It names the input-delay compensation only: the stored timeline
-#: is canonical and no other correction is ever applied to a lag axis.
+#: about which quantity is shown. It names the input-delay compensation only.
 COMPENSATED_LAG_AXIS_LABEL = "lag (s, input-delay compensated)"
 
 #: Accepted lag types. Scalars for a single reported peak, tensors for a whole axis.

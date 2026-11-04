@@ -127,19 +127,32 @@ flat_excluded_by_fhr_filter : bool
 """
 
 import os
+import sys
 import argparse
 import logging
 import traceback
 
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
+#: Repository root: ``hdf5_dataset/up_flat_analysis.py`` -> up two.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
-from create_hdf5_dataset import (
+# Launched as a script (an IDE's Run button), this file's own directory is on
+# sys.path but the repository root is not; the launch helpers below need it.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor  # noqa: E402
+from create_hdf5_dataset import (  # noqa: E402
     find_flat_regions,
     deduplicate_segments,
     interpolate_bad_values,
+)
+from teb_vae.lag_attn_rws.eval.launch import (  # noqa: E402
+    missing_required,
+    resolve_launch_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -299,7 +312,6 @@ def _process_single_record(
     record_info,
     base_block_size=3200,
     overlap_percentage=0.0,
-    up_shift_secs=0.0,
     min_domain_start=-np.inf,
     max_domain_start=np.inf,
     flat_tolerance=1e-9,
@@ -332,9 +344,6 @@ def _process_single_record(
             gives 4800 samples = 1200 sec = 20 min at 4 Hz.
         overlap_percentage: Fraction of overlap between consecutive segments.
             Default 0.0 (no overlap) for independent non-overlapping epochs.
-        up_shift_secs: Time shift applied to the UP signal in seconds. Default
-            0.0 (no shift) since this is a raw signal analysis tool — the UP time
-            shift is a modelling concern, not relevant for flat region detection.
         min_domain_start: Earliest segment domain_start (seconds relative to
             delivery) to include. Default ``-np.inf`` keeps the complete signal
             from the beginning of the recording.
@@ -383,7 +392,6 @@ def _process_single_record(
         signal_indices=range(0, 2),
         n_input_chan=2,
         labels=["HIE", "ACIDOSIS", "HEALTHY"],
-        up_shift_secs=up_shift_secs,
         default_target_index=default_ti,
     )
     mimo_adaptor.read_single_input(
@@ -739,7 +747,6 @@ def analyze_up_flat_regions(
     output_csv_path="up_flat_analysis.csv",
     base_block_size=3200,
     overlap_percentage=0.0,
-    up_shift_secs=0.0,
     min_domain_start=-np.inf,
     max_domain_start=np.inf,
     flat_tolerance=1e-9,
@@ -776,9 +783,6 @@ def analyze_up_flat_regions(
             gives 4800 samples = 1200 sec = 20 min at 4 Hz.
         overlap_percentage: Fraction of overlap between consecutive segments.
             Default 0.0 (no overlap).
-        up_shift_secs: Time shift applied to the UP signal in seconds. Default
-            0.0 (no shift) — UP shift is a modelling concern, not needed for
-            flat region analysis on raw signals.
         min_domain_start: Earliest segment domain_start (seconds relative to
             delivery) to include. Default ``-np.inf`` keeps the complete signal
             from the beginning of the recording.
@@ -862,7 +866,6 @@ def analyze_up_flat_regions(
                 rec,
                 base_block_size=base_block_size,
                 overlap_percentage=overlap_percentage,
-                up_shift_secs=up_shift_secs,
                 min_domain_start=min_domain_start,
                 max_domain_start=max_domain_start,
                 flat_tolerance=flat_tolerance,
@@ -913,76 +916,149 @@ def analyze_up_flat_regions(
     return df
 
 
-def main():
-    """CLI entry point for the UP flat region analysis tool.
+def build_parser():
+    """Build the command-line parser.
 
-    Parses command-line arguments and delegates to ``analyze_up_flat_regions``.
-    All parameters of the analysis function are exposed as CLI flags.
+    No argument is ``required`` and none carries a non-``None`` default.
+    ``required=True`` fires before :data:`RUN_ARGS` is consulted and would make
+    the Run button unusable. The merge also reads any non-``None`` parsed value
+    as a command-line value, so an argparse default would hide the matching
+    ``RUN_ARGS`` entry. The defaults therefore live in :data:`RUN_ARGS`.
+
+    Returns:
+        The parser.
     """
     parser = argparse.ArgumentParser(
+        prog="python hdf5_dataset/up_flat_analysis.py",
         description="Analyze UP flat regions across EFM recordings.",
     )
-    parser.add_argument("--records_base_path", type=str, required=True,
-                        help="Base path containing outcome subfolders")
-    parser.add_argument("--output_csv", type=str, default="up_flat_analysis.csv",
-                        help="Output CSV path (default: up_flat_analysis.csv)")
-    parser.add_argument("--base_block_size", type=int, default=3200,
-                        help="Base segment size (default 3200 -> 4800 samples = 20 min)")
-    parser.add_argument("--overlap_percentage", type=float, default=0.0,
-                        help="Segment overlap fraction (default 0.0 = no overlap)")
-    parser.add_argument("--up_shift_secs", type=float, default=0.0,
-                        help="UP time shift in seconds (default 0.0 = no shift)")
-    parser.add_argument("--min_domain_start", type=float, default=float("-inf"),
-                        help="Earliest domain_start in sec (default -inf = complete signal)")
-    parser.add_argument("--max_domain_start", type=float, default=float("inf"),
-                        help="Latest domain_start in sec (default inf = complete signal)")
-    parser.add_argument("--flat_tolerance", type=float, default=1e-9)
-    parser.add_argument("--flat_min_length", type=int, default=960,
-                        help="Min consecutive flat samples (default 960 = 4 min)")
-    parser.add_argument("--weight_threshold", type=float, default=0.90)
-    parser.add_argument("--fhr_valid_threshold", type=float, default=50.0)
-    parser.add_argument("--no_exclude_invalid_fhr", action="store_true",
+    parser.add_argument("--records_base_path", "--records-base-path", dest="records_base_path",
+                        type=str, help="Base path containing outcome subfolders. Required.")
+    parser.add_argument("--output_csv", dest="output_csv", type=str,
+                        help="Output CSV path")
+    parser.add_argument("--base_block_size", dest="base_block_size", type=int,
+                        help="Base segment size (3200 -> 4800 samples = 20 min)")
+    parser.add_argument("--overlap_percentage", dest="overlap_percentage", type=float,
+                        help="Segment overlap fraction (0.0 = no overlap)")
+    parser.add_argument("--min_domain_start", dest="min_domain_start", type=float,
+                        help="Earliest domain_start in sec (-inf = complete signal)")
+    parser.add_argument("--max_domain_start", dest="max_domain_start", type=float,
+                        help="Latest domain_start in sec (inf = complete signal)")
+    parser.add_argument("--flat_tolerance", dest="flat_tolerance", type=float)
+    parser.add_argument("--flat_min_length", dest="flat_min_length", type=int,
+                        help="Min consecutive flat samples (960 = 4 min)")
+    parser.add_argument("--weight_threshold", dest="weight_threshold", type=float)
+    parser.add_argument("--fhr_valid_threshold", dest="fhr_valid_threshold", type=float)
+    parser.add_argument("--no_exclude_invalid_fhr", dest="no_exclude_invalid_fhr",
+                        action="store_const", const=True, default=None,
                         help="Disable FHR-validity flagging of flat regions")
-    parser.add_argument("--sampling_rate", type=float, default=4.0)
-    parser.add_argument("--folder_filter", nargs="+", default=None,
-                        help="Folder names to process (default: all 8)")
-    parser.add_argument("--file_limit", type=int, default=-1,
+    parser.add_argument("--sampling_rate", dest="sampling_rate", type=float)
+    parser.add_argument("--folder_filter", dest="folder_filter", nargs="+",
+                        help="Folder names to process (all 8 when absent)")
+    parser.add_argument("--file_limit", dest="file_limit", type=int,
                         help="Max files per subgroup (-1 = all)")
-    parser.add_argument("--no_column_descriptions", action="store_true",
+    parser.add_argument("--no_column_descriptions", dest="no_column_descriptions",
+                        action="store_const", const=True, default=None,
                         help="Omit column description comments from CSV header")
-    parser.add_argument("--no_plot", action="store_true",
-                        help="Skip generating per-GUID plotly signal plots")
-    parser.add_argument("--plot_output_dir", type=str, default=None,
-                        help="Directory for plotly HTML plots (default: plots/ next to CSV)")
+    parser.add_argument("--no_plot", dest="no_plot", action="store_const", const=True,
+                        default=None, help="Skip generating per-GUID plotly signal plots")
+    parser.add_argument("--plot_output_dir", dest="plot_output_dir", type=str,
+                        help="Directory for plotly HTML plots (plots/ next to the CSV when absent)")
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    """Merge the command line over :data:`RUN_ARGS` and run the analysis.
+
+    With no command-line arguments, for example from the IDE's Run button, the
+    run uses :data:`RUN_ARGS` exactly. A flag on the command line overrides its
+    ``RUN_ARGS`` entry.
+
+    Args:
+        argv: Command-line arguments; ``None`` reads ``sys.argv[1:]``.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If ``records_base_path`` is set by neither route.
+    """
+    values, sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    refusal = missing_required(values, ("records_base_path",))
+    if refusal:
+        raise SystemExit(refusal)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logger.info("resolved arguments: " + ", ".join(
+        f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values)))
 
     analyze_up_flat_regions(
-        records_base_path=args.records_base_path,
-        output_csv_path=args.output_csv,
-        base_block_size=args.base_block_size,
-        overlap_percentage=args.overlap_percentage,
-        up_shift_secs=args.up_shift_secs,
-        min_domain_start=args.min_domain_start,
-        max_domain_start=args.max_domain_start,
-        flat_tolerance=args.flat_tolerance,
-        flat_min_length=args.flat_min_length,
-        weight_threshold=args.weight_threshold,
-        fhr_valid_threshold=args.fhr_valid_threshold,
-        exclude_invalid_fhr_flat_regions=not args.no_exclude_invalid_fhr,
-        sampling_rate=args.sampling_rate,
-        folder_filter=args.folder_filter,
-        file_limit=args.file_limit,
-        include_column_descriptions=not args.no_column_descriptions,
-        plot_signals=not args.no_plot,
-        plot_output_dir=args.plot_output_dir,
+        records_base_path=values["records_base_path"],
+        output_csv_path=values["output_csv"],
+        base_block_size=values["base_block_size"],
+        overlap_percentage=values["overlap_percentage"],
+        min_domain_start=values["min_domain_start"],
+        max_domain_start=values["max_domain_start"],
+        flat_tolerance=values["flat_tolerance"],
+        flat_min_length=values["flat_min_length"],
+        weight_threshold=values["weight_threshold"],
+        fhr_valid_threshold=values["fhr_valid_threshold"],
+        exclude_invalid_fhr_flat_regions=not values["no_exclude_invalid_fhr"],
+        sampling_rate=values["sampling_rate"],
+        folder_filter=values["folder_filter"],
+        file_limit=values["file_limit"],
+        include_column_descriptions=not values["no_column_descriptions"],
+        plot_signals=not values["no_plot"],
+        plot_output_dir=values["plot_output_dir"],
     )
+    return 0
+
+
+#: **Edit the values below and press Run.** A flag on the command line overrides
+#: its entry. Each key is the argparse ``dest`` of one flag, and each value is
+#: the default the command line used before this dict existed.
+RUN_ARGS = {
+    # ================================ FILL IN ================================
+    # str -- base path that holds the outcome subfolders of .mat recordings. Required.
+    "records_base_path": None,
+    # str -- output CSV path.
+    "output_csv": "up_flat_analysis.csv",
+
+    # ===================== Everything below has a default =====================
+    # int -- base segment length in samples; 3200 -> 4800 samples = 20 min at 4 Hz.
+    "base_block_size": 3200,
+    # float -- overlap fraction between consecutive segments.
+    "overlap_percentage": 0.0,
+    # float -- earliest and latest segment domain_start, seconds relative to delivery.
+    "min_domain_start": float("-inf"),
+    "max_domain_start": float("inf"),
+    # float -- largest consecutive-sample difference that counts as flat.
+    "flat_tolerance": 1e-9,
+    # int -- minimum flat run in samples; 960 = 4 min at 4 Hz.
+    "flat_min_length": 960,
+    # float -- mean sample weight a segment needs to pass the informational filter.
+    "weight_threshold": 0.90,
+    # float -- FHR-valid percentage below which a flat region is flagged.
+    "fhr_valid_threshold": 50.0,
+    # bool -- True disables the FHR-validity flag.
+    "no_exclude_invalid_fhr": False,
+    # float -- sampling rate in Hz.
+    "sampling_rate": 4.0,
+    # list[str] | None -- folder names to process.  (None -> all 8 folders)
+    "folder_filter": None,
+    # int -- maximum files per subgroup; -1 means all.
+    "file_limit": -1,
+    # bool -- True omits the column-description comments from the CSV header.
+    "no_column_descriptions": False,
+    # bool -- True skips the per-GUID plotly plots.
+    "no_plot": False,
+    # str | None -- directory for the plotly HTML plots.  (None -> plots/ next to the CSV)
+    "plot_output_dir": None,
+}
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

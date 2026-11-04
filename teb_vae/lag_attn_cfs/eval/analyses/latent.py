@@ -59,7 +59,7 @@ SPECTRUM_FILENAME = "latent_spectrum.csv"
 DIAGNOSTICS_FILENAME = "latent_diagnostics.csv"
 PER_RECORDING_FILENAME = "latent_per_recording.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 SPECTRUM_FIGURE = "kl_spectrum"
 
 #: The per-sample diagnostics reduced per recording, each with what it is for. Ordered so the
@@ -207,17 +207,21 @@ def build_spectrum_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(1)
+    figure, axes = figures.new_figure(1, height_per_row=figures.PANEL_HEIGHT, width=5.4)
     axis = axes[0, 0]
     values = finite_column(spectrum, "kl_nats")
     if values.size and np.isfinite(values).any():
         positions = np.arange(values.size, dtype=np.float64)
+        # Active dimensions in the accent hue, inactive ones in light grey: the count against the
+        # threshold is the finding, and the colour states it before the line is read.
         axis.bar(
-            positions, values, color=figures.COLOR_BLUE, alpha=0.85, width=0.8,
-            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+            positions, values, width=0.8,
+            color=[figures.COLOR_BLUE if value > float(threshold) else figures.COLOR_LIGHT_GRAY
+                   for value in values],
+            edgecolor="white", linewidth=figures.HISTOGRAM_EDGE_WIDTH,
         )
         axis.axhline(
-            float(threshold), color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
+            float(threshold), color=figures.COLOR_BLACK, linestyle="--", linewidth=figures.LINE_THIN,
             label=f"threshold {float(threshold):g}",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")

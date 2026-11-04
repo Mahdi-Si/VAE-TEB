@@ -1,7 +1,7 @@
 r"""What the shared CFS evaluation cannot derive about the patch model: ``TRF_PATCH_BINDING``.
 
 The pipeline is ``teb_vae/lag_attn_cfs/eval``, reached through one
-:class:`~teb_vae.lag_attn_cfs.eval.binding.ModelBinding` (plan D1). This module is the only place the
+:class:`~teb_vae.lag_attn_cfs.eval.binding.ModelBinding`. This module is the only place the
 patch eval's registry is written, so no analysis author edits it: a new analysis module under
 ``analyses/`` is registered here once, and declares its own headline scalars as ``HEADLINE``.
 

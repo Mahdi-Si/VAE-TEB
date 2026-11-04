@@ -1,8 +1,8 @@
-r"""Cohort tables, tasks, labeling strategies, context columns and fold checks (SPEC §6, §7.1, §12).
+r"""Cohort tables, tasks, labeling strategies, context columns and fold checks.
 
 One pass per fold x split over ``CombinedHDF5Dataset`` with metadata-only fields, through the
-pilot's :func:`segment_frame` (class code from target/weight, flags, clocks), extended with the §6.1
-columns. GUID consolidation is the pilot's :func:`recording_frame` (conflicts exclude, never a
+pilot's :func:`segment_frame` (class code from target/weight, flags, clocks), extended with the extra
+segment-table columns. GUID consolidation is the pilot's :func:`recording_frame` (conflicts exclude, never a
 majority vote). Split disjointness, patient grouping, class presence and exposure records are the
 pilot's too; the second-stage sentinel is detected by ``lag_attn_cfs`` and, deliberately unlike
 there, turned into ``stage = unknown`` here (L7).
@@ -14,8 +14,8 @@ Clocks, all in seconds relative to delivery, with ``lead = 4 * trim_steps`` and 
     stage     = first if ss + end <= 0, second if ss + lead >= 0, straddle otherwise, unknown if NaN
 
 ``hours_to_delivery``, ``epoch_s``, ``t_end_s``, ``cs``, ``bg``, ``source_file`` and ``class_code``
-are for labels, evaluation and strata only; :func:`context_features` is the §7.1 allow-list.
-Clinical covariates (§7.3) join on ``guid_norm`` (:func:`join_covariates`: static, and timed by a strictly causal
+are for labels, evaluation and strata only; :func:`context_features` is the allow-list.
+Clinical covariates join on ``guid_norm`` (:func:`join_covariates`: static, and timed by a strictly causal
 as-of join) into raw ``cov:<name>`` / ``cov_age_h:<name>`` columns of the segment table; ``data.py`` encodes them
 with train-fold statistics (L4). Their GUID-level availability feeds the L10 confound check.
 """
@@ -49,7 +49,7 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.data import (
 
 SPLITS = ("train", "val", "test")
 STAGES = ("first", "straddle", "second", "unknown")
-#: Stages that set the context vector's ``in_ss`` flag (§7.1): the segment is wholly or partly in second stage.
+#: Stages that set the context vector's ``in_ss`` flag: the segment is wholly or partly in second stage.
 #: First and unknown are the zero level, since an ``unknown`` flag would equal ``~has_ss`` from segment 0
 #: (future information).
 IN_SS_STAGES = ("straddle", "second")
@@ -78,7 +78,7 @@ def normalize_guid(guid: str) -> str:
     return str(guid).strip().upper().replace("-", "")
 
 
-# ---- segment table (§6.1) ----------------------------------------------------------------------
+# ---- segment table ----------------------------------------------------------------------
 def _samples(dataset: CombinedHDF5Dataset) -> Iterator[AttributeDict]:
     """``dataset[i]`` for every i in order, from one h5py read per column per file. The loader reads every field of
     every row separately, and a scalar read decompresses a whole lzf chunk: ~3 ms a segment, ~40 min over a real
@@ -140,7 +140,7 @@ def infer_stride(segments: pd.DataFrame) -> float:
 
 
 def stage_of(ss_rel_s: Any, lead_s: float, end_s: float) -> np.ndarray:
-    """Labour stage over the observed window ``[ss + lead, ss + end]`` (§2.4, trim-aware)."""
+    """Labour stage over the observed window ``[ss + lead, ss + end]`` (trim-aware)."""
     ss = np.asarray(ss_rel_s, dtype=float)
     return np.select([np.isnan(ss), ss + end_s <= 0, ss + lead_s >= 0],
                      ["unknown", "first", "second"], "straddle")
@@ -150,7 +150,7 @@ def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minut
                   stride_s: Any = "auto", epoch_min_s: float = -44640.0,
                   train_epoch_min_s: Optional[float] = None,
                   min_valid_frac: float = 0.1) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Build the segment table with segment-level exclusions (§6.1), no fold validation.
+    """Build the segment table with segment-level exclusions, no fold validation.
 
     Args:
         shards: ``{(fold, split): [shard paths]}``; any labels, e.g. ``{(0, "test"): [path]}``.
@@ -216,14 +216,14 @@ def segment_table(shards: Mapping[Tuple[int, str], Sequence[str]], *, trim_minut
     return seg, info
 
 
-# ---- tasks and labeling strategies (§6.3, §6.5, §6.6) ------------------------------------------
+# ---- tasks and labeling strategies ------------------------------------------
 def strategy_weights(delta_h: Any, y: Any, is_last: Any, *, strategy: str, horizon_h: float,
                      decay_halflife_h: float, time_matched: bool = False) -> np.ndarray:
-    """Per-segment loss weight ω_n (§6.5); the target is always the GUID's ``y``.
+    """Per-segment loss weight ω_n; the target is always the GUID's ``y``.
 
     Negatives (``y == 0``) get 1 under ``propagate``/``horizon*``, unless ``time_matched``: then the ``horizon*``
     schedule weighs every GUID, so early (first-stage) segments of negatives no longer teach "early-looking means
-    healthy" while those of positives are silent (the 2026-10-07 runs' second-stage detector). ``final_only`` weights
+    healthy" while those of positives are silent. ``final_only`` weights
     only the last position (both classes); ``mil`` has no per-segment term (all 0). ``k_warm`` is not here: it drops
     positions from the per-position loss only (``data.GuidDataset``'s ``w_pos``), never the segment-local term.
     """
@@ -242,7 +242,7 @@ def strategy_weights(delta_h: Any, y: Any, is_last: Any, *, strategy: str, horiz
 
 
 def warm_positions(labels: LabelsCfg, scope: str) -> int:
-    """The effective ``labels.k_warm`` (§6.5): ``auto`` is 3 for ``propagate`` and 0 for the others; always 0 in
+    """The effective ``labels.k_warm``: ``auto`` is 3 for ``propagate`` and 0 for the others; always 0 in
     segment scope, which has no sequence context to warm up (the config refuses an explicit k there)."""
     if scope == "segment":
         return 0
@@ -250,7 +250,7 @@ def warm_positions(labels: LabelsCfg, scope: str) -> int:
 
 
 def guid_table(seg: pd.DataFrame, labels: LabelsCfg, cohort: CohortCfg) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """GUID table (§6.2) and the task/label columns of the segment table.
+    """GUID table and the task/label columns of the segment table.
 
     GUID exclusion reasons, first match wins: ``recording_frame``'s (conflicting codes or metadata,
     no class), ``healthy_no_bg`` (``cohort.include_healthy_no_bg: false``), ``task_exclude`` (code
@@ -321,7 +321,7 @@ def guid_table(seg: pd.DataFrame, labels: LabelsCfg, cohort: CohortCfg) -> Tuple
     return seg, guids
 
 
-# ---- fold validation (§6.7) --------------------------------------------------------------------
+# ---- fold validation --------------------------------------------------------------------
 def fold_shards(data: DataCfg, fold: int) -> Dict[str, list]:
     """``{split: sorted shard paths}`` of one fold, after the ``data.subgroups`` allow-list."""
     root = resolve_path(data.kfold_root) / data.fold_dir.format(k=fold)
@@ -337,7 +337,7 @@ def fold_shards(data: DataCfg, fold: int) -> Dict[str, list]:
 
 
 def patient_groups(guids: pd.DataFrame, patient_map: Optional[Path]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """``attach_patient_groups`` joined on ``guid_norm``, like every external table (§6.7): the map's keys are
+    """``attach_patient_groups`` joined on ``guid_norm``, like every external table: the map's keys are
     normalised (:func:`normalize_guid`), so a map in either spelling groups the shard GUIDs. A GUID the map does not
     cover is its own group (its raw GUID); two keys that normalise alike must name the same patient."""
     if patient_map is None:
@@ -434,7 +434,7 @@ def pretrain_exposure(guids: pd.DataFrame, source: SourceCfg, *,
             "allow_pretrain_overlap": allow_overlap, "folds": folds}
 
 
-# ---- clinical covariates (§7.3) and the missingness confound (L10) ------------------------------
+# ---- clinical covariates and the missingness confound (L10) ------------------------------
 #: Raw covariate columns of the segment table: the joined value, and a timed variable's age in hours.
 COV, COV_AGE = "cov:", "cov_age_h:"
 AVAILABILITY_COLUMNS = KEYS + ["variable", "available"]
@@ -450,7 +450,7 @@ def _read_table(path: str, need: Sequence[str], **kw: Any) -> pd.DataFrame:
 
 
 def join_covariates(seg: pd.DataFrame, cov: CovariatesCfg) -> pd.DataFrame:
-    """Raw covariates of every ``seg`` row (§7.3), indexed like ``seg``: ``cov:<name>`` (float for ``numeric``, str
+    """Raw covariates of every ``seg`` row, indexed like ``seg``: ``cov:<name>`` (float for ``numeric``, str
     for ``categorical``; NaN = missing) and, for a timed variable, ``cov_age_h:<name>``.
 
     Each variable lives in exactly one table. ``static_csv``: ``guid`` plus one column per variable, one row per
@@ -492,7 +492,7 @@ def join_covariates(seg: pd.DataFrame, cov: CovariatesCfg) -> pd.DataFrame:
 
 def covariate_availability(seg: pd.DataFrame, guids: pd.DataFrame, cov: CovariatesCfg) -> pd.DataFrame:
     """:data:`AVAILABILITY_COLUMNS` per GUID of ``guids`` and covariate: ``available`` iff a retained segment of the
-    GUID has a joined value (the ``covariate:<name>`` subgroups, §11.6.1, and the L10 check)."""
+    GUID has a joined value (the ``covariate:<name>`` subgroups, and the L10 check)."""
     kept, parts = seg[~seg["excluded"]], []
     for v in cov.variables:
         has = kept[COV + v.name].notna().groupby([kept[k] for k in KEYS]).any().rename("available").reset_index()
@@ -503,7 +503,7 @@ def covariate_availability(seg: pd.DataFrame, guids: pd.DataFrame, cov: Covariat
 
 def confound_check(guids: pd.DataFrame, max_delta: float,
                    availability: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
-    """§7.3 step 4 (L10): per fold, the train missing rate per task class of ``has_tlo`` and of every covariate
+    """Step 4 (L10): per fold, the train missing rate per task class of ``has_tlo`` and of every covariate
     (not ``available`` in ``availability``, :func:`covariate_availability`), keyed by name; a gap over
     ``max_delta`` warns and is ``flagged``."""
     out: Dict[str, Any] = {}
@@ -539,17 +539,17 @@ def fold_summary(seg: pd.DataFrame, guids: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([counts(guids, "guid"), counts(seg, "segment")], ignore_index=True)
 
 
-# ---- context columns (§7.1) --------------------------------------------------------------------
+# ---- context columns --------------------------------------------------------------------
 def psi(x: Any) -> Any:
     """``sign(x) * log1p(|x|)``."""
     return np.sign(x) * np.log1p(np.abs(x))
 
 
 def context_features(seg: pd.DataFrame, *, tlo_pre_onset: str = "clip") -> pd.DataFrame:
-    """The §7.1 allow-listed per-segment context columns; no forbidden clock ever enters, and first and
+    """The allow-listed per-segment context columns; no forbidden clock ever enters, and first and
     unknown stage share ``in_ss = 0`` (:data:`IN_SS_STAGES`). ``tlo_pre_onset: clip`` (``context.tlo``)
     floors TLO at 0: a segment ending before labour onset says nothing about how long until onset, which is
-    future information like the time until second stage (§2.4); ``signed`` keeps it (ablation)."""
+    future information like the time until second stage; ``signed`` keeps it (ablation)."""
     tlo_h = seg["tlo_end_s"] / 3600.0
     if tlo_pre_onset == "clip":
         tlo_h = tlo_h.clip(lower=0.0)

@@ -1,6 +1,6 @@
 # Depth arm: target_attention_blocks = 8 (shipped 6).
 #
-# The other side of the target-depth question, and the upper bracket on the capacity revision. A
+# The other side of the target-depth question, and the upper bracket on the shipped depth. A
 # deeper target prior should lower the base reconstruction D_0, which is the headline number the
 # whole comparison against the dilated-conv-plus-LSTM encoder turns on -- and it will also lower
 # the source-conditioned KL if the extra depth lets the prior predict what the source was

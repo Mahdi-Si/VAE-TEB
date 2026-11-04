@@ -1,4 +1,4 @@
-"""Mandatory sklearn baselines: the linear probe and the shortcut baseline (SPEC §10.9, FR-12).
+"""Mandatory sklearn baselines: the linear probe and the shortcut baseline (FR-12).
 
 Per fold, :func:`train` fits both on train, chooses the probe's ``C`` on val, selects every
 threshold policy on val and saves everything under ``baselines/fold_<k>/``; ``selection_lock.json``
@@ -6,16 +6,16 @@ threshold policy on val and saves everything under ``baselines/fold_<k>/``; ``se
 ``latent_pilot/config.py:1409 lock_selection``. :func:`score_fold` re-scores from the saved files
 only, and refuses test rows without an intact lock (L5).
 
-* **Probe** (§10.9.1). Per cached segment: masked sum, count and max of the value channels
+* **Probe**. Per cached segment: masked sum, count and max of the value channels
   (``role: attention`` cues live in the cache's ``attn`` and are never read). The features at
   position n are [masked mean || masked max] over the last ``baselines.probe_last_n`` retained
-  segments <= n, scaled by the fold's train-only scaler (§8.5, L4; affine per channel, so the scaled
+  segments <= n, scaled by the fold's train-only scaler (L4; affine per channel, so the scaled
   mean/max are the mean/max of scaled steps). The GUID's features at its last position train the
   L2 ``LogisticRegression``; ``C`` in :data:`PROBE_C` minimises val GUID log loss.
-* **Shortcut** (§10.9.2). ``LogisticRegression`` on :data:`SHORTCUT_FEATURES`, standardised on
+* **Shortcut**. ``LogisticRegression`` on :data:`SHORTCUT_FEATURES`, standardised on
   train. These metadata are never model inputs; the model is GUID-level only (NaN segment scores).
 
-Scores are logits (``decision_function``); no calibration, so ``*_cal == raw`` (CONTRACT). On
+Scores are logits (``decision_function``); no calibration, so ``*_cal == raw``. On
 ``labels.task: three_class`` both are multinomial: the alarm logit is ``logit P(adverse)`` from
 ``predict_log_proba``, the probabilities fill :data:`THREE_CLASS_COLUMNS` (the probe's rows: its online
 output; the shortcut's rows: NaN) and every policy also gets per-class OvR thresholds (``"ovr"``).
@@ -63,7 +63,7 @@ GUID_COLUMNS = [
     "clinical_class", "subgroup", "has_tlo", "has_ss", "shared_test", "n_segments", "first_epoch_s",
     "last_t_end_s", "score_final", "score_final_cal",
 ]
-#: 3-class prediction columns (§11.1) of every model on ``labels.task: three_class``, segment and GUID rows: the class
+#: 3-class prediction columns of every model on ``labels.task: three_class``, segment and GUID rows: the class
 #: probabilities (0 healthy, 1 acidosis, 2 hie; target ``class_code - 1``), calibrated twins, and the CORAL g of an
 #: ordinal head (NaN otherwise). A binary task's aux head adds the raw ``p_c0..2`` only.
 THREE_CLASS_COLUMNS = ["p_c0", "p_c1", "p_c2", "p_c0_cal", "p_c1_cal", "p_c2_cal", "ord_score"]
@@ -159,10 +159,10 @@ def fold_frame(run_dir: Path, fold: int, index: pd.DataFrame, n_valid_steps: Any
 
 def label_rows(run_dir: Path, fold: int, index: pd.DataFrame, splits: Sequence[str],
                n_valid_steps: np.ndarray, min_segments: int = 1, *, strategy: Optional[str] = None) -> pd.DataFrame:
-    """:func:`fold_frame` rows of ``splits`` (``strategy``: :func:`fold_frame`'s) with the CONTRACT keys, eval
+    """:func:`fold_frame` rows of ``splits`` (``strategy``: :func:`fold_frame`'s) with the contract keys, eval
     clocks, labels, strata and quality columns every model's prediction rows share (no scores, no ``model_id``/``seed``). ``n_valid_steps`` is
     indexed by cache row. ``y`` is the binary target every binary analysis reads: the task's, with a 3-class
-    target collapsed to adverse (class >= 1, §11.3); the 3-class target is ``class_code - 1``."""
+    target collapsed to adverse (class >= 1); the 3-class target is ``class_code - 1``."""
     frame = fold_frame(run_dir, fold, index, n_valid_steps, min_segments, strategy=strategy)
     frame = frame[frame["split"].isin(splits)].reset_index(drop=True)
     return frame.assign(run_id=Path(run_dir).name, subgroup=frame["source_file"],
@@ -240,7 +240,7 @@ def read_lock(out: Path, config_digest: str) -> Dict[str, Any]:
     """
     why = lock_problem(out, config_digest)
     if why:
-        logger.error(why)  # §10.10.6: every refusal names its guard before raising
+        logger.error(why)  # Every refusal names its guard before raising
         raise RunStateError(why)
     return json.loads((out / LOCK).read_text())
 
@@ -326,7 +326,7 @@ def _fit(cfg: Config, run_dir: Path, fold: int, feats: Features, out: Path) -> N
 
 def score_fold(cfg: Config, run_dir: Path, fold: int, feats: Features,
                splits: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """CONTRACT segment and GUID rows of both baselines on ``splits`` of ``fold``, from saved files.
+    """Segment and GUID prediction rows of both baselines on ``splits`` of ``fold``, from saved files.
 
     Returns:
         ``(segments, guids, lock)``; ``lock`` is ``{}`` when no test row is requested.
@@ -360,7 +360,7 @@ def score_fold(cfg: Config, run_dir: Path, fold: int, feats: Features,
 
 
 def _thresholds(cfg: Config, seg: pd.DataFrame, gd: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    """Every policy on val per model; the GUID-level shortcut gets ``guid_level_policies`` (CONTRACT). On
+    """Every policy on val per model; the GUID-level shortcut gets ``guid_level_policies``. On
     ``three_class`` (``eval.ovr_thresholds``) the same policies per class one-vs-rest go to ``"ovr"``."""
     ev = cfg.classifier.eval
     policies = [p.model_dump() for p in ev.thresholds]

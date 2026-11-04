@@ -56,8 +56,7 @@ from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
 from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL
 
 #: The cap on the cohort draw, under ``eval_config.caps``, and its default: segments, one per
-#: recording, class-balanced. 150 is 50 recordings per class, about 10 minutes on one laptop GPU
-#: for the shipped transformer (see ``ATTRIBUTION.md``, section 13).
+#: recording, class-balanced. 150 is 50 recordings per class.
 COHORT_CAP_NAME = "attribution_cohort_segments"
 DEFAULT_COHORT_SEGMENTS = 150
 

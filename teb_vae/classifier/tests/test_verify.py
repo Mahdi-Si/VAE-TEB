@@ -1,4 +1,4 @@
-"""verify.py (T-V1): every §11.15 criterion hits PASS / FAIL / INCONCLUSIVE on a synthetic summary; a missing registry
+"""verify.py (T-V1): every verify criterion hits PASS / FAIL / INCONCLUSIVE on a synthetic summary; a missing registry
 figure and a missing summary.md section fail; a stale figure left by an earlier render never counts, and a failed report
 step fails the gate; the sanity producers verify re-reads (T2 NP tolerance, block C confound); ``--runs``."""
 from __future__ import annotations

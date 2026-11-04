@@ -1,7 +1,6 @@
-r"""The phase-harmonic operator versions, and the timing and start-up counterexamples (CFS-01/02).
+r"""The phase-harmonic operator versions, and the timing and start-up counterexamples.
 
-Three groups of permanent checks, all on the canonical stored timeline (the dataset builder's UP
-shift is part of the signal and appears nowhere here):
+Three groups of permanent checks, all on the stored timeline:
 
 **The operator.** The legacy ratio-power operator $[y]^p = |y|e^{ip\operatorname{Arg}y}$ has a
 finite jump across the principal-angle branch for non-integer $p$ -- $2|y||\sin\pi p| \approx
@@ -125,8 +124,8 @@ def test_the_legacy_operator_jumps_across_the_branch_exactly_for_the_fractional_
 ) -> None:
     r"""Inputs $2\times10^{-8}$ apart; images $2|\sin\pi p|$ apart -- $1.0266$ at $p = 2^{3/2}$.
 
-    Pinned as the defect it is: this is the counterexample the 2026-09-05 review reproduced, and
-    the legacy operator is retained only so shards already on disk keep their meaning.
+    Pinned as the defect it is: the legacy operator is retained only so shards already on disk
+    keep their meaning.
     """
     jump = _real_product_jump(power, PHASE_OPERATOR_LEGACY)
     expected = 2.0 * abs(np.sin(np.pi * power))

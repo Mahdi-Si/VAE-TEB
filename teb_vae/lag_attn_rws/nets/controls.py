@@ -390,6 +390,27 @@ def source_null_forward_outputs(
         other key -- the prior, both encoder states, the base forecast, and the three keys this arm
         deliberately does not rebuild -- is the matched forward's own tensor; see the constant.
     """
+    return source_null_posterior(model, forward_outputs, u_stream)
+
+
+def source_null_posterior(
+    model,
+    forward_outputs: Dict[str, torch.Tensor],
+    u_stream: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    r"""The body of :func:`source_null_forward_outputs`, without its ``no_grad`` guard.
+
+    The readout runs under ``no_grad``; the training penalty on the source-null KL needs the same
+    computation with gradient, so the computation lives here once and the readout wraps it.
+
+    Args:
+        model: A :class:`~teb_vae.lag_attn_rws.nets.model.SeqVaeLagAttnRws` or a subclass.
+        forward_outputs: The matched forward's dict.
+        u_stream: The source stream the matched forward was given, ``(B, T, c_u)``.
+
+    Returns:
+        A shallow copy of ``forward_outputs`` with exactly :data:`SOURCE_NULL_KEYS` replaced.
+    """
     zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
     gated = zeros if model.source_gate is None else model.source_gate(zeros)
     encoded = model.encode_source_kv(gated)  # (1, T, d_model)
@@ -581,7 +602,33 @@ def source_null_kld(
     Returns:
         A scalar tensor in nats per anchor.
     """
-    nulled = source_null_forward_outputs(model, forward_outputs, u_stream)
+    return source_null_kld_with_grad(model, forward_outputs, u_stream, weight)
+
+
+def source_null_kld_with_grad(
+    model,
+    forward_outputs: Dict[str, torch.Tensor],
+    u_stream: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    r"""The body of :func:`source_null_kld`, without its ``no_grad`` guard.
+
+    The training objective's source-null penalty, $\lambda_{\varnothing}\,\beta\,
+    \mathrm{KL}(q^{\varnothing} \Vert p)$, needs this number with gradient: the penalty charges the
+    posterior for moving off the prior on a source that carries no values, which is the part of
+    the KL the availability pattern and the target state can buy without any source information.
+    The gradient reaches the source pathway, the lag attention, the posterior head and the prior.
+
+    Args:
+        model: The model the matched forward came from.
+        forward_outputs: That forward's dict.
+        u_stream: The source stream it was given, ``(B, T, c_u)``.
+        weight: Decimated validity signal ``(B, T)``.
+
+    Returns:
+        A scalar tensor in nats per anchor, carrying gradient when grad mode is on.
+    """
+    nulled = source_null_posterior(model, forward_outputs, u_stream)
     anchors = forward_outputs.get("anchor_index")
     anchor_valid = forward_outputs.get("anchor_valid")
     # The forward's own index, validated by the objective's mask build this step.

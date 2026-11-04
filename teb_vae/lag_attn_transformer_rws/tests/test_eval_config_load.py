@@ -7,7 +7,7 @@ validates. The merge itself and the loader's refusals are the shared package's, 
 there.
 
 There is a second contract here the sibling's file does not have, and it is the more important
-one. **This delta must equal the sibling's.** The two models exist to be compared, so a holdout
+one. **This delta must equal the sibling's.** The two models exist to be compared, so an evaluation
 split, a Monte Carlo draw count or a bootstrap resample count that differed between them would
 make every side-by-side number a comparison of two protocols rather than of two architectures --
 and nothing in either run's artifacts would say so. The equality is asserted against the sibling's

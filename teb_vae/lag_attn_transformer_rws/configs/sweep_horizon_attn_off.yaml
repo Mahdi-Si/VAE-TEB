@@ -1,8 +1,7 @@
 # Ablate-one arm: horizon_attention_blocks = 0 (shipped 2).
 #
 # The shared decoder core runs bidirectional self-attention over the H = 30 horizon tokens after
-# its dilated refine stack. This arm removes it and leaves the convolutions alone, which is the
-# other half of the pair of mechanisms the capacity revision added to the decoder.
+# its dilated refine stack. This arm removes it and leaves the convolutions alone.
 #
 # What it isolates. The refine stack mixes horizon steps through a fixed local window; at
 # horizon_depth 4 its receptive field is 31 steps, so a token can reach the whole block through the

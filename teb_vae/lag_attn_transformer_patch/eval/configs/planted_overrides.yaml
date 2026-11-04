@@ -41,7 +41,7 @@ eval_config:
     impulse_response_injections: 5
     raw_shift_segments: 8
     delay_map_segments: 8
-    delay_map_anchors: 16   # 4 anchors left the plant in the noise; 16 recover d = 45
+    delay_map_anchors: 16
     event_locked_segments: 8
     event_locked_ig_steps: 512        # the tone path needs it (see eval_overrides.yaml)
     decelerations_segments: 8

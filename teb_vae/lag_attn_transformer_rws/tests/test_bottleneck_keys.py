@@ -1,19 +1,16 @@
 r"""The three keys that decide how the bottleneck behaves, tested for what each one *does*.
 
-``base_decode``, ``posterior_logvar_mode`` and ``source_dropout`` all exist for one measured
-problem, and each is asserted here against the mechanism it was added to remove rather than
-against the fact that the key parses.
+``base_decode``, ``posterior_logvar_mode`` and ``source_dropout`` each change how the bottleneck
+trains, and each is asserted here against the mechanism it removes rather than against the fact
+that the key parses.
 
-The measurement they answer, from the $125$-epoch production run
-(``output/2026-08-05/metrics_history_rr.csv``):
+Two failure modes motivate them:
 
-* ``logvar_prior_floor_frac`` climbs $0.017 \to 0.496$ and is still rising at epoch $125$ -- the
-  conditional prior's scale is collapsing onto its clamp, and the ``beta_prior`` anchor only
-  slowed it, because that anchor's restoring force saturates at $\beta_p / 2$ per dimension while
-  the reconstruction's opposing pressure grows as the decoder sharpens.
-* Between epochs $55$ and $120$ the KL is **unchanged** ($1.444 \to 1.442$ nats) and the latent
-  displacement is **unchanged** (``delta_mu_rms`` $0.084 \to 0.083$), while the held-out
-  predictive gain falls from $+3.25$ to $-0.70$. Same rate, same magnitude, degraded content.
+* The conditional prior's scale can collapse onto its clamp, and the ``beta_prior`` anchor cannot
+  stop that alone, because the anchor's restoring force saturates at $\beta_p / 2$ per dimension
+  while the reconstruction's opposing pressure grows as the decoder sharpens.
+* The source-to-latent map can degrade while the KL rate and the latent displacement stay
+  constant: same rate, same magnitude, degraded content.
 
 The first two keys attack the collapse, and there are exactly **two** gradient paths driving it,
 which is why they are two keys and not one:
@@ -24,7 +21,7 @@ which is why they are two keys and not one:
    $\sigma^q$ onto the *prior's* tensor -- ``posterior_logvar_mode`` severs that, and it is the
    path that **survives** ``base_decode='mean'``.
 
-The third attacks the second measurement: a failure at constant rate is a failure of the content
+The third attacks the second failure mode: a failure at constant rate is a failure of the content
 of $\Delta\mu(h^y, a)$, which a rate lever cannot reach.
 """
 from __future__ import annotations

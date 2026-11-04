@@ -69,7 +69,7 @@ TRIGGERED_FILENAME = "contraction_triggered.csv"
 CONDITIONED_FILENAME = "conditioned_coupling.csv"
 CONDITIONED_PER_RECORDING_FILENAME = "conditioned_coupling_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 DECELERATION_FIGURE = "deceleration_skill"
 TRIGGERED_FIGURE = "contraction_triggered"
 CONDITIONED_FIGURE = "conditioned_coupling"
@@ -91,9 +91,7 @@ MATCH_TOLERANCE_S = 0.5 * events.DECELERATION_MIN_DISTANCE_S - 1.5
 TRIGGER_BASELINE_S = 30.0
 
 #: Where the triggered response is looked for, in seconds after the contraction onset. The
-#: physiological contraction-to-deceleration delay is $20$-$120\,$s, and the preprocessing has
-#: already advanced UP by $20\,$s, so this is that interval on the aligned timeline rather than on
-#: the sensor's.
+#: physiological contraction-to-deceleration delay is $20$-$120\,$s.
 RESPONSE_WINDOW_S: Tuple[float, float] = (20.0, 120.0)
 
 #: Random-trigger draws behind the null band and the null dip distribution. A module constant

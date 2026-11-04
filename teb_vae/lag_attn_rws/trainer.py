@@ -380,6 +380,7 @@ class LagAttnRwsTrainer(GraphModelBase):
             lambda_deriv=vae_config.get("lambda_deriv", 0.0),
             lambda_boundary=vae_config.get("lambda_boundary", 0.0),
             lambda_event_gate=vae_config.get("lambda_event_gate", 0.0),
+            lambda_source_null=vae_config.get("lambda_source_null", 0.0),
             event_weight_floor=vae_config.get("event_weight_floor"),
             event_weight_reach_steps=vae_config.get("event_weight_reach_steps"),
             event_weight_ua_valid=bool(vae_config.get("event_weight_ua_valid", False)),
@@ -547,6 +548,10 @@ class LagAttnRwsTrainer(GraphModelBase):
         # rather than fixed, so the two ModelCheckpoints can never write the same filename however
         # many criteria a config eventually names -- Lightning would otherwise have each overwrite
         # the other's file at the same epoch, leaving one criterion's best silently unsaved.
+        #
+        # `secondary_mode` is optional and defaults to `mode`: a forecast gain such as
+        # `val/pred_gap_mean` is maximised while the loss is minimised, and one shared mode would
+        # keep the three worst-gain epochs.
         secondary_monitor = checkpoint_config.get("secondary_monitor")
         if secondary_monitor:
             self.secondary_checkpoint_callback = ModelCheckpoint(
@@ -556,7 +561,9 @@ class LagAttnRwsTrainer(GraphModelBase):
                     f"{self.CHECKPOINT_STEM}-{_monitor_stem(secondary_monitor)}-{{epoch:02d}}"
                 ),
                 save_top_k=checkpoint_config.get("save_top_k", 3),
-                mode=checkpoint_config.get("mode", "min"),
+                mode=checkpoint_config.get(
+                    "secondary_mode", checkpoint_config.get("mode", "min")
+                ),
             )
             callback_list.append(self.secondary_checkpoint_callback)
 

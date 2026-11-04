@@ -59,7 +59,7 @@ SPECTRUM_FILENAME = "latent_spectrum.csv"
 DIAGNOSTICS_FILENAME = "latent_diagnostics.csv"
 PER_RECORDING_FILENAME = "latent_per_recording.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 SPECTRUM_FIGURE = "kl_spectrum"
 
 #: The per-sample diagnostics reduced per recording, each with what it is for. Ordered so the

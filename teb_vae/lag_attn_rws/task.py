@@ -150,6 +150,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_deriv: float = 0.0,
         lambda_boundary: float = 0.0,
         lambda_event_gate: float = 0.0,
+        lambda_source_null: float = 0.0,
         event_weight_floor: Optional[float] = None,
         event_weight_reach_steps: Optional[int] = None,
         event_weight_ua_valid: bool = False,
@@ -197,6 +198,16 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                 $\lambda_g \, \beta \, \mathbb E_t[g_t]$; requires a net built with
                 ``posterior_event_gate`` and is refused by the objective otherwise. ``0.0`` --
                 the default -- adds nothing. Rides the $\beta$ schedule by construction.
+            lambda_source_null: Weight $\lambda_{\varnothing}$ of the source-null penalty,
+                $\lambda_{\varnothing}\,\beta\,\mathrm{KL}(q^{\varnothing} \Vert p)$, where
+                $q^{\varnothing}$ is the posterior rebuilt against a zeroed source stream. It
+                charges the part of the KL that needs no source values -- the availability pattern
+                and the target state alone can move the posterior off the prior and narrow it --
+                so the coupling the KL reports is pushed towards source variation. Costs one
+                source encode, one lag attention and one posterior head per step. Needs a task
+                whose forward inputs carry the source stream (:meth:`_source_null_penalty`);
+                refused otherwise. ``0.0`` -- the default -- adds nothing. Rides the $\beta$
+                schedule.
             event_weight_floor: $w_{\min} \in [0, 1)$, the weight the **full** branch's
                 reconstruction carries at anchors no recent contraction informs; anchors within
                 ``event_weight_reach_steps`` after a contraction onset weigh $1$. ``None`` -- the
@@ -257,6 +268,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             "lambda_deriv",
             "lambda_boundary",
             "lambda_event_gate",
+            "lambda_source_null",
             "event_weight_floor",
             "event_weight_reach_steps",
             "event_weight_ua_valid",
@@ -347,10 +359,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
     def on_before_optimizer_step(self, optimizer: Any) -> None:
         r"""Log the pre-clip gradient $L_2$ norm and whether it exceeded the clip, per step.
 
-        ``advanced_config.trainer.gradient_clip_val`` ships at a provisional $250$ -- scaled from
-        the sibling's $0.5$ by the $\approx 2 \times 480$ change in loss magnitude, not measured
-        -- and the config says to re-derive it from the first real run. Nothing else records the
-        quantity it must be derived from: Lightning removed ``track_grad_norm`` in 2.x, so a run
+        ``advanced_config.trainer.gradient_clip_val`` is provisional, and the config says to
+        re-derive it from the pre-clip norm of a run at the shipped geometry. Nothing else records
+        the quantity it must be derived from: Lightning removed ``track_grad_norm`` in 2.x, so a run
         reports the clip threshold it used and never what it was clipping. A threshold far below
         the typical norm rescales every step (the run is really training at a much lower
         effective learning rate); far above it, the clip is decoration and a genuine blow-up
@@ -749,6 +760,33 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         return {}
 
+    def _source_null_penalty(
+        self,
+        inputs: Tuple[torch.Tensor, ...],
+        forward_outputs: Dict[str, torch.Tensor],
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""The source-null KL $\mathrm{KL}(q^{\varnothing} \Vert p)$ with gradient, in nats per anchor.
+
+        Refused here: which positional input is the source stream is a fact about the subclass's
+        :meth:`_build_forward_inputs`, and guessing it would penalise the wrong tensor silently.
+
+        Args:
+            inputs: The positional tensors handed to the net's forward.
+            forward_outputs: The net's forward dict for this step.
+            weight: Decimated validity signal $(B, T)$.
+
+        Returns:
+            Never; a subclass that knows its source input returns the scalar.
+
+        Raises:
+            ValueError: Always, naming the task class.
+        """
+        raise ValueError(
+            f"lambda_source_null > 0 is not supported by {type(self).__name__}: this task does not "
+            f"declare which forward input is the source stream. Set lambda_source_null to 0.0."
+        )
+
     def _event_detector(self) -> Callable[..., Dict[str, Any]]:
         r"""The contraction detector the contraction weight runs: this cell's own evaluation's.
 
@@ -1009,6 +1047,15 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # The net's metric dict is all tensors by contract (the likelihood string lives outside
         # it), so splatting it is safe; the task adds what only it can see.
         metrics: Dict[str, Any] = dict(loss_metrics)
+
+        # The source-null penalty, on every stage so ``val/total_loss`` is the objective the run
+        # trains. Added to ``total_loss`` itself, because the checkpoint monitor reads that name.
+        lambda_source_null = float(self.hparams.get("lambda_source_null", 0.0))
+        if lambda_source_null > 0.0:
+            kl_null = self._source_null_penalty(inputs, forward_outputs, weight)
+            main_loss = main_loss + lambda_source_null * beta * kl_null
+            metrics["total_loss"] = main_loss
+            metrics["source_null_kl_penalty"] = kl_null.detach()
         # Unprefixed and detached: the breaker watches metrics['main_loss'] by exact name and
         # falls back to the returned loss, silently, if it is missing.
         metrics["main_loss"] = main_loss.detach()

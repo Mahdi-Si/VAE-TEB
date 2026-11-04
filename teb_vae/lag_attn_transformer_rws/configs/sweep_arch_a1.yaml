@@ -13,7 +13,7 @@
 # drift.
 #
 # The source depth here is the TARGET's depth, whatever that is: the arm's claim is symmetry, so
-# when default.yaml moved the target from four blocks to six this file moved with it.
+# this file must follow any change to default.yaml's target_attention_blocks.
 #
 # Parameter total 5,583,084: -201,728 for the two stems, +787,968 for the source encoder's fourth,
 # fifth and sixth attention blocks, so +586,240 against the shipped configuration rather than the

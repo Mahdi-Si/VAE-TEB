@@ -50,7 +50,7 @@ def test_the_eval_runs_end_to_end_on_a_planted_checkpoint(tmp_path, monkeypatch)
 
     output_dir = tmp_path / "eval"
     # The shared ``attribution`` (reused unchanged, covered by the CFS suites) is skipped: its IG cost
-    # is fixed by the shared ``IG_STEPS`` and no cap, and is ~1 min here.
+    # is fixed by the shared ``IG_STEPS`` and no cap reduces it.
     exit_code = run_module.main(
         checkpoint, output_dir, overrides=overrides_path, device="cpu", num_samples=2, skip="attribution"
     )

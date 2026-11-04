@@ -1,4 +1,4 @@
-# PRODUCTION RUN of the CONTROL (no quality mask) arm on the 2026-10-27 quality-version-4 build.
+# PRODUCTION RUN of the CONTROL (no quality mask) arm on the quality-version-4 build.
 #
 # The base file holds the model and the objective; this overlay holds only what is a property of
 # the box: the shards, the statistics file, the GPUs, the loader workers and the run directory's
@@ -8,8 +8,8 @@
 #   prod_q4_masked.yaml           base default.yaml                cuda_devices [0, 1, 2, 3]
 #   prod_q4_no_quality_mask.yaml  base sweep_no_quality_mask.yaml  cuda_devices [4, 5, 6, 7]
 #
-# The effective batch differs from the 7-GPU runs before 2026-10-28 (896), so their loss curves do
-# not compare step for step with these. The tag differs between the arms, so two launches in the
+# The effective batch differs from a 7-GPU run of the base file (7 x 128 = 896), so the loss
+# curves of the two do not compare step for step. The tag differs between the arms, so two launches in the
 # same minute write to two run directories.
 #
 # Launch from the PyCharm Run button: set RUN_CONFIG in teb_vae/lag_attn_transformer_cfs/trainer.py
@@ -23,7 +23,7 @@ general_config:
   cuda_devices: [4, 5, 6, 7]
 
 dataset_config:
-  # The 2026-10-27 quality-version-4 build: every healthy subgroup, BG and no-BG, 20 train shards and
+  # The quality-version-4 build: every healthy subgroup, BG and no-BG, 20 train shards and
   # 5 test shards. Compare with pre_training_dataset/dataset_files.yaml on the box before a run.
   vae_train_datasets:
     - /data1/fetal-heart-tracing/HDF5_Datasets/last-12-hours-causal-p50-ua-masked-2026-10-27/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5

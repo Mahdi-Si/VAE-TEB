@@ -89,7 +89,7 @@ ANALYSIS_DIRNAME = "distributions"
 SUMMARY_FILENAME = "distribution_summary.csv"
 PER_SEGMENT_FILENAME = "per_segment_metrics.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 #:
 #: **The ``<stem>_by_clinical_class.pdf`` / ``<stem>_by_subgroup.pdf`` shape is reserved** for the
 #: runner's grouped-variant fan-out, and a figure named into it reads to an operator as one of the
@@ -603,10 +603,12 @@ def build_class_figure(
     """
     axis = labels.CLASS_COLUMN
     groups = cohorts_present(segment, axis)
-    figure, axes = figures.new_figure(len(METRICS), 1, height_per_row=3.0)
+    # Two metrics to a row: the three cohort densities of one metric fit a half-width panel, and
+    # the cohort legend is drawn once, in the first.
+    figure, flat = figures.panel_grid(len(METRICS), panel_height=figures.PANEL_HEIGHT + 0.2)
     for row, metric in enumerate(METRICS):
         draw_density_panel(
-            axes[row, 0],
+            flat[row],
             {group: _series(segment, axis, group, metric.name) for group in groups},
             {group: _series(recording, axis, group, metric.name) for group in groups},
             groups,
@@ -639,7 +641,8 @@ def build_subgroup_figure(
     classes = cohorts_present(segment, labels.CLASS_COLUMN)
     axis = labels.SUBGROUP_COLUMN
     figure, axes = figures.new_figure(
-        len(METRICS), max(len(classes), 1), height_per_row=3.0, width=13.0
+        len(METRICS), max(len(classes), 1), height_per_row=figures.PANEL_HEIGHT + 0.2,
+        width=10.8,
     )
     for row, metric in enumerate(METRICS):
         for column, class_name in enumerate(classes):

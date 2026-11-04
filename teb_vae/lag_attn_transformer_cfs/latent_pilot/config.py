@@ -1293,7 +1293,7 @@ def open_run(
       Completed stages are skipped and reported as skipped.
     * **A re-entry without resume.** ``run_dir`` alone: only :data:`RERUNNABLE_STAGES` may run.
       They touch no fitted artifact -- ``report`` rewrites presentation from what is already there,
-      which is exactly what §12 asks for -- and any other stage is refused rather than allowed to
+      which needs no refit -- and any other stage is refused rather than allowed to
       overwrite an artifact a later stage was selected against.
 
     **Resume is stage-level, deliberately.** A fit interrupted halfway restarts from its own

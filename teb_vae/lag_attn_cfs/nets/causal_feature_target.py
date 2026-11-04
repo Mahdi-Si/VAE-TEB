@@ -151,7 +151,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
     #: $36$, not the two-sided $43$: seven scattering channels per block were dropped at write time
     #: because their one-sided warm-up outruns the stored segment at every trim. Both phase blocks
     #: keep their full width -- their $0.008$ Hz band floor excludes those filters entirely -- so
-    #: the second block is unchanged at $66$ and $c_y = 102$.
+    #: the second block is $66$ wide and $c_y = 102$ under the legacy operator, and $44$ wide with
+    #: $c_y = 80$ under ``integer_harmonic_v1``.
     #:
     #: Declared here rather than inherited, so that a change to the two-sided split cannot move
     #: this one and vice versa. It splits two reported numbers and feeds no loss, no shape and no
@@ -395,7 +396,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         The three groups cut **across** the stored block boundary and are therefore not a
         restatement of ``pred_gap_st`` / ``pred_gap_ph``: at the shipped budget the kept set is
-        $32$ channels of the first stored block plus all $66$ of the second, and the two span
+        $32$ channels of the first stored block plus all $44$ of the second, and the two span
         nearly the same rebased range.
 
         Args:
@@ -516,8 +517,10 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         *,
         target_scored_horizon: Optional[Sequence[int]],
         forecast_ar_residual: bool,
+        forecast_ar_max: float = 1.0,
+        target_scored_start: Optional[Sequence[int]] = None,
     ) -> None:
-        r"""Stash the forecast density's two structural keywords, **before** the base constructor.
+        r"""Stash the forecast density's structural keywords, **before** the base constructor.
 
         Split from :meth:`_register_likelihood_structure` for the reason the channel weights are
         split: this half needs no geometry, that half needs the gate and the horizon.
@@ -531,6 +534,20 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             forecast_ar_residual: Score each channel's horizon under an AR(1) residual with a
                 learnable coefficient $\phi_c = \tanh(a_c)$, seeded at $a_c = 0$ so the model
                 starts bitwise at the factorised score. ``False`` builds no parameter.
+            forecast_ar_max: $\phi_{\max} \in (0, 1]$, so that $\phi_c = \phi_{\max}\tanh(a_c)$.
+                At $\phi_c \to 1$ the score of every step after the first reads only the change of
+                the residual, and a level error that persists over the horizon is charged once.
+                ``1.0`` -- the default -- applies no bound and is bitwise the unbounded score.
+            target_scored_start: $\tau^{0}_c$ per **declared** target channel, the first scored
+                horizon step, so the scored cells are $\tau^{0}_c \le \tau < H_c$. Resolved from
+                the shards' novelty curve by
+                :func:`~teb_vae.lag_attn_cfs.scored_horizon.resolve_target_scored_start`: a cell
+                whose coefficient is almost entirely a function of samples the anchor has already
+                seen carries no forecast information, and scoring it pays the objective for
+                reproducing the past. ``None`` -- the default -- starts every channel at $0$.
+
+        Raises:
+            ValueError: If ``forecast_ar_max`` is outside $(0, 1]$.
         """
         self.target_scored_horizon = (
             None
@@ -538,6 +555,14 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             else tuple(int(steps) for steps in target_scored_horizon)
         )
         self.forecast_ar_residual = bool(forecast_ar_residual)
+        if not 0.0 < float(forecast_ar_max) <= 1.0:
+            raise ValueError(f"forecast_ar_max must lie in (0, 1], got {forecast_ar_max}")
+        self.forecast_ar_max = float(forecast_ar_max)
+        self.target_scored_start = (
+            None
+            if target_scored_start is None
+            else tuple(int(step) for step in target_scored_start)
+        )
 
     def _register_likelihood_structure(self) -> None:
         r"""Build the scored-cell mask buffer and the AR(1) parameter, after the base.
@@ -549,13 +574,20 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         alone and both decoder invocations -- base and full -- are scored under one $\phi$, which
         keeps ``pred_gap`` a pure source readout.
 
+        Under ``target_scored_start`` the mask is
+        $m_{\tau,c} = \mathbb 1[\tau^{0}_c \le \tau < H_c]$, with $H_c = H$ where no scored-horizon
+        vector is given.
+
         Raises:
             ValueError: If the scored-horizon vector does not have $c_y$ entries or holds a value
                 outside $[1, H]$ -- a channel scored at no step would be a channel the decoder
-                emits for nothing.
+                emits for nothing -- or if the start vector does not have $c_y$ entries or holds a
+                value outside $[0, H]$, or leaves no cell scored at all.
         """
         width = int(self.decoder_out_channels)
-        if self.target_scored_horizon is not None:
+        if self.target_scored_start is not None:
+            self._register_scored_cells_with_start()
+        elif self.target_scored_horizon is not None:
             steps = self.target_scored_horizon
             if len(steps) != int(self.c_y):
                 raise ValueError(
@@ -582,6 +614,46 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         if self.forecast_ar_residual:
             self.target_ar_logit = torch.nn.Parameter(torch.zeros(width))
 
+    def _register_scored_cells_with_start(self) -> None:
+        r"""Build ``target_cell_mask`` from a start step and an end step per channel.
+
+        $m_{\tau,c} = \mathbb 1[\tau^{0}_c \le \tau < H_c]$ over the kept channels, gathered through
+        the keep-index as the scored-horizon vector is. A channel may be unscored entirely; its
+        decoder outputs then carry no gradient from the score, which is harmless under DDP because
+        every row of the mean and log-variance heads is still in the graph.
+
+        Raises:
+            ValueError: On a vector of the wrong width, a value outside its range, or a mask with
+                no scored cell.
+        """
+        horizon, c_y = int(self.horizon), int(self.c_y)
+        start = self.target_scored_start
+        end = self.target_scored_horizon or (horizon,) * c_y
+        for name, vector, low in (("target_scored_start", start, 0), ("target_scored_horizon", end, 1)):
+            if len(vector) != c_y:
+                raise ValueError(
+                    f"{name} has {len(vector)} entries against c_y={c_y}; it is positional over "
+                    f"the declared channels"
+                )
+            if min(vector) < low or max(vector) > horizon:
+                raise ValueError(
+                    f"{name} entries must lie in [{low}, H={horizon}], got "
+                    f"[{min(vector)}, {max(vector)}]"
+                )
+        declared = (
+            torch.arange(c_y) if self.target_gate is None else self.target_gate.keep_index.cpu()
+        )
+        first = torch.as_tensor([start[int(index)] for index in declared.tolist()])
+        last = torch.as_tensor([end[int(index)] for index in declared.tolist()])
+        taus = torch.arange(horizon)[:, None]
+        mask = ((taus >= first[None, :]) & (taus < last[None, :])).to(torch.float32)
+        if float(mask.sum()) == 0.0:
+            raise ValueError(
+                "target_scored_start leaves no scored cell over the kept channels; lower "
+                "target_min_novelty"
+            )
+        self.register_buffer("target_cell_mask", mask, persistent=False)
+
     @classmethod
     def _resolve_channel_weights(
         cls,
@@ -594,14 +666,14 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         The two stored target blocks are produced by different transforms and weighting them
         equally is a choice rather than a neutral default -- and at the shipped budget it is not
-        even a neutral *count*: $66$ of the $98$ survivors are phase-harmonic, so a uniform
-        objective already spends two-thirds of itself there. This returns $w_c$ per surviving
+        even a neutral *count*: $44$ of the $76$ survivors are phase-harmonic, so a uniform
+        objective already spends more than half of itself there. This returns $w_c$ per surviving
         channel, positional against ``keep_index``, from one weight per stored block.
 
         **The renormalisation is the load-bearing part.** The raw weights are scaled by
         $C_{\mathrm{keep}} / \sum_c w_c$, so the weighted block sums to the same magnitude the
-        unweighted one did. Without it, $(1.0, 0.1)$ would shrink the reconstruction by $2.5\times$
-        against a KL that did not move -- which is a $2.5\times$ increase in the effective $\beta$
+        unweighted one did. Without it, $(1.0, 0.1)$ would shrink the reconstruction by $2.1\times$
+        against a KL that did not move -- which is a $2.1\times$ increase in the effective $\beta$
         wearing a channel-weight's name, and it would put ``gradient_clip_val`` and
         ``additive_margin`` back out of date on both cfs cells. Only the *distribution* across
         channels moves; the ratio the configuration states is preserved exactly.
@@ -707,8 +779,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         stay bitwise what they were.
 
         With a shift, the gather runs per **unique shift value** rather than per element: the
-        resolved vectors carry long runs of equal shifts (a few dozen distinct values over 98
-        channels), so grouping keeps the index tensors at $(B, A \cdot H)$ instead of the
+        resolved vectors carry long runs of equal shifts (a few dozen distinct values over the
+        kept channels), so grouping keeps the index tensors at $(B, A \cdot H)$ instead of the
         $(B, A \cdot H, C_{\mathrm{keep}})$ ``int64`` block a per-element index would materialise
         at the dense evaluation stride.
 
@@ -915,8 +987,14 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 order, before the gate -- the same tensor the forecast target is gathered from.
             anchors: The decoded anchor index $(B, A)$, as ``_build_anchor_index`` returned it.
 
+        **Under ``persistence_lags`` $P > 1$** the same gather runs at steps $u - p$ for
+        $p = 0, \dots, P - 1$, each lag masked by the same warm-up rule on the step it reads (and
+        zeroed where $u - p < 0$), and the $P$ vectors are stacked lag-major on the last axis. The
+        first $C_{\mathrm{keep}}$ entries are therefore the single-lag vector, unchanged.
+
         Returns:
-            The anchor's own target vector $(B, A, C_{\mathrm{keep}})$.
+            The anchor's own target vector $(B, A, C_{\mathrm{keep}})$, or
+            $(B, A, P \cdot C_{\mathrm{keep}})$ under ``persistence_lags`` $P > 1$.
         """
         gathered = (
             target_features
@@ -933,6 +1011,16 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 [min(int(s), 0) for s in shift], dtype=torch.long, device=gathered.device
             )
             index = anchors.to(torch.long)[:, :, None] + offsets[None, None, :]
+        lags = int(getattr(self, "persistence_lags", 1))
+        if lags > 1:
+            # One gather per lag, each read at u - p and masked on that step; the step below 0 is
+            # clamped for the gather and zeroed by the mask.
+            stacked = []
+            for lag in range(lags):
+                shifted = index - lag
+                values = gathered.gather(1, shifted.clamp_min(0))
+                stacked.append(values * self._warm_at(shifted).to(values.dtype))
+            return torch.cat(stacked, dim=-1)
         values = gathered.gather(1, index)
         # Zero below the channel's own warm-up, on the step actually read. The buffer is the input
         # mixin's (``target_warm_steps``, all zeros on the ungated arm), so a model built without
@@ -941,6 +1029,20 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         if waits is None:
             return values
         return values * (index >= waits).to(values.dtype)
+
+    def _warm_at(self, steps: torch.Tensor) -> torch.Tensor:
+        r"""Whether each kept channel is past its warm-up at the given stored step.
+
+        Args:
+            steps: Stored step per anchor and kept channel $(B, A, C_{\mathrm{keep}})$; may be
+                negative, which is never warm.
+
+        Returns:
+            A boolean tensor of the same shape.
+        """
+        waits = getattr(self, "target_warm_steps", None)
+        warm = steps >= 0
+        return warm if waits is None else warm & (steps >= waits)
 
     @torch.no_grad()
     def _gap_by_kept_channel(
@@ -1003,7 +1105,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         A geometry guard, not a result: the band is
         $\lceil (\mathrm{ceiling} - F - \varphi)/S \rceil$ over $\varphi \in [0, S)$, with the
         ceiling the model's own :attr:`anchor_ceiling`. For example, at $F = 134$, $S = 5$ and a
-        ceiling of $185$ that is $11$ at phase $0$ and $10$ otherwise, mean $51/5$; at the
+        ceiling of $290$ that is $32$ at phase $0$ and $31$ otherwise, mean $156/5$; at the
         validation stride of $1$ it is exactly $\mathrm{ceiling} - F$. A value off that band means
         the tiling is not the one the configuration states.
 
@@ -1049,8 +1151,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         This is the readout that sizes the compromise the design makes on the source. Lag attention
         searches $L$ lags back from an anchor, into a region where much of the source is still
-        inside its own warm-up, and the design keeps every source channel rather than gating them
-        -- the alternative costs almost the whole second source block, against a lag search that
+        inside its own warm-up, and the design gates the source only at the anchor floor, not at
+        every lag -- the every-lag criterion would cost source channels against a lag search that
         exists to find the $20$ to $120$ s contraction-to-deceleration delay. So the residual is
         measured instead of resolved, and a **small** value here is the expected finding rather
         than a failure.

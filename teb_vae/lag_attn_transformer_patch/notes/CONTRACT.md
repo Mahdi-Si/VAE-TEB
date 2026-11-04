@@ -1,6 +1,8 @@
-# P0-01 — Co-mixin contract (read-only map)
+# P0-01 — Co-mixin contract map
 
-Written 2026-10-03 against `main` @ `ba350c8`. Paths are relative to `teb_vae/`. Short names:
+This map lists what the shared mixins and tasks read from the patch model, and which class supplies
+each member. Line numbers (`:N`) refer to commit `ba350c8` and may have moved since. Paths are
+relative to `teb_vae/`. Short names:
 `CWI` = `lag_attn_cfs/nets/causal_inputs.py::CausalWarmupInputs`,
 `CFT` = `lag_attn_cfs/nets/causal_feature_target.py::CausalFeatureForecastTarget`,
 `FFT` = `lag_attn_fs/nets/feature_target.py::FeatureForecastTarget`,
@@ -58,7 +60,7 @@ Decision words:
 | `kld_tensor`, `te_analysis` | :922-930 | TrfRws:1238, :575 | **inherit** |
 | `register_buffer` | :493, :525, :584 | `nn.Module` | **inherit** |
 
-### 1c. Members the plan names that CWI does **not** read
+### 1c. Patch-model members that CWI does **not** read
 
 | Member | Real reader(s) | Current supplier | Patch decision |
 |---|---|---|---|
@@ -66,8 +68,8 @@ Decision words:
 | `forecast_likelihood_kwargs()` | FFT.compute_loss feature_target.py:452; CFT `_gap_by_kept_channel` :976; CFS task `forecast_rows` :162; CFS eval | FFT:105 | **reuse by reference** (`= FeatureForecastTarget.forecast_likelihood_kwargs`). It reads only `getattr(self, "target_ar_logit"/"target_cell_mask", None)` and returns `{"cell_mask": None, "ar_coef": tanh(a) or None}`. The patch `compute_loss` can splat it. |
 | `_set_likelihood_structure(*, target_scored_horizon, forecast_ar_residual)` | CFS model constructors (TrfCfs model.py:239) | CFT:514 | **reuse by reference**. It reads nothing from `self`; it only sets `target_scored_horizon` and `forecast_ar_residual`. Call it before `super().__init__` with `target_scored_horizon=None`. |
 | `_register_likelihood_structure()` | TrfCfs model.py:261 (after the base) | CFT:542 | **reuse by reference**. With `target_scored_horizon=None` it reads only `decoder_out_channels` and `forecast_ar_residual` and builds `target_ar_logit = Parameter(zeros(2))`. Because it runs after `initialization`, φ starts at exactly 0. Its reads of `c_y`, `target_gate` and `horizon` (:560-575) are in the scored-horizon branch, which the patch never reaches. |
-| `TARGET_BLOCK_SPLIT` | CFS task `forecast_rows` :147 (not bound), cfs `sample_page`, eval | CFT:160; CRI:174 | **not needed**. Omit it. |
-| `_check_persistence_target()` | **base** TrfRws `__init__` :420-421. The base version raises (:876-903). | CFT:683 (no-op) | **trivial override**: `def _check_persistence_target(self): pass`. The plan omits this (C2). |
+| `TARGET_BLOCK_SPLIT` | CFS task `forecast_rows` :147 (not bound), cfs `sample_page`, eval | CFT:160; CRI:174 | **not needed** on the training model. The eval view (`eval/view.py`) sets it to 1. |
+| `_check_persistence_target()` | **base** TrfRws `__init__` :420-421. The base version raises (:876-903). | CFT:683 (no-op) | **trivial override**: `def _check_persistence_target(self): pass` (C2). |
 | `_default_decoder_out_channels()` | base `__init__` TrfRws:595 | TrfRws:657 (=R=16); FFT:125 | **trivial override**: `return 2`. Use a constant: it is called inside the base `__init__`, before any post-super attribute exists. |
 | `compute_loss(...)` | RWS task `compute_loss_and_metrics` task.py:654 and :708 (perm re-score) | TrfRws:1263; CRI:386 | **new code** (§4) |
 | `_anchors_per_sample(fo, target)` | patch `compute_loss` | CFT:982-1017. Already bound by CRI:184. | **reuse by reference**. It reads `fo["anchor_index"]`, `fo["anchor_valid"]`, the target's dtype and device, and `geometry.t_valid` (dense fallback only). It returns `valid.sum()/B`. |
@@ -117,10 +119,12 @@ def _build_adapter(self, gate: Optional[ChannelGate], declared_width: int, dropo
 - The patch override returns `PatchEmbedding(in_dim=declared_width, d_model=self.d_model,
   sequence_length=self.sequence_length, dropout=dropout)` and must not call super. The two calls
   differ only in dropout (`dropout` vs `source_dropout`).
-- Only CFS eval `analyses/occlusion.py:273` (out of scope) reads `model.source_adapter`. Nothing
-  outside tests reads adapter attributes or checks `isinstance(..., AvailabilityInputAdapter)`.
+- Outside tests, nothing checks `isinstance(..., AvailabilityInputAdapter)`. The patch eval's
+  `raw_attribution` attributes at the input of `model.source_adapter`.
 
-**How `lag_kv_source: adapter` reaches the source adapter output:**
+**How the `adapter` arm of `lag_kv_source` reaches the source adapter output** (the shipped default
+is `encoder`, where `source_kv_modules()` is `(source_adapter, source_encoder)` and K/V is the
+encoder output):
 1. TrfRws:500-523 builds neither `source_encoder` nor `source_kv_stem`.
 2. `source_kv_body()` returns `None` (:755-759).
 3. `source_kv_modules()` returns `(self.source_adapter,)` (:772-773).
@@ -157,7 +161,8 @@ self._set_causal_inputs(horizon=horizon, target_keep_index=None, target_warmup_s
                         source_keep_index=None, source_warmup_steps=None,
                         anchor_stride=anchor_stride, lag_floor=lag_floor)
 self._set_likelihood_structure(target_scored_horizon=None, forecast_ar_residual=forecast_ar_residual)
-super().__init__(**forwarded, c_y=2 * raw_per_step + 1, c_u=2 * raw_per_step + 1, use_up_st=False)
+super().__init__(**forwarded, c_y=2 * raw_per_step + 1, c_u=2 * raw_per_step + 1, use_up_st=False,
+                 target_delays=None, source_delays=None)
 self._validate_causal_geometry()
 self._register_likelihood_structure()
 ```
@@ -180,7 +185,7 @@ The table uses `B`, `T=300`, `L=max_lag+1`, `M=num_heads`, `A=A_max`, `H` and `C
 | Key | Shape | Depends on target co-mixin? |
 |---|---|---|
 | `mu_prior`, `logvar_prior`, `raw_logvar_prior`, `mu_post`, `logvar_post`, `z_prior`, `z_post` | `(B,T,d_z)` | no |
-| `target_state`, `source_state` | `(B,T,d_model)` | no. `source_state` is the `PatchEmbedding` output under `adapter`. |
+| `target_state`, `source_state` | `(B,T,d_model)` | no. `source_state` is the K/V representation: the `PatchEmbedding` output under `adapter`, the source encoder output under `encoder`. |
 | `attended_source_heads` | `(B,T,M,d_head)` | no |
 | `attn_weights` | `(B,T,M,L)` | no |
 | `mu_base`, `logvar_base`, `mu_full`, `logvar_full` | `(B,A,H,C)` | **width C** from `_default_decoder_out_channels`. Under persistence the means include the persistence term. |
@@ -282,7 +287,7 @@ All four are `@torch.no_grad()`. Their shared tail is `_attend_and_pose(model, f
 | `perm_forward_outputs` (:157) | `(model, fo, *, perm_index=None, generator=None, groups=None, anchors=None)` | `fo["source_state"]` (permuted on batch); `model.decoder`; `model.geometry.t_valid` (only if `anchors is None`); `fo.get("persistence")`. Draws fresh ε. Returns a copy with `mu_post, logvar_post, z_post, attn_weights, mu_full, logvar_full, perm_index` replaced. The RWS task passes `anchors=fo.get("anchor_index")` (rws/task.py:696-707). |
 | `source_null_forward_outputs` (:283) | `(model, fo, u_stream)` | Shape, dtype and device of `u_stream` (declared width, pre-gate). Builds a zeros `(1,T,F_in)` stream and passes it through `model.source_gate` (None) and `model.encode_source_kv`, then expands it to B. No decode, no ε. Replaces `mu_post, logvar_post, attn_weights`. Patch: zeros mean validity channel 0, so m = 1, i.e. valid and flat. No `missing` token. |
 | `source_null_kld` (:512) | `(model, fo, u_stream, weight)` | The above, plus `model.geometry`, `model.coverage_floor`, `fo["anchor_index"/"anchor_valid"]`, `fo["mu_prior"/"logvar_prior"]`. Uses the **raw** `weight` (not `scored_weight`). Returns `source_conditioned_kl_raw` of the null arm. |
-| `occluded_forward_outputs` (:401) | `(model, fo, source, *, occlusion=None, anchors=None, generator=None)` | `source` is **post-gate** `(B,T,c_kept)`. Rows where the `(T,)` or `(B,T)` `occlusion` is true are zeroed. Also reads `model.encode_source_kv`, `model.decoder`, `model.geometry.t_valid` (if `anchors is None`) and `fo.get("persistence")`. Replaces `OCCLUSION_KEYS` (:389). Patch caveat: a zeroed patch row reads as valid and flat, not as `missing`. The only caller is cfs eval `analyses/occlusion.py` (out of scope). |
+| `occluded_forward_outputs` (:401) | `(model, fo, source, *, occlusion=None, anchors=None, generator=None)` | `source` is **post-gate** `(B,T,c_kept)`. Rows where the `(T,)` or `(B,T)` `occlusion` is true are zeroed. Also reads `model.encode_source_kv`, `model.decoder`, `model.geometry.t_valid` (if `anchors is None`) and `fo.get("persistence")`. Replaces `OCCLUSION_KEYS` (:389). Patch caveat: a zeroed patch row reads as valid and flat, not as `missing`. The patch eval's `occlusion` edits raw UP itself and calls it with `occlusion=None`. |
 
 None of the four reads a feature-specific attribute. All of them run on the patch forward dict.
 
@@ -333,11 +338,11 @@ Its own members are:
   `SeqVaeLagAttnTrfCrwsTask(SeqVaeLagAttnCrwsTask, SeqVaeLagAttnTrfRwsTask)` are diamonds with
   **empty bodies**.
 
-**Simpler alternative to B.7:** use `class SeqVaeLagAttnTrfPatchTask(SeqVaeLagAttnTrfCrwsTask)`.
-It inherits `__init__(seed)`, `compute_loss_and_metrics`, `_stage`, the four bound members and the
-LR ramp. It overrides only `_build_forward_inputs`, `_added_metrics` and optionally
-`forecast_rows`, whose CRWS version draws `(B,A,H,R)` rows; plotting is disabled anyway. This has
-the same behaviour as B.7 with three fewer members.
+**The task as built (C6):** `class SeqVaeLagAttnTrfPatchTask(SeqVaeLagAttnTrfCrwsTask)`. It
+inherits `__init__(seed)`, `compute_loss_and_metrics`, `_stage`, the four bound members and the LR
+ramp. It overrides `_build_forward_inputs` and `_added_metrics`, and the page seams
+`forecast_rows`, `forecast_extra_rows`, `input_stream_panels` and `input_budget_figure`, because the
+CRWS `forecast_rows` draws `(B,A,H,R)` raw rows.
 
 **RWS task step** (rws/task.py:624-753):
 1. `inputs = _build_forward_inputs(batch)`, then `fhr, weight = _build_raw_target(batch)`.
@@ -486,95 +491,86 @@ unknown key is **dropped silently**, which is why the B.8 refusals are needed.
 
 ---
 
-## 10. Conflicts with the plan
+## 10. Decisions C1–C11
 
-**C1 (minor).**
-- Plan: B.3 step 1 says "`featurize(raw, w)` to get `(value, mask, delta)`".
-- Code: it returns one stacked `(B, 3, L)` tensor (frontend.py:303).
-- Suggested resolution: unpack with `.unbind(1)`. No plan change is needed beyond the wording.
+`IMPLEMENTATION_PLAN.md` §C.3 summarises these decisions in one table.
 
-**C2 (plan omission).**
-- Plan: B.5 lists the four jobs of `PatchSummaryTarget`, and none of them is
-  `_check_persistence_target`.
+**C1 (`featurize` output).**
+- Code: `featurize` returns one stacked `(B, 3, L)` tensor (frontend.py:303), not a tuple.
+- Resolution: `patchify` unpacks it with `.unbind(1)`.
+
+**C2 (persistence).**
 - Code: with `persistence_residual=True` the base raises at TrfRws:420-421/876-903, so
   `sweep_persistence.yaml` would not construct.
-- Suggested resolution: `PatchSummaryTarget` overrides it as a no-op, as CFT:683 does.
+- Resolution: `PatchSummaryTarget` overrides `_check_persistence_target` as a no-op, as CFT:683 does.
 
-**C3 (plan wording).**
-- Plan: P0-01 step 3 places `_resolve_warmup_readout_constants` and `anchor_ceiling` in
-  `causal_feature_target.py`, and lists `scored_weight`, `forecast_likelihood_kwargs`,
-  `_set/_register_likelihood_structure` and `TARGET_BLOCK_SPLIT` as hooks CWI reads.
-- Code: the first two live in `causal_inputs.py` (:460, :272). CWI reads none of the others; §1c
+**C3 (hook list).**
+- Code: `_resolve_warmup_readout_constants` and `anchor_ceiling` live in `causal_inputs.py` (:460,
+  :272), not in `causal_feature_target.py`. CWI does not read `scored_weight`,
+  `forecast_likelihood_kwargs`, `_set/_register_likelihood_structure` or `TARGET_BLOCK_SPLIT`; §1c
   lists their real readers.
-- Suggested resolution: P2-02 uses §1 as the hook list. The real CWI target hooks are
-  `_check_anchor_floor` and `_anchor_target_values`, plus the six `_resolve_*`/split members, which
-  become unnecessary once `_resolve_warmup_readout_constants` is overridden.
+- Resolution: §1 is the hook list. The real CWI target hooks are `_check_anchor_floor` and
+  `_anchor_target_values`, plus the six `_resolve_*`/split members, which become unnecessary once
+  `_resolve_warmup_readout_constants` is overridden.
 
-**C4 (plan omission).**
-- Plan: B.5 copies the CRWS keyword list and passes the result to the base through `locals()`.
+**C4 (forwarded keywords).**
 - Code: `FORWARDED_EXCLUSIONS` does not cover the four new keys `target_summary_loc`,
-  `target_summary_scale`, `variability_eps` and `source_validity`, so the base raises `TypeError`.
-  The CRWS list also lacks `persistence_residual`; the plan does add it.
-- Suggested resolution: extend the exclusion tuple locally, as in the §2 recipe.
+  `target_summary_scale`, `variability_eps` and `source_validity`, so the base would raise
+  `TypeError`. The CRWS keyword list also lacks `persistence_residual`; the patch signature adds it.
+- Resolution: the constructor extends the exclusion tuple locally with `PATCH_ONLY`, as in the §2
+  recipe.
 
-**C5 (minor).**
-- Plan: B.6 step 3 passes `horizon_weight=None`.
-- Code: the copied signature keeps `horizon_weight_halflife_steps`. A config that sets it would
-  register a `horizon_weight` buffer (TrfRws:454-459) that the loss then silently ignores.
-- Suggested resolution: pass `getattr(self, "horizon_weight", None)`, as CRI and FFT do. It is
-  `None` under the shipped `null`. Alternatively, drop the keyword from the signature.
+**C5 (horizon weight).**
+- Code: the signature keeps `horizon_weight_halflife_steps`. A config that sets it registers a
+  `horizon_weight` buffer (TrfRws:454-459).
+- Resolution: the loss passes `getattr(self, "horizon_weight", None)`, as CRI and FFT do. It is
+  `None` under the shipped `null`.
 
-**C6 (plan omission).**
-- Plan: B.7 lists the members to write and does not include the class attribute
-  `_stage: str = DENSE_STAGES[0]`.
+**C6 (`_stage` class default).**
 - Code: `VaeSource` (sources.py:367-368) and the plot callback call `_build_forward_inputs`
-  outside a step, so without the class default they fail with `AttributeError`.
-- Suggested resolution: declare `_stage` as CRWS does (crws/task.py:209). A simpler route is to
-  subclass `SeqVaeLagAttnTrfCrwsTask` (§6), which provides it.
+  outside a step, so without the class default `_stage: str = DENSE_STAGES[0]` they fail with
+  `AttributeError`.
+- Resolution: the task subclasses `SeqVaeLagAttnTrfCrwsTask` (§6), which provides it.
 
-**C7 (plan omission).**
-- Plan: B.8 does not mention the seed.
+**C7 (seed).**
 - Code: `LagAttnTrfRwsTrainer.create_model` never puts `general_config.seed` into the task
-  hyperparameters, so `anchor_phase` always keys on `seed = 0`.
-- Suggested resolution: override `create_model` as `super().create_model()` followed by
+  hyperparameters, so `anchor_phase` would always key on `seed = 0`.
+- Resolution: `create_model` calls `super().create_model()` and then
   `self.apply_config_hyperparameters({"seed": ...}, self.pl_model)`, as in crws/trainer.py:258-260.
   It cannot be bound, because it uses zero-arg `super`.
 
-**C8 (conflict).**
-- Plan: B.8 says pre-flight "imports the e2e guards, adapts their key lists, and does not copy
-  them".
-- Code: `_check_no_inert_model_keys` reads the module global `INERT_MODEL_KEYS` and has no
-  parameter. The other two hardcode `"up"`/`"fhr"`.
-- Suggested resolution:
-  - Write one refusal of about 10 lines over the patch's removed keys plus prefix matches
-    (`causal_*`, `target_weight_*`), and `target_scored_horizon`, `target_forecast_shift`,
-    `target_novelty_frac`.
-  - Import `_check_raw_source_normalized` and `_check_raw_length_against_shard` as-is. The config
-    must state `sequence_length` and `raw_per_step`, or the length check is silently skipped.
-  - Import CRWS `_check_phase_key_fields`, `_check_raw_target_fields(config, fields=("fhr",))` and
-    `_check_boundary_term_is_off`. Together these cover `weight`, `guid`, `epoch` and
+**C8 (pre-flight).**
+- Code: the e2e `_check_no_inert_model_keys` reads the module global `INERT_MODEL_KEYS` and has no
+  parameter. The other two e2e guards hardcode `"up"`/`"fhr"`.
+- Resolution:
+  - One short refusal covers the patch's removed keys plus the prefix matches (`causal_*`,
+    `target_weight_*`, `target_phase_fast_*`), and `target_scored_horizon`,
+    `target_forecast_shift`, `target_novelty_frac`.
+  - `_check_raw_source_normalized` and `_check_raw_length_against_shard` are imported as they are.
+    The config must state `sequence_length` and `raw_per_step`, or the length check is silently
+    skipped.
+  - The CRWS `_check_phase_key_fields`, `_check_raw_target_fields(config, fields=("fhr",))` and
+    `_check_boundary_term_is_off` are imported. Together these cover `weight`, `guid`, `epoch` and
     `lambda_boundary = 0`; the shared objective raises otherwise (losses.py:893).
 
-**C9 (minor).**
-- Plan: B.5 removes `use_up_st` from the signature.
-- Code: the base default is then `True` (TrfRws:132). The value is inert here, because its only
-  readers are the overridden readout method, the unused RWS `_build_source_stream` and pages.
-- Suggested resolution: pass `use_up_st=False` to the base so the model does not claim an ST
-  block.
+**C9 (`use_up_st`).**
+- Code: without the keyword the base default is `True` (TrfRws:132). The value is inert here,
+  because its only readers are the overridden readout method, the unused RWS `_build_source_stream`
+  and pages.
+- Resolution: the constructor passes `use_up_st=False` to the base, so the model does not claim an
+  ST block.
 
-**C10 (plan omission).**
-- Plan: B.8 does not mention `TRACKED_METRICS` or `causal_standing_message`.
+**C10 (tracked metrics and startup message).**
 - Code:
   - The inherited `TRACKED_METRICS` lacks `anchors_per_sample` and `kld_source_null`, so neither
-    reaches `metrics_history.csv`.
-  - The inherited `causal_standing_message` (rws/trainer.py:239-262) logs "input features at step
-    t read up to 974 s into their own future", which is false for patches.
-- Suggested resolution: extend `TRACKED_METRICS` as CRWS does, and override the message as e2e
-  does (:136).
+    would reach `metrics_history.csv`.
+  - The inherited `causal_standing_message` (rws/trainer.py:239-262) describes stored feature
+    inputs, which is false for patches.
+- Resolution: `TRACKED_METRICS` is extended as in CRWS, and the message is overridden as in e2e
+  (:136).
 
-**C11 (note, P5-02).**
-- Plan: P5-02 says to name each changed classifier file.
+**C11 (classifier, P5-02).**
 - Code: the classifier has no package registry.
-- Suggested resolution: expect zero changed classifier source files and one new test. The patch
-  `trainer.py` must define exactly one class with `TASK_CLS` in its own module. Keep the forward
-  parameter named `u_patch`, not `u_stream`; see §7 on `kld_excess`.
+- Resolution: no classifier source file changes; one new test. The patch `trainer.py` defines
+  exactly one class with `TASK_CLS` in its own module. The forward parameter is named `u_patch`, not
+  `u_stream`; see §7 on `kld_excess`.

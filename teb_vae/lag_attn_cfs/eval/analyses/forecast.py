@@ -45,8 +45,7 @@ zeros -- flattering exactly the horizons that fall in gaps.
 $H$ horizon steps and one recording contributes tens of segments, so every statistic is averaged
 within a recording first and the bootstrap resamples recordings, never anchors. The exception is
 the anchor profile, which averages the retained segments' per-anchor scores directly -- it is a
-picture of where in the segment the score sits, not a cohort statistic, and `FIGURE_GUIDE.md` says
-so.
+picture of where in the segment the score sits, not a cohort statistic.
 """
 from __future__ import annotations
 
@@ -85,7 +84,7 @@ SKILL_FILENAME = "forecast_skill.csv"
 HORIZON_FILENAME = "forecast_horizon.csv"
 ANCHOR_FILENAME = "forecast_anchor_profile.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` will name them.
+#: The figure stems.
 BASELINE_FIGURE = "baseline_comparison"
 ANCHOR_FIGURE = "anchor_profile"
 OVERLAY_FIGURE = "forecast_overlay"
@@ -363,7 +362,9 @@ def build_baseline_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    # Side by side: the two panels share no axis, and two half-width panels keep the violins
+    # bodies and the skill bars short enough to compare at a glance.
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT)
     figures.violin_panel(
         axes[0, 0],
         {
@@ -374,7 +375,7 @@ def build_baseline_figure(
         ylabel="nats per anchor",
     )
 
-    axis = axes[1, 0]
+    axis = axes[0, 1]
     labels = [f"{row['branch']} vs {row['baseline']}" for row in skill_rows]
     values = np.asarray([float(row["mse_skill"]) for row in skill_rows], dtype=np.float64)
     positions = np.arange(len(skill_rows), dtype=np.float64)
@@ -388,11 +389,16 @@ def build_baseline_figure(
         )
         low = np.clip(values - bounds[:, 0], 0.0, None)
         high = np.clip(bounds[:, 1] - values, 0.0, None)
-        axis.barh(positions, values, color=figures.COLOR_BLUE, alpha=0.85, height=0.6)
+        # Coloured by sign, so a model that loses to a baseline is found before the axis is read.
+        axis.barh(
+            positions, values, height=0.55,
+            color=[figures.COLOR_BLUE if value >= 0.0 else figures.COLOR_VERMILLION for value in values],
+        )
         axis.errorbar(
             values, positions, xerr=np.vstack([low, high]),
-            fmt="none", ecolor=figures.COLOR_BLACK, elinewidth=figures.LINE_REGULAR, capsize=3.0,
+            fmt="none", ecolor=figures.COLOR_BLACK, elinewidth=figures.LINE_THIN, capsize=2.5,
         )
+        axis.invert_yaxis()
         axis.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         axis.set_yticks(positions)
         axis.set_yticklabels(labels, fontsize=figures.FONT_LABEL)
@@ -400,7 +406,8 @@ def build_baseline_figure(
         axis.text(0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes)
     axis.set_title("Squared-error skill")
     axis.set_xlabel("1 - MSE(model) / MSE(baseline)")
-    figures.style_axes(axis)
+    figures.style_axes(axis, grid="xy")
+    axis.grid(False, axis="y")
     return figure
 
 
@@ -456,6 +463,8 @@ def build_anchor_profile_figure(
         xlabel="anchor (decimated steps)",
         ylabel="nats per anchor",
     )
+    # The gap is signed, and zero is the line that decides whether the source helped.
+    axes[1, 0].axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
     for axis in (axes[0, 0], axes[1, 0]):
         for low, high in spans.values():
             if high > low:
@@ -479,7 +488,9 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
     Returns:
         The figure.
     """
-    figure, axes = figures.new_figure(4)
+    # A 2 x 2 grid on one lead-time axis: four full-width strips flattened every curve, and the
+    # four quantities are read against each other column by column.
+    figure, axes = figures.new_figure(2, 2, height_per_row=figures.PANEL_HEIGHT)
     lead = _finite_column(curves, "lead_seconds")
     # Per scored coefficient where the record carries the counts: the per-step score also falls
     # wherever the fast channels' scored horizon ends, which is fewer terms and not a better
@@ -497,14 +508,14 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
         ylabel="nats per scored coefficient" if per_coefficient else "nats per horizon step",
     )
     figures.multi_line_panel(
-        axes[1, 0], lead, _finite_column(curves, "gap_nats")[None, :], ["pred_gap"],
+        axes[0, 1], lead, _finite_column(curves, "gap_nats")[None, :], ["pred_gap"],
         title="Forecast gap",
         xlabel="lead time (s)", ylabel="nats per horizon step",
     )
     has_unit = len(curves) and "rmse_unit" in getattr(curves, "columns", [])
     unit = str(curves["rmse_unit"].iloc[0]) if has_unit else NORMALISED_UNIT
     figures.multi_line_panel(
-        axes[2, 0], lead,
+        axes[1, 0], lead,
         np.vstack(
             [_finite_column(curves, f"rmse_{branch}_normalised") for branch in MODEL_BRANCHES]
         ),
@@ -513,13 +524,15 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
         xlabel="lead time (s)", ylabel=f"RMSE ({unit})",
     )
     figures.multi_line_panel(
-        axes[3, 0], lead, _finite_column(curves, "scored_channels_per_anchor")[None, :],
+        axes[1, 1], lead, _finite_column(curves, "scored_channels_per_anchor")[None, :],
         ["scored channels"],
         title="Scored channels",
         xlabel="lead time (s)", ylabel="channels per anchor",
     )
-    for axis in axes[:, 0]:
+    for axis in axes.ravel():
         axis.set_xlim(0.0, float(horizon_steps) * SECONDS_PER_STEP)
+    # The gap is signed: zero is the line that decides whether the source helped.
+    axes[0, 1].axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
     return figure
 
 
@@ -863,17 +876,23 @@ def build_overlay_figure(
             series = step_series(target[row, :, :, channel], first=first, stride=stride)
             past = np.arange(step - history + 1, step + 1)
             known = (past >= 0) & (past < series.size)
+            # Dotted, so the history the model read cannot be mistaken for the dashed target-only
+            # forecast drawn in the same panel.
             axis.plot((past[known] - step) * SECONDS_PER_STEP, series[past[known]],
-                      color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--")
+                      color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, linestyle=":")
             lead = (np.arange(horizon) + 1.0) * SECONDS_PER_STEP
             axis.plot(lead, target[row, position, :, channel], color=figures.COLOR_BLACK,
                       linewidth=figures.LINE_REGULAR)
-            for branch, colour in (("base", figures.COLOR_BLUE), ("full", figures.COLOR_VERMILLION)):
+            # The run-wide branch styles: target-only dashed slate, source-conditioned solid
+            # vermillion, so a column where the two coincide still shows both.
+            for branch in ("base", "full"):
                 mean = retained.get(f"mu_{branch}")
                 if mean is None:
                     continue
+                colour = figures.SERIES_STYLES[branch]["color"]
                 mean = np.asarray(mean[row, position, :, channel], dtype=np.float64)
-                axis.plot(lead, mean, color=colour, linewidth=figures.LINE_REGULAR)
+                axis.plot(lead, mean, color=colour, linewidth=figures.LINE_REGULAR,
+                          linestyle=figures.SERIES_STYLES[branch]["linestyle"])
                 logvar = retained.get(f"logvar_{branch}")
                 if predictive_band and logvar is not None:
                     spread = np.sqrt(marginal_variance(
@@ -910,17 +929,18 @@ def build_overlay_figure(
                 axis.set_xlabel("time from anchor (s)")
 
     handles = [
-        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--", label="target, history"),
+        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, linestyle=":", label="target, history"),
         Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="target, forecast"),
-        Line2D([0], [0], color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR, label="target-only"),
-        Line2D([0], [0], color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label="source-conditioned"),
+        Line2D([0], [0], linewidth=figures.LINE_REGULAR, label="target-only",
+               **figures.SERIES_STYLES["target-only"]),
+        Line2D([0], [0], linewidth=figures.LINE_REGULAR, label="source-conditioned",
+               **figures.SERIES_STYLES["source-conditioned"]),
         Patch(color=figures.COLOR_LIGHT_GRAY, label="unscored cells"),
         Patch(color=figures.COLOR_GREEN, alpha=0.3, label="contraction"),
     ]
     height_in = float(figure.get_size_inches()[1])
-    # One short key for the band, and only where a band is drawn; the rest of what a reader may ask
-    # (the anchor each column is drawn at, the shared scales, the AR(1) widening) is in
-    # ``FIGURE_GUIDE.md``.
+    # One short key for the band, and only where a band is drawn; the figure carries no further
+    # notes (the anchor each column is drawn at, the shared scales, the AR(1) widening).
     bottom = (
         figures.caveat_note(figure, "Band: predictive $\\pm 1\\sigma$.") if predictive_band else 0.0
     )
@@ -928,7 +948,7 @@ def build_overlay_figure(
                   fontsize=figures.FONT_SMALL, bbox_to_anchor=(0.5, 1.0))
     figure.subplots_adjust(
         left=0.9 / float(figure.get_size_inches()[0]), right=0.99,
-        top=1.0 - 0.75 / height_in, bottom=bottom + 0.45 / height_in, hspace=0.55, wspace=0.12,
+        top=1.0 - 0.5 / height_in, bottom=bottom + 0.45 / height_in, hspace=0.6, wspace=0.14,
     )
     figures.mark_laid_out(figure)
     return figure

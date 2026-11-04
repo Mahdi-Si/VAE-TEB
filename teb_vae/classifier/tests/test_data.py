@@ -1,5 +1,5 @@
 """data.py: the P3/P4 batch contract, samplers, segment dropout, the shuffled-label control, covariates (encoding,
-ModDrop, the covariates-off pass), L4, and T-L1 at batch level (SPEC §7.1, §7.3, §10.4, §10.9.3, §12, §15), on
+ModDrop, the covariates-off pass), L4, and T-L1 at batch level, on
 fold 1 of the fixture tree."""
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def test_sequence_batches_pad_and_group_by_guid(env):
 
 
 # ---- samplers ----------------------------------------------------------------------------------
-# ---- shuffled-label control (§10.9.3) ----------------------------------------------------------
+# ---- shuffled-label control ----------------------------------------------------------
 def test_shuffled_labels_permute_train_and_val_only(env):
     from teb_vae.classifier.config import TASKS
 
@@ -138,16 +138,16 @@ def test_shuffled_labels_permute_train_and_val_only(env):
     assert not _unit(env, shuffle_seed=8).frames["train"]["y"].equals(b["y"])
 
 
-# ---- covariates (§7.3) -------------------------------------------------------------------------
-# ---- T-L1 at batch level (§12 L1, §15) ---------------------------------------------------------
+# ---- covariates -------------------------------------------------------------------------
+# ---- T-L1 at batch level (L1) ---------------------------------------------------------
 def perturb_forbidden(run_dir, source, dest, covariates=None):
-    """A copy of ``run_dir/cohort`` and the feature cache under ``dest`` with every forbidden input (§7.1, L1)
+    """A copy of ``run_dir/cohort`` and the feature cache under ``dest`` with every forbidden input (L1)
     permuted or randomised: absolute clocks shifted per GUID (within-GUID differences are allowed), the negative
     part of ``ss_rel_s`` and whether it is known (first vs unknown stage), the magnitude of a negative (pre-onset)
     ``tlo_end_s``, ``hours_to_delivery``,
     ``cs``/``bg``/``source_file`` and the GUID metadata. With ``covariates`` (the run's ``CovariatesCfg``), the
     covariate columns are re-joined on the shifted clocks from a copy of the timed table whose ``time_s`` moves with
-    its GUID, so covariate time can only matter relative to the segment end (§7.3). Returns ``(perturbed run dir,
+    its GUID, so covariate time can only matter relative to the segment end. Returns ``(perturbed run dir,
     perturbed cache record)``; also used by the model-level T-L1 (test_leakage.py)."""
     rng = np.random.default_rng(0)
     seg = pd.read_parquet(run_dir / "cohort" / "segments.parquet")
@@ -157,7 +157,7 @@ def perturb_forbidden(run_dir, source, dest, covariates=None):
     shift = pd.Series(rng.integers(-50, 50, len(guids)) * 97.0, index=guids)  # per GUID: Δt is allowed
 
     window = seg["t_end_s"] - seg["epoch_s"]
-    # Not (known to be) in second stage yet: first and unknown must look alike (§7.1, has_ss), so each such
+    # Not (known to be) in second stage yet: first and unknown must look alike (has_ss), so each such
     # segment gets an unknown onset or a random future one.
     pending = (seg["ss_rel_s"].isna() | (seg["ss_rel_s"] + window < 0)).to_numpy()
     unknown = pending & (rng.random(len(seg)) < 0.5)

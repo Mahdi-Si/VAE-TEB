@@ -47,7 +47,7 @@ dataset_config:
   #
   # They must be the CAUSAL variant, and that is not a preference: the two-sided files carry every
   # one of these field names and dtypes, and only the root `transform` attribute and the stored
-  # widths (36/66/36/15 against 43/66/43/15) tell them apart. Evaluating a two-sided shard would
+  # widths tell them apart. Evaluating a two-sided shard would
   # report a causal model on coefficients containing their own future. Preflight refuses on both
   # the attribute and the widths.
   #
@@ -246,8 +246,7 @@ eval_config:
   #                  acidosis and HIE subgroup), times `attribution_segments_per_recording`. Up to
   #                  4 anchors each, from the top 30% of that segment's own K_t. Not a retention
   #                  cap: it bounds a pass of tens of forward-and-backward passes per anchor,
-  #                  readout and baseline -- about five times a cohort segment, so roughly 20 s per
-  #                  segment on the laptop GPU below and about 50 min here; the analysis's cost
+  #                  readout and baseline -- about five times a cohort segment; the analysis's cost
   #                  block records what it took. Absent means the analysis's own default (24).
   #   attribution_segments_per_recording
   #               4  segments taken from each drawn recording, spread evenly over its stored
@@ -258,14 +257,13 @@ eval_config:
   #             150  SEGMENTS the attribution CLASS COMPARISON draws (50 recordings per class),
   #                  one per recording, by the same rule. Each gets only the source-null
   #                  integrated gradients of `kld` and `pred_gap` plus Grad-CAM, about a fifth of
-  #                  an `attribution_segments` segment: roughly 4 s per segment on one RTX 4080
-  #                  laptop GPU for the shipped transformer, so about 10 min here.
+  #                  an `attribution_segments` segment.
   #   attribution_strata_segments
   #              72  SEGMENTS the late-window STRATA pass draws (24 recordings per class, one late
   #                  segment each), from segments that start at most 2 h before delivery. Each
   #                  segment is attributed once per stratum (high and low K_t, inside and between
   #                  contractions, one pooled K_t band) under both baselines, about seven cohort
-  #                  segments each, so about 40 min here.
+  #                  segments each.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -341,18 +339,14 @@ eval_config:
   # per recording, bootstrapped over recordings, and `coupling_exceeds_availability_clock` FAILs
   # when the lower end of that interval does not clear this key.
   #
-  # UNSET AGAIN, because no run of the model this cell now trains has measured it. The previous
-  # 0.15 sat just below the bootstrap interval [0.157, 0.164] of Delta_clock = 0.160 nats per
-  # anchor, measured on the H = 15 diagnosed run, on the UNALIGNED arm. THIS CELL now trains at
-  # H = 10, and the conv-Transformer cell, which must be gated against the same bar, has moved
-  # further (see its own copy of this leaf). A threshold carried across that change would decide a
-  # FAIL or a PASS on exactly the run that has to measure it, and nobody could tell a healthy model
-  # failing from a broken one passing -- the reason it shipped null before it was first set.
+  # UNSET, because the margin is a property of the configuration being trained, and a threshold
+  # carried across a configuration change would decide a FAIL or a PASS on exactly the run that
+  # has to measure it. Nobody could then tell a healthy model failing from a broken one passing.
   #
   # At null the verdict is INCONCLUSIVE, and Delta_clock, both interval ends and the positive
   # fraction are still emitted (`coupling_minus_clock_nats` in the headline block). Set it from the
-  # first converged run of the current configuration, just below the lower end of its interval, and
-  # record that run here as the provenance. The gated quantity is right on every alignment arm: it
+  # first converged run of the current configuration, just below the lower end of its interval.
+  # The gated quantity is right on every alignment arm: it
   # is a difference of two KLs taken on one support, and no reference clock enters that arithmetic.
   #
   # Validated when set: a finite number of at least 0.001 nats, because zero passes on any
@@ -373,10 +367,10 @@ eval_config:
   #   anchor    [0, 14]   the anchor's own neighbourhood, 0-60 s back. Under `lag_kv_source:
   #                       conv_stem` this is roughly the K/V receptive field, so it is the band a
   #                       local memory can resolve at all.
-  #   near      [15, 44]  60-180 s back. On the shipped dual reference the 20-60 s physiological
-  #                       band lands at lags -0.1 to 38.9 (realised offset, canonical stored
-  #                       timeline), so this is where a contraction-to-
-  #                       deceleration delay is expected to be readable.
+  #   near      [15, 44]  60-180 s back. On the legacy dual-reference arm the 20-60 s
+  #                       physiological band lands at lags 19.9 to 38.9 (realised offset, H = 10),
+  #                       so this is where a contraction-to-deceleration delay is expected to be
+  #                       readable.
   #   mid       [45, 67]  180-272 s back.
   #   far       [68, 90]  272-364 s back, up to the window's far edge.
   #
@@ -399,8 +393,8 @@ eval_config:
   # a typo is refused at config load with the supported set named, before the model is built.
   #
   # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
-  # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
-  # `.pdf` filenames, so a run that changes this writes filenames those files do not list. Change
+  # default is load-bearing: the committed `figure_manifest.json` records `.pdf` filenames, so a
+  # run that changes this writes filenames the manifest does not list. Change
   # it for a one-off export, not as the committed setting, unless you also update the manifest.
   #
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;

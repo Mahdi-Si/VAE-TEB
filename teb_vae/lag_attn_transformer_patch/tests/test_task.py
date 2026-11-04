@@ -1,4 +1,4 @@
-"""P4-07: the task's two own members, ``_build_forward_inputs`` and ``_added_metrics``.
+"""The task's two own members, ``_build_forward_inputs`` and ``_added_metrics``.
 
 Everything else is the CRWS task's and is pinned in its suite.
 """

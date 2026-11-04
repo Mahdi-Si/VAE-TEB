@@ -52,13 +52,10 @@ general_config:
   epochs: 10000
   accumulate_grad_batches: 1
 
-  # Reduce if a training step does not fit. The numbers below were measured at this cell's FIRST
-  # geometry -- a shorter horizon, a longer lag bank and a one-draw objective -- and have NOT been
-  # re-measured; the mixture objective multiplies the decoder's share by `train_mc_draws`.
-  # MEASURED at that geometry: one training step
-  # peaks at about 8145 MiB per device here, and it scales very nearly linearly -- 4094 MiB at 64,
-  # 2059 MiB at 32. `anchor_chunk` / `lag_chunk` below do NOT help a training step, which is a
-  # measurement rather than an expectation, so this is the setting to reach for first.
+  # Reduce if a training step does not fit. The training-step peak scales with the batch size,
+  # and the mixture objective multiplies the decoder's share by `train_mc_draws`. `anchor_chunk` /
+  # `lag_chunk` below do NOT reduce a training step's peak, so this is the setting to reach for
+  # first.
   batch_size:
     train: 256
     test: 256
@@ -145,8 +142,8 @@ model_config:
     d_z: 64
 
     # H stored steps of future, on the stored clock. Long enough to hold a contraction-locked
-    # deceleration whole: measured on raw traces, the FHR nadir trails the contraction peak by
-    # more than the short horizon this cell first shipped with could see. Three keys follow it and
+    # deceleration whole, because the FHR nadir can trail the contraction peak by more than a
+    # shorter horizon can see. Three keys follow it and
     # are stated beside it: `anchor_stride` (S = H / 2), `horizon_weight_halflife_steps` (H) and
     # the two block-scaled guards under `advanced_config`. `horizon_depth` must keep the horizon
     # core's receptive field at H + 1 or more.
@@ -180,9 +177,8 @@ model_config:
     # The source pathway
     # ---------------------------------------------------------------------------------------
     # Candidate lags 0..max_lag, so L = max_lag + 1 stored steps of source history. Short on
-    # purpose: on the long bank this cell first shipped with, removing every band but the nearest
-    # IMPROVED the fitted model's predictive score, and the measured source effect sits within a
-    # few tens of seconds of a contraction peak.
+    # purpose: the bank holds only the recent source history in which a contraction-locked
+    # deceleration follows its contraction.
     max_lag: 37
 
     # The mean bound, IN PRIOR STANDARD DEVIATIONS. Not the sibling's raw-latent-unit bound, which
@@ -295,24 +291,16 @@ model_config:
 
     # Peak-memory settings. Null evaluates every anchor and every lag in one pass.
     #
-    # MEASURED at this cell's first geometry, 2026-09-09, on one 12 GiB device, ungated at the declared
-    # widths (an upper bound on the gated model). The finding is that these two bound the peak of an
-    # EVALUATION step and do essentially nothing for a TRAINING step:
-    #
-    #   train, batch 128:         8145 MiB unchunked, 8147 MiB at (39, 22) -- flat
-    #   dense evaluation, 128:    4447 MiB unchunked, 2309 MiB at (39, 22) -- down 48%
-    #   dense with proposals:     4447 MiB unchunked, 3277 MiB at (39, 22) -- down 26%
-    #
-    # The reason is that chunking changes the ORDER the proposals are computed in and not whether
+    # These two bound the peak of an EVALUATION step and do essentially nothing for a TRAINING
+    # step. The reason is that chunking changes the ORDER the proposals are computed in and not whether
     # their activations are retained: under backward every chunk stays in the graph until the
     # gradient has flowed, so the training peak is set by the batch size and by nothing here. Reach
     # for `batch_size.train` first when a training step does not fit, and for these when a dense
     # evaluation does not.
     #
     # They change floating-point summation order, so a run that sets them must record them -- which
-    # the resolved config does. Measured at the production widths, the bounded update moves by
-    # 1.2e-05 and the decoder output by 2.4e-07 against an unchunked pass, on a repeat-run floor of
-    # exactly zero.
+    # the resolved config does. `eval.memory` reports the size of that reassociation difference
+    # against an unchunked pass.
     anchor_chunk: null
     lag_chunk: null
 
@@ -582,13 +570,12 @@ advanced_config:
     # divergence, and the cancellation ratio with both of its parts.
     #
     # WHAT IT COSTS, because it is paid on rank zero and every other rank waits at the next
-    # collective while it is paid. MEASURED at this geometry: about 13 s per plotted epoch for
-    # the two pages below, of which under 2 s is the model -- one forward over the drawn samples
-    # alone, since the per-lag proposals it needs are the largest tensor this architecture holds.
-    # The rest is matplotlib, and it is already the cheap version: the page is written at its own
+    # collective while it is paid. The model's share is one forward over the drawn samples alone,
+    # since the per-lag proposals it needs are the largest tensor this architecture holds. Most of
+    # the rest is matplotlib, and it is already the cheap version: the page is written at its own
     # resolution rather than the family's publication one and with no tight bounding box, and its
-    # two captions are wrapped before they are handed over. Together those took the same page
-    # from 50 s. Raising `num_examples` or lowering `plot_frequency` scales that time directly.
+    # two captions are wrapped before they are handed over. Raising `num_examples` or lowering
+    # `plot_frequency` scales that time directly.
     #
     # The cadence is `general_config.plot_frequency`, shared with the loss curve so the two are
     # read together. The run logs a line when it starts drawing and a line with the elapsed time

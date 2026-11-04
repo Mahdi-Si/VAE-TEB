@@ -204,10 +204,10 @@ def test_a_readable_clock_excess_profile_nominates_the_band_around_its_peak(tmp_
 
 
 def test_a_degenerate_clock_excess_profile_nominates_nothing_and_says_why(tmp_path) -> None:
-    """The guard that matters most, and the one expected to fire on the runs measured so far.
+    """The guard that matters most: a flat clock-excess profile must nominate no lag band.
 
-    The diagnosed run put 67.5% of its KL in an availability clock and 0.160 nats of source
-    content across 91 lags. ``entmax15`` assigns lags exactly zero, so a profile that flat still
+    A profile with most of its KL in an availability clock and a fraction of a nat of source
+    content across 91 lags is nearly flat. ``entmax15`` assigns lags exactly zero, so a profile that flat still
     has a perfectly confident argmax -- and a mask cut from it would name a band on arithmetic
     accident while looking exactly like a finding. A withheld mask is the measurement.
     """

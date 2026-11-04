@@ -10,7 +10,7 @@
 # Read the sign carefully now: default.yaml ships base_decode: mean and posterior_logvar_mode:
 # independent, the two keys added to REMOVE that pathology, so this run is a check that the
 # collapse is gone rather than a reproduction of it. `logvar_prior_floor_frac` staying flat is the
-# pass condition, not the failure. The configuration the collapse was measured in is
+# pass condition, not the failure. The configuration without those two fixes is
 # base_decode: sample plus posterior_logvar_mode: residual; see smoke_hie_control.yaml.
 #
 # What it is NOT: a generalisation measurement. `output/hie_cs.hdf5` is 339 windows from 14
@@ -35,8 +35,7 @@ general_config:
   # Counted in optimizer STEPS, not epochs. 339 windows at batch 32 is 11 steps per epoch against
   # the production run's 450 -- an epoch here is ~40x smaller -- and the prior collapse this
   # config exists to reproduce is driven by steps taken, not by epochs elapsed. 200 epochs is
-  # ~2,200 steps, matching the 2,000-step window the gradient-norm re-derivation procedure asks
-  # for. A first pass at 60 epochs (~660 steps) left BOTH arms still moving and could not be read.
+  # ~2,200 steps.
   epochs: 200
   # The two figure cadences (loss_plot_epoch.html and the per-epoch diagnostic) share this key.
   # Every epoch would spend more wall-clock plotting than training at this shard size.

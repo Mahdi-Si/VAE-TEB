@@ -77,8 +77,7 @@ shards happen to hold -- and the exact anchor filter runs afterwards.
 
 *Post-delivery endpoints.* $\mathrm{epoch} < 0$ does not prove that a segment, or a scored forecast
 window, lies wholly before delivery. Each scored coefficient endpoint is checked per channel,
-including the checkpoint's ``target_forecast_shift``, and the exclusion reason is serialized. The
-stored UP timeline is canonical: no downstream timing correction is applied anywhere in this package.
+including the checkpoint's ``target_forecast_shift``, and the exclusion reason is serialized.
 
 Deduplication, bags and bins
 ----------------------------
@@ -978,8 +977,8 @@ def coverage_summary(segments: pd.DataFrame, recordings: pd.DataFrame) -> pd.Dat
         # Each stratum kind emits its named strata and then one "unknown" row holding whatever
         # matched none of them, so every kind's rows sum to the split's "all" row. Without it a
         # non-canonical shard basename, a rejected class code or an absent CS/BG flag simply
-        # vanishes between the total and the strata, and section 4.1's missingness requirement
-        # goes unanswered by the one table that reports coverage.
+        # vanishes between the total and the strata, and the one table that reports coverage
+        # cannot account for the missing recordings.
         all_guids = set(guids)
 
         def _emit_kind(kind: str, named: Sequence[Tuple[str, Any]]) -> None:

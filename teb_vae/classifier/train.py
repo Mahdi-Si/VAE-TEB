@@ -1,15 +1,15 @@
-r"""Training-framework integration of the neural classifier (SPEC §10.5, §10.8, §10.10).
+r"""Training-framework integration of the neural classifier.
 
 :class:`ClassifierTask` (``LightningModelBase``) and :class:`ClassifierTrainer` (``GraphModelBase``) follow the
 ``lag_attn_rws`` family pattern; one trainer per unit = (fold, seed, kind). :func:`train_unit` is steps 1-3 of the
-§10.10.1 outer loop (unit config, fit, teardown); :func:`score_split` scores a split from ``best.ckpt`` (raw,
-prior-corrected logits); :func:`unit_calibration` / :func:`calibrate_frames` are §10.8. Callbacks, in registration
-order (§10.10.2): :class:`GuidEpochMetricsCallback` (first: F4), ``MetricsLoggingCallback`` +
+Outer loop (unit config, fit, teardown); :func:`score_split` scores a split from ``best.ckpt`` (raw,
+prior-corrected logits); :func:`unit_calibration` / :func:`calibrate_frames` calibrate. Callbacks, in registration
+order: :class:`GuidEpochMetricsCallback` (first: F4), ``MetricsLoggingCallback`` +
 ``MetricsHistoryCsvCallback``, ``LossPlotCallback``, ``HyperparameterLoggingCallback``, :class:`ClassifierPlotCallback`,
 ``ModelCheckpoint("best")``, then from the base ``EarlyStopping``, ``LearningRateMonitor`` (switched to ``step``),
 ``EMAWeightAveraging`` (inserted after it when ``train.ema``) and ``MLflowRunLoggingCallback``.
 
-Framework gotchas (§10.10.7): F1 ``compile_model=False``; F2/F3 the optimizer and scheduler overrides; F4 the callback
+Framework gotchas: F1 ``compile_model=False``; F2/F3 the optimizer and scheduler overrides; F4 the callback
 order; F5 ``cuda_devices: []`` forces CPU in :meth:`ClassifierTrainer._build_trainer_kwargs`; F6 every output dir is
 the unit dir; F7 :func:`_teardown`; F10 ``log_model: false`` (``config.unit_config``); F11 ``ClassifierNet`` has no
 ``model``/``net``/``network``/``module`` submodule, so ``_clean_state_dict`` only strips the task's ``model.`` /
@@ -73,7 +73,7 @@ NAN = float("nan")
 MONITOR_ALPHA = 0.3
 ONLINE_POSITIONS = (1, 3, 5)
 
-#: §10.10.3, the always-present columns of ``metrics_history.csv``; :func:`tracked_metrics` adds the conditional ones.
+#: The always-present columns of ``metrics_history.csv``; :func:`tracked_metrics` adds the conditional ones.
 TRACKED_METRICS: Tuple[str, ...] = (
     *(f"train/{m}" for m in ("total_loss", "loss_final", "loss_positions", "loss_bag", "loss_segment", "loss_aux3",
                              "acc_bin", "grad_norm", "grad_clip_frac", "weight_norm", "attn_entropy",
@@ -92,16 +92,16 @@ def has_three_class(labels: LabelsCfg) -> bool:
 
 
 def tracked_metrics(c: Classifier, advanced: Mapping[str, Any]) -> Tuple[str, ...]:
-    """:data:`TRACKED_METRICS` with the §10.10.3 conditional additions (3-class, spike breaker) of this unit; the
+    """:data:`TRACKED_METRICS` with the conditional additions (3-class, spike breaker) of this unit; the
     clip fraction only when clipping is on (it is never logged otherwise)."""
     clip = (advanced.get("trainer") or {}).get("gradient_clip_val")
     out = [m for m in TRACKED_METRICS if m != "train/grad_clip_frac" or (clip is not None and float(clip) > 0)]
-    if has_three_class(c.labels):  # §10.10.2 3-class row
+    if has_three_class(c.labels):  # 3-class monitoring metrics
         out += ["val/macro_f1", "val/auroc_macro", *(f"val/{m}_class{k}" for m in ("precision", "recall", "f1",
                                                                                    "auroc_ovr") for k in range(3))]
     if (advanced.get("spike_breaker") or {}).get("enabled", False):
         out += ["train/spike_skipped", "train/spike_ema_loss"]
-    if c.train.regime == "cotrain":  # §10.10.3 cotrain row, plus the gated selection monitor (§10.10.2 #12)
+    if c.train.regime == "cotrain":  # Cotrain row, plus the gated selection monitor
         out += ["train/vae_total_loss", "train/vae_kld", "train/vae_nll", "train/l2sp",
                 *(f"val/{m}" for m in GATE_METRICS), "val/gate_ok", selection_monitor(advanced, "cotrain")[0]]
     return tuple(out)
@@ -112,7 +112,7 @@ def _entropy(a: torch.Tensor) -> torch.Tensor:
     return -(a * a.clamp_min(1e-12).log()).sum(-1)
 
 
-#: Per-segment pooling-attention scalars of the prediction tables (§11.12 E5; never per-step arrays), NaN where the
+#: Per-segment pooling-attention scalars of the prediction tables (E5; never per-step arrays), NaN where the
 #: model has no such weights: see :func:`_attention`.
 ATTN_COLUMNS = ["attn_late_mass", "attn_centroid", "seq_attn_final"]
 
@@ -173,7 +173,7 @@ def _rows(net: ClassifierNet, out: Mapping[str, torch.Tensor], batch: Mapping[st
 
 def _aggregates(seg: pd.DataFrame, col: str, aggregators: Sequence[str], tau: float
                 ) -> Tuple[pd.Series, Dict[str, pd.Series]]:
-    """Segment scope (§11.2): the online score, the running primary aggregate of ``col`` per GUID (aligned with
+    """Segment scope: the online score, the running primary aggregate of ``col`` per GUID (aligned with
     ``seg``, whose rows are in ``seg_pos`` order per GUID), and ``{aggregator: GUID score}`` indexed by guid."""
     by = seg.groupby("guid", sort=False)[col]
     online = by.transform(lambda s: running_aggregate(s.to_numpy(copy=True), aggregators[0], tau))
@@ -187,7 +187,7 @@ def _frames(frame: pd.DataFrame, parts: Sequence[Mapping[str, np.ndarray]], *, s
     aggregators in segment scope; ``p_c<k>`` at the final position | mean over the GUID's segments; ``ord_score``
     read like ``score_final``). Segment rows carry ``p_c<k>``, ``ord_score`` and ``pseg_c<k>`` (from ``p3_seg``).
     ``causal=False`` (:attr:`ClassifierNet.causal`): ``logit_online``, ``p_c<k>`` and ``ord_score`` are NaN on every
-    segment row, since a non-causal position sees later segments (§9.1); the GUID's ``score_final``, ``p_c<k>`` and
+    segment row, since a non-causal position sees later segments; the GUID's ``score_final``, ``p_c<k>`` and
     ``ord_score`` still read the final position (the segment-local head's ``pseg_c<k>`` stay: they are causal)."""
     cat = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
     probs = {name: cat.pop(key) for key, name in (("p3", "p_c"), ("p3_seg", "pseg_c")) if key in cat}
@@ -238,7 +238,7 @@ def _auroc(y: Any, s: Any) -> float:
 
 
 def guid_metrics(seg: pd.DataFrame, gd: pd.DataFrame, alpha: float = MONITOR_ALPHA) -> Dict[str, Any]:
-    """§10.10.2 monitoring metrics from the engine's formulas (``metrics.threshold_free`` et al.), plus the
+    """Monitoring metrics from the engine's formulas (``metrics.threshold_free`` et al.), plus the
     ``epoch_summary.jsonl`` confusions and supports. Scores are prior-corrected, uncalibrated logits."""
     y, s = (gd["y"].to_numpy() > 0).astype(int), gd["score_final"].to_numpy(float)
     tf = metrics.threshold_free(y, s, alpha=alpha)
@@ -271,10 +271,10 @@ def guid_metrics(seg: pd.DataFrame, gd: pd.DataFrame, alpha: float = MONITOR_ALP
 
 # ---- the Lightning module ----------------------------------------------------------------------------------------
 class ClassifierTask(LightningModelBase):
-    """Lightning task of :class:`~teb_vae.classifier.model.ClassifierNet` (§10.10.1).
+    """Lightning task of :class:`~teb_vae.classifier.model.ClassifierNet`.
 
     Every ctor kwarg is JSON-able (hparams / MLflow params). ``classifier_kwargs`` rebuilds the net without a config;
-    ``prior_offset`` (K_out floats, §10.2) is subtracted from raw head outputs before any GUID score is formed.
+    ``prior_offset`` (K_out floats) is subtracted from raw head outputs before any GUID score is formed.
     ``checkpoint_extras`` (scaler, fingerprint, channels) is set by the trainer and written by
     :meth:`on_save_checkpoint`; it is not a hyperparameter because it is large.
     """
@@ -309,7 +309,7 @@ class ClassifierTask(LightningModelBase):
         total, parts = compute_loss(out, batch, scope=self.scope, labels_cfg=self.labels_cfg,
                                     train_cfg=self.train_cfg, class_weights=self.hparams.class_weights,
                                     priors=self.priors_main, lse_tau=self.lse_tau, alpha=self.hparams.loss_alpha)
-        if "vae_loss" in batch:  # a co-training step (§10.6): λ_cls L_cls + λ_vae L_vae + λ_sp ‖θ - θ₀‖²
+        if "vae_loss" in batch:  # a co-training step: λ_cls L_cls + λ_vae L_vae + λ_sp ‖θ - θ₀‖²
             cw, l2sp = self.train_cfg.cotrain, self.backbone.l2sp()
             parts |= {"loss_cls": total.detach(), "l2sp": l2sp.detach(), **batch["vae_metrics"]}
             total = cw.cls_weight * total + cw.vae_weight * batch["vae_loss"] + cw.l2sp * l2sp
@@ -386,7 +386,7 @@ class ClassifierTask(LightningModelBase):
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """Pre-clip ``train/grad_norm`` and ``train/grad_clip_frac`` every 25 steps and on the last batch
-        (``lag_attn_rws/task.py:216``). First, the §10.1 guard on an online backbone (``VaeSource.check_frozen``)."""
+        (``lag_attn_rws/task.py:216``). First, the guard on an online backbone (``VaeSource.check_frozen``)."""
         if self.backbone is not None:
             self.backbone.source.check_frozen()
         trainer = self.trainer
@@ -537,12 +537,12 @@ class ClassifierPlotCallback(Callback):
 
 
 class LpftUnfreezeCallback(Callback):
-    """#11 (§10.1 ``lpft``, Kumar 2022): stage 1 trains the head alone for ``head_epochs`` epochs, with early stopping
+    """#11 (``lpft``, Kumar 2022): stage 1 trains the head alone for ``head_epochs`` epochs, with early stopping
     suspended (patience ∞) so it runs its full length; at the first epoch of stage 2 the backbone allowlist starts
     requiring gradients (its optimizer group at ``train.backbone_lr`` exists from the start), early stopping is reset
     (``wait_count`` 0, ``best_score`` ±∞, patience restored) and one line goes to ``stage_transitions.jsonl``.
     ``train/stage`` (1 | 2) is logged every epoch. ``best.ckpt`` keeps competing across stages, so a stage-1 head is a
-    candidate as the frozen epoch is (§10.6). ``ponytail:`` the cosine schedule runs over both stages, so stage 2
+    candidate as the frozen epoch is. ``ponytail:`` the cosine schedule runs over both stages, so stage 2
     starts below ``backbone_lr``; a per-stage schedule if fine-tuning looks LR-starved."""
 
     def __init__(self, *, head_epochs: int, output_dir: Any) -> None:
@@ -577,7 +577,7 @@ class LpftUnfreezeCallback(Callback):
         pl_module.log("train/stage", float(stage), on_step=False, on_epoch=True, logger=True)
 
 
-#: ``val/<name>`` of the preservation gate (§10.6); ``forecast_mse_rel`` is the gated one.
+#: ``val/<name>`` of the preservation gate; ``forecast_mse_rel`` is the gated one.
 GATE_METRICS = ("forecast_mse_rel", "kld_active_frac", "logvar_prior_floor_frac", "delta_mu_sat_frac")
 #: Validation segments of the gate's fixed subset (seeded by the unit).
 GATE_SEGMENTS = 64
@@ -618,7 +618,7 @@ def preservation(source: VaeSource, rows: Mapping[str, Any], chunk: int) -> Dict
 
 
 class PreservationGateCallback(Callback):
-    """#12 (§10.6, ``cotrain``): the preservation gate. At fit start, :func:`preservation` of the pretrained VAE on the
+    """#12 (``cotrain``): the preservation gate. At fit start, :func:`preservation` of the pretrained VAE on the
     fixed validation ``rows`` is the baseline; every validation epoch (on the weights validation sees, EMA included)
     it logs ``val/forecast_mse_rel`` (relative forecast MSE increase), ``val/kld_active_frac``,
     ``val/logvar_prior_floor_frac``, ``val/delta_mu_sat_frac``, ``val/gate_ok`` (``forecast_mse_rel ≤ tolerance``) and
@@ -669,7 +669,7 @@ class PreservationGateCallback(Callback):
 
 # ---- the experiment driver ---------------------------------------------------------------------------------------
 def prior_correction(c: Classifier, unit: UnitData) -> List[float]:
-    """§10.2 offset (K_out floats) subtracted from raw head outputs: ``log w`` when ``weighted_*`` uses class
+    """Offset (K_out floats) subtracted from raw head outputs: ``log w`` when ``weighted_*`` uses class
     weights, ``-τ log π`` for ``logit_adjusted``, plus ``log(n_0/n_k)`` for ``sampler: class_balanced`` (it trains
     under a uniform class prior, as inverse weighting does); zeros otherwise (and for ordinal heads)."""
     loss, k = c.train.loss, len(unit.class_counts)
@@ -688,12 +688,12 @@ def prior_correction(c: Classifier, unit: UnitData) -> List[float]:
 
 
 def online_backbone(c: Classifier, unit: UnitData, *, trainable: bool) -> OnlineFeatures:
-    """The online regimes' backbone (§10.1): the configured :class:`~teb_vae.classifier.sources.VaeSource` behind the
+    """The online regimes' backbone: the configured :class:`~teb_vae.classifier.sources.VaeSource` behind the
     unit's frozen train scaler (fitted on the cache = the frozen encoder, which is also the encoder at the start of
     every P7 training stage: LPFT's stage 2 starts from stage 1's untouched backbone, so no refit is needed). With
     ``trainable``, the ``train.unfreeze`` allowlist (off until stage 2 under ``lpft``); otherwise frozen (scoring).
 
-    ``cotrain`` (trainable): the joint objective (§10.6, :class:`~teb_vae.classifier.sources.OnlineFeatures`) with β
+    ``cotrain`` (trainable): the joint objective (:class:`~teb_vae.classifier.sources.OnlineFeatures`) with β
     pinned ``constant`` at the checkpoint's final value (the VAE task is never attached to a trainer, so its epoch is
     0 and a warm-up schedule would train at its start value). The VAE task's own optimizer and LR warm-up are never
     built: the classifier's optimizer and schedule govern every parameter. ``ponytail:`` for the same reason the
@@ -740,7 +740,7 @@ class ClassifierTrainer(GraphModelBase):
                       labels_cfg=c.labels.model_dump(mode="json"), priors=u.priors, n_cov=u.n_cov,
                       fusion=c.context.fusion)
         weights = class_weights(u.class_counts, c.train.loss.weighting, c.train.loss.beta_en).tolist()
-        alpha = metrics.primary_alpha(c.eval.model_dump(mode="json"))  # pauc's FPR range (§10.2)
+        alpha = metrics.primary_alpha(c.eval.model_dump(mode="json"))  # pauc's FPR range
         criterion(c.train.loss, c.labels.head, weights, u.priors["main"], alpha)  # fail before the first step
         self.pl_model = self.TASK_CLS(
             ClassifierNet(**kwargs), lr=self.lr, weight_decay=c.train.optimizer.weight_decay,
@@ -763,7 +763,7 @@ class ClassifierTrainer(GraphModelBase):
         self.apply_config_hyperparameters({"lr": self.lr}, self.pl_model)
 
     def setup_record(self) -> Dict[str, Any]:
-        """``setup.json`` (§10.10.4)."""
+        """``setup.json``."""
         c, u, net, hp = self.unit.cfg, self.unit, self.pl_model.orig_model, self.pl_model.hparams
         counts = {s: {"n_segments": len(f), "n_guids": int(f["guid"].nunique()),
                       "guids_per_class": {str(k): int(v) for k, v in
@@ -834,7 +834,7 @@ class ClassifierTrainer(GraphModelBase):
                 attribute_dict_collate(self.reader.bind(val)(pick)), tolerance=c.train.cotrain.gates["forecast_mse_rel"],
                 monitor=selection_monitor(adv)[0], mode=selection_monitor(adv)[1], chunk=c.train.cotrain.vae_chunk,
                 output_dir=self.train_results_dir))
-        # §10.10.2 #6: best.ckpt is chosen on the early-stopping monitor (cotrain: its gated twin, #12)
+        # best.ckpt is chosen on the early-stopping monitor (cotrain: its gated twin, #12)
         monitor, mode = selection_monitor(adv, c.train.regime)
         callbacks.append(ModelCheckpoint(dirpath=self.model_checkpoint_dir, filename="best", save_top_k=1,
                                          monitor=monitor, mode=mode, auto_insert_metric_name=False,
@@ -842,7 +842,7 @@ class ClassifierTrainer(GraphModelBase):
         return callbacks
 
     def _build_trainer_kwargs(self, callbacks, model=None) -> dict:
-        """Base kwargs, then: LR monitor per step with EMA right after it (§10.10.2 #8-9), no distributed sampler
+        """Base kwargs, then: LR monitor per step with EMA right after it, no distributed sampler
         (custom batch sampler), CPU when ``cuda_devices`` is empty (F5)."""
         kw = super()._build_trainer_kwargs(callbacks, model=model)
         cbs = [LearningRateMonitor(logging_interval="step") if isinstance(cb, LearningRateMonitor) else cb
@@ -875,14 +875,14 @@ class ClassifierTrainer(GraphModelBase):
         record = {"best_ckpt": cb.best_model_path, "monitor": cb.monitor, "best_score": float(cb.best_model_score),
                   "best_epoch": epoch, "epochs_run": trainer.current_epoch,
                   "best_val": next((line for line in lines if line["epoch"] == epoch), None)}
-        if not math.isfinite(record["best_score"]):  # cotrain: every epoch failed the preservation gate (§10.6)
+        if not math.isfinite(record["best_score"]):  # cotrain: every epoch failed the preservation gate
             record["gate_failed_every_epoch"] = True  # train_unit fails the unit: no epoch is selectable
         return record
 
 
 # ---- the unit (outer loop steps 1-3) ------------------------------------------------------------------------------
 #: This process's own log pair, relative to the run dir, which :func:`_teardown` re-installs after each unit: the run's
-#: ``run.log`` in the main process; a fold process (``run.fold_job``, SPEC §14.4) points it at its fold's files, so it
+#: ``run.log`` in the main process; a fold process (``run.fold_job``) points it at its fold's files, so it
 #: never writes (or rotates) the run-level log another process owns.
 PROCESS_LOGS: Tuple[str, str] = ("run.log", "run.jsonl")
 
@@ -905,22 +905,22 @@ def _teardown(gm: Optional[ClassifierTrainer], run_dir: Path) -> None:
 
 def train_unit(cfg: Config, run_dir: Any, manifest: Mapping[str, Any], *, fold: int, seed: int, kind: str,
                unit: Optional[UnitData] = None, mlflow_parent_id: Optional[str] = None) -> Dict[str, Any]:
-    """Train one unit (§10.10.1 steps 1-3) and return its ``fold_results.json`` record.
+    """Train one unit and return its ``fold_results.json`` record.
 
     Writes under ``unit_dir(run_dir, fold, seed, kind)``: ``model_checkpoints/{resolved_config.yaml, best.ckpt,
     last.ckpt}``, ``train_results/*``, ``setup.json``, ``scaler.json``, ``fold_results.json``. ``kind="shuffled"``
     trains on train labels permuted with ``seed + 1000·fold`` and selects ``best.ckpt`` on permuted val labels too,
     ``kind="noind"`` on the ``no_indicator`` context (:func:`~teb_vae.classifier.data.without_indicators`), ``kind="frozen"`` on the cache under
-    :func:`~teb_vae.classifier.config.frozen_baseline` (an online regime's frozen baseline, §10.1), as the shuffled
-    control is ("one seed, frozen regime", §10.9.3). A failure is recorded (``status: failed`` + traceback) and
-    re-raised only with ``run.fail_fast``; a cotrain unit whose every epoch failed the preservation gate is one (§10.6:
-    no selectable checkpoint), so it is never locked or predicted.
+    :func:`~teb_vae.classifier.config.frozen_baseline` (an online regime's frozen baseline), as the shuffled
+    control is ("one seed, frozen regime"). A failure is recorded (``status: failed`` + traceback) and
+    re-raised only with ``run.fail_fast``; a cotrain unit whose every epoch failed the preservation gate is one
+    (no selectable checkpoint), so it is never locked or predicted.
     """
     run_dir = Path(run_dir)
     if kind in ("frozen", "shuffled"):
         cfg = frozen_baseline(cfg)
         unit = None if unit is None else dataclasses.replace(unit, cfg=cfg.classifier)
-    shuffle_seed = seed + 1000 * fold if kind == "shuffled" else None  # §10.7: a fresh permutation per fold
+    shuffle_seed = seed + 1000 * fold if kind == "shuffled" else None  # A fresh permutation per fold
     if unit is not None and (unit.fold, unit.shuffle_seed) != (fold, shuffle_seed):
         raise ValueError(f"unit is fold {unit.fold} / shuffle_seed {unit.shuffle_seed}; this {kind} unit needs "
                          f"fold {fold} / shuffle_seed {shuffle_seed}")
@@ -938,12 +938,12 @@ def train_unit(cfg: Config, run_dir: Any, manifest: Mapping[str, Any], *, fold: 
                                   manifest["source"], fold, shuffle_seed=shuffle_seed)
         gm = ClassifierTrainer(config_path, unit_dir=out, unit=unit, source=manifest.get("source"))
         gm.setup_config()
-        record["mlflow_run_id"] = getattr(gm.mlflow_logger, "run_id", None)  # the child run (§10.10.5)
+        record["mlflow_run_id"] = getattr(gm.mlflow_logger, "run_id", None)  # the child run
         gm.create_model()
         unit.scaler.save(out / "scaler.json")
         (out / "setup.json").write_text(json.dumps(json_safe(gm.setup_record()), indent=2))
         record |= gm.train_model()
-        if record.get("gate_failed_every_epoch"):  # §10.6: only gate-passing epochs are selectable; none is
+        if record.get("gate_failed_every_epoch"):  # Only gate-passing epochs are selectable; none is
             raise RuntimeError(f"preservation gate failed at every epoch ({record['monitor']} is {record['best_score']} "
                                f"throughout): no selectable checkpoint; the frozen unit is the baseline")
         record["status"] = "done"
@@ -988,7 +988,7 @@ def backbone_state(ckpt_path: Any) -> Dict[str, torch.Tensor]:
 
 def score_split(unit_dir_or_task: Any, unit: UnitData, split: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """``(segments, guids)`` of ``split``: one row per retained segment / GUID, RAW (uncalibrated) logits after the
-    §10.2 prior correction, from ``<unit_dir>/model_checkpoints/best.ckpt`` (or a live :class:`ClassifierTask`).
+    Prior correction, from ``<unit_dir>/model_checkpoints/best.ckpt`` (or a live :class:`ClassifierTask`).
 
     Segments: ``unit.frames[split]`` columns + ``logit_seg``, ``logit_online``, ``attn_entropy`` (+ ``p_c0..2``;
     ``ord_score`` for a CORAL head; ``pseg_c0..2`` for a sequence-scope multiclass segment head, see :func:`_rows`).
@@ -1024,7 +1024,7 @@ def _unit_model(unit_dir: Any, unit: UnitData) -> Tuple[ClassifierNet, Dict[str,
     return net, hp, features
 
 
-# ---- E6 attribution (§11.12; hand-written Integrated Gradients: captum is not a dependency) ------------------------
+# ---- E6 attribution (hand-written Integrated Gradients: captum is not a dependency) ------------------------
 #: ``predictions/attribution.parquet`` columns: per GUID and channel group, the summed |IG| and signed IG over its
 #: segments, steps and channels, and the GUID's score at the input and at the baseline (``f_x - f_0`` = Σ signed).
 ATTRIBUTION_COLUMNS = ["fold", "seed", "split", "guid", "y", "class_code", "channel_group", "abs", "signed", "f_x",
@@ -1048,7 +1048,7 @@ def integrated_gradients(net: ClassifierNet, batch: Mapping[str, torch.Tensor], 
                          n_steps: int, aggregator: str, tau: float
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Integrated Gradients (Sundararajan 2017) of :func:`guid_scores` w.r.t. the scaled features ``[x || attn]`` on the
-    straight path from the baseline 0 (the train-fold mean, §8.5) to the input, by the midpoint rule over ``n_steps``;
+    straight path from the baseline 0 (the train-fold mean) to the input, by the midpoint rule over ``n_steps``;
     context and covariates stay at their values. Returns ``(attributions like [x || attn], f(x), f(0))``; per GUID the
     attributions sum to ``f(x) - f(0)`` up to the quadrature error (completeness)."""
     keys = [k for k in ("x", "attn") if k in batch]
@@ -1127,7 +1127,7 @@ def attribute_split(unit_dir: Any, unit: UnitData, split: str, n_steps: int) -> 
     return out[["guid", "y", "class_code", "channel_group", "abs", "signed", "f_x", "f_0"]]
 
 
-# ---- calibration (§10.8) ------------------------------------------------------------------------------------------
+# ---- calibration ------------------------------------------------------------------------------------------
 P3 = [f"p_c{k}" for k in range(3)]
 LOG_T_BOUNDS = (-math.log(100.0), math.log(100.0))
 
@@ -1345,7 +1345,7 @@ def calibrate_frames(seg: pd.DataFrame, gd: pd.DataFrame, cal: Mapping[str, Any]
             gd.assign(score_final_cal=_alarm_lp(lp_gd)))
 
 
-# ---- stage offsets (§11.3: the `<kind>_stage` decision view) ------------------------------------------------------
+# ---- stage offsets (the `<kind>_stage` decision view) ------------------------------------------------------
 def apply_stage_offsets(seg: pd.DataFrame, gd: pd.DataFrame, record: Mapping[str, Any], *, scope: str,
                         aggregators: Sequence[str], tau: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """``(seg, gd)`` under the per-stratum offsets of :func:`~teb_vae.classifier.thresholds.fit_stage_offsets`:

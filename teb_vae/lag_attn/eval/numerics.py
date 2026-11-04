@@ -3,8 +3,8 @@ r"""The pinned numeric environment for an evaluation run: fp32, no TF32, seeded.
 Two of these settings are correctness requirements rather than preferences.
 
 **TF32 is the non-obvious one.** It is on by default for matmul on Ampere and later, and it
-carries $10$ mantissa bits. ``MEMORY_AND_EFFICIENCY.md`` rules out bf16 for $K_t$ because the
-per-step KL is a small difference of larger quantities and bf16 has $8$; the same argument
+carries $10$ mantissa bits. bf16 is ruled out for $K_t$ because the per-step KL is a small
+difference of larger quantities and bf16 has $8$; the same argument
 applies to TF32 with two bits more headroom, which is not enough to make it safe by
 inspection. It is therefore disabled explicitly rather than assumed away.
 

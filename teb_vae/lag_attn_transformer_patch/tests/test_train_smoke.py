@@ -1,4 +1,4 @@
-"""P4-08: one real 3-epoch fit of ``tiny.yaml`` through the entry point.
+"""One real 3-epoch fit of ``tiny.yaml`` through the entry point.
 
 The committed shard has no FHR gap and no non-finite UP sample, so neither ``missing`` token would
 ever see a gradient (AdamW decay alone still nudges it, which ``torch.equal`` would call "trained").

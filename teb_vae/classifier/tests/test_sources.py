@@ -1,4 +1,4 @@
-"""T-S1..T-S4 (SPEC §15): feature sources, feature cache and scaler, on the §15 fixture tree.
+"""T-S1..T-S4: feature sources, feature cache and scaler, on the fixture tree.
 
 The VAE is a tiny ``lag_attn_transformer_cfs`` model built the way that package's tests build theirs
 (``make_task`` on ``TINY_KWARGS``), widened to the fixture's geometry (T = 300, c_y = 102, c_u = 51)
@@ -69,7 +69,7 @@ def test_vae_source_shapes_mask_and_derived_keys(vae_overrides, fold1):
 
 def test_load_task_keeps_every_checkpoint_hyperparameter(vae_checkpoint, tmp_path):
     """The task is rebuilt with every hyperparameter its constructor chain takes (the cfs ``seed`` through
-    ``**kwargs``, the rws loss weights), so co-training optimises the pretraining objective (§10.6); never compiled."""
+    ``**kwargs``, the rws loss weights), so co-training optimises the pretraining objective; never compiled."""
     blob = torch.load(vae_checkpoint, map_location="cpu", weights_only=False)
     blob["hyper_parameters"] |= {"lambda_ms": 0.1, "lambda_deriv": 0.2, "lambda_boundary": 0.05, "seed": 7,
                                  "compile_model": True, "lr_gamma": 0.5}  # lr_gamma: LightningModelBase's, not taken

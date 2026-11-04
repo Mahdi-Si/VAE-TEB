@@ -27,9 +27,8 @@ rising edge). It runs on the **raw** trace at :data:`~teb_vae.lag_attn_rws.eval.
 under the raw validity :func:`~teb_vae.lag_attn_rws.eval.events.raw_validity` expands from the
 decimated weight, and its onsets are floored onto the decimated grid. A weight here and a bin on
 that cell's table therefore name one event by construction. (A pooled $4$-second trace fed to the
-same detector was measured to disagree on about one event in six: at that rate the detector's
-smoothing window collapses and the $\sigma$-relative prominence rule selects a different peak set.)
-The stored UP timeline is read as it is stored.
+same detector disagrees with it: at that rate the detector's smoothing window collapses and the
+$\sigma$-relative prominence rule selects a different peak set.)
 
 **On a signal-quality build the detector can also read the UA mask** (``raw_valid``, the loader's
 ``up_valid``). An invalid UA sample is then a gap exactly as an uncovered step is: the detector

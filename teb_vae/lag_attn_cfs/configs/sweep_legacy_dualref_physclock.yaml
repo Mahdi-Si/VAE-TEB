@@ -1,22 +1,19 @@
-# The configuration this cell shipped before 2026-09-05, preserved verbatim as a comparator: the
-# LEGACY fractional-phase representation (ratio_power_v0, 66 / 15 phase channels), the dual input
+# The legacy configuration of this cell, kept as a comparator: the LEGACY fractional-phase representation (ratio_power_v0, 66 / 15 phase channels), the dual input
 # reference (target onto target_max = 402.16 s, source onto 288.2672 s), the approximate PHYSICAL
 # forecast clock (labels advanced per channel by round(0.875 (tau_c - tau_min) / 4 s), up to 85
 # steps) and its stride-5 tiling.
 #
-# THE HORIZON IS NOT PINNED HERE and follows default.yaml, which moved to H = 10 on 2026-09-05: the
+# THE HORIZON IS NOT PINNED HERE and follows default.yaml, which ships H = 10: the
 # arm exists to compare the representation, the input references and the forecast clock against
 # the promoted default, and that comparison is only readable with the horizon held equal on both
 # sides. Under H = 10 the physical clock's ceiling is T_valid - 85 = 205, the dense span is 71
 # anchors and stride 5 tiles it into 15 tiles at phase 0 (14 otherwise). The
 # `horizon_weight_halflife_steps`, `gradient_clip_val` and `additive_margin` the default re-derived
 # for H = 10 are inherited with it. What this arm is therefore NOT is a bitwise replay of the
-# pre-promotion run, which forecast 30 steps; the run records of that configuration remain the
-# record of it.
+# legacy configuration, which forecast 30 steps.
 #
-# It reads the LEGACY shards (REPOINT_ME_causal), which is why its dataset paths are its own. The
-# review's findings against this arm are recorded in teb_vae/CFS_SCATTERING_PHASE_FORECAST_CRITIQUE.md;
-# it is kept so the promoted default can be compared against what it replaced, not as a candidate.
+# It reads the LEGACY shards (REPOINT_ME_causal), which is why its dataset paths are its own. It is
+# kept so the default can be compared against what it replaced, not as a candidate.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_legacy_dualref_physclock.yaml

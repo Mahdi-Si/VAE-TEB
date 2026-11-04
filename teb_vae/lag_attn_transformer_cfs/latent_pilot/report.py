@@ -77,8 +77,7 @@ FIGURE_TRAJECTORIES = "figure3_trajectories"
 
 #: The coverage control's sensitivity view. Not one of the three main figures: it exists so that a
 #: separation can be read against how the recordings were ascertained and how late they were still
-#: observed, which is the alternative explanation §7.3 requires to be looked at rather than argued
-#: away.
+#: observed, which is the alternative explanation to look at rather than argue away.
 FIGURE_COVERAGE_SPACE = "figure1b_latent_space_by_coverage"
 
 #: The classification readout. Not part of the original three: those answer whether the latent
@@ -612,7 +611,7 @@ def figure_latent_space(
 def coverage_groupings(frame: pd.DataFrame) -> Dict[str, List[str]]:
     """Label each recording by how it was ascertained and by how late it was still observed.
 
-    The two variables §7.3's coverage control asks the same picture to be coloured by. A cloud that
+    The two variables the coverage control colours the same picture by. A cloud that
     separates mainly by blood-gas or Caesarean ascertainment, or mainly by how much signal survived
     to the end of the recording, is not an outcome result -- and the only way to see that is to
     colour the same map by those variables and look.

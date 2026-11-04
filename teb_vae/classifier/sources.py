@@ -1,19 +1,19 @@
-r"""Feature sources, the frozen feature cache and the per-channel scaler (SPEC §8).
+r"""Feature sources, the frozen feature cache and the per-channel scaler.
 
 Two sources turn one collated ``CombinedHDF5Dataset`` batch into :class:`StepFeatures` on the 4-s
-grid: :class:`VaeSource`, a frozen VAE's per-step outputs (§8.2), and :class:`Hdf5Source`, the
-stored ST/PH/raw streams (§8.3). There is no base class; both carry ``step_seconds``,
+grid: :class:`VaeSource`, a frozen VAE's per-step outputs, and :class:`Hdf5Source`, the
+stored ST/PH/raw streams. There is no base class; both carry ``step_seconds``,
 ``required_fields``, ``trainable``, ``fingerprint``, ``dataset(paths)`` and ``__call__(batch)``.
 Invalid steps are zeroed and ``time_pool`` is applied inside ``__call__``, so the cache and an
 online consumer see the same tensors.
 
 :func:`extract` runs a source once per unique ``(guid, epoch_s)`` of the cohort segment table into
-``cache_root/<fingerprint hash>/`` (§8.4); :func:`open_cache` and :func:`read_rows` read it back.
-:func:`fit_scaler` is the §8.5 train-only, recording-weighted scaler. Transforms (``log1p``,
+``cache_root/<fingerprint hash>/``; :func:`open_cache` and :func:`read_rows` read it back.
+:func:`fit_scaler` is the train-only, recording-weighted scaler. Transforms (``log1p``,
 ``asinh``) are applied by the source, so cached values -- and every scaler fit -- are
 post-transform.
 
-**Online regimes (P7, §10.1).** ``VaeSource(..., unfreeze=prefixes)`` is trainable: only parameters under an
+**Online regimes (P7).** ``VaeSource(..., unfreeze=prefixes)`` is trainable: only parameters under an
 allowlisted module prefix may require gradients, and :class:`OnlineFeatures` (the ``nn.Module`` the classifier
 registers as ``backbone``) keeps every other VAE module in ``eval()`` whatever Lightning's ``train()`` does, runs the
 source on a batch's raw HDF5 rows and scales the result with the fold's frozen scaler. The frozen cache is still built
@@ -55,13 +55,13 @@ IDENTITY_FIELDS = ("weight", "guid", "epoch")
 INDEX_COLUMNS = ["fold", "split", "guid", "epoch_s", "source_file", "ds_index"]
 #: Loader filters that decide who is in the cohort: inherited from a checkpoint, they are refused.
 SHAPING_FILTERS = ("epoch_max", "cs_label", "bg_label", "allowed_guids")
-#: Source files on every extraction path; VaeSource adds its VAE packages (§8.4).
+#: Source files on every extraction path; VaeSource adds its VAE packages.
 CODE_FILES = (Path(__file__), Path(sys.modules[CombinedHDF5Dataset.__module__].__file__))
 
 
 @dataclass(frozen=True)
 class StepFeatures:
-    """One batch of per-step features (§8.1).
+    """One batch of per-step features.
 
     ``values`` is ``(B, T', C)`` float, ``step_mask`` ``(B, T')`` bool, ``attn`` ``(B, T', C_a)``
     attention-only cues or None. ``channels`` names the ``C`` value channels, then the ``C_a``
@@ -144,12 +144,12 @@ def _finish(values: torch.Tensor, mask: torch.Tensor, attn: Optional[torch.Tenso
     return StepFeatures(values=values, step_mask=mask, attn=attn, channels=tuple(channels))
 
 
-# ---- VaeSource (§8.2) --------------------------------------------------------------------------
+# ---- VaeSource --------------------------------------------------------------------------
 def trainer_class(package: str) -> type:
     """The one trainer class ``teb_vae.<package>.trainer`` defines, with MODEL_CLS / TASK_CLS."""
     if package == "lag_attn":
         raise NotImplementedError("source.vae.package 'lag_attn' has other output keys (single z, "
-                                  "te_lag_map) and is unsupported in v1 (SPEC §2.7)")
+                                  "te_lag_map) and is unsupported in v1")
     module = importlib.import_module(f"teb_vae.{package}.trainer")
     found = [c for c in vars(module).values() if isinstance(c, type)
              and c.__module__ == module.__name__ and hasattr(c, "TASK_CLS")]
@@ -180,7 +180,7 @@ def load_task(checkpoint: Path, package: str, device: str) -> Tuple[Any, Dict[st
     (``lag_attn_cfs/eval/binding.py`` imports a missing ``analyses.time_shift``). The binding is the
     family trainer's ``MODEL_CLS``/``TASK_CLS``, built with every checkpoint hyperparameter its constructor takes
     (:func:`task_parameters`; absent ones keep the class defaults), so the co-training ``L_vae`` is the pretraining
-    objective (``lambda_ms``/``lambda_deriv``/``lambda_boundary`` included, §10.6); ``compile_model`` stays off (the
+    objective (``lambda_ms``/``lambda_deriv``/``lambda_boundary`` included); ``compile_model`` stays off (the
     feature and co-training hooks need the eager module). Returns ``(task in eval mode on device, blob)``.
     """
     trainer = trainer_class(package)
@@ -257,7 +257,7 @@ def _resolve_last(prefix: str, names: Sequence[str]) -> str:
 
 
 class VaeSource:
-    """A VAE's per-step outputs (§8.2). Frozen (``unfreeze`` empty): ``eval()`` and no gradient throughout.
+    """A VAE's per-step outputs. Frozen (``unfreeze`` empty): ``eval()`` and no gradient throughout.
 
     ``unfreeze`` (``train.unfreeze``) makes it trainable: exactly the parameters under those module prefixes may
     require gradients (a prefix matching nothing raises), and gradients flow only when grad mode is on. Which of them
@@ -267,8 +267,8 @@ class VaeSource:
     (``kld_per_dim``, ``kld_excess``) stay on the posterior means.
 
     ``kld_excess`` = ``kld_per_t`` minus the per-step KL of the posterior rebuilt against a zero source
-    (``controls.source_null_forward_outputs``, one extra source encode, no gradient): the availability clock removed
-    (§2.6). Families whose model has no ``encode_source_kv`` / ``u_stream`` input (``lag_attn_transformer_e2e``,
+    (``controls.source_null_forward_outputs``, one extra source encode, no gradient): the availability clock removed.
+    Families whose model has no ``encode_source_kv`` / ``u_stream`` input (``lag_attn_transformer_e2e``,
     ``lag_slot_transformer_cfs``) refuse it.
     """
 
@@ -296,7 +296,7 @@ class VaeSource:
         self.pool = cfg.time_pool
         self.dataset_kwargs = checkpoint_loader_kwargs(
             load_config(str(resolved_config_for(checkpoint))))
-        # L13: stats file == checkpoint loader == classifier (source.hdf5.trim_minutes, CONTRACT).
+        # L13: stats file == checkpoint loader == classifier (source.hdf5.trim_minutes).
         stats = _stats_record(self.dataset_kwargs["stats_path"],
                               self.dataset_kwargs.get("trim_minutes"), cfg.hdf5.trim_minutes)
         self.dataset_kwargs["stats_path"] = stats["stats_path"]  # the file fingerprinted, any cwd
@@ -329,7 +329,7 @@ class VaeSource:
         return [(n, p) for n, p in self.model.named_parameters() if _under(n, self.unfreeze)]
 
     def check_frozen(self) -> None:
-        """The §10.1 pre-step guard (pilot ``check_pilot_mode``): no parameter outside the allowlist requires
+        """The pre-step guard (pilot ``check_pilot_mode``): no parameter outside the allowlist requires
         gradients, and every module outside it is in ``eval()`` (dropout off)."""
         leaked = [n for n, p in self.model.named_parameters() if p.requires_grad and not _under(n, self.unfreeze)]
         training = [n or "<root>" for n, m in self.model.named_modules() if m.training and not _under(n, self.unfreeze)]
@@ -364,7 +364,7 @@ class VaeSource:
         return self._run(batch, sample_z=sample_z)[0]
 
     def objective(self, batch: Any) -> Tuple[StepFeatures, torch.Tensor, Dict[str, Any]]:
-        """Co-training (§10.6): ``(features, loss, metrics)`` of the VAE task's own ``compute_loss_and_metrics`` in its
+        """Co-training: ``(features, loss, metrics)`` of the VAE task's own ``compute_loss_and_metrics`` in its
         training geometry (tiled anchors; β as the task's hparams say), the features read off that same forward by a
         hook, so the model runs once. Every family's latents are dense on T whatever the geometry (only the decoder's
         anchor axis is tiled), so they are the features ``__call__`` gives; the slot family's are on the anchor axis,
@@ -433,12 +433,12 @@ def _take(value: Any, index: torch.Tensor) -> Any:
     return value[index.to(value.device)] if torch.is_tensor(value) else [value[i] for i in index.tolist()]
 
 
-#: ``train/<name>`` of a co-training step (§10.10.3) <- the VAE objective's metric it reads.
+#: ``train/<name>`` of a co-training step <- the VAE objective's metric it reads.
 VAE_METRICS = {"vae_kld": "source_conditioned_kl_raw", "vae_nll": "nll_full_block"}
 
 
 class OnlineFeatures(nn.Module):
-    """A :class:`VaeSource` run inside the classifier (the online regimes, §10.1): registered on the Lightning task
+    """A :class:`VaeSource` run inside the classifier (the online regimes): registered on the Lightning task
     as ``backbone``, so the device moves, the optimizer groups, EMA and ``best.ckpt`` all see the VAE (``vae.*``) and
     the fold's frozen scaler (persistent buffers). The VAE's Lightning task stays outside the module tree.
 
@@ -451,7 +451,7 @@ class OnlineFeatures(nn.Module):
     ``train(mode)`` keeps every module outside the allowlist in ``eval()``: Lightning calls ``train()`` on the whole
     task every epoch, and dropout in a frozen module would change the features the head was fitted on.
 
-    ``cotrain`` (``train.cotrain``, §10.6; training steps only): the rows run through :meth:`VaeSource.objective`, and
+    ``cotrain`` (``train.cotrain``; training steps only): the rows run through :meth:`VaeSource.objective`, and
     the returned batch adds ``vae_loss`` (the VAE objective, a row-weighted mean over the rows that train) and
     ``vae_metrics`` (:data:`VAE_METRICS` + ``vae_total_loss``). Under ``grad_segments: last_k:<k>`` only each GUID's
     last k segments train (and enter ``vae_loss``); the others run the plain forward under ``no_grad`` (``ponytail:``
@@ -479,7 +479,7 @@ class OnlineFeatures(nn.Module):
         self.train()
 
     def l2sp(self) -> torch.Tensor:
-        """L2-SP (§10.6): ``Σ ‖θ - θ₀‖²`` over the allowlisted VAE parameters."""
+        """L2-SP: ``Σ ‖θ - θ₀‖²`` over the allowlisted VAE parameters."""
         return sum(((p - getattr(self, f"theta0_{i}")) ** 2).sum() for i, (_, p) in enumerate(self.source.allowlist()))
 
     def _trains(self, real: Optional[torch.Tensor], n: int) -> torch.Tensor:
@@ -550,9 +550,9 @@ class OnlineFeatures(nn.Module):
         return out
 
 
-# ---- Hdf5Source (§8.3) -------------------------------------------------------------------------
+# ---- Hdf5Source -------------------------------------------------------------------------
 class Hdf5Source:
-    """Stored ST/PH/raw streams (§8.3), normalised by ``stats_path``; cold causal cells zeroed.
+    """Stored ST/PH/raw streams, normalised by ``stats_path``; cold causal cells zeroed.
 
     ``probe_shard`` is any shard of the tree: channel counts and warm-ups are read from it.
     """
@@ -612,7 +612,7 @@ class Hdf5Source:
 
 
 class CombinedSource:
-    """``source.kind: vae+hdf5`` (§8.2): the VAE's per-step outputs and the stored ST/PH streams side by side, in one
+    """``source.kind: vae+hdf5``: the VAE's per-step outputs and the stored ST/PH streams side by side, in one
     frozen cache. One dataset serves both: the checkpoint's loader contract (so the VAE reads exactly its own
     inputs) with the HDF5 fields added to ``load_fields`` and ``normalize_fields``, and validity masks on a causal
     build; both sources must name the same stats file (L13). Values are ``[vae || hdf5]``, the step mask is the AND
@@ -663,7 +663,7 @@ def make_source(cfg: SourceCfg, probe_shard: str, *, device: str = "cpu") -> Any
     return CombinedSource(cfg, probe_shard, device=device)
 
 
-# ---- cache (§8.4) ------------------------------------------------------------------------------
+# ---- cache ------------------------------------------------------------------------------
 #: Fingerprint fields kept for information only: neither in the cache key nor checked (``code_sha256`` covers the code).
 INFO_FIELDS = {"code_revision"}
 
@@ -695,7 +695,7 @@ def _cache_bytes(directory: Path) -> int:
 
 def extract(source: Any, segments: pd.DataFrame, shards: Mapping[Tuple[int, str], Sequence[str]], *,
             cache_root: Any, dtype: str = "float16", batch_size: int = 64) -> Dict[str, Any]:
-    """Run ``source`` once per unique ``(guid, epoch_s)`` of the retained cohort rows (§8.4).
+    """Run ``source`` once per unique ``(guid, epoch_s)`` of the retained cohort rows.
 
     Args:
         source: A :class:`VaeSource` or :class:`Hdf5Source`.
@@ -821,11 +821,11 @@ def read_rows(cache_dir: Any, rows: Sequence[int]) -> StepFeatures:
                         channels=channels)
 
 
-# ---- scaler (§8.5) -----------------------------------------------------------------------------
+# ---- scaler -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Scaler:
     """Per-channel ``(x - center) / scale`` over the kept channels; zero-variance ones dropped, and under
-    ``drop_at_floor`` (``source.drop_floor_channels``) the near-constant ones too (§8.5)."""
+    ``drop_at_floor`` (``source.drop_floor_channels``) the near-constant ones too."""
 
     channels: Tuple[str, ...]
     center: np.ndarray
@@ -856,7 +856,7 @@ class Scaler:
 
 def fit_scaler(index: pd.DataFrame, values: Any, step_mask: Any, channels: Sequence[str], *,
                minimum_scale: float = 1e-3, relative_floor: float = 0.1, drop_at_floor: bool = False) -> Scaler:
-    """Fit the per-channel scaler on one fold's **train** rows (§8.5, L4).
+    """Fit the per-channel scaler on one fold's **train** rows (L4).
 
     Generalises ``latent_pilot/extract.py:592 fit_scaler`` + ``_hierarchical_moments`` (not
     importable at HEAD, and keyed to one latent) to any stream: moments are means over valid steps
@@ -907,7 +907,7 @@ def fit_scaler(index: pd.DataFrame, values: Any, step_mask: Any, channels: Seque
         logger.warning(f"scaler: dropping {len(dropped)} zero-variance channel(s): {dropped}")
     at_floor = keep & (std < floor)
     names_at_floor = [name for name, a in zip(channels, at_floor) if a]
-    if names_at_floor:  # near-constant inputs (the 2026-10-07 run: 60 of 64 delta_mu channels)
+    if names_at_floor:  # near-constant inputs
         logger.warning(f"scaler: {len(names_at_floor)} channel(s) with train std under the floor {floor:.4g} "
                        f"({'dropped' if drop_at_floor else 'kept at the floor'}): {names_at_floor}")
     if drop_at_floor:

@@ -101,7 +101,7 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         decoder_out_channels: Optional[int] = None,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -139,12 +139,13 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         r"""Initialize the model.
 
         Every keyword the base takes is forwarded unchanged or renamed; only the six below are
-        this input domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The defaults that differ
-        from the base's -- ``horizon`` $15$, ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ --
-        are the causal dataset's geometry rather than a preference, and a run that leaves them at
-        the base's values would be describing a dataset that does not exist.
+        this input domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The
+        defaults that differ from the base's -- ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$
+        -- are the causal dataset's geometry rather than a preference, and a run that leaves them at
+        the base's values would be describing a dataset that does not exist. ``horizon`` is $30$,
+        the same as the base's.
 
-        Note which of those four the *target* forces: none of them. A raw sample is honest at every
+        Note which of those three the *target* forces: none of them. A raw sample is honest at every
         step, so no validity constraint ties the floor to the resolved budget here; the values are
         held at the causal-feature cells' so that the two cells differ in exactly one variable --
         what the decoder emits.

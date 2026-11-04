@@ -1335,7 +1335,7 @@ def test_the_novelty_proxy_follows_the_target_gather_when_the_labels_are_advance
     phase_pairs: Dict[str, np.ndarray],
     channel_plan: Dict[str, CausalChannelPlan],
 ) -> None:
-    r"""CFS-08: the stored vector is a STORED-CLOCK proxy, and the physical clock is another gather.
+    r"""The stored vector is a STORED-CLOCK proxy, and the physical clock is another gather.
 
     The physical clock advances channel $c$'s labels by
     $s_c = \operatorname{round}(\kappa(\tau_c - \tau_{\min}) / \Delta)$ stored steps, so its last
@@ -1424,7 +1424,7 @@ def test_the_novelty_curve_is_horizon_free_and_the_fraction_is_a_lookup_into_it(
         assert (table >= 0.0).all() and (table <= 1.0).all(), name
     # S_0 (the low-pass alone, 13.3 s mean delay) holds almost all of its mass inside ten steps and
     # all of it well inside the segment; its long thin tail is the 15% L^1 mass past the energy
-    # threshold that CFS-01 pins.
+    # threshold.
     assert float(curve["fhr_st"][0, 10]) > 0.99
     assert float(curve["fhr_st"][0, segment_steps]) == pytest.approx(1.0, abs=1e-6)
     # The slowest stored wavelet is still accumulating mass at the far end of the segment.

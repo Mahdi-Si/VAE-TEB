@@ -21,8 +21,6 @@ reparameterisation stream for the rest of the run.
 noticed.** Zeroing floors the source's *variation*; it is not literally the availability pattern
 acting alone, because the encoder's response to a flat trajectory is not the pattern's response.
 So $\Delta_{\mathrm{clock}}$ is a slightly weaker statement than "the coupling exceeds the clock".
-``lag_attn_cfs/DESIGN.md`` section 8 is the record and this analysis cites it rather than
-restating the argument in a second place that could drift from it.
 
 **Both readouts are reduced on one support**, the dense $(B, T)$ anchor mask the matched KL itself
 was reduced over, summed over $d_z$ and divided by the same contributing-anchor count. That is
@@ -152,8 +150,7 @@ NULL_CAVEAT = (
     "availability pattern acting alone -- both the input adapter and the source encoder are "
     "nonlinear, so the encoder's response to a flat trajectory is not the pattern's response. "
     "This difference is therefore a slightly weaker statement than 'the coupling exceeds the "
-    "clock'. See lag_attn_cfs/DESIGN.md section 8 for the argument; it is cited rather than "
-    "restated so the two cannot drift apart."
+    "clock'."
 )
 
 #: Why the permutation control cannot answer this, recorded beside the number so a reader holding
@@ -280,7 +277,7 @@ def build_difference_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT)
     difference = next(
         (row for row in rows if row.get("metric") == DIFFERENCE_COLUMN), {}
     )
@@ -293,7 +290,7 @@ def build_difference_figure(
         reference_label="no excess",
     )
     figures.violin_panel(
-        axes[1, 0],
+        axes[0, 1],
         {
             "matched": finite_column(per_guid, COUPLING_COLUMN),
             "source-null": finite_column(per_guid, NULL_COLUMN),
@@ -331,10 +328,10 @@ def delta_mask(positive: Sequence[float], shape: Dict[str, Any]) -> Tuple[
     :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.peak_width`, reused rather than reimplemented so
     that "the peak" means one thing across this package and no threshold is invented here.
 
-    **Withheld entirely when the profile is degenerate**, and that is the load-bearing half. This
-    family's diagnosed run put $67.5\%$ of its KL in an availability clock and $0.160$ nats of
-    source content across the whole lag window; a mask cut from a profile that flat would name a band on
-    arithmetic accident, and it would look exactly like a finding. The guard firing is a result to
+    **Withheld entirely when the profile is degenerate**, and that is the load-bearing half. The
+    clock-excess profile can be nearly flat -- most of the KL in an availability clock and a
+    fraction of a nat of source content across the whole lag window; a mask cut from a profile
+    that flat would name a band on arithmetic accident, and it would look exactly like a finding. The guard firing is a result to
     report, not a failure to route around.
 
     Args:
@@ -563,8 +560,8 @@ def build_lag_figure(
     # Bin EDGES: the bands are inclusive lag ranges, so a shade from centre to centre would be
     # one bin short at each end, adjacent bands would leave a gap, and a one-lag band would vanish.
     half_lag = SECONDS_PER_STEP / 2.0
-    # The legends go into headroom made above the data first, so the band names written along
-    # the top edge below sit over that empty strip rather than across the curves or the legend.
+    # The legend goes into headroom made above the data. The band names go under the top panel,
+    # into the gap its hidden tick labels leave, so they cross neither the curves nor the legend.
     figures.legend_with_headroom(top, ncol=2, headroom=0.35, fontsize=figures.FONT_SMALL)
     for index, (name, span) in enumerate(bands.items()):
         lo = float(seconds[max(span[0], 0)]) - half_lag if seconds.size else 0.0
@@ -576,8 +573,8 @@ def build_lag_figure(
             )
         top.annotate(
             name, xy=((lo + hi) / 2.0, 0.0), xycoords=("data", "axes fraction"),
-            xytext=(0, 2), textcoords="offset points", ha="center", va="bottom",
-            fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
+            xytext=(0, -2), textcoords="offset points", ha="center", va="top",
+            fontsize=figures.FONT_SMALL, color=figures.COLOR_GRAY, annotation_clip=False,
         )
 
     mask = record.get("delta_mask")
@@ -586,17 +583,18 @@ def build_lag_figure(
             float(seconds[mask[0]]) - half_lag, float(seconds[mask[1]]) + half_lag,
             color=figures.COLOR_VERMILLION, alpha=0.15, zorder=1, label="delta mask",
         )
-    figures.legend_with_headroom(bottom, ncol=2, headroom=0.35, fontsize=figures.FONT_SMALL)
+    # The verdict notes title the legend, so they sit in its headroom and not on the zero line.
     notes = []
     if record.get("clock_excess_degenerate"):
         notes.append("degenerate, no mask")
     if record.get("clock_excess_at_window_edge"):
         notes.append("edge-censored peak")
-    if notes:
-        bottom.annotate(
-            "; ".join(notes), xy=(0.01, 0.04), xycoords="axes fraction",
-            fontsize=figures.FONT_TINY, color=figures.COLOR_VERMILLION,
-        )
+    legend = figures.legend_with_headroom(
+        bottom, ncol=2, headroom=0.35 + 0.15 * bool(notes), fontsize=figures.FONT_SMALL,
+        title="; ".join(notes) or None, title_fontsize=figures.FONT_SMALL,
+    )
+    if notes and legend is not None:
+        legend.get_title().set_color(figures.COLOR_VERMILLION)
     figures.style_axes(top)
     figures.style_axes(bottom)
     figures.caveat_note(figure)

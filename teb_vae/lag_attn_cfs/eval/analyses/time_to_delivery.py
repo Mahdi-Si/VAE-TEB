@@ -55,7 +55,7 @@ PER_RECORDING_FILENAME = "time_to_delivery_per_recording.csv"
 SIGNIFICANCE_FILENAME = "time_to_delivery_significance.csv"
 PAIRWISE_FILENAME = "time_to_delivery_pairwise.csv"
 
-#: The figure stems, named as ``FIGURE_GUIDE.md`` names them. Each is a **stem**, not a filename:
+#: The figure stems. Each is a **stem**, not a filename:
 #: every readout gets both pages to itself, written as ``<stem>_<readout slug>``, for the reason
 #: :class:`~teb_vae.lag_attn_cfs.eval.cohort.ClockReadout` gives -- the two are in the same unit
 #: and not on the same scale, so one shared y range flattens whichever is smaller into a

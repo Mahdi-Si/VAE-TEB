@@ -9,7 +9,7 @@
 # if it forecasts better, the trade is real and Phase 2's window sweep prices it.
 #
 # The source depth here is the TARGET's depth, whatever that is: the arm's claim is symmetry, so
-# when default.yaml moved the target from four blocks to six this file moved with it.
+# this file must follow any change to default.yaml's target_attention_blocks.
 #
 # Against A1 -- the same arm without the stem -- the difference is exactly 201,728 parameters,
 # two gated causal depthwise convolution blocks per encoder (50,176 at kernel 5 plus 50,688 at

@@ -10,7 +10,7 @@ columns read on this model, and the fourteen analyses it adds or ports. The rest
 | `teb_vae/lag_attn_cfs/eval/EVAL.md` | **The contract**: the run, the output layout, the configuration reference, every shared analysis, the verdicts, the guard recovery table. |
 | `teb_vae/lag_attn_cfs/eval/FIGURE_GUIDE.md` | Every shared figure and how it is misread. |
 | `teb_vae/lag_attn_cfs/eval/ATTRIBUTION.md` | The shared Captum pass (`attribution`), which runs here unchanged. |
-| `../notes/EVAL_PLAN.md` | The decisions D1–D9 this package was built under, and the registry. |
+| `../notes/EVAL_PLAN.md` | The decisions D1–D9 this package is built on, and the registry. |
 
 ## What this package supplies
 
@@ -21,7 +21,7 @@ columns read on this model, and the fourteen analyses it adds or ports. The rest
 | `raw.py` | The raw-signal substrate (D6): raw → patch → forward with edits, units (`SummaryUnits`), the resting-tone estimator, the occlusion fills, segment draws, `RawReadout` for Captum over raw `(B, T, R)`, and re-exports of the shared selection and event detectors. |
 | `figures.py` | Three helpers on top of the shared drawing primitives: `spans_decades`, `share_axis`, `stacked_page`. |
 | `analyses/` | Ports: `samples`, `occlusion`, `time_shift`, `calibration`. New: `channel_skill`, `latent_descriptors`, `event_locked`, `decelerations`, `signal_loss`, `delay_map`, `raw_shift`, `impulse_response`, `raw_attribution`, `fhr_drivers`. |
-| `configs/eval_overrides.yaml` | The production delta: the CFS causal holdout split, `load_fields` without the ST/PH blocks, `clock_margin_min_nats: null`, the transformer-CFS `occlusion_bands` (inside `max_lag` 37), and a cap per new analysis with its production cost. |
+| `configs/eval_overrides.yaml` | The production delta: the CFS causal holdout split, `load_fields` without the ST/PH blocks, `clock_margin_min_nats: null`, the transformer-CFS `occlusion_bands` (inside `max_lag` 37), and a cap per new analysis. |
 | `configs/planted_overrides.yaml` | The planted-delay instrument: the committed 8-segment planted shard (holdout = training shard, by design), CPU-sized caps, bands `near [0, 14]`, `planted [15, 44]`, `far [45, 60]`. |
 | `run.py`, `verify.py` | The command lines. Both delegate to the shared ones; `run.py` owns the parser so `--only`/`--skip` name this registry. `verify` emits no cross-cell table. |
 
@@ -43,7 +43,7 @@ python -m teb_vae.lag_attn_transformer_patch.eval.run --checkpoint <run>/model_c
 python -m teb_vae.lag_attn_transformer_patch.eval.verify <out>/eval_results/summary.json
 python -m teb_vae.lag_attn_transformer_patch.eval.verify --runs <dir-of-runs> --out RESULTS_arms.md
 
-# The planted instrument (local; about 9 min on a GTX 1660 Ti, 5 of them event_locked).
+# The planted instrument (local).
 python -m teb_vae.lag_attn_transformer_patch.trainer --config teb_vae/lag_attn_transformer_patch/configs/planted.yaml
 python -m teb_vae.lag_attn_transformer_patch.eval.run \
     --checkpoint output/teb_vae_trf_patch_planted/<run>/model_checkpoints/<name>.ckpt \
@@ -107,7 +107,7 @@ training loss by construction.
 
 Each has the shared protocol (`run_<name>_analysis(context, *, eval_config, output_dir, probe)`,
 failure-isolated), writes under `<out>/eval_results/<name>/`, and states its caps in
-`eval_overrides.yaml` under `caps.<name>_*`. Costs are on one GTX 1660 Ti at the production caps.
+`eval_overrides.yaml` under `caps.<name>_*`. The cost lines give the work at the production caps.
 Unless a section says otherwise, rows reduce per recording, then across recordings, and intervals
 resample recordings.
 
@@ -123,7 +123,7 @@ and `eps` floor marked), the two patch input streams, then the shared latent/KL/
 `sample_pages.csv`). No headline.
 **Reading.** `full` is one posterior draw; `base` is decoded at the prior mean. **Misread:** a tile
 is one latent's 120 s forecast of 4 s patch means, not a beat-to-beat trace.
-**Cost.** The shared pages' (`caps.pages` 24, `pages_per_class` 10); 18 s on the planted run.
+**Cost.** The shared pages' (`caps.pages` 24, `pages_per_class` 10).
 
 ### `occlusion` (port, D5)
 
@@ -137,7 +137,7 @@ Headline: the shared `occlusion_peak_band*` (baseline arm) plus `occlusion_zero_
 **Reading.** Positive = the forecast needed that UP. The live fraction is read off the validity
 channel. **Misread:** one anchor per segment; a band delta whose interval spans 0 says nothing.
 The `missing` arm is flagged `reliable: False`.
-**Cost.** 512 segments × 13 arms (reference + 3 arms × 4 bands), about 3 ms per arm-segment: under a minute.
+**Cost.** 512 segments × 13 arms (reference + 3 arms × 4 bands).
 
 ### `time_shift` (port)
 
@@ -162,7 +162,7 @@ raw STV (3.75 s epochs, bpm), as decile reliability and a per-recording Spearman
 **Misread:** the per-channel reading uses the retained **mean-decoded** pair, the pooled one a
 posterior draw; they differ by design. Below the 0.25 bpm and `eps` floors the variability target
 measures quantisation, not physiology. The per-recording ρ is the statistic, not the bins.
-**Cost.** No forward; retained waveforms (`caps.waveforms` 512, ~170 MB).
+**Cost.** No forward; retained waveforms (`caps.waveforms` 512).
 
 ### `channel_skill` (new, replaces `spectral_skill`)
 
@@ -179,7 +179,7 @@ Headline: `channel_skill_pred_gap_{level,variability}_nats`, `…level_rmse_{ful
 `pred_gap_mc_nats`. A null crossover means no sign change (`kind` says whether it always or never
 beats). The variability RMSE is a factor on rms-Δ, never bpm. Climatology is dropped while the
 summary constants are the identity placeholders (`summary_constants_identity`).
-**Cost.** No forward; seconds.
+**Cost.** No forward.
 
 ### `raw_attribution` (new)
 
@@ -197,7 +197,7 @@ within-patch position, and each head's own KL against its attention.
 `after_anchor_max_abs`, `outside_window_max_abs` and `validity_channel_max_abs` must be exactly 0.
 **Misread:** model sensitivity along a path from zero UP, not a causal effect. Zero is the z-mean,
 above resting tone, so resting stretches carry attribution too (`event_locked` uses a tone baseline).
-**Cost.** 24 segments × 4 anchors × 10 IG calls at 128 steps: ~6 min.
+**Cost.** 24 segments × 4 anchors × 10 IG calls at 128 steps.
 
 ### `fhr_drivers` (new)
 
@@ -212,7 +212,7 @@ under `pop_mean` only.
 **Reading.** `lag50_s`/`lag90_s` hold half and 90% of |IG|; 90% inside the conv-stem reach
 (`share_in_stem`) is near-persistence. `seg_median` against `pop_mean` separates level from pattern.
 **Misread:** a long `lag90_s` under `pop_mean` can be the level alone; read `seg_median` beside it.
-**Cost.** 24 segments × 4 anchors × 8 IG-equivalents at 128 steps: ~7.5 min.
+**Cost.** 24 segments × 4 anchors × 8 IG-equivalents at 128 steps.
 
 ### `impulse_response` (new)
 
@@ -228,7 +228,7 @@ raw UP at known tokens, on two backgrounds paired with themselves: `segment` (re
 `causality_max_abs` must be 0. **Misread:** the headline is the kernel's peak, which may sit far from
 the delay the forecast uses; read the whole kernel, and its size against the data's own
 contraction-triggered FHR change (`decelerations_triggered_fhr.csv`).
-**Cost.** 128 segments × 2 backgrounds × (1 + 5 injections) = 1536 segment-forwards: ~1 min.
+**Cost.** 128 segments × 2 backgrounds × (1 + 5 injections) = 1536 segment-forwards.
 
 ### `raw_shift` (new)
 
@@ -240,7 +240,7 @@ samples at resting tone, re-patchified. ΔK, Δ`pred_gap`, and the shift of the 
 Headline: `raw_shift_attention_centroid_{slope,r2}`, `raw_shift_klmap_centroid_slope` (whole-patch fits).
 **Reading.** Slope 1 (both axes in seconds) = a content tracker; 0 = fixed lags. **Misread:** `s > 0`
 hands the model future UP: a non-causal probe, not a forecast.
-**Cost.** 256 segments × 51 arms = 13 056 segment-forwards: ~6 min.
+**Cost.** 256 segments × 51 arms = 13 056 segment-forwards.
 
 ### `delay_map` (new)
 
@@ -253,8 +253,8 @@ cell count beside it.
 `delay_map_argmax_steps`, `delay_map_argmax_s`, `delay_map_peak_nats`.
 **Reading.** The argmax d* is the delay the forecast uses; a flat curve means the forecast does not
 use UP timing. No verdict. **Misread:** corner diagonals hold few cells (see `n_cells`); a lone
-peak there is noise. Fewer anchors per segment left the planted delay in the noise.
-**Cost.** 512 segments × 16 anchors × 39 arms (the reference + 38 lags): ~5 min.
+peak there is noise.
+**Cost.** 512 segments × 16 anchors × 39 arms (the reference + 38 lags).
 
 ### `event_locked` (new)
 
@@ -270,8 +270,7 @@ resting-tone baseline at peak + 6 offsets, in seconds from the peak, with rise/f
 **Reading.** 1 = no tracking, > 1 = the head follows the contraction. Per head in the summary CSV.
 **Misread:** the head-mean index can sit below 1 while one head tracks; read the heads. The tone path
 is rough: read `ig_completeness.*.n_rows_over_tolerance`, not only the median.
-**Cost.** 256 dense forwards + 64 events × 6 offsets × 2 readouts at 512 IG steps: ~20 min (the
-override comment; the planted run did 396 IG rows in 294 s).
+**Cost.** 256 dense forwards + 64 events × 6 offsets × 2 readouts at 512 IG steps.
 
 ### `decelerations` (new)
 
@@ -289,7 +288,7 @@ two figures. Headline: `decelerations_measured_delay_median_s` (pooled over pair
 **Misread:** a d̂ median near the measured median is not tracking (a constant can match a median);
 ρ and the enrichment against its control are the test. The headline delay median pools events; the
 summary CSV's is a mean of per-recording medians.
-**Cost.** 256 dense forwards: about a minute.
+**Cost.** 256 dense forwards.
 
 ### `latent_descriptors` (new)
 
@@ -302,7 +301,7 @@ area, gap fraction, contraction count, UP tone, time since the last peak.
 `latent_r2_decel_depth_delta_mu`, `latent_r2_up_tone_delta_mu`.
 **Misread:** a linear probe, not an attribution; the descriptors correlate with each other.
 Negative R² is worse than the fold mean, not a signed effect.
-**Cost.** 512 dense forwards + ridge: ~1 min.
+**Cost.** 512 dense forwards + ridge.
 
 ### `signal_loss` (new)
 
@@ -317,7 +316,7 @@ against K, the log-variances and NLL (binned, Spearman). Interventional, on gap-
 **Reading.** `missing_occurrence` says how often the `missing` token appears at all; the
 observational half is empty without it. **Misread:** under `source_validity: finite` the UP stays
 visible across an FHR gap; the injection probes the FHR stream only.
-**Cost.** 1024 forwards (~30 s) + 64 segments × 4 anchors × 13 forwards (~1.5 min).
+**Cost.** 1024 forwards + 64 segments × 4 anchors × 13 forwards.
 
 ## Lean limits
 
@@ -346,8 +345,9 @@ visible across an FHR gap; the injection probes the FHR stream only.
 > lean-limit: deceleration pairing is greedy. A nadir claimed by two contractions keeps the later one,
 > and the loser does not re-claim its second-deepest nadir.
 
-> lean-limit: no cross-cell table. A `pred_gap` here is over a 60-cell patch block; the comparison
-> with CFS goes through the classifier and the source share of the KL (`../RESULTS.md`).
+> lean-limit: no cross-cell table. A `pred_gap` here is over a 60-cell patch block, so its nats are
+> not comparable with a CFS cell's. A comparison with CFS must use quantities that do not depend on
+> the target, such as the downstream classifier on the same cohort and folds.
 
 > lean-limit: on the planted shard `time_shift` and `cross_subgroup` record skips (one segment per
 > recording, one cohort), and every class contrast is empty (no labels).

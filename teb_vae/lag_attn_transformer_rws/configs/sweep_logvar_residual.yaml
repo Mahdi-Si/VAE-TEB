@@ -5,9 +5,8 @@
 #
 # What it isolates. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior + delta), so the
 # FULL branch's pressure to sharpen sigma_q lands on the prior's own tensor and D_1 drags the
-# prior's log-variance down alongside its own. Measured on the tiny model, the full branch's
-# reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head under 'residual'
-# and exactly 0 under 'independent'. This is the path that SURVIVES base_decode: mean, which is
+# prior's log-variance down alongside its own; under 'independent' the full branch's
+# reconstruction puts exactly zero gradient on the prior log-variance head. This is the path that SURVIVES base_decode: mean, which is
 # why the two arms are separate rather than one combined revert.
 #
 # What to read. The same columns as sweep_base_sample: `logvar_prior_floor_frac`,

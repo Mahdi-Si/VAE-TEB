@@ -222,9 +222,6 @@ NO_BG_SUBGROUPS = {"healthy_no_bg_cs", "healthy_no_bg_no_cs"}
 # ---------------------------------------------------------------------------
 # Phase-harmonic channel selection
 # ---------------------------------------------------------------------------
-# Full rationale, measurements and rejected alternatives:
-#   hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md
-#
 # A phase-harmonic coefficient pairs two wavelets $(\psi_i, \psi_j)$ and is
 # large only when their phases are locked at ratio $p = \xi_j / \xi_i$. The
 # selection is therefore a band in true Hz (which frequencies may participate)
@@ -713,7 +710,7 @@ def _write_causal_attrs(
     property of the filter bank alone, and deliberately free of any forecast
     horizon or target clock: those are model-side choices, and the model looks
     its own $H + s_c$ up in this table rather than reading a number the dataset
-    computed for a horizon it may not use (CFS-08). It is an envelope-mass proxy
+    computed for a horizon it may not use. It is an envelope-mass proxy
     and not an exact "known/new" value fraction of a nonlinear coefficient.
     Older shards carry the scalar ``causal_novelty_frac`` instead, written at
     one fixed horizon; the loader reads either.
@@ -1585,8 +1582,7 @@ def _phase_pair_mask(
     here instead.
 
     Because pairs always satisfy $\xi_i \le \xi_j$, requiring both endpoints in
-    band is equivalent to $\xi_i \ge$ ``min_hz`` and $\xi_j \le$ ``max_hz`` —
-    the predicate form used in PHASE_HARMONIC_CHANNEL_SELECTION.md §10.
+    band is equivalent to $\xi_i \ge$ ``min_hz`` and $\xi_j \le$ ``max_hz``.
 
     Args:
         model: Constructed transform, supplying ``center_freqs``, ``i_idx``,
@@ -1721,8 +1717,7 @@ def compute_scattering_masks(
 
     The two self-phase blocks (``fhr_ph``, ``up_ph``) are selected by true-Hz
     band crossed with the $2^{k/Q}$ harmonic grid — see the constants at the
-    top of this module and PHASE_HARMONIC_CHANNEL_SELECTION.md for the
-    rationale. The cross-channel block (``fhr_up_ph``) is unchanged: it still
+    top of this module. The cross-channel block (``fhr_up_ph``) is unchanged: it still
     uses the two-band selector, whose $k = 0$ term is a genuine UP-to-FHR
     coupling rather than the redundant self-energy diagonal.
 
@@ -1836,7 +1831,7 @@ def compute_scattering_masks(
         # Measured here, from the same bank and the same plan the widths come from, so the curve
         # written beside a block's warm-up describes that block's channels by construction.
         # Tabulated to the stored segment length: no label can sit further from an anchor than
-        # that, and no forecast horizon is baked in -- the model side looks its own up (CFS-08).
+        # that, and no forecast horizon is baked in -- the model side looks its own up.
         masks["causal_novelty_curve"] = novelty_curve(
             causal_bank, plan, target_pairs, source_pairs,
             max_window_steps=signal_length // scattering_T, decimation=scattering_T,

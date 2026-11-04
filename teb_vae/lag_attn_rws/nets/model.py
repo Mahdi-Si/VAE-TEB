@@ -136,7 +136,7 @@ class SeqVaeLagAttnRws(nn.Module):
         decoder_out_channels: Optional[int] = None,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -494,14 +494,12 @@ class SeqVaeLagAttnRws(nn.Module):
         #
         # AvailabilityInputAdapter reproduces InputAdapter(post_residual_activation=False) exactly
         # -- the plain residual seam this net wants, since the post-residual GELU at the adapter,
-        # front and fusion seams gates the backward gradient (measured ~x0.39 stacked) and leaves a
-        # fraction of the exported units persistently compressed for no measured benefit -- and
-        # adds the two availability terms. Those terms are what make a finite reach budget
+        # front and fusion seams gates the backward gradient and leaves a fraction of the exported
+        # units persistently compressed -- and adds the two availability terms. Those terms are what make a finite reach budget
         # trainable here at all: under a guard the first max_c delta_c steps of every surviving
         # channel are exact zeros, and a zero token entering repeated normalisation layers produces
-        # derivatives of order 1/sqrt(eps). With the plain adapter this model reached global
-        # gradient norms around 1e26 at EVERY finite budget -- a switch, not a gradient, so no
-        # warm-up or clip setting recovered it.
+        # derivatives of order 1/sqrt(eps). That is a switch, not a gradient, so no warm-up or
+        # clip setting recovers it with the plain adapter.
         #
         # Unguarded, neither availability term is constructed, so the module is parameter-for-
         # parameter the plain adapter it replaces and the ungated model is unchanged.

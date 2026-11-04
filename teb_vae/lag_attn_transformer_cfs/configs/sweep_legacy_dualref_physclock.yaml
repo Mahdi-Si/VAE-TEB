@@ -14,11 +14,10 @@
 # ceil(51 / 5) = 11 tiles at phase 0 (10 otherwise). The `gradient_clip_val` and `additive_margin`
 # the default scaled for its own block are inherited with it, although this arm's legacy block is
 # wider (H x 98 surviving channels). What this arm is therefore NOT is a bitwise replay of the
-# pre-promotion run; the run records of that configuration remain the record of it.
+# pre-promotion run.
 #
-# It reads the LEGACY shards (REPOINT_ME_causal), which is why its dataset paths are its own. The
-# review's findings against this arm are recorded in teb_vae/CFS_SCATTERING_PHASE_FORECAST_CRITIQUE.md;
-# it is kept so the promoted default can be compared against what it replaced, not as a candidate.
+# It reads the LEGACY shards (REPOINT_ME_causal), which is why its dataset paths are its own. It
+# is kept so the promoted default can be compared against what it replaced, not as a candidate.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_legacy_dualref_physclock.yaml

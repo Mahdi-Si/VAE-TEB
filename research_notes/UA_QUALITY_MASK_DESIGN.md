@@ -539,8 +539,9 @@ title.
 
 The model side (later): the lag attention collapses a per-sample mask to `m_lag[0]` and broadcasts it
 over the batch (`lag_attn/nets/attention.py:229, 274`). A per-sample key mask is therefore dropped today
-without an error. Also, if the mask reaches the posterior but not the prior, it repeats the "clock" leak
-of `LAG_READOUT_DIAGNOSIS.md` §5.
+without an error. Also, if the mask reaches the posterior but not the prior, it creates a "clock" leak:
+the posterior then reads an availability signal that the prior lacks, and the KL can encode that signal
+instead of the UA content.
 
 ### 4.9 Loader and statistics as implemented
 

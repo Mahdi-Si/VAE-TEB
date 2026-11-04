@@ -95,11 +95,7 @@ model_config:
     # 1.0, INHERITED from both comparison models rather than re-swept, and the reason is that the
     # block cardinality is unchanged: this objective sums over the same H * C_keep = 2340
     # coefficients the feature-domain sibling does, so the scale-matched beta is the same number and
-    # that sibling's four-arm sweep (1.0 / 2.5 / 5.0 / 10.0, 200 epochs on the committed HIE shard)
-    # already answered it. That sweep came out monotone in beta with its LOWER edge winning every
-    # column of the selection rule -- nll_base_block 1945.89 against 1951.97 at 5.0, pred_gap +1.20
-    # against -9.20 -- so the scale-matching argument that first put 5.0 in that file was refuted by
-    # measurement, not merely bounded.
+    # that sibling's four-arm sweep (1.0 / 2.5 / 5.0 / 10.0) covers this cell too.
     beta_schedule:
       kind: linear_warmup
       start: 0.0
@@ -111,10 +107,9 @@ model_config:
     free_bits: 0.0
     # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
     # conditional prior's log-variance off its clamp floor: nothing else in the objective penalises
-    # a NARROW prior, and the first production run of this family pinned 99.2% of prior coordinates
-    # on the -5 floor within one epoch (0.118 at epoch 0, 0.812 at epoch 1). Constant, not a
-    # schedule -- the collapse completes between epoch 0 and epoch 1, so any warm-up would arrive
-    # after the damage.
+    # a NARROW prior, so without it the prior's log-variance can fall onto the -5 floor within the
+    # first epochs. Constant, not a schedule -- a warm-up would arrive after the collapse it exists
+    # to prevent.
     #
     # A threshold rather than a dial: the restoring force d/dlv_p is 0.5*(exp(lv_p) - 1), which
     # SATURATES at 0.5*beta_prior as the log-variance falls, while the reconstruction's opposing
@@ -123,11 +118,10 @@ model_config:
     #
     # 0.1, and it moves with beta rather than independently: what is held fixed across this file and
     # both comparison models is the RATIO beta_prior/beta = 0.1, so the anchor keeps the same
-    # standing against the KL it is measured beside. The feature-domain sibling's four-arm sweep has
-    # logvar_prior_floor_frac at 0.0121 at this weight against a 0.2 acceptance criterion -- six-fold
-    # inside it -- and this configuration is not anchor-limited at any weight in that bracket, because
-    # `base_decode: mean` and `posterior_logvar_mode: independent` below remove both paths by which
-    # the reconstruction reaches the prior's log-variance.
+    # standing against the KL it is weighed beside. The anchor has less to fight here than under the
+    # sample / residual settings, because `base_decode: mean` and `posterior_logvar_mode:
+    # independent` below remove both paths by which the reconstruction reaches the prior's
+    # log-variance.
     beta_prior: 0.1
 
     # --- Reconstruction likelihood --------------------------------------------
@@ -192,15 +186,14 @@ model_config:
     # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
     # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
     #
-    # This exists because the measured failure is specific to the source pathway: over epochs 55-120
-    # of the 125-epoch raw run the KL held at 1.44 nats and the latent displacement at 0.084, both
-    # unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
-    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
-    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    # This exists for a failure specific to the source pathway: the map from the source to
+    # delta_mu can memorise while the KL and the latent displacement hold constant, so the held-out
+    # predictive gain falls at an unchanged rate. A rate-based lever (beta) cannot reach a failure
+    # that happens at constant rate.
     #
-    # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
-    # particular rate here, and putting an unvalidated one in the headline run would confound it.
-    # The arms that measure the strength are one-key overrides of this file; for this package no
+    # Shipped null, NOT an elevated value, and that is deliberate: nothing here fixes a particular
+    # rate, and putting an unvalidated one in the baseline run would confound it.
+    # The arms that set the strength are one-key overrides of this file; for this package no
     # sweep config ships, and tests/test_config_load.py lints the directory so one cannot arrive
     # undeclared.
     source_dropout: null
@@ -230,10 +223,9 @@ model_config:
     # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
     # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast, so
     # its gradient on the prior log-variance points down without limit and nothing opposes it from
-    # below. The 125-epoch anchored run has logvar_prior_floor_frac climbing 0.017 -> 0.496 and still
-    # rising at epoch 125; the beta_prior anchor slowed that and did not stop it, because the
-    # anchor's restoring force saturates at beta_prior/2 per dimension while the reconstruction's
-    # opposing pressure grows as the decoder sharpens.
+    # below. The beta_prior anchor can slow that descent but cannot stop it, because the anchor's
+    # restoring force saturates at beta_prior/2 per dimension while the reconstruction's opposing
+    # pressure grows as the decoder sharpens.
     #
     # Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p), which
     # pulls the prior out to cover the posterior, and the scale anchor. Note this does NOT make the
@@ -261,9 +253,8 @@ model_config:
     # This is the second of the two paths that collapse the prior's scale, and the one that survives
     # base_decode: mean. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior + delta), so
     # the full branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor: D_1 drags the
-    # prior's log-variance down alongside its own. Measured on the tiny model, the full branch's
-    # reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head under
-    # 'residual' and exactly 0 under 'independent'.
+    # prior's log-variance down alongside its own. Under 'independent' the full branch's
+    # reconstruction puts exactly 0 gradient on the prior log-variance head.
     #
     # With both keys shipped, the prior's log-variance receives gradient from KL(q||p) -- which pulls
     # it UP, to cover the posterior -- and from the beta_prior anchor, and from nothing that wants it
@@ -274,10 +265,9 @@ model_config:
     # constant the independent head is seeded at, so the KL is still exactly 0 at step 0.
     #
     # With head_init_calibration FALSE the init KL is not small: two independently initialised heads
-    # disagree by whatever their init happens to give, measured on the tiny model at 54 nats/step
-    # mean and 142 nats/step max, against exactly 0 under 'residual' with or without the calibration.
-    # That matters because the readout rests on K_t == 0 at init -- unearned divergence on that scale
-    # is indistinguishable from coupling in every downstream figure. Any arm that sets
+    # disagree by whatever their init happens to give, against exactly 0 under 'residual' with or
+    # without the calibration. That matters because the readout rests on K_t == 0 at init --
+    # unearned divergence is indistinguishable from coupling in every downstream figure. Any arm that sets
     # head_init_calibration: false therefore inherits a broken zero-KL start from this key and should
     # pin posterior_logvar_mode: residual unless the arm is about that start. The ablate-one arm is a
     # one-key override of this file: posterior_logvar_mode: residual.
@@ -457,24 +447,15 @@ advanced_config:
     # reduction is over 2340 terms, the largest in the family. Any of those moving is a difference
     # this comparison would attribute to an encoder or to a target domain.
     precision: "32-true"
-    # MEASURED at this encoder, and it is the one constant in this file that both comparison models
-    # would have got wrong: they independently arrived at 5000 -- the conv-Transformer raw model from
-    # a 1018-epoch run (q99 4683) and the conv-LSTM feature model from a 120-epoch instrumented run at
-    # this same block size (q99 4421) -- and this stack's norms are half that.
+    # Re-derived for this encoder rather than inherited from the two comparison models' 5000. The
+    # rule is both siblings': the smallest round value above the q99 of pre-clip
+    # `train/grad_norm`, at their granularity of 1e+3, read with this key parked at 1.0e+9 so that
+    # nothing rescales the steps the norms are drawn from. A clip far above the tail would leave
+    # the non-finite guard as the only protection.
     #
-    # Derived from a 120-epoch instrumented run of configs/smoke_hie.yaml over output/hie_cs.hdf5
-    # (339 windows, batch 32, 11 optimizer steps per epoch = 1320 steps, of which the CSV records
-    # one per epoch) with this key parked at 1.0e+9 so nothing rescaled the steps the norms were
-    # drawn from. Pre-clip `train/grad_norm`: q50 1503.5, q90 2289.4, q95 2510.7, q99 3047.8,
-    # max 3304.2, min 738.2, and 0.000 of the sampled steps above the inherited 5000. The rule is
-    # both siblings' -- the smallest round value above q99, at their granularity of 1e+3 -- which
-    # gives 4000: above the tail, 1.2x the observed maximum, and not so far above it that the
-    # non-finite guard becomes the only protection left.
-    #
-    # Why the same objective over the same block produces half the gradient norm here: LayerScale
-    # starts every residual branch at 1e-2, RMSNorm sits pre-block on every path, and there is no
-    # recurrent path accumulating a product of Jacobians across 300 steps. RESULTS.md carries the
-    # working.
+    # Why the same objective over the same block can produce a smaller gradient norm here:
+    # LayerScale starts every residual branch at 1e-2, RMSNorm sits pre-block on every path, and
+    # there is no recurrent path accumulating a product of Jacobians across 300 steps.
     #
     # What that sample is: metrics_history.csv records ONE optimizer step per epoch for this metric,
     # not the epoch's aggregate (the metrics collector reads callback_metrics at validation end,
@@ -550,15 +531,10 @@ advanced_config:
     ema_floor: 1.0e+9
     # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables.
     #
-    # MEASURED at this encoder, and it lands on the conv-LSTM feature model's value -- so the
-    # equality with that model is a result rather than an inheritance, and it is asserted rather
-    # than exempted in tests/test_config_load.py. Over the 100 post-warm-up epochs of the same
-    # 120-epoch instrumented run, `train/main_loss` sat at 4880 +- 436 (min 3823, max 6031) with
-    # epoch-to-epoch |delta| of median 380, q90 827, q99 1193, max 1258. 5e+3 is 4.0x the largest
-    # ordinary movement observed and 11.5x the standard deviation -- the same two ratios the feature
-    # sibling's own derivation produced against ITS fluctuation (3.3x and 12x), which is what makes
-    # this the same rule reaching the same number rather than a different rule reaching a convenient
-    # one. The breaker never fired in that run.
+    # The conv-LSTM feature model's value. The block is the same 2340 coefficients, so the same
+    # scaling rule gives the same number, and tests/test_config_load.py asserts the equality rather
+    # than exempting it. The margin must clear the ordinary epoch-to-epoch movement of
+    # `train/main_loss` and stay far below a genuine blow-up.
     #
     # The margin is stated in nats of the summed block and does not transfer across block sizes,
     # which is why the raw conv-Transformer sibling's 1.0e+3 is not the value here -- that is the one
