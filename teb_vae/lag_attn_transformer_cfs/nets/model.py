@@ -37,11 +37,10 @@ it, both shared with the conv-LSTM cell.
 The unit consequence, restated where a reader will look for it: under the shipped
 ``configs/default.yaml`` the forecast block is $H \cdot C_{\mathrm{keep}} = 30 \times 76 = 2280$
 cells, and the reconstruction is summed over the scored subset of them,
-$\sum_c \min(H_c, H)$, because a fast phase channel is scored over its first $H_c = 5$ steps only
-(``DESIGN.md``, amendment of 2026-09-23). That is a different sum from the raw variant's
-$H \cdot R$ samples, from the two-sided feature variant's $30 \times 78 = 2340$ and, since the
-same amendment, from the conv-LSTM causal cell's block, which keeps its own horizon and scores
-every cell. So the nats are comparable to none of those, nor across warm-up budgets within this
+$\sum_c \min(H_c, H)$, because a fast phase channel is scored over its first $H_c = 5$ steps only.
+That is a different sum from the raw variant's $H \cdot R$ samples, from the two-sided feature
+variant's $30 \times 78 = 2340$ and from the conv-LSTM causal cell's block, which keeps its own
+horizon and scores every cell. So the nats are comparable to none of those, nor across warm-up budgets within this
 model, since $C_{\mathrm{keep}}$ moves with the budget. The constructor default below stays the
 architecture parent's $30$; the horizon is a configuration decision and the config states it.
 """
@@ -95,7 +94,7 @@ class SeqVaeLagAttnTrfCfs(
         decoder_hidden: int = 128,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,  # the horizon core hard-codes per-block FiLM, which requires FiLM
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -124,6 +123,7 @@ class SeqVaeLagAttnTrfCfs(
         coverage_floor: float = 0.9,
         base_decode: str = "sample",
         persistence_residual: bool = False,
+        persistence_lags: int = 1,
         horizon_weight_halflife_steps: Optional[float] = None,
         target_keep_index: Optional[Sequence[int]] = None,
         target_warmup_steps: Optional[Sequence[int]] = None,
@@ -139,6 +139,8 @@ class SeqVaeLagAttnTrfCfs(
         target_forecast_shift: Optional[Sequence[int]] = None,
         target_scored_horizon: Optional[Sequence[int]] = None,
         forecast_ar_residual: bool = False,
+        forecast_ar_max: float = 1.0,
+        target_scored_start: Optional[Sequence[int]] = None,
         source_quality_mask: bool = False,
         init_weights: bool = True,
     ) -> None:
@@ -198,6 +200,18 @@ class SeqVaeLagAttnTrfCfs(
             forecast_ar_residual: Score the horizon under a per-channel AR(1) residual with a
                 learnable $\phi_c = \tanh(a_c)$, seeded at $0$. ``False`` builds no parameter and
                 is the factorised score.
+            forecast_ar_max: $\phi_{\max} \in (0, 1]$, the bound on the AR(1) coefficient,
+                $\phi_c = \phi_{\max} \tanh(a_c)$. At $\phi_c = 1$ every step after the first is
+                scored on the change of the residual alone, so a constant level error costs one
+                cell; a bound below $1$ keeps part of the level error in every innovation. ``1.0``
+                -- the default -- is the unbounded coefficient, bitwise.
+            target_scored_start: $\tau^{0}_c$ per **declared** target channel, the first horizon
+                step scored for that channel, resolved by the trainer from the shards' novelty
+                curve and ``target_min_novelty``. A cell is scored when
+                $\tau^{0}_c \le \tau < H_c$; a channel with $\tau^{0}_c \ge H_c$ is not scored at
+                all. ``None`` -- the default -- starts every channel at step $0$.
+            persistence_lags: $P$, the number of the target's own most recent stored values the
+                decoder's persistence term reads. ``1`` -- the default -- is the single-lag term.
             source_quality_mask: Require ``source_valid`` in every forward and apply it: bad UA
                 steps leave the lag keys, and an anchor with no valid key keeps $q = p$. Paired
                 with the dataset's ``ua_step_mask``. ``False`` builds the model bitwise as before
@@ -247,6 +261,8 @@ class SeqVaeLagAttnTrfCfs(
         self._set_likelihood_structure(
             target_scored_horizon=target_scored_horizon,
             forecast_ar_residual=forecast_ar_residual,
+            forecast_ar_max=forecast_ar_max,
+            target_scored_start=target_scored_start,
         )
 
         # The alignment shifts reach the base under ITS names, which is the one place in this

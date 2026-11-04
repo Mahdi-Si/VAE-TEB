@@ -1,25 +1,18 @@
 # `SeqVaeLagAttn`: the lag-attention VAE-TEB model
 
 **Code:** `teb_vae/lag_attn/nets/model.py` and the modules it imports from
-`teb_vae/lag_attn/nets/` (`attention.py`, `blocks.py`, `decoders.py`, `encoders.py`, `heads.py`).
+`teb_vae/lag_attn/nets/` (`attention.py`, `blocks.py`, `decoders.py`, `delays.py`, `encoders.py`,
+`heads.py`).
 **Training:** `teb_vae/lag_attn/task.py` (objective and controls) and
 `teb_vae/lag_attn/trainer.py` (experiment driver), configured by `teb_vae/lag_attn/configs/default.yaml`.
 **Companion documents:** `teb_vae/lag_attn/DESIGN.md` is the short standalone contract (tensor
 interface, geometry, deviation record). This document is the long-form, code-grounded description
 of the network and how it is trained.
 
-`SeqVaeLagAttn` is a single self-contained `nn.Module`. It is the flattened rebuild of the earlier
-three-level inheritance chain that lived under the now-deprecated `model/vae_teb_prediction/model/`.
-That older tree, and its historical framing of each level as a set of deltas on the one below, are
-described in `knowledge/vae-teb-lag-attn-v3-implemented-model.md`, which is kept frozen as a record
-of where this model came from. **This model is not a subclass of anything and is not
-checkpoint-compatible with that tree**; read this document, not the frozen one, for what the code
-does today. The flatten preserved the model's structure exactly — the parameter count, every
-state-dict key and shape, and the forward/loss contracts. The complete list of intentional
-differences from the original is §8 of `DESIGN.md`. The structural test that once asserted this
-against a captured snapshot has been retired: its fixtures were captured at the predecessor's
-input widths ($c_y = 87$, $c_u = 101$), which the dataset has since changed, so there is no
-longer a common geometry to compare at.
+`SeqVaeLagAttn` is a single self-contained `nn.Module`. It is a flattened rebuild of an earlier
+three-level inheritance chain. **This model is not a subclass of anything and is not
+checkpoint-compatible with the predecessor.** §8 of `DESIGN.md` lists the intentional differences
+from the predecessor.
 
 ---
 
@@ -81,18 +74,29 @@ of width $c_y = 109$. The source stream is either $\mathrm{concat}(u_{\mathrm{st
 of width $c_u = 58$ (when `use_up_st=True`) or $u_{\mathrm{ph}}$ alone of width $c_u = 15$ (when
 `use_up_st=False`). Both UP fields are first-class HDF5 datasets; there is no slicing fallback.
 
-The widths are checked **against the first batch**, not at construction. $c_y$ and $c_u$ are
-properties of the dataset, and the constructor cannot see one: an earlier version compared them
-against module constants, which went stale the moment the pipeline's phase-harmonic selection
-changed — and, because a checkpoint stores its constructor kwargs, would have made every
-pre-change checkpoint un-rebuildable. Assembling and checking the streams is the *task's* job:
+The widths are checked **against every batch**, not at construction. $c_y$ and $c_u$ are
+properties of the dataset, and the constructor cannot see the dataset. Assembling and checking
+the streams is the *task's* job:
 `SeqVaeLagAttnTask._build_source_stream` and `_build_target_streams` concatenate the fields and
 raise a clear error naming the actual per-field widths, the configured value, and the config key
 that fixes it.
 
-> **The number $58$ is ambiguous across that change**: it is the current `use_up_st=True` width
-> ($43 + 15$) and was the old `use_up_st=False` width. Decide from `use_up_st` first, then set the
-> width — never migrate $c_u$ by pattern-matching the number.
+> **The number $58$ is ambiguous**: it is the current `use_up_st=True` width ($43 + 15$) and was
+> the width of the old phase-only selection. Decide from `use_up_st` first, then set the width —
+> never migrate $c_u$ by pattern-matching the number.
+
+**Causal input guard.** The stored features are two-sided wavelet transforms, so the value at step
+$t$ contains raw signal from after $t$. The config key `causal_reach_budget_s` sets a reach budget
+in seconds. `trainer.py::_build_model_kwargs` resolves it through
+`channel_reach.resolve_stream_budgets` into the constructor arguments `target_keep_index`,
+`target_delays`, `source_keep_index` and `source_delays`. The model then builds one `ChannelGate`
+(`delays.py`) per stream. The gate keeps the channels whose forward reach fits the budget and
+delays each survivor by $\delta_c = \lceil \mathrm{reach}_c / \Delta \rceil$ steps, filling the
+delayed prefix with zeros. The resolver raises if $\max_c \delta_c$ exceeds `warmup_period`, so
+the zero-filled prefix falls inside the steps the loss discards. The gate runs inside `forward`,
+after the data boundary has checked the batch against the full declared widths. With no budget
+(`causal_reach_budget_s: null`), no gate is built. The shipped config sets
+`causal_reach_budget_s: 120`.
 
 Three geometry guards — the ones the model genuinely owns — still run at construction:
 $\mathrm{num\_heads} \cdot d_{\mathrm{head}} = d_{\mathrm{model}}$, $d_z \bmod
@@ -126,14 +130,11 @@ decimated steps; `CombinedHDF5Dataset` trims $15$ steps from each end under `tri
 **The model performs no trimming and must not** — omit `trim_minutes` and the loader silently
 yields $330$ steps, which every module here will happily accept.
 
-> **Lag readouts are on the stored timeline, and it is canonical.** The pipeline's MIMO adaptor
-> is built with `up_shift_secs=-20`, so the UP trace is advanced $80$ raw samples ($5$ decimated
-> steps) earlier than FHR before any transform is taken
-> (`hdf5_dataset/dataset_explained_research.md` §3.4). That shift is part of how the stored
-> signals are. Every lag this model reports is measured on the stored grid and stays there: an
-> attention peak at lag $\ell$ is $4\ell$ seconds, and no downstream figure, column or reading
-> adds the builder's shift back or subtracts it. The `up_shift_secs` evaluation key that once did
-> so was removed on 2026-09-05.
+> **Lag readouts are on the stored timeline, and it is canonical.** An attention peak at lag
+> $\ell$ is $4\ell$ seconds on the stored grid. When a causal reach budget is configured, the
+> source channels are read $\delta$ steps stale, so a peak at lag $\ell$ refers to source content
+> $\ell + \delta$ steps back. `SeqVaeLagAttn.source_delay_steps` reports the maximum source delay,
+> and `nets/lag_report.py::lag_compensated_seconds` computes $\Delta(\ell + \delta)$.
 
 The anchor support is $\mathcal{A} = [w_{\mathrm{warm}}, T - H_d)$: the steps whose $H_d$-long
 forecast window is fully inside the observed sequence. The tiny test geometry
@@ -148,7 +149,9 @@ exercises the paths a production model takes (§25).
 
 `forward` runs the following, all in the $(B, T, \cdot)$ layout unless noted:
 
-1. **Adapt.** $Y$ and $U$ are projected to $d_{\mathrm{model}}$ by their own `InputAdapter` (§6).
+1. **Gate and adapt.** $Y = \mathrm{concat}(y_{\mathrm{st}}, y_{\mathrm{ph}})$ and $U$ pass
+   through their `ChannelGate` when a reach budget is configured (§2). Each stream is then
+   projected to $d_{\mathrm{model}}$ by its own `AvailabilityInputAdapter` (§6).
 2. **Encode.** `target_encoder` and `source_encoder` produce the causal history states
    $H^y, H^u \in \mathbb{R}^{B \times T \times d_{\mathrm{model}}}$ (§7).
 3. **Prior.** `prior_head(H^y)` returns $\mu^p$, $\log\sigma^{2,p}$ (bounded), the raw pre-bound
@@ -199,7 +202,7 @@ which would make a net impossible to construct without a configured logger. A te
   copies the affine parameters, so the swap is a no-op for the affine transform and changes only
   which elements the statistics pool over.
 - **`validate_choice(value, allowed, name)`** — the shared enum guard behind the constructor's
-  string arguments (`kld_support`, `lag_bias_init`), raising with the offending value and the
+  string arguments (`kld_support`, `lag_bias_init`, `posterior_logvar_mode`), raising with the offending value and the
   permitted set rather than failing later on an unrecognised branch.
 - **`smooth_bound(r, lo, hi)`** $= lo + (hi - lo)\,\sigma(r)$ — a scaled sigmoid mapping a raw value
   into the open interval $(lo, hi)$. Unlike `torch.clamp` its gradient is strictly positive
@@ -215,12 +218,26 @@ which would make a net impossible to construct without a configured logger. A te
   *effective* forget bias $b_{ih} + b_{hh}$ starts at $1$) so the gate starts open and gradients
   survive the early steps of a long sequence.
 
-## 6. Input adapters (`encoders.py::InputAdapter`)
+## 6. Input adapters (`encoders.py::AvailabilityInputAdapter`)
 
-One class serves both streams; they differ only in `in_dim`. The adapter is
-`Linear` $\to$ `LayerNorm` $\to$ `GELU` $\to$ `Dropout` $\to$ `ResidualMLP`, projecting
-$(B, T, \text{in\_dim}) \to (B, T, d_{\mathrm{model}})$. `in_dim` is required rather than defaulted
+One class serves both streams; they differ only in `in_dim`. The stack is the same as
+`InputAdapter`: `Linear` $\to$ `LayerNorm` $\to$ `GELU` $\to$ `Dropout` $\to$ `ResidualMLP`,
+projecting $(B, T, \text{in\_dim}) \to (B, T, d_{\mathrm{model}})$. `in_dim` is the width the gate
+emits (or the declared width when the stream is ungated). It is required rather than defaulted,
 because the two streams have different widths and a default would silently fit only one of them.
+The model builds both adapters with `post_residual_activation=True`.
+
+When the stream has per-channel delays $\delta_c$, the adapter adds two terms to the first linear's
+output:
+
+$$e_t = W_x \left(x_t \odot m_t\right) + W_m\!\left(m_t - \mathbf 1\right)
+    + \mathbb 1\!\left[\textstyle\sum_c m_{t,c} = 0\right] e_{\mathrm{start}},
+\qquad m_{t,c} = \mathbb 1[t \ge \delta_c].$$
+
+The $W_m$ term tells the model which channels are not yet available, and $e_{\mathrm{start}}$ is a
+learned embedding for a step where no channel is available. The $W_m$ term is exactly zero wherever
+every channel is available. With no delays, neither term is constructed, and the adapter has the
+same parameters as a plain `InputAdapter`.
 
 ## 7. Causal CNN–LSTM encoders (`encoders.py::CausalConvLstmEncoder`)
 
@@ -240,13 +257,12 @@ over the projected input and are then fused:
 They fail in different directions — the conv stack cannot remember past its receptive field, the
 LSTM blurs what it does remember — so concatenating them $(2 d_{\mathrm{model}})$ and fusing back
 down through a `ResidualMLP` lets each cover the other. A front `ResidualMLP` precedes both branches
-and a final `output_norm` `LayerNorm` caps the exit to roughly per-step $N(0, I)$; without it the
-exit drifts unbounded, which downstream shows up as a single latent dimension sitting at an absurd
-prior mean.
+and a final `output_norm` `LayerNorm` normalises the exit per step, so the encoder state cannot
+drift unbounded.
 
 The two encoders share this architecture and differ only in their base convolution kernel schedule
 (target `(3, 7, 11)`, source `(3, 5, 11)`); both run at $d_{\mathrm{model}}$, because the streams'
-differing channel counts have already been equalised by their own `InputAdapter` upstream.
+differing channel counts have already been equalised by their own `AvailabilityInputAdapter` upstream.
 `encoder_extra_dilations`
 appends one extra block per requested dilation, each at kernel size $15$, extending both stacks'
 receptive fields; the base dilation schedule is $(1, 2, 4)$ and the production config appends
@@ -260,18 +276,16 @@ on a $(B, C, T)$ tensor reduces over every non-batch dimension inside a group, i
 so its statistics **pool across time**: the normalised value at $t$ becomes a function of the whole
 sequence, including $t' > t$. Then $H^y_t$ carries a low-bandwidth image of its own future, the
 "prior" $p(z_t \mid Y_{\le t})$ secretly conditions on that future, and $K_t$ is no longer a
-transfer-entropy surrogate at all. The leak is small and completely invisible in a loss curve — it
-corrupts only the quantity the model exists to measure. Measured relative leak into
-`target_state[t]` from resampling $Y_{>t}$: $\approx 11.5\%$ at $T{=}32$, $\approx 3.4\%$ at
-$T{=}300$.
+transfer-entropy surrogate at all. The leak does not show in a loss curve; it corrupts only the
+quantity the model exists to measure. `tests/test_causal_encoder.py` checks that the encoder
+states have zero future leak with the swap.
 
 `causal_norm=True` (production) calls `causalize_norms` on both encoders, swapping every encoder
 `GroupNorm` for a `CausalGroupNorm`. Each encoder holds one `pre_norm` per conv block plus
 $n_{\mathrm{blocks}} - 1$ inter-block skip norms, so the total across both encoders is
 $2(2 n_{\mathrm{blocks}} - 1)$: **10** in the base 3-block geometry, **18** in production, where
 `encoder_extra_dilations: [8, 16]` takes each stack to 5 blocks. `n_causalized_norms` records the
-actual count. Measured
-leak after the swap: $0.0$. Because the swap preserves parameter names and shapes, a state-dict
+actual count. Because the swap preserves parameter names and shapes, a state-dict
 still aligns key-for-key. The decoders and the shared horizon core are deliberately **not**
 causalised — their `GroupNorm`s pool over the forecast-horizon axis of a *single anchor*, mixing
 that anchor's outputs rather than reaching across input time (§12). `causal_norm=False` restores the
@@ -434,6 +448,20 @@ load-bearing:
   \log\sigma^{2,p}_t$ at init and break the exact zero. The forward therefore threads
   `raw_logvar_prior` through, and `posterior_head` raises if it is not supplied.
 
+The equations above describe `posterior_logvar_mode='residual'`, which is the constructor default
+and the shipped value. Under `posterior_logvar_mode='independent'` the posterior log-variance has
+its own head, `logvar_post_head`, with no dependence on the prior's raw value. Under `'residual'`
+the reconstruction gradient that sharpens $\sigma^q$ also reaches `raw_logvar_prior`;
+`'independent'` removes that gradient path. `_zero_init_delta_heads` seeds the independent head
+with zero weight and its bias at the pre-image of log-variance $0$, and raises unless $0$ lies
+inside `logvar_clamp`. This model's prior head is not calibrated to log-variance $0$ at
+initialisation, so under `'independent'` the KL at initialisation is not exactly zero.
+
+`source_dropout` sets one dropout rate for the source pathway: the source adapter, the source
+encoder, and the attended source summary inside the posterior fusion. With `source_dropout=None`
+the adapter and the encoder run at the global `dropout`, and the posterior fusion applies no
+dropout to the attended summary.
+
 Two latent structures are supported:
 
 - **Flat** (`head_structured_latent=False`): the posterior concatenates $[LN(H^y) \,\|\, LN(A)]$,
@@ -460,7 +488,7 @@ $N(\mu^q, \sigma^{2,q})$ directly, which keeps $\mu^q$ and $\sigma^q$ on the gra
 identical inputs return different `z`, `mu_full` and `logvar_full`. The KL readouts are unaffected
 (they are functions of $\mu$ and $\log\sigma^2$ only). Only `encode_only` offers `sample_z=False`,
 which returns $\mu^q$ in place of a sample; it defaults to `True`. (The
-older tree carried a latent-statistics EMA-normalisation mechanism; it had no consumer in this tree
+predecessor carried a latent-statistics EMA-normalisation mechanism; it had no consumer in this tree
 and was removed in the flatten, along with its three running buffers — see `DESIGN.md` §8.)
 
 ## 12. Future decoders (`decoders.py`)
@@ -760,15 +788,20 @@ runs the fit through the framework's `build_trainer`. Notable behaviours:
   `freeze_unused_attn_proj` has taken it out of the expectation set), else
   `'ddp_find_unused_parameters_true'`. It sources every input from `config`, deliberately not from
   the passed Lightning module, whose attributes would not answer the question.
-- **Spike breaker as a non-finite guard only.** The framework breaker's relative test is
+- **Causal reach budget.** `_build_model_kwargs` translates `causal_reach_budget_s` into the four
+  channel tuples (§2), so every checkpoint's `model_kwargs` carries them.
+  `causal_standing_message` logs the resolved budget at startup, or states that no budget is set.
+- **Spike breaker: non-finite guard plus an additive test, relative test off.** The framework
+  breaker's relative test is
   $\text{watched} > \text{multiplier} \cdot \max(\mathrm{EMA}, \mathrm{ema\_floor})$, which assumes a
   loss bounded below by zero. This model's `main_loss` is a Gaussian NLL with learned observation
-  variance and goes negative routinely; once the EMA is negative, $\max(\mathrm{EMA}, 0)$ is $0$ and
-  every positive batch reads as a spike, so the run silently drops its hardest batches and no value
-  of `ema_floor` rescues the relative test. The shipped config sets `ema_floor: 1.0e9` — far above
-  any reachable loss — which switches the relative test off while leaving the non-finite guard
-  intact. That guard is the part worth keeping: it stops a `NaN` loss from writing `NaN` gradients
-  into every weight.
+  variance and can be negative. Once the EMA is negative, $\max(\mathrm{EMA}, 0)$ is $0$ and every
+  positive batch reads as a spike. The shipped config sets `ema_floor: 1.0e+9`, which switches the
+  relative test off. The non-finite guard stays active and stops a `NaN` loss from writing `NaN`
+  gradients into every weight. The shipped `additive_margin: 3.0` skips a batch when
+  $\text{watched} > \mathrm{EMA} + \mathrm{margin}$, compared against the raw EMA, so it also works
+  when the loss is negative. `max_consecutive_skips: 25` force-accepts the next finite batch after
+  that many consecutive skips.
 
 `freeze_unused_attn_proj=True` clears `requires_grad` on $W_o$'s parameters when
 `head_structured_latent` is also set (a numerical no-op — AdamW never updated them), which is what
@@ -784,17 +817,14 @@ with a stranger's source and asks what happens. It ships as a **readout** (`lamb
 produces two readouts that are not equally useful:
 
 - **KL space** — $K_{\mathrm{shuffled}} = \mathrm{KL}(q(z \mid Y, \pi(U)) \,\|\, p(z \mid Y))$,
-  against the same prior. This answers "did the source move my belief?", which a mismatched source
-  does too — often *more* strongly, since the posterior only ever trained on matched pairs and a
-  stranger's source is out of distribution. So $K_{\mathrm{shuffled}} \gtrsim K_{\mathrm{true}}$ is
-  routine even on a model that plainly uses the source. **`kld_raw` alone is therefore not a
-  source-specific TE surrogate**, and the spec's original acceptance
-  ($K_{\mathrm{shuffled}} < K_{\mathrm{true}} - \text{margin}$) is not achievable. A positive
-  `lambda_perm` collapsed the source pathway in half the seeds tried, so it stays $0$.
-- **Prediction space** — the control that discriminates, and it needs no auxiliary loss. Feeding the
-  decoder a latent drawn from $q(z \mid Y, \pi(U))$ and re-scoring against the true future lands
-  *above* the target-only baseline loss on a model genuinely using the source: a wrong source is
-  worse than no source. The ordering that means something is
+  against the same prior. This answers "did the source move my belief?". A mismatched source can
+  also move the posterior, because the posterior trains only on matched pairs and a stranger's
+  source is out of distribution. **`kld_raw` alone is therefore not a source-specific TE
+  surrogate.** With `lambda_perm > 0`, the task adds $\lambda_{\mathrm{perm}} K_{\mathrm{shuffled}}$
+  to the loss; the shipped config keeps `lambda_perm: 0.0`.
+- **Prediction space** — the control that tests specificity, and it needs no auxiliary loss. The
+  task feeds the decoder a latent drawn from $q(z \mid Y, \pi(U))$ and re-scores it against the true
+  future. The ordering that indicates a source-specific model is
 
   $$L_{\mathrm{feat}} < L_{\mathrm{base}} < L_{\mathrm{feat, shuffled}},$$
 
@@ -821,8 +851,8 @@ pathway. Omitted, the mean is taken over the perm steps alone and is right.
 **Fused single backward.** The source path contains no batch-coupled operator (only causal
 convolutions, an LSTM and LayerNorm), so
 $\mathrm{Encoder}(\mathrm{Adapter}(\pi(U)))_i = H^u[\pi(i)]$. `perm_kl_from_forward` therefore
-permutes the already-computed `source_state` along the batch axis — exactly equivalent to re-encoding
-$\pi(U)$, verified to $\approx 1.6\times10^{-6}$ — and only the attention and posterior are re-run.
+permutes the already-computed `source_state` along the batch axis — equivalent to re-encoding
+$\pi(U)$ — and only the attention and posterior are re-run.
 This keeps the whole control inside the *single* main forward and backward, which is what lets the
 model keep automatic optimisation; under plain `'ddp'` a second backward that does not touch every
 parameter would deadlock or force `find_unused_parameters`. Gradient clipping, accumulation, LR
@@ -846,10 +876,12 @@ small to derange would otherwise build a divergent autograd graph and deadlock t
 ## 21. Production configuration summary (`configs/default.yaml`)
 
 Backbone: `d_model: 128`, `d_z: 24`, `horizon: 30`, `warmup_period: 30`, `sequence_length: 300`,
-`c_y: 109`, `c_u: 58`, `use_up_st: true`, `lstm_layers: 2`, `dropout: 0.1`, `decoder_hidden: 128`,
-`logvar_clamp: [-5.0, 3.0]`, `mu_scale: 5.0`, `delta_mu_scale: 3.0`, `delta_logvar_scale: 2.0`.
+`c_y: 109`, `c_u: 58`, `use_up_st: true`, `lstm_layers: 2`, `dropout: 0.1`, `source_dropout: null`,
+`decoder_hidden: 128`, `logvar_clamp: [-5.0, 3.0]`, `mu_scale: 5.0`, `delta_mu_scale: 3.0`,
+`delta_logvar_scale: 2.0`, `posterior_logvar_mode: residual`.
 
-Correctness-critical / research toggles: `causal_norm: true`, `kld_support: anchor`,
+Correctness-critical / research toggles: `causal_norm: true`, `causal_reach_budget_s: 120`,
+`kld_support: anchor`,
 `head_structured_latent: true`, `freeze_unused_attn_proj: true`, `lambda_perm: 0.0`,
 `perm_every_n_batches: 4`, `use_entmax: true`, `lag_bias_init: alibi_decay`,
 `lag_smoothness_lambda: 1.0e-3`.
@@ -859,9 +891,9 @@ Attention: `max_lag: 90`, `num_heads: 4`, `d_head: 32`. Horizon core: `horizon_r
 
 Loss (task/`compute_loss` arguments, not constructor kwargs): `likelihood: gaussian_nll`,
 `sigma_obs: learned`, `detach_baseline_in_full: true`, `lambda_full: 1.0`, `lambda_base: 0.5`,
-`free_bits: 0.1`, `beta_schedule: {kind: linear_warmup, start: 1.0e-4, end: 0.1, warmup_epochs: 50}`
-(`end` is a starting value to retune against `kld_raw`), and `kld_beta: 0.001` — the fallback used
-only when `beta_schedule.kind` is `constant`, and therefore inert in the shipped configuration.
+`free_bits: 0.1`, `beta_schedule: {kind: linear_warmup, start: 1.0e-4, end: 0.001, warmup_epochs: 50}`,
+and `kld_beta: 0.001` — the fallback used only when `beta_schedule.kind` is `constant`, and
+therefore inert in the shipped configuration.
 
 ## 22. Constructor arguments
 
@@ -872,6 +904,9 @@ config. The ones that change behaviour materially:
 | --- | --- | --- | --- |
 | `use_up_st` | `True` | `True` | source stream includes UP scattering ($c_u=58$) vs phase-harmonic only ($c_u=15$) |
 | `causal_norm` | `False` | `True` | swap encoder `GroupNorm`s for `CausalGroupNorm`; **required** for the TE reading |
+| `target_keep_index` / `target_delays` / `source_keep_index` / `source_delays` | `None` | resolved from `causal_reach_budget_s: 120` | per-stream `ChannelGate`: surviving channels and their delays (§2). `None` builds no gate |
+| `posterior_logvar_mode` | `'residual'` | `'residual'` | posterior log-variance as a bounded delta on the raw prior vs its own head (§10) |
+| `source_dropout` | `None` | `None` | one dropout rate for the source adapter, source encoder and posterior source summary; `None` keeps `dropout` on the first two and no dropout on the third (§10) |
 | `head_structured_latent` | `False` | `True` | per-head latent groups $\Rightarrow$ additive per-head KL and a rigorous `te_lag_map` |
 | `freeze_unused_attn_proj` | `False` | `True` | freeze $W_o$ so the run can use plain `'ddp'`. Conditioned on `head_structured_latent`: with a flat latent $W_o$ is live and the flag is a no-op |
 | `kld_support` | `'full'` | `'anchor'` | training-KL time support: all post-warmup steps vs supervised anchors only |
@@ -895,7 +930,9 @@ the task reads them from the loss config and passes them through per step.
 `model_config.VAE_model.lag_smoothness_lambda` (`trainer.py::create_model`); there is no
 `lambda_lag:` key in the YAML and adding one would be silently ignored. `beta` has no config key at
 all — it is derived per epoch by the task from `beta_schedule` (falling back to `kld_beta`). The
-remaining six loss arguments keep their names. The constructor kwargs are otherwise resolved by a single `inspect.signature`
+remaining six loss arguments keep their names. `causal_reach_budget_s` is also not a constructor
+argument: the driver translates it into the four channel tuples. The constructor kwargs are
+otherwise resolved by a single `inspect.signature`
 sweep, so a flat `VAE_model` key is forwarded exactly when it names a real constructor argument,
 is not in `_NON_CONSTRUCTOR_KEYS` (`horizon_refine`, `encoder`, `init_weights`), and is not `None`
 — a misspelled key is dropped without complaint and the constructor default silently applies.
@@ -908,7 +945,7 @@ interventional TE beyond the `lag_band_mask` ablation hook; and any alternative-
 *normaliser* is optional (softmax fallback) and ships **on**; the `entmax` *dependency* is not
 optional — `attention.py` imports it unconditionally at module level, so `use_entmax=False` still
 requires the package installed. The latent-statistics EMA normalisation,
-the dead lag-memory-bank builder, and the stub raw-future decoder that existed in the source tree
+the dead lag-memory-bank builder, and the stub raw-future decoder that existed in the predecessor
 were all removed in the flatten (see the deviation record, `DESIGN.md` §8).
 
 ## 24. Interpretation rules
@@ -948,8 +985,8 @@ called "prod" (`causal_norm`, `kld_support`, `lag_bias_init`, `lambda_perm`, `pe
 `freeze_unused_attn_proj`), and `SHIPPED_KWARGS` is what `default.yaml` actually sets — `use_entmax`,
 `head_structured_latent`, `horizon_depth: 3`, `horizon_film` and `encoder_extra_dilations`. Only
 the last builds the per-head posterior, the FiLM generator, the third refine block and the two
-extra conv blocks per encoder, so a test written against `PROD_KWARGS` leaves roughly a third of
-the production model's parameters unexercised and `freeze_unused_attn_proj` inert. The
+extra conv blocks per encoder, so a test written against `PROD_KWARGS` leaves those modules
+unexercised and `freeze_unused_attn_proj` inert. No kwarg set configures a causal reach budget. The
 `perturb_posterior` fixture is equally load-bearing: the delta heads are zero-initialised, so every
 KL assertion on an untouched model passes vacuously — including on a model that is entirely wrong.
 
@@ -957,7 +994,6 @@ KL assertion on an untouched model passes vacuously — including on a model tha
 
 `SeqVaeLagAttn` is a source-pure, strictly-causal, residual sequential VAE that forecasts a fetal
 FHR feature stream from its own past plus a lag-attended uterine-pressure source, and reports the
-per-step KL between its source-conditioned posterior and its target-only prior — earned from an exact
-zero at initialisation, anchor-aligned, honestly split into optimised and raw readouts, and
-attributed across lags — as a defensible transfer-entropy surrogate for source$\to$target
-information flow.
+per-step KL between its source-conditioned posterior and its target-only prior — exactly zero at
+initialisation, anchor-aligned, split into optimised and raw readouts, and attributed across
+lags — as a transfer-entropy surrogate for source$\to$target information flow.

@@ -1,4 +1,4 @@
-"""Fold weighting (SPEC §11.7) in metrics and report: ``metrics.fold_weights_of``, the fold band of the ``*_folds``
+"""Fold weighting in metrics and report: ``metrics.fold_weights_of``, the fold band of the ``*_folds``
 subgroup figures (``report.fold_rates``) and the report's own weighted per-fold curves (``report._fold_w``,
 ``_s_rows``, ``_reliability``, ``_ovr_curve``)."""
 from __future__ import annotations

@@ -1,8 +1,8 @@
-"""Metric engine and analysis registry for the classifier (SPEC §11.4, §11.5, §11.7, §11.9).
+"""Metric engine and analysis registry for the classifier.
 
 The engine is pure functions over numpy arrays (labels, calibrated logits, thresholds) and never
 imports torch, so evaluation re-runs from the prediction tables alone. sklearn computes every metric
-it has; the rest is a few lines of formula (Appendix B).
+it has; the rest is a few lines of formula.
 
 The pilot helpers (``latent_pilot/evaluate.py``: ``confusion_counts``, ``derived_rates``,
 ``paired_bootstrap``, ``metric_intervals``) are ported, not imported: that module loads torch and
@@ -41,7 +41,7 @@ from sklearn.preprocessing import SplineTransformer
 
 NAN = float("nan")
 
-#: Columns of ``evaluation/tables/metrics.parquet``: §11.9 plus ``point`` (checkpoint | bin | end;
+#: Columns of ``evaluation/tables/metrics.parquet``: the long-format columns plus ``point`` (checkpoint | bin | end;
 #: ``n/a`` for the P2 rows, which are read at a policy's own basis point), in order.
 METRIC_COLUMNS: Tuple[str, ...] = (
     "run_id", "model_id", "seed", "fold", "split", "level", "task", "head", "label_strategy",
@@ -68,7 +68,7 @@ def _yl(y: Any, logit: Any, w: Any = None) -> Tuple[np.ndarray, np.ndarray]:
 def _nonzero(w: Any, n: int, *rows: Any) -> Tuple[Any, ...]:
     """``(w, *rows)`` without the zero-weight rows: ``w`` validated as one finite weight $w_i \\ge 0$ per row, each of
     ``rows`` (row-aligned on axis 0; None passes) cut to the rows with $w_i > 0$. A zero weight is then exactly a
-    dropped row, bootstrap strata and draws included (§11.7 fold weighting: a shared GUID under ``exclude``).
+    dropped row, bootstrap strata and draws included (fold weighting: a shared GUID under ``exclude``).
     ``w=None`` (unweighted) returns everything unchanged."""
     if w is None:
         return (None, *rows)
@@ -106,14 +106,14 @@ def _ece(y: np.ndarray, p: np.ndarray, n_bins: int = 10, w: Optional[np.ndarray]
 
 
 def threshold_free(y: Any, logit: Any, *, alpha: float, w: Any = None) -> Dict[str, float]:
-    """Ranking and calibration metrics of calibrated logits (§11.4).
+    """Ranking and calibration metrics of calibrated logits.
 
     ``calib_intercept`` is calibration-in-the-large (slope fixed at 1, logit as offset);
     ``calib_slope`` the unpenalised logistic slope of y on the logit. ICI/E50/E90 use a cubic
     B-spline logistic smooth of y on the logit (Austin & Steyerberg, LOWESS-free). Ranking and
     recalibration metrics are NaN when a class is missing; logloss/brier/ece stay defined.
 
-    ``w``: optional row weights $w_i \\ge 0$ (§11.7 fold weighting; :func:`fold_weights_of`), giving each metric on
+    ``w``: optional row weights $w_i \\ge 0$ (fold weighting; :func:`fold_weights_of`), giving each metric on
     the weighted population. Zero-weight rows are dropped first (:func:`_nonzero`); sklearn takes the rest as
     ``sample_weight`` (AUROC, AUPRC, pAUC, logloss, Brier, scaled Brier, the slope and the ICI smooth); prevalence
     and ICI are weighted means, E50/E90 weighted quantiles (:func:`_wquantile`), ECE :func:`_ece`'s weighted form,
@@ -156,7 +156,7 @@ def threshold_free(y: Any, logit: Any, *, alpha: float, w: Any = None) -> Dict[s
 def confusion_rates(tp: Any, fp: Any, tn: Any, fn: Any) -> Dict[str, float]:
     """Counts plus rates. NaN only when a class count is 0; PPV/NPV/F1 are 0 when never fired.
 
-    Integer counts come back as ints; weighted counts (any float, §11.7 fold weighting) come back as floats, same
+    Integer counts come back as ints; weighted counts (any float, fold weighting) come back as floats, same
     rules (a weighted class total of 0 is a missing class)."""
     cast = int if all(isinstance(x, (int, np.integer)) for x in (tp, fp, tn, fn)) else float
     tp, fp, tn, fn = cast(tp), cast(fp), cast(tn), cast(fn)
@@ -179,7 +179,7 @@ def confusion_rates(tp: Any, fp: Any, tn: Any, fn: Any) -> Dict[str, float]:
 
 
 def thresholded(y: Any, logit: Any, thr: float, w: Any = None) -> Dict[str, float]:
-    """Confusion and rates of the rule ``logit > thr`` (§11.4); includes ``threshold``. ``w``: optional row weights
+    """Confusion and rates of the rule ``logit > thr``; includes ``threshold``. ``w``: optional row weights
     (``confusion_matrix``'s ``sample_weight``; zero-weight rows dropped), so the counts are weighted floats."""
     y, s = _yl(y, logit, w)
     w, y, s = _nonzero(w, y.size, y, s)
@@ -266,7 +266,7 @@ def wilson(k: Any, n: Any, confidence: float = 0.95) -> Tuple[Any, Any]:
 
 
 def kish_wilson(num: Any, den: Any, w: Any, confidence: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
-    """Wilson interval of each row's weighted proportion at Kish's effective sample size (§11.7 fold weighting).
+    """Wilson interval of each row's weighted proportion at Kish's effective sample size (fold weighting).
 
     ``num``, ``den``: ``(C, n)`` bool over rows (``num`` within ``den``), ``w``: ``(n,)`` row weights. Row $c$ has
     $\\hat p = \\sum_i w_i\\,\\mathrm{num}_{ci} / \\sum_i w_i\\,\\mathrm{den}_{ci}$ and
@@ -282,7 +282,7 @@ def kish_wilson(num: Any, den: Any, w: Any, confidence: float = 0.95) -> Tuple[n
 
 
 def adjust_ppv_npv(sens: float, spec: float, prevalence: float) -> Tuple[float, float]:
-    """PPV/NPV at a reference prevalence via Bayes (§11.7)."""
+    """PPV/NPV at a reference prevalence via Bayes."""
     pi = prevalence
     return (sens * pi / (sens * pi + (1 - spec) * (1 - pi)),
             spec * (1 - pi) / (spec * (1 - pi) + (1 - sens) * pi))
@@ -297,7 +297,7 @@ def pooled_confusion(
     guid_rows: pd.DataFrame, thresholds_by_fold: Mapping[Any, float], shared_test_policy: str,
     *, score: str = "score_final_cal",
 ) -> Dict[str, Any]:
-    """Pooled OOF confusion: each row thresholded at its own fold's threshold, counts summed (§11.7).
+    """Pooled OOF confusion: each row thresholded at its own fold's threshold, counts summed.
 
     ``guid_rows`` needs ``fold, guid, y, shared_test`` and ``score``. Shared test GUIDs are kept once
     at the lowest fold (``first_fold``) or dropped (``exclude``); any other duplicate GUID raises.
@@ -324,7 +324,7 @@ def bootstrap_ci(
     fn: Callable[[np.ndarray], Mapping[str, float]], units: Any, y: Any, *,
     resamples: int = 2000, seed: int = 0, confidence: float = 0.95,
 ) -> Dict[str, Any]:
-    """Outcome-stratified cluster percentile bootstrap (§11.7; pilot ``paired_bootstrap`` semantics).
+    """Outcome-stratified cluster percentile bootstrap (pilot ``paired_bootstrap`` semantics).
 
     ``fn(idx)`` computes ``{metric: value}`` on the rows ``idx`` of the caller's aligned arrays, so
     one call can score several models on the same draws (paired). ``units`` names each row's cluster
@@ -505,13 +505,13 @@ def rate_ci(num: Any, den: Any, y: Any, units: Any = None, *, resamples: int, se
     """``(ci_lo, ci_hi, n_undefined)`` of each row's rate ``num[c].sum() / den[c].sum()`` (``(C, n)`` bool over
     rows, ``num`` within ``den``).
 
-    Wilson (§11.7) where every cluster of ``units`` (None: each row its own) holds at most one ``den``
+    Wilson where every cluster of ``units`` (None: each row its own) holds at most one ``den``
     row, i.e. one decision per cluster; its ``n_undefined`` is NaN (no draws). Elsewhere the decisions are not
     independent, so that row falls back to the outcome-stratified cluster percentile bootstrap (:func:`_unit_draws`
     on labels ``y``) of the ratio over all clusters; a draw with an empty denominator is undefined, left out of the
-    percentiles and counted in ``n_undefined`` (§11.7: never silently dropped). NaN CIs where ``den`` is empty.
+    percentiles and counted in ``n_undefined`` (never silently dropped). NaN CIs where ``den`` is empty.
 
-    ``w``: optional row weights (§11.7 fold weighting), the rate then
+    ``w``: optional row weights (fold weighting), the rate then
     $\\sum w\\,\\mathrm{num} / \\sum w\\,\\mathrm{den}$. Zero-weight rows are dropped first (:func:`_nonzero`), so
     they neither count as a cluster's decision nor enter the strata. The Wilson path becomes :func:`kish_wilson`; the bootstrap path weighs each row by $w_i$ times its
     unit's multiplicity.
@@ -579,14 +579,14 @@ def roc_band(y: Any, s: Any, units: Any, grid: np.ndarray, *, resamples: int, se
 def metric_rows(
     values: Mapping[str, float], ci: Optional[Mapping[str, Mapping[str, float]]] = None, **keys: Any
 ) -> list:
-    """§11.9 long-table rows, one per metric. ``values`` is ``{metric: value}`` (e.g. from
+    """Long-table rows, one per metric. ``values`` is ``{metric: value}`` (e.g. from
     :func:`threshold_free`); ``ci`` is ``bootstrap_ci(...)['metrics']``; ``keys`` fill the other
     :data:`METRIC_COLUMNS` (unset ones are None, ``point`` is ``n/a``). Build with
     ``pd.DataFrame(rows, columns=METRIC_COLUMNS)``.
     """
     unknown = set(keys) - set(METRIC_COLUMNS)
     if unknown:
-        raise ValueError(f"not §11.9 columns: {sorted(unknown)}")
+        raise ValueError(f"not long-format metric columns: {sorted(unknown)}")
     base, ci = dict.fromkeys(METRIC_COLUMNS) | {"point": "n/a"} | keys, ci or {}
     return [base | {"metric": m, "value": float(v), "ci_lo": ci.get(m, {}).get("ci_lo", NAN),
                     "ci_hi": ci.get(m, {}).get("ci_hi", NAN), "n_boot_undefined": ci.get(m, {}).get("n_undefined")}
@@ -595,8 +595,8 @@ def metric_rows(
 
 # --- analyses ---
 #
-# The P2 analysis registry (§11.12 blocks C, R1/R9, T1/T2, B1, plus the §11.4/§11.7 metric rows),
-# run fail-soft by :func:`evaluate` under the VAE's ``Report.step`` (§11.14). Evaluation reads only
+# The P2 analysis registry (blocks C, R1/R9, T1/T2, B1, plus the metric rows),
+# run fail-soft by :func:`evaluate` under the VAE's ``Report.step``. Evaluation reads only
 # ``<run>/predictions/*``, ``<run>/cohort/*`` and the resolved config (manifest.json optionally, for
 # provenance). Every table lands in ``<run>/evaluation/tables/``; ``report.py`` draws every figure
 # from those tables afterwards (figures are never rendered here). Nothing below imports torch at
@@ -618,16 +618,16 @@ from teb_vae.lag_attn.eval.report import Report, build_manifest, json_safe  # no
 SPLITS = ("val", "test")
 VAL_LABEL = "optimistic (used for selection)"
 BASELINES = ("probe", "shortcut", "shuffled")
-NOIND = "noind"  # model_id of the `no_indicator` ablation (§7.3.4), which verify criterion 10 accepts
-SHUFFLED_WARN_AUROC = 0.60  # §10.9.3 / §11.15 criterion 7: a fixed leak flag, not a config key
+NOIND = "noind"  # model_id of the `no_indicator` ablation, which verify criterion 10 accepts
+SHUFFLED_WARN_AUROC = 0.60  # verify criterion 7: a fixed leak flag, not a config key
 CLASSES = ("healthy", "acidosis", "hie")
-#: Tables §11.13 lists that P2 writes; verify criterion 11 requires each non-empty.
+#: Tables that P2 writes; verify criterion 11 requires each non-empty.
 P2_TABLES = ("metrics", "thresholds", "roc_points")
 #: FPR grid for the pooled bootstrap band and the vertical average (R1).
 ROC_GRID = np.linspace(0.0, 1.0, 101)
-#: Denominator of each metric-type basis (§11.5.1).
+#: Denominator of each metric-type basis.
 _DENOM = {"instantaneous": "bin_present", "committed_cumulative": "available", "committed_overall": "all"}
-#: Single proportions get Wilson intervals (§11.7): metric -> (hits, misses).
+#: Single proportions get Wilson intervals: metric -> (hits, misses).
 _PROP = {"sens": ("tp", "fn"), "spec": ("tn", "fp"), "fpr": ("fp", "tn"), "ppv": ("tp", "fp"), "npv": ("tn", "fn")}
 _DERIVED = ("bal_acc", "mcc", "lr_pos", "lr_neg", "f1")
 _HEADLINE = ("auroc", "auprc", "sens", "spec", "fpr", "ppv", "npv")
@@ -659,8 +659,8 @@ def _read_json(path: Path) -> Any:
 
 
 def load_context(run_dir: Any, cfg: Any) -> SimpleNamespace:
-    """Read the CONTRACT evaluation inputs; refuse predictions written under another config. ``thr`` holds each
-    unit's binary levels; its per-class OvR thresholds (``thresholds.json["ovr"]``, §11.3 T5) are ``thr_ovr``.
+    """Read the evaluation inputs; refuse predictions written under another config. ``thr`` holds each
+    unit's binary levels; its per-class OvR thresholds (``thresholds.json["ovr"]``, T5) are ``thr_ovr``.
 
     Raises:
         ValueError: If ``predictions/provenance.json``'s ``config_digest`` differs from the digest
@@ -696,7 +696,7 @@ def _keys(ctx: SimpleNamespace, m: str, sd: str, **extra: Any) -> Dict[str, Any]
 
 def cluster(df: pd.DataFrame) -> pd.Series:
     """Bootstrap cluster of each row: ``patient`` (``data.patient_map``, else the GUID) when the table
-    carries it (CONTRACT), else the GUID (runs predicted before the column existed)."""
+    carries it, else the GUID (runs predicted before the column existed)."""
     return df["patient"].fillna(df["guid"]).astype(str) if "patient" in df.columns else df["guid"].astype(str)
 
 
@@ -734,20 +734,19 @@ def level_units(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dict[str, 
 
 
 def fold_weights_of(frame: pd.DataFrame, policy: str, split: str) -> np.ndarray:
-    """Row weights of the per-fold populations of ``frame`` (§11.7 fold weighting): ``1/K`` for a row whose GUID
+    """Row weights of the per-fold populations of ``frame`` (fold weighting): ``1/K`` for a row whose GUID
     appears in K of the folds in ``frame``, so the K per-fold copies of a shared test GUID add up to the one GUID
     :func:`pool_rows` keeps; 0 for a shared GUID under ``data.shared_test_policy: exclude``, which pooling drops. Every
     other row weighs 1.
 
     ``frame`` holds every fold of one model/seed/split (columns ``fold``, ``guid``, ``shared_test``), one or more rows
     per GUID and fold (segment populations repeat the GUID). Pass the whole frame, then split it by fold: K is counted
-    over the folds the frame holds. Why: each fold's test set holds the same augmented healthy no-BG GUIDs (§2.5; 906 in
-    the 2026-10-07 run, 77 % of a fold's healthy GUIDs against 25 % pooled), so unweighted per-fold metrics are not
-    comparable with the pooled ones (fold-mean test AUROC 0.698 unweighted, 0.654 weighted, pooled 0.654).
+    over the folds the frame holds. Why: each fold's test set holds the same augmented healthy no-BG GUIDs, so a
+    fold's healthy share of shared GUIDs is far above the pooled share, and unweighted per-fold metrics are not
+    comparable with the pooled ones.
 
-    **Test only**: every val row weighs 1. Val GUIDs repeat across folds too (nested val sampling, every class: 1414
-    of 2542 val GUIDs sit in 2–9 folds' val splits), but that repetition does not skew a fold's composition (per-fold val
-    prevalence 0.50, as pooled), and each fold's thresholds and calibration were selected on its unweighted val
+    **Test only**: every val row weighs 1. Val GUIDs repeat across folds too (nested val sampling, every class), but
+    that repetition does not skew a fold's composition (per-fold val prevalence as pooled), and each fold's thresholds and calibration were selected on its unweighted val
     population, which its val rows must keep describing."""
     if split != "test":
         return np.ones(len(frame))
@@ -769,7 +768,7 @@ def pool_rows(units: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
 
 
 def _weighted(frame: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
-    """``(frame, w)``: a population with an optional ``w`` column (§11.7 fold weighting, :func:`fold_weights_of`)
+    """``(frame, w)``: a population with an optional ``w`` column (fold weighting, :func:`fold_weights_of`)
     cut to its rows with $w_i > 0$ (:func:`_nonzero`, which validates the weights), and those weights; ``(frame,
     None)`` (unweighted) without the column, or when every kept weight is 1 (a fold without shared GUIDs, a one-fold
     run), so such a population takes the unweighted path bit for bit, int counts included, as the time-resolved groups
@@ -876,7 +875,7 @@ def _pooled_ci(flagged: pd.DataFrame, thr_by_fold: Mapping[int, float], policy: 
 
 def policy_populations(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dict[Tuple[str, str], Tuple[dict, pd.DataFrame]]:
     """``{(level, policy_id): ({fold: thresholds entry}, population with fold, shared_test, patient)}``:
-    each policy's basis population (§11.3) on :func:`segments`, the segments its threshold was chosen on."""
+    each policy's basis population on :func:`segments`, the segments its threshold was chosen on."""
     ev, out = ctx.cfg["eval"], {}
     for key, per_level in ctx.thr.items():
         km, ks, kf = key.split("|")
@@ -900,7 +899,7 @@ def policy_populations(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dic
 
 
 def _fold_w(frame: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
-    """``frame`` (every fold of one model/seed/split: ``fold``, ``guid``, ``shared_test``) with its §11.7 fold weights
+    """``frame`` (every fold of one model/seed/split: ``fold``, ``guid``, ``shared_test``) with its fold weights
     as a ``w`` column (:func:`fold_weights_of`) on test, for the per-fold rows: split the result by fold, so each fold
     is scored on the weighted fold population (:func:`_weighted`). Val comes back unchanged, without ``w``, so its rows
     take the unweighted path bit for bit. Pool ``frame`` itself, never the result: :func:`pool_rows` keeps each GUID
@@ -910,7 +909,7 @@ def _fold_w(frame: pd.DataFrame, policy: str, split: str) -> pd.DataFrame:
 
 def _three_class_rows(ctx: SimpleNamespace, m: str, sd: str, split: str, alpha: float, policy: str,
                       boot: Mapping[str, Any]) -> list:
-    """§11.4 3-class rows of one model/seed/split, per fold and pooled (:func:`pool_rows`), at GUID level and, for a
+    """3-class metric rows of one model/seed/split, per fold and pooled (:func:`pool_rows`), at GUID level and, for a
     model :func:`level_units` scores at segment level, at segment level: every ``in_eval_window`` segment of
     :func:`segments` with its row's probabilities (the output after segment n: segment-local in segment scope, the
     online output in sequence scope). Probabilities are the calibrated ``p_c0..2_cal`` (a binary task's aux head: its
@@ -973,7 +972,7 @@ def _three_class_rows(ctx: SimpleNamespace, m: str, sd: str, split: str, alpha: 
 
 
 def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """§11.4/§11.7 rows for val and test, per fold and pooled, per model/seed, GUID and segment level.
+    """Rows for val and test, per fold and pooled, per model/seed, GUID and segment level.
 
     Threshold-free with cluster-bootstrap CIs; per policy (on its own basis population) per fold with
     Wilson + bootstrap CIs, and pooled OOF via :func:`pooled_confusion` under
@@ -981,11 +980,10 @@ def run_metrics(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir
     (``subgroup='shared_test_policy'``; H3 light). Val rows are the optimistic, selection-side copy.
     A model with class probabilities adds the 3-class rows of :func:`_three_class_rows` (with CIs).
 
-    Every per-fold test row is on the weighted fold population (§11.7 fold weighting, :func:`_fold_w`): a shared test
+    Every per-fold test row is on the weighted fold population (fold weighting, :func:`_fold_w`): a shared test
     GUID weighs $1/K$ in each of its $K$ folds (0 under ``exclude``), so each fold has the pooled composition and its
-    ``n_pos``/``n_neg`` are weight sums. Unweighted, every fold's test set holds the 906 shared healthy GUIDs (77 % of
-    its healthy GUIDs, 25 % pooled), and the fold-mean test AUROC was 0.698 against 0.654 pooled. Pooled and val rows
-    are unweighted.
+    ``n_pos``/``n_neg`` are weight sums. Unweighted, every fold's test set holds every shared healthy GUID, so its
+    composition differs from the pooled one. Pooled and val rows are unweighted.
     """
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
     other = {"first_fold": "exclude", "exclude": "first_fold"}[policy]
@@ -1187,12 +1185,12 @@ def run_T2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 
 
 def shuffled_interval(per_fold: Any, pooled: float, pooled_lo: float, pooled_hi: float) -> Tuple[float, float, float]:
-    """``(point, lo, hi)`` criterion 7 tests (§11.15): the fold-mean test AUROC of the shuffled-label control with a
+    """``(point, lo, hi)`` criterion 7 tests: the fold-mean test AUROC of the shuffled-label control with a
     95 % t interval over the folds, ``mean ± t_{0.975, k-1}·SD/√k``.
 
     Each fold trains its own control, so the spread across folds holds the training variation. The pooled bootstrap
-    CI holds only the test sampling of fixed models: in run 2026-10-07--17-52 it was ±0.015 while the per-fold AUROCs
-    had an SD of 0.072, so a null control failed by chance. With fewer than 2 finite folds, the pooled value and its
+    CI holds only the test sampling of fixed models, so it is narrower than the fold spread and a null control can fail
+    by chance. With fewer than 2 finite folds, the pooled value and its
     bootstrap CI are returned. ``ponytail:`` the folds share training data, so the t interval is somewhat too narrow
     (Bates 2024); a nested-CV interval if this criterion fails near the edge."""
     a = np.asarray(per_fold, float)
@@ -1433,7 +1431,7 @@ def run_C(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 
 # --- time-resolved ---
 #
-# P4 (SPEC §11.5, §11.12 blocks M, A, R2-R8, T3, T4; L14). Per model/seed/split, every fold and the
+# P4 (blocks M, A, R2-R8, T3, T4; L14). Per model/seed/split, every fold and the
 # pooled OOF group (shared-test dedupe as :func:`pool_rows`) is prepared once (:func:`_tr_groups`):
 # segments after ``eval.exclude_last_min``, sorted by (guid, seg_pos), with the online score s, its
 # running max r and, per policy, the raw decision ``s > thr`` and the latched state (``eval.alarm_rule``).
@@ -1441,7 +1439,7 @@ def run_C(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 # is ever filled and no point re-scans segments. Rates get Wilson CIs, or the patient-cluster bootstrap
 # where a patient holds two GUIDs of the cell (:func:`rate_ci`), rankings the vectorised weighted
 # Mann-Whitney (:func:`bootstrap_auroc`, clustered on the patient).
-# GUID-level time-resolved rows are ``level='online'`` (§11.9), so they never mix with the P2 offline
+# GUID-level time-resolved rows are ``level='online'``, so they never mix with the P2 offline
 # ``guid`` rows; their ``point`` is checkpoint, bin or end, and ``t`` is in the axis display units
 # (to_delivery: hours before delivery; bins: the centre for instantaneous, the right edge c_hi for the
 # committed types, where each is evaluated).
@@ -1503,7 +1501,7 @@ def _prep(seg: pd.DataFrame, ents: Mapping, pids: list, seg_ents: Mapping, seg_p
 def _fold_weighted(groups: list, units: pd.DataFrame, policy: str, split: str) -> list:
     """``groups`` with ``U.w`` (G,) set on each per-fold group: its GUIDs' :func:`fold_weights_of` over ``units`` (one
     row per (fold, guid) of every fold), so every per-fold time-resolved row is computed on the weighted fold
-    population (§11.7 fold weighting: a shared test GUID at $1/K$ in each of its K folds, 0 under
+    population (fold weighting: a shared test GUID at $1/K$ in each of its K folds, 0 under
     ``shared_test_policy: exclude``). ``U.w`` stays None (the unweighted path, bit for bit) on the pooled group, which
     keeps each GUID once, and on a group whose weights are all 1 (every val group)."""
     w = pd.Series(fold_weights_of(units, policy, split), pd.MultiIndex.from_frame(units[["fold", "guid"]]))
@@ -1748,10 +1746,10 @@ def _tf_block(y: np.ndarray, pop: np.ndarray, score: np.ndarray, *, names: Tuple
 
 def _mt_frames(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, ev: Mapping[str, Any], *, alpha: float,
                boot: Mapping[str, Any], rank_ci: np.ndarray, **keys: Any) -> Tuple[list, Dict[str, np.ndarray]]:
-    """§11.5.1 column blocks of one group on one axis: every policy under the three metric types (tp,
+    """Column blocks of one group on one axis: every policy under the three metric types (tp,
     fp, sens, spec, fpr; PPV/NPV at checkpoints/end), the threshold-free companions (snapshot AUROC,
-    AUPRC, pAUC; cumulative AUROC), and the ``underpowered`` marker; all GUIDs and per stage (§11.5.4,
-    the stage of the snapshot / of n*; committed_overall is not stratified: an unmonitored GUID has no
+    AUPRC, pAUC; cumulative AUROC), and the ``underpowered`` marker; all GUIDs and per stage
+    (the stage of the snapshot / of n*; committed_overall is not stratified: an unmonitored GUID has no
     stage at c*). AUROC CIs where ``rank_ci`` (stage strata: checkpoints and end only). A per-fold test group
     (``U.w``, :func:`_fold_weighted`) gives the weighted fold population: ``n_pos``/``n_neg``, tp/fp and the power
     rule (``eval.min_bin_class_n``) on weight sums, rates, rankings and CIs weighted. Also returns the unweighted
@@ -1900,7 +1898,7 @@ def _boot(ev: Mapping[str, Any]) -> Dict[str, int]:
 
 def run_M(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """Block M (M1-M7) with R7 and the T4 table: every policy (whatever its basis) under the three
-    metric types (§11.5.1) at ``eval.checkpoints_h`` (to_delivery) + end and on the ``eval.bin_h`` grid
+    metric types at ``eval.checkpoints_h`` (to_delivery) + end and on the ``eval.bin_h`` grid
     of every ``eval.time_axes`` axis, per fold and pooled, val and test, all GUIDs and per stage; the
     threshold-free companions; M6 for models with segment scores; M7 sanity; L14 inclusion records.
 
@@ -2016,7 +2014,7 @@ def _stat_ci(x: np.ndarray, stat: Callable, boot: Mapping[str, Any], units: Opti
     of the GUIDs, or with ``units`` of their patients (a patient's GUIDs weigh together). The median is the
     weighted lower median, for the value and every draw alike. NaN if empty.
 
-    ``w``: optional GUID weights (§11.7 fold weighting, :func:`fold_weights_of`). Zero-weight GUIDs are dropped first
+    ``w``: optional GUID weights (fold weighting, :func:`fold_weights_of`). Zero-weight GUIDs are dropped first
     (:func:`_nonzero`); the sample and every draw then weigh GUID $i$ by $w_i$ times its unit's multiplicity, so the
     mean is $\\sum_i w_i x_i / \\sum_i w_i$ and the median the weighted lower median. ``w=None`` is the unweighted
     path, unchanged bit for bit."""
@@ -2042,7 +2040,7 @@ def run_A(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     and IQR, alarm burden, alarms per detection, and the detection / false-alarm curves vs hours
     before delivery (bin right edges and checkpoints).
 
-    A per-fold test group is its weighted fold population (``U.w``, :func:`_fold_weighted`; §11.7 fold weighting):
+    A per-fold test group is its weighted fold population (``U.w``, :func:`_fold_weighted`; fold weighting):
     ``n_pos``/``n_neg`` and the event counts are weight sums, the event and curve fractions weighted ratios with
     :func:`rate_ci`'s weighted CIs, burden means weighted means, lead-time and time-to-first-false-alarm medians weighted
     lower medians (:func:`_stat_ci`) and their quartiles weighted quantiles (:func:`_wquantile`); a zero-weight GUID
@@ -2140,7 +2138,7 @@ def run_R2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     the GUIDs available (``committed_cumulative@<h>``), over all GUIDs with -inf for the unmonitored
     (``committed_overall@<h>``), and of the snapshot inside the staleness window (``snapshot@<h>``);
     per fold and pooled, val and test, ``level='online'``. ``precision`` next to ``tpr`` (= recall)
-    is the PR curve. Per-fold test curves weigh each GUID by its fold weight ``U.w`` (§11.7), so their
+    is the PR curve. Per-fold test curves weigh each GUID by its fold weight ``U.w``, so their
     ``n_pos``/``n_neg`` are weight sums."""
     ev, frames = eval_config, []
     for m, sd in _models(ctx):
@@ -2196,7 +2194,7 @@ def run_R5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 def _count_rows(fire: np.ndarray, y: np.ndarray, units: Any, boot: Mapping[str, Any], w: Any = None,
                 **keys: Any) -> list:
     """tp, fp, sens, spec, fpr rows of one decision per GUID row (``fire``, ``y`` bool); :func:`rate_ci` CIs. ``w``:
-    optional row weights (§11.7 fold weights; zero-weight rows dropped first, :func:`_nonzero`), so the counts and
+    optional row weights (fold weights; zero-weight rows dropped first, :func:`_nonzero`), so the counts and
     ``n_pos``/``n_neg`` are weight sums and the CIs :func:`rate_ci`'s weighted ones."""
     w, fire, y, units = _nonzero(w, y.size, fire, y, units)
 
@@ -2290,7 +2288,7 @@ def _refit_rates(pop: pd.DataFrame, thr: np.ndarray, code: np.ndarray, M: np.nda
                  w: Any = None) -> Dict[str, np.ndarray]:
     """sens / spec / fpr per draw of the test basis rows ``pop`` fired at their fold's draw threshold ``thr[b, code]``
     (``thr`` (B, folds)), each row weighing its patient's multiplicity ``M[b, at]``; NaN where a threshold is. ``w``:
-    optional row weights (§11.7 fold weights), so row $i$ weighs $w_i\\,M_{b,\\mathrm{at}_i}$; None is unweighted."""
+    optional row weights (fold weights), so row $i$ weighs $w_i\\,M_{b,\\mathrm{at}_i}$; None is unweighted."""
     y, s = pop["y"].to_numpy() == 1, pop["score"].to_numpy(np.float64)
     out = {k: np.full(len(thr), NAN) for k in ("sens", "fpr")}
     for sl in _chunks(len(thr), len(pop)):
@@ -2307,7 +2305,7 @@ def _refit_rates(pop: pd.DataFrame, thr: np.ndarray, code: np.ndarray, M: np.nda
 
 
 def refit_rows(ctx: SimpleNamespace, m: str, sd: str, pops: Mapping[str, Any], boot: Mapping[str, Any]) -> list:
-    """§11.7 variant b, the refit bootstrap (``eval.bootstrap.refit_threshold``): test sens / spec / FPR of every policy
+    """Variant b, the refit bootstrap (``eval.bootstrap.refit_threshold``): test sens / spec / FPR of every policy
     (per fold and pooled) whose CIs carry the threshold's own sampling noise, plus per fold the chosen threshold with
     the percentile interval of its refits. Rows ``split='test'``, ``subgroup='threshold_refit'``, value ``refit``,
     keyed as T3 (c); ``pops`` is ``{split: policy_populations(...)}``.
@@ -2359,7 +2357,7 @@ def refit_rows(ctx: SimpleNamespace, m: str, sd: str, pops: Mapping[str, Any], b
             draws, j = _refit_rates(t, thr, code, M, at, w), None if fold == "pooled" else folds.index(fold)
             if j is not None:
                 point, draws = point | {"threshold": float(chosen[j])}, draws | {"threshold": thr[:, j]}
-            ci = _percentile_ci(point, draws, method="refit bootstrap (§11.7 b)", resamples=B, seed=sd_,
+            ci = _percentile_ci(point, draws, method="refit bootstrap (variant b)", resamples=B, seed=sd_,
                                 confidence=0.95, n=M.shape[1])["metrics"]
             rows += metric_rows(point, ci, fold=str(fold), threshold=NAN if j is None else float(chosen[j]),
                                 **_class_counts(t["y"].to_numpy() == 1, w), **k)
@@ -2426,7 +2424,7 @@ def run_T3(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
             "b": ({"status": "done", "rows": "subgroup='threshold_refit' (test; per fold: the chosen threshold with its "
                    "refit interval)", "resamples": boot["resamples"], "seed": boot["seed"]} if refit else
                   {"status": "off", "reason": "eval.bootstrap.refit_threshold is false"}),
-            "plan": {"b": "refit bootstrap (§11.7 b): per replicate, every policy re-selected on the fold's resampled "
+            "plan": {"b": "refit bootstrap (variant b): per replicate, every policy re-selected on the fold's resampled "
                           "val GUIDs, then the fold's (pooled: all folds') resampled test GUIDs scored",
                      "c": "threshold = v_(k*+j), j in -2..2, on the sorted val basis negatives of each fold"}}
 
@@ -2454,7 +2452,7 @@ def run_T4(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
         "rows": "metrics.parquet: level online, axis to_delivery, point checkpoint|end, policy_id x metric_type x t"}}
 
 
-#: The analyses, in run order (§11.14): P2, then P4. ``metrics`` precedes the blocks that read its
+#: The analyses, in run order: P2, then P4. ``metrics`` precedes the blocks that read its
 #: rows, R1 writes ``roc_points`` before R2/R5 append to it, and M precedes T4.
 ANALYSES: Dict[str, Callable[..., Dict[str, Any]]] = {
     "C": run_C, "metrics": run_metrics, "R1": run_R1, "R9": run_R9, "T1": run_T1, "T2": run_T2, "B1": run_B1,
@@ -2465,7 +2463,7 @@ ANALYSES: Dict[str, Callable[..., Dict[str, Any]]] = {
 def headline(df: pd.DataFrame, alpha: float) -> Dict[str, Dict[str, Any]]:
     """``results.headline``: per (model_id, seed, level, policy, metric) the pooled test value with CI,
     the per-fold test mean +/- SD over the finite folds (``n_folds_nan`` counts the others, which verify
-    surfaces), and the (optimistic) validation values (§11.9)."""
+    surfaces), and the (optimistic) validation values."""
     d = df[df["metric"].isin((*_HEADLINE, f"pauc@{alpha:g}")) & df["subgroup"].isna()
            & (df["policy_id"].fillna("") != "oracle") & (df["point"] == "n/a")]
     out = {}
@@ -2510,7 +2508,7 @@ def run_context(run_dir: Path) -> Dict[str, Any]:
 
 def evaluate(run_dir: Any, cfg: Any, *, only: Optional[Sequence[str]] = None,
              skip: Optional[Sequence[str]] = None, allow_partial: bool = False) -> int:
-    """Run the analyses fail-soft into ``<run>/evaluation/`` (§11.13-§11.14).
+    """Run the analyses fail-soft into ``<run>/evaluation/``.
 
     Each analysis runs under ``Report.step``; ``steps.json`` is rewritten after each one. A full run
     renames the prior ``summary.json``/``steps.json`` to ``*.bak.<stamp>.json`` and ``tables/`` to
@@ -2567,7 +2565,7 @@ def evaluate(run_dir: Any, cfg: Any, *, only: Optional[Sequence[str]] = None,
     rep.set("sanity", {"checks": ctx.sanity, "failed": sorted(k for k, v in ctx.sanity.items() if v["verdict"] == "fail")})
     rep.set("config_digest", ctx.digest)
     rep.set("config", ctx.cfg)
-    # §11.7: per-fold test rows on the weighted fold population (fold_weights_of: a shared GUID at 1/K); report reads
+    # Per-fold test rows on the weighted fold population (fold_weights_of: a shared GUID at 1/K); report reads
     # the key to tell these evaluations from older, unweighted ones
     rep.set("fold_weighting", "inverse_k")
     rep.set("labels", {"val": VAL_LABEL, "oracle": "tpr@fpr rows: read off the test ROC, never a decision",
@@ -2583,14 +2581,14 @@ def evaluate(run_dir: Any, cfg: Any, *, only: Optional[Sequence[str]] = None,
 # ==== P6 blocks. Each section below belongs to one block; register analyses with ``ANALYSES.update(...)`` (run order = section order) at its end. ====
 # ---- block S (subgroups: S1-S7, R11, K3, X10) ----
 #
-# §11.6 and §11.12 block S, with R11 (subgroup ROC), K3 (calibration per subgroup) and X10 (per-class x subgroup).
+# Block S, with R11 (subgroup ROC), K3 (calibration per subgroup) and X10 (per-class x subgroup).
 # Membership (:func:`subgroup_members`) is computed once per evaluation from GUID-level fields and cached on the
 # context. Each analysis restricts a population the engine above already built (``level_units``,
 # ``policy_populations``, ``_tr_groups``) with a (cell, GUID) membership matrix (:func:`_member_matrix`; a *cell* is
 # one member, i.e. one (subgroup, subgroup_value)), so no subgroup ever changes a threshold. Tables:
-# ``subgroups.parquet`` (S1, S4, S5 and the K3 reliability points: §11.9 columns plus :data:`S_EXTRA`),
+# ``subgroups.parquet`` (S1, S4, S5 and the K3 reliability points: the long-format columns plus :data:`S_EXTRA`),
 # ``subgroup_tests.parquet`` (S6) and ``subgroup_cutpoints.json``; the S2 and X10 time-resolved rows go to
-# ``metrics.parquet``, the R11 curves to ``roc_points.parquet``. Scale (§11.10): S2, X10, R11 and K3 cover the primary
+# ``metrics.parquet``, the R11 curves to ``roc_points.parquet``. Scale: S2, X10, R11 and K3 cover the primary
 # model (:func:`primary_model`) only, S2 and the X10 bin grid the primary policy; the shuffled-label control gets no
 # subgroup analysis (its labels are permuted, so its subgroups mean nothing).
 
@@ -2598,14 +2596,14 @@ from teb_vae.lag_attn.eval import stats as vae_stats  # noqa: E402
 
 TERTILE_FAMILIES = ("admission_tlo_tertile", "labour_duration_tertile", "n_segments_tertile", "span_tertile",
                     "valid_frac_tertile")
-#: The §11.6.1 families in table order; ``covariate:<name>`` families come from the declared covariates.
+#: The families in table order; ``covariate:<name>`` families come from the declared covariates.
 SUBGROUP_FAMILIES = ("class", "source_file", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "cs", "bg",
                      "healthy_comparator", "stage_last", "reached_second_stage", "has_tlo", *TERTILE_FAMILIES,
                      "late_coverage", "shared_test", "fold")
 #: Families whose members hold one clinical class by definition (X10).
 SINGLE_CLASS_FAMILIES = ("class", "source_file", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs")
-#: Documented, never computed (§11.6.1); the report states why instead of drawing an empty line.
-EMPTY_FAMILIES = {"acidosis_x_bg": "every acidosis GUID has bg = 1 (§2.3)", "hie_x_bg": "every HIE GUID has bg = 1 (§2.3)"}
+#: Documented, never computed; the report states why instead of drawing an empty line.
+EMPTY_FAMILIES = {"acidosis_x_bg": "every acidosis GUID has bg = 1", "hie_x_bg": "every HIE GUID has bg = 1"}
 #: Member-name tokens in display and test order (:func:`member_order`): worst cohort first as ``labels.ordered_groups``
 #: (HIE, acidosis, healthy; the shard cells in reversed canonical order), positive before negative, stages in time
 #: order, tertiles low to high, unknown last. S6 orients every pair by it, so Cliff's delta > 0 = the earlier member higher.
@@ -2615,9 +2613,9 @@ _MEMBER_RANK = {t: i for i, t in enumerate(MEMBER_ORDER)}
 S2_FAMILIES = ("class", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "stage_last", "has_tlo", *TERTILE_FAMILIES)
 ROC_FAMILIES = ("cs", "bg", "healthy_comparator", "stage_last", "has_tlo", *TERTILE_FAMILIES)  # R11: mixed families
 K3_FAMILIES = ("cs", "bg", "stage_last", "has_tlo")
-#: S6 family-wise error rate: a module constant, not a config key (the VAE rationale, §11.6.2).
+#: S6 family-wise error rate: a module constant, not a config key (the VAE rationale).
 S_ALPHA = 0.05
-#: ``subgroups.parquet`` columns beyond §11.9: the writing analysis, the member's population (healthy_only |
+#: ``subgroups.parquet`` columns beyond the long format: the writing analysis, the member's population (healthy_only |
 #: unhealthy_only | mixed, from the task targets its GUIDs carry), the power guard (value NaN, the estimate kept in
 #: ``value_raw``) and S4's bootstrap p-values.
 S_EXTRA = ("analysis", "population", "underpowered", "value_raw", "p_value", "p_holm")
@@ -2626,7 +2624,7 @@ RESTRICTED = "restricted_pair"
 
 def subgroup_families(cfg: Mapping[str, Any]) -> list:
     """The run's families: ``eval.subgroup_families`` without the documented-empty ones (:data:`EMPTY_FAMILIES`), plus
-    ``covariate:<name>`` per declared covariate (§7.3, S7). Empty for a config without them."""
+    ``covariate:<name>`` per declared covariate (S7). Empty for a config without them."""
     ev, cov = cfg.get("eval") or {}, ((cfg.get("context") or {}).get("covariates") or {}).get("variables") or []
     return list(dict.fromkeys([*(f for f in ev.get("subgroup_families") or [] if f not in EMPTY_FAMILIES),
                                *(f"covariate:{v['name']}" for v in cov)]))
@@ -2642,7 +2640,7 @@ def member_order(values: Any) -> list:
 
 
 def primary_model(models: Sequence[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-    """The (model_id, seed) the subgroup figures and the scale-limited analyses use: ``model``'s seed ensemble (§10.7),
+    """The (model_id, seed) the subgroup figures and the scale-limited analyses use: ``model``'s seed ensemble,
     else ``model``, else the first model that is no baseline or control, else the first one (a probe-only run); None
     without models."""
     models = list(models)
@@ -2653,7 +2651,7 @@ def primary_model(models: Sequence[Tuple[str, str]]) -> Optional[Tuple[str, str]
 def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[str], *,
                      cutpoints: Optional[Mapping[str, Sequence[float]]] = None,
                      covariates: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, list]]:
-    """§11.6.1 membership, per GUID from GUID-level fields (never the row-level target).
+    """Subgroup membership, per GUID from GUID-level fields (never the row-level target).
 
     Args:
         guids: prediction GUID rows (``predictions/guids.parquet`` columns ``fold, split, guid, clinical_class,
@@ -2664,7 +2662,7 @@ def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[
             TLO and labour duration (first segment: ``tlo_end_h``, ``+ hours_to_delivery``), mean ``valid_frac``.
         families: family ids (:func:`subgroup_families`); ``covariate:<name>`` reads ``covariates``.
         cutpoints: ``{tertile family: [q1/3, q2/3]}`` to reuse (``subgroup_cutpoints.json``); a family it lacks gets
-            the cut-points of the pooled test GUIDs, each GUID once (§11.6.1: descriptive strata, reused for val).
+            the cut-points of the pooled test GUIDs, each GUID once (descriptive strata, reused for val).
         covariates: ``cohort/covariate_availability.parquet`` rows (fold, split, guid, variable, available).
 
     Returns:
@@ -2673,7 +2671,7 @@ def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[
         classes in ``class`` and ``class_x_cs``. Tertiles are ``T1`` (<= q1/3), ``T2``, ``T3``, and ``unknown`` for a
         missing value (no TLO). Other members: ``cs_pos|cs_neg``, ``bg_pos|bg_neg``,
         ``all_healthy|bg_healthy|no_bg_healthy`` (every adverse GUID with that healthy subset: the pre-specified
-        comparators, §11.6.1), ``healthy_bg_pos_cs_neg``, …,
+        comparators), ``healthy_bg_pos_cs_neg``, …,
         stages ``first|straddle|second|unknown``, ``yes|no`` (reached_second_stage also ``unknown``), the fold
         number, ``available|missing``.
 
@@ -2715,7 +2713,7 @@ def subgroup_members(guids: pd.DataFrame, seg: pd.DataFrame, families: Sequence[
         "class": [cls, unh], "source_file": [g["subgroup"].astype(str)], "class_x_cs": [cls + "_" + cs, unh + "_" + cs],
         "healthy_x_bg": [("healthy_" + bg).where(healthy)], "healthy_bg_x_cs": [("healthy_" + bg + "_" + cs).where(healthy)],
         "cs": [cs], "bg": [bg],
-        # §11.6.1 pre-specified healthy comparators: every adverse GUID with all healthy, with the blood-gas (BG+)
+        # Pre-specified healthy comparators: every adverse GUID with all healthy, with the blood-gas (BG+)
         # healthy only, or with the no-gas (BG-) healthy only; all three are mixed populations
         "healthy_comparator": [pd.Series("all_healthy", index=g.index),
                                pd.Series("bg_healthy", index=g.index).where(~healthy | g["bg"].astype(bool)),
@@ -2793,7 +2791,7 @@ def _policy_pops(ctx: SimpleNamespace, m: str, sd: str, split: str) -> Dict[Tupl
 
 def _rank_point(y: np.ndarray, s: np.ndarray, alpha: float, w: Optional[np.ndarray] = None) -> Dict[str, float]:
     """AUROC, AUPRC and pAUC@alpha point values (:func:`_rank_stats`: sklearn's; NaN with one class). ``w``: optional
-    row weights (§11.7 fold weighting), the weighted rank statistics; a zero-weight row adds nothing."""
+    row weights (fold weighting), the weighted rank statistics; a zero-weight row adds nothing."""
     o, st, _ = _ranked(np.asarray(s, np.float64))
     y = np.asarray(y, np.int64)
     W = np.ones((1, y.size)) if w is None else np.asarray(w, np.float64)[None, :]
@@ -2812,7 +2810,7 @@ def _guid_col(ctx: SimpleNamespace, m: str, sd: str, split: str, x: pd.DataFrame
 
 
 def _append_subgroups(out_dir: Path, frame: pd.DataFrame, analysis: str) -> int:
-    """Replace ``analysis``' rows of ``subgroups.parquet`` with ``frame`` (§11.9 columns + :data:`S_EXTRA`)."""
+    """Replace ``analysis``' rows of ``subgroups.parquet`` with ``frame`` (columns + :data:`S_EXTRA`)."""
     path, cols = out_dir / "tables" / "subgroups.parquet", [*METRIC_COLUMNS, *S_EXTRA]
     new = frame.reindex(columns=cols).assign(analysis=analysis)
     for c in ("value", "ci_lo", "ci_hi", "t", "threshold", "n_pos", "n_neg", "value_raw", "p_value", "p_holm", "n_boot_undefined"):
@@ -2840,11 +2838,11 @@ def _s_frame(blocks: list) -> pd.DataFrame:
 def _s1_rates(ctx: SimpleNamespace, x: pd.DataFrame, fire: np.ndarray, mn: int, boot: Mapping[str, Any],
               w: Optional[np.ndarray] = None, **keys: Any) -> Dict[str, Any]:
     """S1 thresholded column block (:func:`_s_frame`) of one population ``x`` (fold, guid, y, patient) and its decisions ``fire``, per cell: what
-    the cell's population reports (§11.6): healthy-only tn, fp, spec, fpr; unhealthy-only tp, fn, sens; mixed those
+    the cell's population reports: healthy-only tn, fp, spec, fpr; unhealthy-only tp, fn, sens; mixed those
     plus PPV and NPV. Rates carry :func:`rate_ci` CIs (Wilson; the patient-cluster bootstrap where a patient holds two
     of the cell's rows); a rate whose class count is below ``mn`` (``eval.min_subgroup_n``) is NaN and
     ``underpowered``, its estimate in ``value_raw``. PPV/NPV are 0 when the rule never fires (:func:`confusion_rates`).
-    ``w``: optional row weights (a per-fold test population, §11.7 fold weighting): the counts, ``n_pos``/``n_neg``
+    ``w``: optional row weights (a per-fold test population, fold weighting): the counts, ``n_pos``/``n_neg``
     and the power rule become weight sums, the rates weighted ratios with weighted CIs. ``keys`` fill the other
     columns."""
     cells, Mm = _cells(ctx), _member_matrix(ctx, x["fold"], x["guid"])
@@ -2879,7 +2877,7 @@ def _s1_rates(ctx: SimpleNamespace, x: pd.DataFrame, fire: np.ndarray, mn: int, 
 
 def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """S1 ``subgroups.parquet``: every model but the shuffled control, val and test, per fold and pooled
-    (:func:`pool_rows`), GUID level, per member (§11.6.2 items 1-3):
+    (:func:`pool_rows`), GUID level, per member:
 
     * counts ``n_guids``, ``n_segments``, ``prevalence`` (``n_pos``/``n_neg`` adverse/healthy GUIDs);
     * mixed members, threshold-free on ``score_final_cal``: pooled test, every :func:`threshold_free` metric (AUROC,
@@ -2888,7 +2886,7 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     * per GUID-level policy, on its basis population at each fold's own threshold: :func:`_s1_rates`.
 
     A metric needing a class with fewer than ``eval.min_subgroup_n`` GUIDs is NaN with ``underpowered`` (estimate in
-    ``value_raw``). Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; §11.7 fold
+    ``value_raw``). Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; fold
     weighting): counts, ``n_pos``/``n_neg`` and the power rule on weight sums, rates and rankings weighted. Also writes
     ``subgroup_cutpoints.json``.
     """
@@ -2956,13 +2954,13 @@ def run_S1(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 def _cell_time_blocks(U: SimpleNamespace, V: SimpleNamespace, pts: pd.DataFrame, Mm: np.ndarray, cells: pd.DataFrame,
                       pidx: list, has_pos: np.ndarray, has_neg: np.ndarray, ev: Mapping[str, Any],
                       boot: Mapping[str, Any], *, suffix: str = "", **keys: Any) -> list:
-    """Column blocks (:func:`_blocks_frame`) of the §11.5.1 metric types restricted to each cell (rows of ``Mm``, (C, G)
+    """Column blocks (:func:`_blocks_frame`) of the metric types restricted to each cell (rows of ``Mm``, (C, G)
     over ``U``'s GUIDs) under the policies ``U.pids[pidx]``, at the points ``pts`` (the :func:`_view` ``V``): tp and
     sens for cells ``has_pos``, fp, spec and fpr for cells ``has_neg`` (:func:`rate_ci` CIs), and the ``underpowered``
     marker (a needed class below ``eval.min_subgroup_n`` GUIDs at the point: that class's rates are NaN, the other
     class's stay). Metric names carry ``suffix`` (X10: ``_ovr_c<k>``).
 
-    A per-fold test group (``U.w``, :func:`_fold_weighted`) gives the weighted fold population (§11.7 fold weighting):
+    A per-fold test group (``U.w``, :func:`_fold_weighted`) gives the weighted fold population (fold weighting):
     ``tp``/``fp`` and ``n_pos``/``n_neg`` are weight sums (a shared test GUID counts $1/K$ in each of its K folds), the
     rates their weighted ratios with :func:`rate_ci`'s weighted CIs, and the power rule compares the weighted class
     counts. The folds' weighted counts then add up to the pooled group's (each GUID once), and the pooled rate is a
@@ -3020,7 +3018,7 @@ def _sub_view(V: SimpleNamespace, pts: pd.DataFrame, sel: np.ndarray) -> Tuple[S
 def run_S2(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """S2: the three metric types vs time per member (:func:`_cell_time_blocks` on the :func:`run_M` groups and views),
     primary model and policy, every axis, bins, checkpoints and end: every family for pooled test and for each fold's
-    test group (but the ``fold`` family, one member there); the ``class`` family for val (the §11.10 core set).
+    test group (but the ``fold`` family, one member there); the ``class`` family for val (the core set).
     ``level='online'`` rows in ``metrics.parquet``. The per-fold test rows are computed on the weighted fold population
     (``U.w``, :func:`_fold_weighted`): their ``tp``/``fp`` and ``n_pos``/``n_neg`` are weight sums, which the
     ``*_folds`` figures read for their line and band; val rows are unweighted."""
@@ -3099,7 +3097,7 @@ def _deltas(ctx: SimpleNamespace, x: pd.DataFrame, fire: Optional[np.ndarray], b
 
 
 def run_S4(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """S4 Δ vs complement (§11.6.2 item 5), pooled test, every model but the shuffled control: ΔAUROC of the GUID final
+    """S4 Δ vs complement, pooled test, every model but the shuffled control: ΔAUROC of the GUID final
     score and Δsens/Δspec at the primary policy (its basis population, each fold's threshold) from a paired
     patient-cluster bootstrap (:func:`_deltas`); ``p_holm`` Holm-adjusted within each (family, metric). Rows of
     ``subgroups.parquet`` (``analysis`` S4)."""
@@ -3131,7 +3129,7 @@ def run_S5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     (:data:`MEMBER_ORDER`) positive, ``subgroup_value`` ``<positive>_vs_<other>``; the AUROC of the GUID final score, per
     fold (point) and pooled (patient-cluster bootstrap CI), val and test, every model but the shuffled control. The
     subtype sensitivity at each policy is the S1 ``class`` row of the positive class, and the shared FPR the ``healthy``
-    one (§11.6.1: identical across pairs, reported once); S2 carries them vs time. Per-fold test rows are on the
+    one (identical across pairs, reported once); S2 carries them vs time. Per-fold test rows are on the
     weighted fold population (:func:`_folds_and_pooled`): weighted AUROC, ``n_pos``/``n_neg`` and the power rule on
     weight sums."""
     ev, policy = eval_config, ctx.cfg["data"]["shared_test_policy"]
@@ -3163,7 +3161,7 @@ def run_S5(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 
 
 def run_S6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """S6 ``subgroup_tests.parquet`` (§11.6.2 item 7; the ``cross_subgroup.py`` pattern), pooled test GUID final scores,
+    """S6 ``subgroup_tests.parquet`` (the ``cross_subgroup.py`` pattern), pooled test GUID final scores,
     every model but the shuffled control. Per family and stratum (``class``: one test across its disjoint classes;
     every other family: per clinical class, the members restricted to it; the overlapping ``unhealthy*`` members are
     left out), Kruskal-Wallis over the members with >= ``MIN_GROUP_SIZE`` GUIDs (smaller ones excluded and recorded),
@@ -3281,7 +3279,7 @@ def run_K3(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
 
 
 def _ovr_groups(ctx: SimpleNamespace, m: str, sd: str, split: str, k: int) -> Optional[list]:
-    """:func:`_tr_groups` of class k's one-vs-rest view (§11.3 T5, as ``thresholds.ovr_thresholds`` selected it): target
+    """:func:`_tr_groups` of class k's one-vs-rest view (T5, as ``thresholds.ovr_thresholds`` selected it): target
     ``class_code - 1 == k``, online and segment scores ``logit(p_c<k>_cal)``, the GUID-level thresholds of
     ``thresholds.json[unit]['ovr'][k]``, per-fold test groups with their fold weights ``U.w`` (:func:`_fold_weighted`).
     None without them or without an online/segment class probability."""
@@ -3311,7 +3309,7 @@ def run_X10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pa
     primary policy on the bin grid of every axis (the figure). Not applicable without OvR thresholds."""
     ev, boot, pm, frames = eval_config, _boot(eval_config), primary_model(_models(ctx)), []
     if not ctx.thr_ovr or pm is None:
-        return {**_meta(ctx), "n_rows": 0, "plan": {"status": "not applicable: no per-class OvR thresholds (§11.3 T5)"}}
+        return {**_meta(ctx), "n_rows": 0, "plan": {"status": "not applicable: no per-class OvR thresholds (T5)"}}
     cells = _cells(ctx)
     single = cells["subgroup"].isin(SINGLE_CLASS_FAMILIES).to_numpy()
     for k in range(3):
@@ -3348,7 +3346,7 @@ ANALYSES.update({"S1": run_S1, "S2": run_S2, "S4": run_S4, "S5": run_S5, "S6": r
 
 # ---- block KH (calibration and heterogeneity: K1, K2, K4-K7, H1-H4, R10, R12, R13) ----
 #
-# Rows keep the §11.9 long format. The views that are not the run's calibrated, primary-pooling one carry a
+# Rows keep the long format. The views that are not the run's calibrated, primary-pooling one carry a
 # ``subgroup`` tag, so every ``subgroup.isna()`` reader (headline, B1, T2, summary.md) skips them: ``calibration`` /
 # ``uncalibrated`` (K1), ``prevalence_shift`` (K5), ``fold_heterogeneity`` (H1) and ``shared_test_policy`` (H3, as
 # ``run_metrics``' thresholded sensitivity rows). K7 rows are time-resolved (``level='online'``, like M). K6 and H3
@@ -3359,7 +3357,7 @@ from scipy.stats import chi2  # noqa: E402
 
 #: The :func:`threshold_free` calibration metrics K1/K5 recompute (a monotone map leaves the ranking ones unchanged).
 CALIB_NAMES = ("calib_intercept", "calib_slope", "ece", "ici", "e50", "e90", "brier", "scaled_brier", "logloss")
-#: K6 threshold probabilities p_t over [0.05, 0.6] (§11.4).
+#: K6 threshold probabilities p_t over [0.05, 0.6].
 DC_PTS = np.round(np.linspace(0.05, 0.6, 56), 2)
 #: H3 metrics compared under the two shared-test policies (pooled test, GUID level).
 H3_METRICS = ("auroc", "auprc", "brier", "calib_intercept", "calib_slope", "sens", "spec", "fpr", "ppv", "npv")
@@ -3381,7 +3379,7 @@ def _guid_units(ctx: SimpleNamespace, m: str, sd: str, split: str, score: str) -
 
 def prior_shifted(test: pd.DataFrame, val: pd.DataFrame) -> np.ndarray:
     """K5: each test GUID's calibrated logit moved from its fold's val prevalence to its fold's test prevalence,
-    ``logit p' = logit p - logit pi_val + logit pi_test`` (:func:`prior_shift`, §11.7; GUID-level prevalences)."""
+    ``logit p' = logit p - logit pi_val + logit pi_test`` (:func:`prior_shift`; GUID-level prevalences)."""
     pv, pt = (x.groupby("fold")["y"].mean().clip(1e-6, 1 - 1e-6) for x in (val, test))  # ponytail: a one-class fold
     return prior_shift(test["score_final_cal"], test["fold"].map(pv).to_numpy(), test["fold"].map(pt).to_numpy())
 
@@ -3506,7 +3504,7 @@ def run_H(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
     * H1: :func:`i_squared` of the per-fold GUID AUROC per model/seed/split, SE = bootstrap CI width / (2 z_0.975)
       (rows ``fold='pooled'``, ``subgroup='fold_heterogeneity'``, ``subgroup_value='auroc'``: ``i2``, ``cochran_q``,
       ``cochran_q_p``, ``fold_sd``); the per-fold values the forest draws are ``run_metrics``' rows. On test those rows
-      are the weighted fold populations' AUROCs with their weighted bootstrap CIs (§11.7 fold weighting), so Q and
+      are the weighted fold populations' AUROCs with their weighted bootstrap CIs (fold weighting), so Q and
       $I^2$ compare folds of the pooled composition. ``ponytail:`` the folds still share the shared test GUIDs (at
       $1/K$ each), so their estimates are positively correlated and Q runs somewhat low; a fold-covariance Q if $I^2$
       becomes a decision input.
@@ -3555,9 +3553,9 @@ def run_H(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 def run_R10(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """R10: at every ``eval.checkpoints_h`` and end, the snapshot ROC (R4's population: the GUID's last segment in the
     staleness window) restricted to snapshots in the first stage and in the second stage (the snapshot segment's
-    stage, §11.5.4), per fold and pooled, val and test -> ``roc_points`` variants ``snapshot_first@<h|end>`` and
-    ``snapshot_second@<h|end>`` (``level='online'``). Per-fold test curves weigh each GUID by its fold weight ``U.w``
-    (§11.7), so their ``n_pos``/``n_neg`` are weight sums."""
+    stage), per fold and pooled, val and test -> ``roc_points`` variants ``snapshot_first@<h|end>`` and
+    ``snapshot_second@<h|end>`` (``level='online'``). Per-fold test curves weigh each GUID by its fold weight ``U.w``,
+    so their ``n_pos``/``n_neg`` are weight sums."""
     ev, frames = eval_config, []
     for m, sd in _models(ctx):
         for split in SPLITS:
@@ -3620,7 +3618,7 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     probability against 1[class = k] and ``brier_macro``, their mean. ``level='online'``, ``metric_type=
     'threshold_free'``, ``denominator='bin_present'``; NaN where a class has fewer than ``eval.min_bin_class_n`` GUIDs
     (M's rule). The pooled rows carry a patient-cluster bootstrap CI of the mean (one weighted product per axis).
-    Per-fold test rows weigh each GUID by its fold weight ``U.w`` (§11.7): the means, ``n_pos``/``n_neg`` and the
+    Per-fold test rows weigh each GUID by its fold weight ``U.w``: the means, ``n_pos``/``n_neg`` and the
     ``min_bin_class_n`` rule are on the weighted counts."""
     ev = eval_config
     boot, mn, blocks = _boot(ev), ev["min_bin_class_n"], []
@@ -3644,7 +3642,7 @@ def run_K7(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
                     if V is None:
                         continue
                     pop = V.inst
-                    popf = pop.astype(np.float64) if U.w is None else pop * U.w[:, None]  # fold weights (§11.7)
+                    popf = pop.astype(np.float64) if U.w is None else pop * U.w[:, None]  # fold weights
                     n_pos, n_neg = (pop & U.y[:, None]).sum(0), (pop & ~U.y[:, None]).sum(0)
                     if U.w is not None:  # weighted fold counts: the power rule and `live` read them
                         n_pos, n_neg = popf[U.y].sum(0), popf[~U.y].sum(0)
@@ -3685,7 +3683,7 @@ ANALYSES.update({"K": run_K, "H": run_H, "R10": run_R10, "R12": run_R12, "K7": r
 
 # ---- block A6 (first detection per subgroup and fold) ----
 #
-# §11.12 A6: when each test GUID is first alarmed, per member of FD_FAMILIES, per fold and pooled, on the clinically
+# A6: when each test GUID is first alarmed, per member of FD_FAMILIES, per fold and pooled, on the clinically
 # anchored axes. It reads the M engine's groups (:func:`_tr_groups`, fold weights included) and their latched state
 # ``U.la`` (``eval.alarm_rule``), primary model and policy. First detection is a time-to-event outcome: a GUID enters
 # observation at its first segment (monitoring often starts late in labour) and leaves at its last (delivery ends it),
@@ -3696,8 +3694,8 @@ ANALYSES.update({"K": run_K, "H": run_H, "R10": run_R10, "R12": run_R12, "K7": r
 
 #: A6 axes (those in ``eval.time_axes``): delivery and second-stage onset, in hours and landmark-registered.
 FD_AXES = ("to_delivery", "rel_second_stage", NORM_AXIS)
-#: A6 families: the clinical classes, and the healthy blood-gas split (train/val healthy GUIDs are about 85 % BG+, the
-#: augmented test ones about 80 % BG-, §11.6.1 healthy_comparator), the healthy shift most likely to move false alarms.
+#: A6 families: the clinical classes, and the healthy blood-gas split (train/val healthy GUIDs are mostly BG+, the
+#: augmented test ones mostly BG-, healthy_comparator), the healthy shift most likely to move false alarms.
 FD_FAMILIES = ("class", "healthy_x_bg")
 #: A6 quantiles (in time order: q10 is the earliest tenth) of the first-detection time among the detected GUIDs.
 FD_QUANTILES = (0.10, 0.25, 0.75, 0.90)
@@ -3726,7 +3724,7 @@ def _fd_rows(U: SimpleNamespace, sel: np.ndarray, alarmed: np.ndarray, fa: np.nd
     population): ``fd_detected_frac``, the share alarmed by the GUID's last segment (:func:`rate_ci`); over the
     detected GUIDs, the first-detection median ``fd_median`` (:func:`_stat_ci`, the patient-cluster bootstrap) and the
     :data:`FD_QUANTILES` ``fd_q<p>`` (:func:`_wquantile`), all in the display units of ``t`` (:func:`_display`).
-    ``n_pos``/``n_neg``: the cell's class counts. A per-fold test group weighs its GUIDs (``U.w``, §11.7). Also returns
+    ``n_pos``/``n_neg``: the cell's class counts. A per-fold test group weighs its GUIDs (``U.w``). Also returns
     ``{cell: (fraction, ci_lo, ci_hi)}`` for the fold heterogeneity of :func:`run_A6`."""
     rows, fracs, flip = [], {}, axis == "to_delivery"
     for k in np.flatnonzero(sel.any(1)):
@@ -3750,7 +3748,7 @@ def _fd_rows(U: SimpleNamespace, sel: np.ndarray, alarmed: np.ndarray, fa: np.nd
 
 def run_A6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """A6: first detection per subgroup and fold, on each :data:`FD_AXES` axis in ``eval.time_axes``, for the primary
-    model and policy under ``eval.alarm_rule``, pooled test and each fold's test group (weighted, §11.7).
+    model and policy under ``eval.alarm_rule``, pooled test and each fold's test group (weighted).
 
     Writes ``first_detection.parquet`` (:data:`FD_COLUMNS`: one row per fold or ``pooled``, axis, member of
     :data:`FD_FAMILIES` and GUID eligible on the axis; ``entry_c``, ``exit_c`` and ``first_alarm_c`` are the clocks of
@@ -3758,7 +3756,7 @@ def run_A6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
     ``to_delivery`` is negative hours) and ``level='alarm'`` rows (:func:`_fd_rows`; ``subgroup`` = the family). Per
     axis and member, ``fold='pooled'`` also gets Cochran's Q p-value and Higgins' I² of the per-fold detected fractions
     (:func:`i_squared`, SE from each fold's 95 % CI): ``fd_detected_frac_q_p`` and ``fd_detected_frac_i2``. The
-    healthy folds share the augmented test GUIDs (§2.5), so their estimates are positively correlated and I²
+    healthy folds share the augmented test GUIDs, so their estimates are positively correlated and I²
     understates their heterogeneity.
 
     Sanity ``a6_first_alarm_matches_latch``: on every axis, group and evaluation point, "first-alarm clock <= c*"
@@ -3833,7 +3831,7 @@ ANALYSES.update({"A6": run_A6})
 
 # ---- block X (confusion and 3-class: X1-X9) ----
 #
-# §11.3-§11.5, §11.12 block X. The GUID- and segment-level 3-class rows are :func:`_three_class_rows` (``metrics``),
+# Block X. The GUID- and segment-level 3-class rows are :func:`_three_class_rows` (``metrics``),
 # their CIs one set of 3-class-stratified patient-cluster draws (:func:`three_class_ci`). ``X`` adds a ``three_class``
 # run's time-resolved rows on the M engine's groups: the argmax snapshot rows (X3, X5a, X7; ``policy_id = argmax``)
 # and, per class k, the M engine on the OvR score with the class-k OvR thresholds (X5b, X6; ``ovr_c<k>/<M metric>``).
@@ -4046,7 +4044,7 @@ def run_X(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path
 
 def aux_collapse(f: pd.DataFrame, task: str) -> np.ndarray:
     """X9's aux score: ``logit`` of the aux head's (raw) probability of ``task``'s positive classes (``P(acidosis) +
-    P(HIE)`` for adverse_vs_healthy, §6.3); NaN where the row has no aux output."""
+    P(HIE)`` for adverse_vs_healthy); NaN where the row has no aux output."""
     from teb_vae.classifier.config import TASKS
 
     q = sum(f[f"p_c{c - 1}"].to_numpy(np.float64) for c, t in TASKS[task].items() if t == 1)
@@ -4077,7 +4075,7 @@ def run_X9(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Pat
       basis population ``disagreement`` (Wilson CI) is the fraction of GUIDs whose two decisions differ,
       ``binary_only`` / ``aux_only`` the GUIDs only that score alarms.
 
-    Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; §11.7 fold weighting): weighted
+    Per-fold test rows are on the weighted fold population (:func:`_folds_and_pooled`; fold weighting): weighted
     AUROCs and their bootstrap, the weighted Spearman correlation (:func:`_wspearman`), a weighted disagreement
     fraction with its Kish-Wilson CI, and weight sums for the GUID counts and ``n_pos``/``n_neg``.
     """
@@ -4155,7 +4153,7 @@ ANALYSES.update({"X": run_X, "X9": run_X9})
 
 # ---- block E (errors and interpretation: E1-E5) ----
 #
-# §11.12 block E, read off the time-resolved groups (:func:`_tr_groups`: after ``eval.exclude_last_min``, each GUID
+# Block E, read off the time-resolved groups (:func:`_tr_groups`: after ``eval.exclude_last_min``, each GUID
 # with its fold's thresholds), so a GUID's score, alarm and first-alarm time are the ones block A counts. The GUID
 # alarm score is the running max of the calibrated online score at its last segment (the running segment aggregator
 # without an online score) and the decision the primary policy's latched alarm. Tables: ``errors.parquet`` (E1: every
@@ -4268,8 +4266,8 @@ ATTRIBUTION_TABLE = ["model_id", "seed", "fold", "split", "channel_group", "clin
 
 
 def run_E6(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """E6 -> ``attribution.parquet`` (:data:`ATTRIBUTION_TABLE`): the primary model's test IG attributions (§11.12;
-    ``run.attribution_fold``) per channel group and class, per fold and pooled (shared test GUIDs as
+    """E6 -> ``attribution.parquet`` (:data:`ATTRIBUTION_TABLE`): the primary model's test IG attributions
+    (``run.attribution_fold``) per channel group and class, per fold and pooled (shared test GUIDs as
     ``data.shared_test_policy``). A seed ensemble's are its members' means per GUID (IG is linear in the score and
     ``ens`` averages the raw member scores). The IG completeness error (|Σ IG - (f(x) - f(0))| over |f(x) - f(0)|) is
     reported, not gated. Off (nothing written) unless ``eval.attribution.enabled``."""
@@ -4320,7 +4318,7 @@ P2_TABLES += ("errors",)  # non-empty whenever a model has an online or segment 
 ANALYSES.update({"E": run_E, "E6": run_E6})
 
 
-# ---- Δ vs frozen (§10.1: every non-frozen regime reads against its frozen baseline) ----
+# ---- Δ vs frozen (every non-frozen regime reads against its frozen baseline) ----
 def run_VF(ctx: SimpleNamespace, *, eval_config: Mapping[str, Any], out_dir: Path) -> Dict[str, Any]:
     """Each ``model`` seed (and its ensemble) with a ``frozen`` unit at that seed (the online regimes), minus that
     baseline, on the pooled OOF test GUIDs under one paired patient-cluster bootstrap (:func:`paired_deltas`, block Q's
@@ -4354,7 +4352,7 @@ ANALYSES.update({"VF": run_VF})
 
 # ---- block Q (model comparison: Q1-Q3) ----
 #
-# §11.8 and §11.12 block Q, run by ``run.py compare`` over 2-:data:`MAX_COMPARED` finished runs. It spans runs, so it is
+# Block Q, run by ``run.py compare`` over 2-:data:`MAX_COMPARED` finished runs. It spans runs, so it is
 # not an evaluate analysis and nothing here enters ``ANALYSES``. Runs pair only when their cohorts do
 # (:func:`cohort_digest`). Each run contributes its primary model (:func:`primary_model`); the first run is the
 # reference, and every delta is run minus reference. Q2 is the paired outcome-stratified patient-cluster bootstrap
@@ -4368,7 +4366,7 @@ import hashlib  # noqa: E402
 MAX_COMPARED = 6
 #: The ``cohort/guids.parquet`` fields that make two runs' GUID-level rows pair (:func:`cohort_digest`).
 COHORT_KEY = ("fold", "split", "guid", "patient", "y")
-#: ``comparison.parquet`` columns beyond §11.9: the compared and reference run (directory names) and the reference's
+#: ``comparison.parquet`` columns beyond the long format: the compared and reference run (directory names) and the reference's
 #: model, the member's population (as S4), the power guard (value NaN, the estimate in ``value_raw``), each side's point
 #: value and the bootstrap p-values.
 Q_EXTRA = ("run", "reference", "reference_model", "population", "underpowered", "value_raw", "run_value",
@@ -4404,7 +4402,7 @@ def delong_p(y: Any, a: Any, b: Any) -> float:
 
 def nadeau_bengio_p(d: Any) -> float:
     """Two-sided Nadeau-Bengio corrected resampled t-test of per-fold differences ``d`` (k-fold CV: variance factor
-    1/k + n_test/n_train = 1/k + 1/(k-1), df k - 1; SPEC Appendix B). NaN below two finite folds; 1 (0) when every
+    1/k + n_test/n_train = 1/k + 1/(k-1), df k - 1). NaN below two finite folds; 1 (0) when every
     fold agrees and the mean is (is not) 0."""
     d = np.asarray(d, dtype=np.float64)
     d, k = d[np.isfinite(d)], int(np.isfinite(d).sum())
@@ -4422,8 +4420,8 @@ def cohort_digest(run_dir: Any) -> str:
     Equal digests mean the same val and test GUIDs of the same patients in the same folds, against the same binary
     outcome, so the runs' GUID-level rows pair. Label weights, labeling strategies, covariates and the train split
     (``data.train_epoch_min_s`` can drop train GUIDs) stay out, so their ablations compare. A ``three_class`` run
-    (``y`` = class index 0-2) pairs with an ``adverse_vs_healthy`` one: its binary rows are the collapsed adverse score
-    (§11.3). ``hie_vs_rest`` does not (another outcome).
+    (``y`` = class index 0-2) pairs with an ``adverse_vs_healthy`` one: its binary rows are the collapsed adverse score.
+    ``hie_vs_rest`` does not (another outcome).
     """
     g = pd.read_parquet(Path(run_dir) / "cohort" / "guids.parquet")
     g = g[~g["excluded"].astype(bool) & (g["split"] != "train")]
@@ -4432,7 +4430,7 @@ def cohort_digest(run_dir: Any) -> str:
 
 
 def paired_draws(frames: Sequence[pd.DataFrame], *, resamples: int, seed: int) -> list:
-    """One outcome-stratified patient-cluster bootstrap shared by several populations (§11.8, paired).
+    """One outcome-stratified patient-cluster bootstrap shared by several populations (paired).
 
     Per frame (rows with ``patient`` and ``y``), a ``(1 + resamples, rows)`` weight matrix: row 0 is the sample itself,
     row b each row's patient multiplicity in draw b. The draws cover the union of the frames' patients
@@ -4466,7 +4464,7 @@ def paired_deltas(ref: pd.DataFrame, run: pd.DataFrame, metrics: Sequence[str], 
     Rows carry ``fold, guid, patient, y``, plus ``score`` for ``auroc`` and ``fire`` for ``sens``/``spec``. Records
     cover the whole population (``subgroup`` None, ``population`` mixed), then each cell of ``cells`` (``subgroup,
     subgroup_value, population``, membership ``member(frame)`` (C, rows)). A cell reports what its population allows,
-    as S4 does (§11.6): ``delta_auroc`` for mixed cells, ``delta_sens`` where it holds adverse GUIDs, ``delta_spec``
+    as S4 does: ``delta_auroc`` for mixed cells, ``delta_sens`` where it holds adverse GUIDs, ``delta_spec``
     where it holds healthy ones.
 
     The point value is the sample (draw row 0), with a percentile CI and the two-sided bootstrap p = 2 min(P(d <= 0),
@@ -4545,7 +4543,7 @@ def _q_side(ctx: SimpleNamespace, name: str, pm: Optional[Tuple[str, str]] = Non
 
 
 def compare_runs(run_dirs: Sequence[Any], *, policy: Optional[str] = None) -> pd.DataFrame:
-    """Q2 ``comparison.parquet`` rows (§11.9 columns + :data:`Q_EXTRA`) of 2-:data:`MAX_COMPARED` finished runs.
+    """Q2 ``comparison.parquet`` rows (columns + :data:`Q_EXTRA`) of 2-:data:`MAX_COMPARED` finished runs.
 
     The first run is the reference. For each other run, :func:`paired_deltas` of its primary model minus the
     reference's, on the pooled OOF test GUIDs, for the whole population and every member of the reference's subgroup

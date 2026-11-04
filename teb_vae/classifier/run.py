@@ -1,10 +1,10 @@
-r"""Classifier CLI and run directory (SPEC §14).
+r"""Classifier CLI and run directory.
 
     python -m teb_vae.classifier.run --config teb_vae/classifier/configs/smoke.yaml --stage cohort \
         [--set classifier.data.kfold_root=/path ...] [--run-dir PATH] [--folds 1,2] [--device cpu] \
         [--devices cuda:0,cuda:1,...]
 
-    python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--policy np30] --out DIR   # §11.8, block Q
+    python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--policy np30] --out DIR   # block Q
 
 or edit :data:`RUN_ARGS` at the bottom and run the file. Stages live in :data:`STAGES`, a plain
 dict of ``fn(cfg, run_dir, manifest) -> Optional[int]`` run in insertion order by ``--stage all``;
@@ -17,15 +17,15 @@ and ``verify`` read only earlier outputs, so naming one explicitly always re-run
 is a partial look (``evaluation/partial_<stamp>/``): it leaves ``stage_state.json`` untouched. An existing
 run directory whose config digest differs raises, so a resume never mixes settings.
 
-``train`` runs the §10.10.1 outer loop per fold: the sklearn baselines, then one neural unit per
+``train`` runs the outer loop per fold: the sklearn baselines, then one neural unit per
 ``run.seeds`` (kind ``model``), the shuffled-label control on the first seed and, when the cohort flags a
-missingness confound under ``context.auto_ablate_missing``, the ``noind`` ablation (§7.3.4). Each unit ends in
+missingness confound under ``context.auto_ablate_missing``, the ``noind`` ablation. Each unit ends in
 ``selection_lock.json`` (val calibration + thresholds); a locked unit is skipped on resume, a failed
 one is recorded (exit code 1; ``run.fail_fast`` raises instead) and ``evaluate`` refuses the run
-unless ``--allow-partial``. Per-unit status: ``stage_state.json["train"]["units"]``. MLflow (§10.10.5):
+unless ``--allow-partial``. Per-unit status: ``stage_state.json["train"]["units"]``. MLflow:
 one parent run per run directory, fail-closed; units nest under it; ``report`` logs the results to it.
 
-Fold-parallel (§14.4): with ``run.devices`` (``--devices cuda:0,cuda:1,...``) the per-fold part of ``train`` and
+Fold-parallel: with ``run.devices`` (``--devices cuda:0,cuda:1,...``) the per-fold part of ``train`` and
 ``predict`` runs in one spawned process per fold, one device slot each (:mod:`~teb_vae.classifier.parallel`); the
 parent keeps the baselines and the MLflow parent, merges each fold as its process ends, and runs ``evaluate``,
 ``report`` and ``verify`` once over every fold, exactly as the serial path does.
@@ -88,10 +88,10 @@ from utils.custom_logger import setup_logging  # noqa: E402
 VERSIONED = ("torch", "numpy", "pandas", "scikit-learn", "h5py", "pydantic", "lightning")
 #: What a neural unit's lock digests: everything val selected, frozen before test is scored (L5).
 UNIT_LOCKED = ("model_checkpoints/best.ckpt", "scaler.json", "calibration.json", "thresholds.json")
-#: What a seed ensemble's lock digests (§10.7), besides its members' own ``selection_lock.json``: a retrained member
+#: What a seed ensemble's lock digests, besides its members' own ``selection_lock.json``: a retrained member
 #: re-locks, which changes that digest, so a stale ensemble is re-selected by the next ``train``.
 ENS_LOCKED = ("calibration.json", "thresholds.json")
-#: The §11.3 stage-offset view (``eval.stage_offsets``) per unit: the offsets fitted on the val negatives and the
+#: The stage-offset view (``eval.stage_offsets``) per unit: the offsets fitted on the val negatives and the
 #: thresholds re-selected on the shifted val rows. Both enter the unit's lock; its prediction rows are ``<kind>_stage``.
 STAGE_FILES = ("stage_offsets.json", "thresholds_stage.json")
 STAGE_SUFFIX = "_stage"
@@ -118,27 +118,27 @@ def shard_record(path: str) -> Dict[str, Any]:
             "source_guid_digest": None if guid_digest is None else str(guid_digest)}
 
 
-# ---- neural units (§10.10.1 outer loop, steps 4-5) ------------------------------------------------
+# ---- neural units (outer loop, steps 4-5) ------------------------------------------------
 def neural_units(c: Classifier, confound: Optional[Mapping[str, Any]] = None) -> List[Tuple[str, int]]:
-    """``(kind, seed)`` per fold: a ``model`` unit per ``run.seeds``, then the §10.9.3 shuffled control (first seed),
+    """``(kind, seed)`` per fold: a ``model`` unit per ``run.seeds``, then the shuffled control (first seed),
     then, with ``context.auto_ablate_missing`` and any fold's missingness confound flagged (``confound``, the cohort
-    record), the §7.3.4 ``noind`` ablation (first seed; every fold, so it pools), then under an online regime the
-    §10.1 ``frozen`` baseline per seed (``config.frozen_baseline``: the same head on the frozen cache).
-    ``noind`` runs the configured regime, the shuffled control the frozen one (§10.9.3)."""
+    record), the ``noind`` ablation (first seed; every fold, so it pools), then under an online regime the
+    ``frozen`` baseline per seed (``config.frozen_baseline``: the same head on the frozen cache).
+    ``noind`` runs the configured regime, the shuffled control the frozen one."""
     shuffled = [("shuffled", c.run.seeds[0])] if c.baselines.shuffled_control else []
     noind = [("noind", c.run.seeds[0])] if c.context.auto_ablate_missing and cohort.confound_flagged(confound) else []
     frozen = [("frozen", s) for s in c.run.seeds] if c.train.regime != "frozen_cached" else []
     return [("model", s) for s in c.run.seeds] + shuffled + noind + frozen
 
 
-# ---- seed ensembles (§10.7) -----------------------------------------------------------------------
+# ---- seed ensembles -----------------------------------------------------------------------
 #: Raw score columns of :func:`score_split` averaged across seeds, besides every GUID ``score_*``.
 ENS_MEAN = ("logit_seg", "logit_online", "attn_entropy", *ATTN_COLUMNS, "ord_score")
 
 
 def ensembles(c: Classifier, confound: Optional[Mapping[str, Any]] = None) -> Dict[str, List[int]]:
     """``{kind: seeds}`` of every unit kind trained under more than one seed per fold: ``model`` with several
-    ``run.seeds`` (and the online regimes' ``frozen`` baseline with them). Each gets a seed ensemble (§10.7)."""
+    ``run.seeds`` (and the online regimes' ``frozen`` baseline with them). Each gets a seed ensemble."""
     seeds: Dict[str, List[int]] = {}
     for kind, seed in neural_units(c, confound):
         seeds.setdefault(kind, []).append(seed)
@@ -146,7 +146,7 @@ def ensembles(c: Classifier, confound: Optional[Mapping[str, Any]] = None) -> Di
 
 
 def ens_dir(run_dir: Path, fold: int, kind: str) -> Path:
-    """``<run>/folds/fold_<k>/ens`` (kind ``model``) or ``.../ens/<kind>`` (§14.2)."""
+    """``<run>/folds/fold_<k>/ens`` (kind ``model``) or ``.../ens/<kind>``."""
     base = Path(run_dir) / "folds" / f"fold_{fold}" / "ens"
     return base if kind == "model" else base / kind
 
@@ -157,7 +157,7 @@ def ens_files(out: Path, members: Sequence[Path]) -> List[str]:
 
 
 def ensemble_scores(scored: Sequence[Tuple[pd.DataFrame, pd.DataFrame]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """The seed ensemble (§10.7) of :func:`score_split` outputs over the same rows: every raw (prior-corrected,
+    """The seed ensemble of :func:`score_split` outputs over the same rows: every raw (prior-corrected,
     uncalibrated) logit, :data:`ENS_MEAN` and GUID ``score_*``, is the mean over seeds; class probabilities (``p_c*``,
     ``pseg_c*``) are the softmax of the mean log-probability, i.e. of the mean class logits up to a per-row constant.
     The CORAL g (``ord_score``) is averaged like a logit, so an ordinal ensemble keeps one ranking. Calibration and
@@ -197,9 +197,9 @@ def _cache_rows(source: Mapping[str, Any]) -> Tuple[pd.DataFrame, np.ndarray]:
 
 def unit_rows(labels: pd.DataFrame, scored: Tuple[pd.DataFrame, pd.DataFrame], cal: Mapping[str, Any], kind: str,
               seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """CONTRACT segment and GUID rows of one neural unit on one split: ``labels`` (:func:`label_rows` of that
+    """Segment and GUID prediction rows of one neural unit on one split: ``labels`` (:func:`label_rows` of that
     split) joined with :func:`score_split`'s raw logits, the pooling-attention scalars (:data:`ATTN_COLUMNS`, after
-    the CONTRACT columns), and every score's ``*_cal`` twin (:func:`calibrate_frames`). Optional columns:
+    the contract columns), and every score's ``*_cal`` twin (:func:`calibrate_frames`). Optional columns:
     ``score_<agg>[_cal]`` (segment scope); :data:`THREE_CLASS_COLUMNS` under a 3-class calibration record
     (``labels.task: three_class``), the raw ``p_c0..2`` of a binary task's aux head."""
     seg_s, gd_s = scored
@@ -225,15 +225,15 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
               files: Sequence[str] = UNIT_LOCKED,
               note: str = "best.ckpt, scaler, calibration and thresholds, fixed on val before test is scored"
               ) -> Dict[str, Any]:
-    """Step 4: calibration fit on the val GUID rows (§10.8, :func:`unit_calibration`), every threshold policy on the
-    calibrated val rows (§11.3; on ``three_class`` also per class one-vs-rest, ``thresholds.json["ovr"]``), then
-    ``selection_lock.json`` last, digesting ``files``. The val selections go to the unit's MLflow child (§10.10.5).
+    """Step 4: calibration fit on the val GUID rows (:func:`unit_calibration`), every threshold policy on the
+    calibrated val rows (on ``three_class`` also per class one-vs-rest, ``thresholds.json["ovr"]``), then
+    ``selection_lock.json`` last, digesting ``files``. The val selections go to the unit's MLflow child.
     ``unit`` is the fold's unshuffled data for the shuffled unit too: its permuted val labels only steer its training.
     A unit with no causal per-position score (non-causal, no segment head) is thresholded like the shortcut
     (:func:`~teb_vae.classifier.thresholds.guid_level_policies`); one without a segment score (``segment_head:
     false``) skips its ``segment``-basis policies (recorded ``skipped``). ``scored``: the val scores, when they do not
     come from ``out``'s own checkpoint (a seed ensemble, :func:`lock_ensemble`). With ``eval.stage_offsets`` and a
-    causal online score, the §11.3 stage view is selected here too: :data:`STAGE_FILES`, digested by the same lock."""
+    causal online score, the stage view is selected here too: :data:`STAGE_FILES`, digested by the same lock."""
     c = cfg.classifier
     scored = score_split(out, unit, "val") if scored is None else scored
     cal = unit_calibration(c, scored[1])
@@ -257,7 +257,7 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
     (out / "calibration.json").write_text(json.dumps(cal, indent=2))
     (out / "thresholds.json").write_text(json.dumps(thr, indent=2))  # plain json: -Infinity is legal
     files = list(files)
-    if c.eval.stage_offsets and seg["logit_online_cal"].notna().any():  # §11.3: the `<kind>_stage` view, val-selected
+    if c.eval.stage_offsets and seg["logit_online_cal"].notna().any():  # The `<kind>_stage` view, val-selected
         off = fit_stage_offsets(seg)
         s2, g2 = apply_stage_offsets(seg, gd, off, scope=c.model.scope, aggregators=c.model.segment_aggregators,
                                      tau=c.model.lse_tau)
@@ -276,7 +276,7 @@ def lock_unit(cfg: Config, out: Path, unit: UnitData, labels: pd.DataFrame, kind
 
 def lock_ensemble(cfg: Config, run_dir: Path, unit: UnitData, labels: pd.DataFrame, kind: str,
                   seeds: Sequence[int]) -> Dict[str, Any]:
-    """§10.7 for one fold and ``kind``: the members' val scores (:func:`score_split` of each ``best.ckpt``) are
+    """For one fold and ``kind``: the members' val scores (:func:`score_split` of each ``best.ckpt``) are
     averaged (:func:`ensemble_scores`), then calibrated once and thresholded once on those val rows by
     :func:`lock_unit`, into :func:`ens_dir` (``seed='ens'``). The lock digests the members' locks too
     (:func:`ens_files`). Call it only when every member is locked."""
@@ -294,8 +294,8 @@ def neural_predict(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], spli
                    ) -> Tuple[list, list, Dict[str, Any], List[Dict[str, Any]], List[str]]:
     """Rows of every neural unit from its saved files: ``(segments, guids, thresholds, units, missing)``. A unit that
     failed in train is only listed in ``missing``; any other unit without an intact lock refuses (L5). With
-    ``eval.covariates_off`` and covariates, every non-shuffled unit is also scored with every covariate missing
-    (§7.3.5), under its own locked calibration and thresholds, as ``model_id = <kind>_covoff``. A kind with several
+    ``eval.covariates_off`` and covariates, every non-shuffled unit is also scored with every covariate missing,
+    under its own locked calibration and thresholds, as ``model_id = <kind>_covoff``. A kind with several
     seeds adds its seed ensemble (:func:`ensembles`) as ``seed='ens'`` rows under the ensemble's own lock, which is
     read before any row of the fold is scored; a failed member makes the ensemble ``missing``. One fold at a time
     (:func:`predict_fold_rows`)."""
@@ -311,7 +311,7 @@ def neural_predict(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], spli
 
 
 def _stage_rows(c: Classifier, out: Path, seg: pd.DataFrame, gd: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """The ``<kind>_stage`` rows (§11.3) of a unit's ``(seg, gd)``: :func:`apply_stage_offsets` under the offsets the
+    """The ``<kind>_stage`` rows of a unit's ``(seg, gd)``: :func:`apply_stage_offsets` under the offsets the
     unit at ``out`` locked (:data:`STAGE_FILES`); every other column, the calibration included, is the unit's."""
     off = json.loads((out / STAGE_FILES[0]).read_text())
     s, g = apply_stage_offsets(seg, gd, off, scope=c.model.scope, aggregators=c.model.segment_aggregators,
@@ -323,7 +323,7 @@ def _stage_rows(c: Classifier, out: Path, seg: pd.DataFrame, gd: pd.DataFrame) -
 def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int,
                       splits: Sequence[str] = ("val", "test")
                       ) -> Tuple[list, list, Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    """:func:`neural_predict` of one fold, in the same row order: what a fold process scores (§14.4). A unit (or
+    """:func:`neural_predict` of one fold, in the same row order: what a fold process scores. A unit (or
     ensemble) that locked :data:`STAGE_FILES` also yields its ``<kind>_stage`` rows under ``thresholds_stage.json``."""
     c, want, source = cfg.classifier, digest(cfg), manifest["source"]
     index, n_valid = _cache_rows(source)
@@ -396,7 +396,7 @@ def predict_fold_rows(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], f
 
 
 def _unit_state(run_dir: Path, key: str, **fields: Any) -> None:
-    """§10.10.6: one unit's status and timestamps under ``stage_state.json["train"]["units"]``."""
+    """One unit's status and timestamps under ``stage_state.json["train"]["units"]``."""
     path = run_dir / "stage_state.json"
     state = _read_json(path)
     units = state.setdefault("train", {}).setdefault("units", {})
@@ -421,7 +421,7 @@ def _progress(cfg: Config, run_dir: Path, rec: Mapping[str, Any]) -> None:
 
 
 def kfold_summary(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """§10.10.4: per-unit best metrics; mean/SD/min/max across folds of the best val metrics per ``kind|seed``."""
+    """Per-unit best metrics; mean/SD/min/max across folds of the best val metrics per ``kind|seed``."""
     units = [{k: r.get(k) for k in ("fold", "seed", "kind", "status", "best_epoch", "monitor", "best_score",
                                     "train_seconds", "unit_dir")}
              | {"val": {k: v for k, v in (r.get("best_val") or {}).items() if k.startswith("val/")}} for r in records]
@@ -432,7 +432,7 @@ def kfold_summary(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "missing_units": [f"{u['kind']}|{u['seed']}|{u['fold']}" for u in units if u["status"] != "done"]}
 
 
-# ---- MLflow parent (§10.10.5) ---------------------------------------------------------------------
+# ---- MLflow parent ---------------------------------------------------------------------
 def _mlflow(cfg: Config) -> Dict[str, Any]:
     return (cfg.advanced_config.get("tracking") or {}).get("mlflow") or {}
 
@@ -551,7 +551,7 @@ def log_parent(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
 
 
 def stage_cohort(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
-    """§6 tables and fold checks into ``cohort/``; shards, counts, exposure and confound into the manifest."""
+    """Tables and fold checks into ``cohort/``; shards, counts, exposure and confound into the manifest."""
     result = cohort.build_cohort(cfg.classifier, run_dir / "cohort")
     manifest["shards"] = [shard_record(path) for path in result.pop("shards")]
     manifest["exposure"] = result.pop("exposure")
@@ -560,8 +560,8 @@ def stage_cohort(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
 
 
 def stage_extract(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
-    """§8.4: the (frozen) source once per unique cohort segment into the fingerprinted cache. Online regimes need it
-    too: it carries the frames, the train scaler, the priors and their ``frozen`` baseline unit (§10.1)."""
+    """The (frozen) source once per unique cohort segment into the fingerprinted cache. Online regimes need it
+    too: it carries the frames, the train scaler, the priors and their ``frozen`` baseline unit."""
     c = cfg.classifier
     segments = pd.read_parquet(run_dir / "cohort" / "segments.parquet")
     shards = {(k, s): p for k in c.run.folds for s, p in cohort.fold_shards(c.data, k).items()}
@@ -573,7 +573,7 @@ def stage_extract(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
 def train_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int, parent: Optional[str], *,
                state: Optional[Callable[..., None]] = None,
                progress: Optional[Callable[[Mapping[str, Any]], None]] = None) -> Dict[str, Any]:
-    """§10.10.1 for one fold: every neural unit (a locked one is skipped), then the fold's seed ensembles (§10.7).
+    """For one fold: every neural unit (a locked one is skipped), then the fold's seed ensembles.
 
     Args:
         cfg: The run's config.
@@ -583,7 +583,7 @@ def train_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: in
         parent: The MLflow parent run id; None trains every unit with MLflow off when MLflow is enabled (F9).
         state: ``state(key, **fields)`` records a unit's status; default :func:`_unit_state` (``stage_state.json``).
         progress: ``progress(record)`` records a unit trained here; default :func:`_progress` (``kfold_progress.log``).
-            A fold process (§14.4) passes its own pair, because only the parent writes run-level files.
+            A fold process passes its own pair, because only the parent writes run-level files.
 
     Returns:
         ``{"records": [...], "ens_failed": [...]}``: the ``fold_results.json`` record of every unit, trained here or
@@ -627,7 +627,7 @@ def train_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: in
             state(key, status=rec["status"], finished=_now())
             progress(rec)
         records.append(rec)
-    for kind, seeds in ensembles(c, manifest.get("confound")).items():  # §10.7, once every member is locked
+    for kind, seeds in ensembles(c, manifest.get("confound")).items():  # seed ensembles, once every member is locked
         out, key = ens_dir(run_dir, fold, kind), f"{kind}|ens|{fold}"
         if not all((unit_dir(run_dir, fold, s, kind) / LOCK).is_file() for s in seeds):
             logger.warning(f"ensemble {key}: a member is not locked (it failed); no ensemble")
@@ -659,8 +659,8 @@ def train_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: in
 
 
 def stage_train(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
-    """§14.1 train per fold: the sklearn baselines, then every neural unit (§10.10.1), fold after fold on
-    ``run.device`` or, with ``run.devices``, in fold processes (§14.4); 1 iff a unit or a seed ensemble failed."""
+    """Train per fold: the sklearn baselines, then every neural unit, fold after fold on
+    ``run.device`` or, with ``run.devices``, in fold processes; 1 iff a unit or a seed ensemble failed."""
     c = cfg.classifier
     manifest["baselines"] = baselines.train(cfg, run_dir, manifest["source"])
     parent = mlflow_parent(cfg, run_dir, manifest)
@@ -676,7 +676,7 @@ def stage_train(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
 
 def attribution_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: int,
                      split: str = "test") -> pd.DataFrame:
-    """E6 (§11.12, ``eval.attribution.enabled``) of one fold: :func:`~teb_vae.classifier.train.attribute_split` of
+    """E6 (``eval.attribution.enabled``) of one fold: :func:`~teb_vae.classifier.train.attribute_split` of
     every locked ``model`` unit (each seed; an ensemble's IG is the mean of its members', IG being linear in the score)
     on ``split``, with ``eval.attribution.n_steps`` quadrature points. A unit that failed in train is skipped (it is
     already in ``missing_units``); any other must hold its lock (L5). Columns :data:`ATTRIBUTION_COLUMNS`."""
@@ -704,9 +704,9 @@ def predict_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: 
 
 
 def stage_predict(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
-    """§11.1: val and test rows of every model into ``predictions/`` with thresholds and provenance (L5). The neural
-    units are scored per fold (:func:`predict_fold`), fold after fold or, with ``run.devices``, in fold processes
-    (§14.4); either way the tables are concatenated in fold order, so they are the same rows in the same order."""
+    """Val and test rows of every model into ``predictions/`` with thresholds and provenance (L5). The neural
+    units are scored per fold (:func:`predict_fold`), fold after fold or, with ``run.devices``, in fold processes;
+    either way the tables are concatenated in fold order, so they are the same rows in the same order."""
     c = cfg.classifier
     segments, guids, thresholds, units = baselines.predict(cfg, run_dir, manifest["source"])
     by_fold = (fan_out(cfg, run_dir, manifest, "predict") if c.run.devices else
@@ -734,7 +734,7 @@ def stage_predict(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> None:
                                           "written_at": written, "units": units, "missing_units": missing})
 
 
-# ---- fold processes (§14.4) -----------------------------------------------------------------------
+# ---- fold processes -----------------------------------------------------------------------
 #: What a fold process runs; everything else (cohort, extract, the sklearn baselines, the MLflow parent, evaluate,
 #: report, verify) runs once, in the parent.
 FOLD_JOBS = ("train", "predict")
@@ -796,7 +796,7 @@ def fold_job(fold: int, device: str, job: str, cfg_json: Dict[str, Any], run_dir
 
 def fan_out(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], job: str,
             parent: Optional[str] = None) -> Dict[int, Any]:
-    """``job`` of every fold of ``run.folds`` in fold processes over ``run.devices`` (§14.4); ``{fold: result}``.
+    """``job`` of every fold of ``run.folds`` in fold processes over ``run.devices``; ``{fold: result}``.
 
     Each fold's worker dir is emptied first, so no result outlives the process that wrote it. This process stays the
     only writer of run-level files. ``train``: as each fold process ends, its unit states and trained units are merged
@@ -878,9 +878,9 @@ def _dead_fold(cfg: Config, run_dir: Path, manifest: Mapping[str, Any], fold: in
 
 
 def stage_evaluate(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
-    """§11.12 analyses (fail-soft; 1 iff a step raised). ``--only``/``--skip`` run a partial evaluation into
+    """Analyses (fail-soft; 1 iff a step raised). ``--only``/``--skip`` run a partial evaluation into
     ``evaluation/partial_<stamp>/``; report and verify keep reading the last full one. A run with failed units is
-    refused unless ``--allow-partial`` (§10.10.1)."""
+    refused unless ``--allow-partial``."""
     arguments = manifest.get("arguments", {})
     missing = _read_json(run_dir / "predictions" / "provenance.json").get("missing_units")
     if missing and not arguments.get("allow_partial"):
@@ -902,7 +902,7 @@ def stage_report(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
 
 
 def stage_verify(cfg: Config, run_dir: Path, manifest: Dict[str, Any]) -> int:
-    """§11.15 gate over ``evaluation/summary.json``; 1 on any FAIL. Verdicts: ``evaluation/verify.json``."""
+    """Gate over ``evaluation/summary.json``; 1 on any FAIL. Verdicts: ``evaluation/verify.json``."""
     return verify.main([str(run_dir), "--json-out", str(run_dir / "evaluation" / "verify.json")])
 
 
@@ -927,7 +927,7 @@ def main(*, config: str, stage: str = "all", overrides: Optional[List[str]] = No
         folds: Comma-separated fold ids, overriding ``run.folds``.
         device: Overrides ``run.device`` (not part of the digest).
         devices: Comma-separated device slots overriding ``run.devices`` (not part of the digest), e.g.
-            ``cuda:0,cuda:1``: train and predict run one fold process per slot (§14.4).
+            ``cuda:0,cuda:1``: train and predict run one fold process per slot.
         only: Comma-separated analysis ids for ``evaluate`` (default: all).
         skip: Comma-separated analysis ids ``evaluate`` leaves out.
         allow_partial: Let ``evaluate`` pool a run whose ``train`` had failed units.
@@ -1004,7 +1004,7 @@ def main(*, config: str, stage: str = "all", overrides: Optional[List[str]] = No
 
 def build_parser() -> argparse.ArgumentParser:
     """Every default is None, so :data:`RUN_ARGS` can fill what the command line leaves out."""
-    parser = argparse.ArgumentParser(description="CTG outcome classifier (SPEC §14).")
+    parser = argparse.ArgumentParser(description="CTG outcome classifier.")
     parser.add_argument("--config")
     parser.add_argument("--stage", choices=[*STAGES, "all"])
     parser.add_argument("--set", dest="overrides", action="append", metavar="KEY.PATH=VALUE")
@@ -1021,10 +1021,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def compare(runs: Sequence[Any], out: Any, *, policy: Optional[str] = None) -> int:
-    """``compare`` (§11.8, §11.12 block Q) of 2-6 finished runs, the first the reference, into ``out``: Q2
+    """``compare`` (block Q) of 2-6 finished runs, the first the reference, into ``out``: Q2
     ``comparison.parquet`` (:func:`metrics.compare_runs`), then the Q1/Q2 figures and Q3 ``comparison.md``
-    (:func:`report.compare_report`). It reads the runs and writes only under ``out``, and it creates no MLflow run
-    (§10.10.5). It refuses runs whose cohort digests differ (:func:`metrics.cohort_digest`). Returns the report's exit
+    (:func:`report.compare_report`). It reads the runs and writes only under ``out``, and it creates no MLflow run.
+    It refuses runs whose cohort digests differ (:func:`metrics.cohort_digest`). Returns the report's exit
     code (1 iff a figure or the markdown raised)."""
     table = metrics.compare_runs(runs, policy=policy)
     out = Path(out)
@@ -1036,7 +1036,7 @@ def compare(runs: Sequence[Any], out: Any, *, policy: Optional[str] = None) -> i
 
 def compare_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m teb_vae.classifier.run compare",
-                                     description="Model comparison across finished runs (SPEC §11.8, block Q).")
+                                     description="Model comparison across finished runs (block Q).")
     parser.add_argument("--runs", nargs="+", required=True, metavar="RUN_DIR",
                         help="2-6 finished runs sharing a cohort; the first is the reference")
     parser.add_argument("--out", required=True, help="output directory, the only place compare writes")
@@ -1105,7 +1105,7 @@ RUN_ARGS: Dict[str, Any] = {
     # predict too while `devices` is None. Not part of the digest.
     "device": None,
     # None runs the folds one after another on `device`. A comma-separated list of device slots runs train and
-    # predict with one process per fold, one fold per slot (SPEC §14.4), e.g.
+    # predict with one process per fold, one fold per slot, e.g.
     #   "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"   8 folds at once, one per GPU
     #   "cuda:0,cuda:0"                                             2 folds sharing one GPU
     #   "cpu,cpu"                                                   2 folds at once on CPU
@@ -1114,7 +1114,7 @@ RUN_ARGS: Dict[str, Any] = {
     "devices": "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7",
     # evaluate only: None runs every analysis. A comma-separated subset of analysis ids runs only those, as a
     # partial look in evaluation/partial_<stamp>/ (the full evaluation, report and verify are left as they were).
-    # Ids (SPEC §11.12): C cohort, metrics, R1 R2 R5 R8 R9 R10 R11 R12 ROC/PR, T1-T4 thresholds, B1 baselines,
+    # Ids: C cohort, metrics, R1 R2 R5 R8 R9 R10 R11 R12 ROC/PR, T1-T4 thresholds, B1 baselines,
     # M time-resolved, A alarms, S1 S2 S4 S5 S6 subgroups, K K3 K7 calibration, X X9 X10 3-class, H heterogeneity,
     # E errors, E6 attribution, VF regime vs frozen. E.g. "metrics,R1".
     "only": None,

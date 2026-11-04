@@ -1,4 +1,4 @@
-# Arm (plan B.9): Does the UP mask choice matter?
+# Arm: Does the UP mask choice matter?
 base: default.yaml
 
 general_config:

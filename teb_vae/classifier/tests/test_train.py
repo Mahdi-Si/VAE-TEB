@@ -1,5 +1,5 @@
-"""train.py and the unit config: framework integration (SPEC §10.10, §13.2, §15 T-F1, T-F2, T-F3, T-F5), the
-optimiser/scheduler overrides, the §10.2 prior correction and §10.8 calibration, on fold 1 of the fixture tree."""
+"""train.py and the unit config: framework integration (T-F1, T-F2, T-F3, T-F5), the
+optimiser/scheduler overrides, the prior correction and the calibration, on fold 1 of the fixture tree."""
 from __future__ import annotations
 
 import json
@@ -16,7 +16,7 @@ from teb_vae.classifier.tests.conftest import SMOKE_CONFIG
 SHIPPED = sorted(config.DEFAULT_CONFIG.parent.glob("*.yaml"))
 SCOPES = ("sequence", "segment")
 SEED = {"sequence": 42, "segment": 7}  # one run dir, two units
-#: The early-stopping monitor per scope; best.ckpt must follow it (§10.10.2 #6).
+#: The early-stopping monitor per scope; best.ckpt must follow it.
 MONITOR = {"sequence": ("val/guid_logloss", "min"), "segment": ("val/guid_auroc", "max")}
 EPOCHS = 2
 
@@ -105,7 +105,7 @@ def test_prior_correction_known_answers():
 # ---- T-F3: callback order and the trainer kwargs ------------------------------------------------------------------
 # ---- T-F2 / T-F3: the train smoke, both scopes ---------------------------------------------------------------------
 # ---- T-F5: teardown ------------------------------------------------------------------------------------------------
-# ---- calibration (§10.8) -------------------------------------------------------------------------------------------
+# ---- calibration -------------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def synthetic():
     rng = np.random.default_rng(0)

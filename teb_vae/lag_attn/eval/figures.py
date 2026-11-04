@@ -4,22 +4,22 @@ Three generic panels -- a histogram, a median-plus-IQR ribbon, and a heatmap wit
 plus the repository's figure conventions, re-exported so an analysis imports its plotting
 surface from one place.
 
-**The style is a journal figure's, and it is decided here once.** :func:`configure_figure_style`
-applies ``utils.style``'s publication base and then :data:`STYLE_REFINEMENT` over it, which is what
-turns a training-diagnostic look into a print one: an open frame (left and bottom spines only, box
-frames on heatmaps), outward ticks, a 7 pt serif type scale with matching ``stix`` mathtext,
-unframed legends, a hairline grid, and a double-column default width of :data:`FIGURE_WIDTH`
-inches (183 mm, the wide-column width of the major journals) so a figure is designed at the size
-it will be read rather than scaled down to it. Every panel here reads its weights and sizes from
-the *active* ``rcParams`` rather than from literals, which is what lets a package's own refinement
-reach inside them.
+**The style is decided here once.** :func:`configure_figure_style` applies ``utils.style``'s
+publication base and then :data:`STYLE_REFINEMENT` over it: an open frame in a tone lighter than
+the ink (box frames on heatmaps), outward ticks, a 6.5-8.5 pt serif type scale with matching
+``stix`` mathtext, borderless white-backed legends, a solid grid on the value axis only, and data lines about
+twice the frame weight. The default width is :data:`FIGURE_WIDTH` inches (183 mm, the wide-column
+width of the major journals), and :func:`panel_grid` lays panels out **two to a row** at that
+width rather than as a stack of full-width strips, so a panel keeps an aspect a curve can be read
+at. Every panel here reads its weights and sizes from the *active* ``rcParams`` rather than from
+literals, which is what lets a package's own refinement reach inside them.
 
-**The palette is the evaluation packages' own.** :data:`COLOR_BLUE` and its siblings are the
-Okabe-Ito colour-blind-safe set, which is the palette the major journals recommend and which
-survives a greyscale print; the training callbacks keep the brighter hues of
-:mod:`teb_vae.lag_attn.figure_primitives`, so an evaluation figure and a training figure of the
-same quantity are reconciled by legend rather than by hue. The names are kept so every analysis
-keeps naming a colour by its job.
+**The palette is the evaluation packages' own, and the forecast branches have fixed styles.**
+:data:`COLOR_BLUE` and its siblings are six saturated hues checked as a set for colour-vision
+separation (see :data:`LINE_PALETTE`); :data:`SERIES_STYLES` fixes the two forecast branches to
+the convention of the per-recording sample pages -- target-only dashed slate, source-conditioned
+solid vermillion -- so the two branches are the same marks on every figure. The names are kept so
+every analysis keeps naming a colour by its job.
 
 **Importing this module does not restyle anything.** ``apply_publication_style`` mutates global
 ``rcParams``, so calling it at import time would silently restyle any other figure produced in
@@ -49,8 +49,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from cycler import cycler  # noqa: E402
 from matplotlib import cbook  # noqa: E402
 from matplotlib.backend_bases import FigureCanvasBase  # noqa: E402
+from matplotlib.colors import to_rgba  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     attach_lag_seconds_axis,
@@ -67,20 +70,29 @@ from utils.style import (  # noqa: E402
 )
 
 __all__ = [
+    "BODY_ALPHA",
     "CLASS_COLORS_DEFAULT",
     "COLOR_BLACK",
     "COLOR_BLUE",
     "COLOR_GRAY",
     "COLOR_GREEN",
+    "COLOR_GRID",
     "COLOR_LIGHT_GRAY",
+    "COLOR_MAGENTA",
     "COLOR_ORANGE",
     "COLOR_PURPLE",
+    "COLOR_SPINE",
     "COLOR_VERMILLION",
     "DEFAULT_FIGURE_FORMAT",
     "EVAL_SAVE_DPI",
     "FIGURE_WIDTH",
     "FOOTNOTE_MAX_CHARS",
     "LINE_PALETTE",
+    "PANEL_HEIGHT",
+    "SERIES_STYLES",
+    "integer_counts",
+    "panel_grid",
+    "series_style",
     "SAVE_DPI",
     "STYLE_REFINEMENT",
     "SUPPORTED_FIGURE_FORMATS",
@@ -99,6 +111,7 @@ __all__ = [
     "label_panels",
     "label_rows",
     "layout_rect",
+    "legend_strip",
     "legend_with_headroom",
     "mark_laid_out",
     "multi_line_panel",
@@ -117,108 +130,171 @@ __all__ = [
 # =============================================================================
 # The palette
 # =============================================================================
-#: The Okabe-Ito set, named by the job each hue does in the figures rather than by its number.
-#: Chosen because it is distinguishable under the common colour-vision deficiencies and keeps a
-#: luminance order in greyscale, which the training callbacks' saturated hues do not.
-COLOR_BLUE = "#0072B2"
-COLOR_ORANGE = "#E69F00"
-COLOR_GREEN = "#009E73"
-COLOR_PURPLE = "#CC79A7"
-COLOR_VERMILLION = "#D55E00"
-#: Text and reference marks: dark enough to read at 6 pt, lighter than the data ink.
-COLOR_GRAY = "#4D4D4D"
-COLOR_BLACK = "#000000"
-#: Grid, frames behind data, and the reference diagonal: the lightest mark on the page.
-COLOR_LIGHT_GRAY = "#D9D9D9"
+#: The qualitative hues, named by the job each one does in the figures rather than by its number.
+#:
+#: Six saturated hues inside one OKLCH lightness band ($0.43 \le L \le 0.77$), chosen to read at a
+#: glance on screen the way the per-recording sample pages do, and checked as a set rather than by
+#: eye: in the order of :data:`LINE_PALETTE` every adjacent pair keeps an OKLab distance of at least
+#: $8.9 \times 10^{-2}$ under the simulated deutan, protan and tritan deficiencies and at least
+#: $0.22$ for normal vision. Orange, green and magenta sit below $3:1$ contrast on white, so a panel
+#: that colours a series with one of them also names it in a legend or a direct label.
+COLOR_BLUE = "#2A78D6"
+COLOR_ORANGE = "#EDA100"
+COLOR_GREEN = "#1BAF7A"
+COLOR_PURPLE = "#6250D6"
+COLOR_VERMILLION = "#E4572E"
+#: A sixth hue, only for a panel with more series than the five above.
+COLOR_MAGENTA = "#E87BA4"
+#: Secondary ink and the reference series: tick labels, notes, the target-only forecast. A cool
+#: slate rather than a neutral grey, so a reference line beside a saturated hue still reads as
+#: "the comparison" and not as a faded copy of the data.
+COLOR_GRAY = "#5C6370"
+#: Primary ink: titles, axis labels, the truth trace. Near-black, because pure black next to the
+#: saturated hues reads as a heavier weight than the line actually has.
+COLOR_BLACK = "#1F2328"
+#: Shaded spans behind data (structural regions, unscored cells) and the reference diagonal.
+COLOR_LIGHT_GRAY = "#D9DCE1"
+#: The value-axis grid: one step off white, so it is legible against an empty panel and vanishes
+#: under a filled mark.
+COLOR_GRID = "#E8EAED"
+#: Frame and tick colour: lighter than the ink, so the data and the text carry the page rather
+#: than the box around them.
+COLOR_SPINE = "#6B7280"
 
-#: The order :func:`multi_line_panel` draws its series in: the qualitative hues first, most
-#: distinct pairs first, then the neutral ones.
+#: The order :func:`multi_line_panel` draws its series in. This exact order is the one the
+#: colour-vision checks above were run on: blue and vermillion first because they are the most
+#: distinct pair, and no two adjacent slots share a lightness or a hue family.
 LINE_PALETTE = (
-    COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE, COLOR_GRAY, COLOR_BLACK,
+    COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE, COLOR_MAGENTA,
+    COLOR_GRAY,
 )
+
+#: Fixed styles for the series that have a **meaning** across the whole run, keyed by the label a
+#: builder passes. :func:`multi_line_panel` applies them before it falls back to
+#: :data:`LINE_PALETTE`, so the two forecast branches look the same on every figure of the run --
+#: and the same as on the per-recording sample pages: the target-only reference in dashed slate,
+#: the source-conditioned forecast in solid vermillion. Two branches that overlap therefore stay
+#: two visible marks (a dash over a line) instead of one hue hiding the other.
+#: The dashed reference is drawn **above** the solid forecast (``zorder``), so where the two
+#: coincide the dashes still show over the vermillion line rather than vanishing under it.
+SERIES_STYLES = {
+    "target-only": {"color": COLOR_GRAY, "linestyle": "--", "zorder": 2.6},
+    "base": {"color": COLOR_GRAY, "linestyle": "--", "zorder": 2.6},
+    "source-conditioned": {"color": COLOR_VERMILLION, "linestyle": "-", "zorder": 2.4},
+    "full": {"color": COLOR_VERMILLION, "linestyle": "-", "zorder": 2.4},
+}
+
+#: Face opacity of a filled distribution body (violin, density): enough to carry the cohort's hue,
+#: light enough that the box drawn inside it and an overlapping body behind it stay readable.
+BODY_ALPHA = 0.38
+
+#: Colour of the inner box plot of a violin: dark ink rather than black, for the reason given at
+#: :data:`COLOR_BLACK`.
+INNER_BOX_COLOR = "#2B3036"
 
 # =============================================================================
 # The style
 # =============================================================================
 #: Default figure width in inches: 183 mm, the double-column width of Nature, Science, IEEE and
-#: the major ML venues' two-column pages. A figure drawn at this width with 7 pt type is read at
-#: the size it was designed at rather than shrunk to fit.
+#: the major ML venues' two-column pages. A figure drawn at this width is read at the size it was
+#: designed at rather than shrunk to fit. Two panels sit side by side at this width
+#: (:func:`panel_grid`); a single full-width panel is reserved for a time axis that needs it.
 FIGURE_WIDTH = 7.2
 
+#: Height in inches of one row of a :func:`panel_grid`. With two columns at :data:`FIGURE_WIDTH`
+#: this gives each panel an aspect near $1.4 : 1$, which is what a value panel reads best at; the
+#: earlier full-width strips were $3.3 : 1$ and flattened every curve into a line.
+PANEL_HEIGHT = 2.5
+
 #: The refinement applied over ``utils.style.apply_publication_style``. That base is shared with
-#: the training callbacks and tuned for figures read on a screen during a run; this is the delta
-#: that makes an evaluation figure a print one. Applied as a delta rather than a replacement so
-#: the serif family, the DPI and the white background stay the repository's.
+#: the training callbacks and the per-recording sample pages; this delta keeps its serif face and
+#: its white background and changes what made the evaluation pages read as unfinished: type too
+#: small for the panel, hairline marks that vanished, a full black frame and a grid on both axes.
 STYLE_REFINEMENT = {
-    # Type: a four-step scale, 5.5-7 pt, inside the 5-8 pt band the journals ask for at final size.
-    # Half a point below the earlier scale throughout, so tick labels and legends stop touching on
-    # the dense multi-panel pages while the axis labels stay the largest text on the page.
-    # Mathtext in the STIX face so a symbol in a label matches the Times body around it.
-    "font.size": 6.5,
-    "axes.titlesize": 7.0,
+    # Type: 6.5-8.5 pt, the band the sample pages are read at. The title is the largest text on a
+    # panel and the tick labels the smallest, so the hierarchy is legible without bold. Mathtext
+    # in the STIX face so a symbol in a label matches the Times body around it.
+    "font.size": 7.5,
+    "axes.titlesize": 8.5,
     "axes.titleweight": "normal",
-    "axes.titlepad": 4.0,
-    "axes.labelsize": 6.5,
-    "axes.labelpad": 2.5,
-    "xtick.labelsize": 5.5,
-    "ytick.labelsize": 5.5,
-    "legend.fontsize": 5.5,
-    "legend.title_fontsize": 5.5,
+    "axes.titlepad": 6.0,
+    "axes.titlecolor": COLOR_BLACK,
+    "axes.labelsize": 7.5,
+    "axes.labelpad": 3.0,
+    "axes.labelcolor": COLOR_BLACK,
+    "xtick.labelsize": 6.5,
+    "ytick.labelsize": 6.5,
+    "xtick.labelcolor": COLOR_GRAY,
+    "ytick.labelcolor": COLOR_GRAY,
+    "legend.fontsize": 6.5,
+    "legend.title_fontsize": 6.5,
     "mathtext.fontset": "stix",
-    # Frame: left and bottom spines only, hairline weight, ticks outward. The box frame heatmaps
-    # need is restored per axes by ``style_axes``.
-    "axes.linewidth": 0.4,
-    "axes.edgecolor": COLOR_BLACK,
+    "text.color": COLOR_BLACK,
+    # Frame: left and bottom spines only, in a lighter tone than the ink, ticks outward. The box
+    # frame heatmaps need is restored per axes by ``style_axes``.
+    "axes.linewidth": 0.6,
+    "axes.edgecolor": COLOR_SPINE,
     "axes.spines.top": False,
     "axes.spines.right": False,
+    "axes.xmargin": 0.02,
     "xtick.direction": "out",
     "ytick.direction": "out",
-    "xtick.major.size": 2.5,
-    "ytick.major.size": 2.5,
-    "xtick.major.width": 0.4,
-    "ytick.major.width": 0.4,
-    "xtick.minor.size": 1.5,
-    "ytick.minor.size": 1.5,
-    "xtick.minor.width": 0.25,
-    "ytick.minor.width": 0.25,
-    "xtick.major.pad": 2.0,
-    "ytick.major.pad": 2.0,
-    # Grid: a hairline one can read a value against, faint enough to vanish under a shape.
-    "grid.color": COLOR_LIGHT_GRAY,
-    "grid.linewidth": 0.25,
-    "grid.alpha": 0.5,
-    # Legend: unframed. A box around a legend is the single most common mark of an unconsidered
-    # figure, and the entries are short enough to read against the data.
-    "legend.frameon": False,
+    "xtick.color": COLOR_SPINE,
+    "ytick.color": COLOR_SPINE,
+    "xtick.major.size": 3.0,
+    "ytick.major.size": 3.0,
+    "xtick.major.width": 0.6,
+    "ytick.major.width": 0.6,
+    "xtick.minor.size": 1.8,
+    "ytick.minor.size": 1.8,
+    "xtick.minor.width": 0.4,
+    "ytick.minor.width": 0.4,
+    "xtick.major.pad": 2.5,
+    "ytick.major.pad": 2.5,
+    # Grid: solid, one step off white, on the value axis only (``style_axes``).
+    "grid.color": COLOR_GRID,
+    "grid.linewidth": 0.6,
+    "grid.alpha": 1.0,
+    # Legend: no visible border, but a white backing. A full-height interval band or a reference
+    # line often crosses the legend corner, and without the backing it runs through the text.
+    "legend.frameon": True,
+    "legend.framealpha": 0.85,
+    "legend.facecolor": "white",
+    "legend.edgecolor": "none",
+    "legend.fancybox": False,
     "legend.borderpad": 0.3,
-    "legend.labelspacing": 0.3,
-    "legend.handlelength": 1.6,
+    "legend.labelspacing": 0.35,
+    "legend.handlelength": 1.8,
     "legend.handleheight": 0.7,
     "legend.handletextpad": 0.5,
     "legend.borderaxespad": 0.3,
-    "legend.columnspacing": 1.0,
-    # Data defaults for every artist drawn without an explicit weight.
-    "lines.linewidth": 0.7,
-    "lines.markersize": 2.5,
-    "lines.markeredgewidth": 0.3,
-    "patch.linewidth": 0.35,
-    "hatch.linewidth": 0.35,
+    "legend.columnspacing": 1.2,
+    # Data defaults for every artist drawn without an explicit weight. A data line is roughly
+    # twice the frame weight, so the curve and not the box carries the panel.
+    "lines.linewidth": 1.1,
+    "lines.markersize": 3.5,
+    "lines.markeredgewidth": 0.5,
+    "patch.linewidth": 0.5,
+    "hatch.linewidth": 0.5,
+    "hatch.color": COLOR_LIGHT_GRAY,
+    "axes.prop_cycle": cycler(color=list(LINE_PALETTE)),
+    "image.cmap": "viridis",
     # Tick formatting: mathtext exponents rather than ``1e-3`` in a monospace face, and an offset
     # only when the axis really needs one.
     "axes.formatter.use_mathtext": True,
     "axes.formatter.limits": (-3, 4),
     "axes.formatter.useoffset": False,
-    # Output: a tight bounding box with a hair of margin.
-    "savefig.pad_inches": 0.02,
+    # Output: a tight bounding box with a small margin.
+    "savefig.pad_inches": 0.04,
 }
 
 #: Drawn on an axes that has no finite data, in place of an empty frame that reads as a bug.
 EMPTY_NOTE = "no finite values"
 
-#: Weight in points of the dark outline every histogram bar and bar-chart bar carries. Thin:
-#: about a third of the data line weight, enough to separate adjacent bins at print size and
-#: light enough that a fill reads as one mark.
-HISTOGRAM_EDGE_WIDTH = 0.25
+#: Weight in points of the white gap between adjacent histogram and bar-chart bars: enough to
+#: separate two bins at print size, and drawn in the surface colour so it reads as space rather
+#: than as an outline.
+HISTOGRAM_EDGE_WIDTH = 0.6
 
 #: Panel letters, stamped by :func:`render_figure` on every figure with more than one data panel,
 #: in the order the axes were created. Lowercase and bold -- the convention of Nature and of the
@@ -246,8 +322,8 @@ FOOTNOTE_SIZE = 6.0
 _FOOTNOTE_LINE_HEIGHT = 1.35
 #: The longest footnote a figure carries, in characters: one line at the double-column width. A
 #: journal figure holds a short note and leaves the argument to its caption, which here is the
-#: records, ``summary.json`` and ``FIGURE_GUIDE.md``; a caveat that needs a paragraph is written
-#: there, not under the axes.
+#: records and ``summary.json``; a caveat that needs a paragraph is written there, not under the
+#: axes.
 FOOTNOTE_MAX_CHARS = 120
 #: Average advance of a serif glyph at 1 pt, used to wrap a footnote to the figure width.
 _GLYPH_ADVANCE_EM = 0.47
@@ -257,15 +333,13 @@ _GLYPH_ADVANCE_EM = 0.47
 #: ``SAVE_DPI`` ($600$), which the training callbacks keep. It sets the pixel grid of a raster
 #: format and of any rasterised artist inside a vector one; a heatmap drawn with
 #: ``interpolation='none'`` is embedded in a PDF or SVG at its own cell resolution whatever this
-#: says. MEASURED on the full per-sample page: at $600$ dpi it was a $236$-megapixel PNG, and PNG
-#: encoding plus image resampling were most of its render time; both scale with the square of the
-#: resolution, and at this value the text is still sharp at a reader's zoom.
+#: says. PNG encoding and image resampling scale with the square of the resolution, and at this
+#: value the text is still sharp at a reader's zoom.
 EVAL_SAVE_DPI = 200
 
 #: The format a run writes when its config names none. PDF because every committed
-#: ``figure_manifest.json`` and ``FIGURE_GUIDE.md`` in this repository records ``.pdf`` names, and
-#: those are compared against a real run: changing this default would invalidate all of them at
-#: once. A run that wants another format says so in ``eval_config.figure_format``.
+#: ``figure_manifest.json`` in this repository records ``.pdf`` names, and those are compared
+#: against a real run: changing this default would invalidate all of them at once. A run that wants another format says so in ``eval_config.figure_format``.
 DEFAULT_FIGURE_FORMAT = "pdf"
 
 #: The formats a run may ask for, taken from the live matplotlib build rather than written out
@@ -363,10 +437,15 @@ def style_axes(ax: Any, *, grid: str = "major") -> None:
     comes from the active ``rcParams``, so a package's refinement reaches here without a second
     copy of the numbers.
 
+    **The default grid is on the value axis only.** A value is read across to its axis, never down
+    to the category or time axis, so vertical rules add a second texture without adding a reading;
+    a panel whose $x$ is also a value (an agreement scatter) asks for ``"xy"``.
+
     Args:
         ax: Target axes.
-        grid: ``"major"`` for a hairline major grid, ``"both"`` to add a dotted minor one, or
-            ``"none"`` for no grid and a boxed frame.
+        grid: ``"major"`` for a solid grid on the $y$ axis, ``"xy"`` for one on both axes,
+            ``"both"`` to add a dotted minor grid to ``"xy"``, or ``"none"`` for no grid and a
+            boxed frame.
     """
     ax.set_axisbelow(True)
     width = float(plt.rcParams["axes.linewidth"])
@@ -379,8 +458,9 @@ def style_axes(ax: Any, *, grid: str = "major") -> None:
     if boxed:
         ax.grid(False)
         return
+    ax.grid(False)
     ax.grid(
-        True, which="major", linestyle="-",
+        True, which="major", axis="y" if grid == "major" else "both", linestyle="-",
         linewidth=plt.rcParams["grid.linewidth"], alpha=plt.rcParams["grid.alpha"],
         color=plt.rcParams["grid.color"],
     )
@@ -391,6 +471,41 @@ def style_axes(ax: Any, *, grid: str = "major") -> None:
             linewidth=plt.rcParams["grid.linewidth"], alpha=plt.rcParams["grid.alpha"] * 0.6,
             color=plt.rcParams["grid.color"],
         )
+
+
+def integer_counts(ax: Any) -> None:
+    """Put the $y$ ticks of a count axis on whole numbers.
+
+    A histogram over a dozen recordings otherwise gets ticks at $0.5$, $1.5$, $2.5$ -- a count no
+    bin can hold, and the first thing a reader notices.
+
+    Args:
+        ax: Target axes whose $y$ axis is a count.
+    """
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+
+def series_style(label: str, index: int, n_series: int) -> dict:
+    """Return the colour and line style one series of a line panel is drawn with.
+
+    Args:
+        label: The series label. A label in :data:`SERIES_STYLES` gets its fixed style.
+        index: The series position, for the palette fallback.
+        n_series: How many series the panel carries; past :data:`LINE_PALETTE` an ordered
+            sequential map takes over, where the order is the point.
+
+    Returns:
+        ``{'color': ..., 'linestyle': ..., 'zorder': ...}``.
+    """
+    fixed = SERIES_STYLES.get(str(label))
+    if fixed is not None:
+        return dict(fixed)
+    if n_series <= len(LINE_PALETTE):
+        return {"color": LINE_PALETTE[index], "linestyle": "-", "zorder": 2.0}
+    return {
+        "color": plt.get_cmap("viridis")(index / max(n_series - 1, 1)),
+        "linestyle": "-", "zorder": 2.0,
+    }
 
 
 def footnote(fig: Any, text: str) -> float:
@@ -612,22 +727,55 @@ def histogram_panel(
         style_axes(ax)
         return 0
 
-    # Bars outlined in a thin dark hairline, so adjacent bars read as separate bins rather than
-    # as one filled area; the weight is well below the data line weight so the outline never
-    # reads as a second series.
+    # Bars separated by a gap in the surface colour rather than outlined in black: the gap tells
+    # adjacent bins apart, and a dark outline round every bar is a second texture that competes
+    # with the distribution it encloses.
     ax.hist(
-        finite, bins=int(bins), color=color, alpha=0.85, edgecolor=COLOR_BLACK,
+        finite, bins=int(bins), color=color, alpha=0.9, edgecolor="white",
         linewidth=HISTOGRAM_EDGE_WIDTH,
     )
     median = float(np.median(finite))
-    ax.axvline(median, color=COLOR_VERMILLION, linestyle="--", linewidth=plt.rcParams["lines.linewidth"],
-               label="median")
+    ax.axvline(median, color=COLOR_BLACK, linestyle="--", linewidth=plt.rcParams["lines.linewidth"],
+               label=f"median {median:.3g}")
     if reference is not None and np.isfinite(reference):
         ax.axvline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
                    label=reference_label or "reference")
-    ax.legend(loc="best")
+    integer_counts(ax)
+    legend_strip(ax)
     style_axes(ax)
     return int(finite.size)
+
+
+#: The attribute :func:`legend_strip` keeps a panel's data limits under, so a second call -- a
+#: builder adding one more labelled artist after the panel drew its own key -- sizes the strip
+#: from the data again rather than stacking a second strip on the first.
+_LEGEND_BASE_YLIM = "_eval_legend_base_ylim"
+
+
+def legend_strip(ax: Any, **kwargs: Any) -> Any:
+    """Place a one-column legend in headroom sized to the entries it holds.
+
+    The headroom :func:`legend_with_headroom` makes is a fixed fraction, which is enough for one
+    row and too little for the three-entry key of a histogram (median, reference, an interval
+    shading), whose last entry then lands on the tallest bar. Here the room grows with the entry
+    count, so the key always sits over empty space. Safe to call again after another labelled
+    artist is added: the strip is re-sized from the data limits of the first call.
+
+    Args:
+        ax: The axes, with every labelled artist already drawn.
+        **kwargs: Passed to ``ax.legend``.
+
+    Returns:
+        The legend, or ``None`` when nothing on the axes carries a label.
+    """
+    handles, _ = ax.get_legend_handles_labels()
+    if not handles:
+        return None
+    lo, hi = getattr(ax, _LEGEND_BASE_YLIM, None) or ax.get_ylim()
+    setattr(ax, _LEGEND_BASE_YLIM, (lo, hi))
+    ax.set_ylim(lo, hi + (hi - lo) * (0.1 + 0.11 * len(handles)))
+    kwargs.setdefault("loc", "upper right")
+    return ax.legend(ncol=1, **kwargs)
 
 
 def ribbon_plot(
@@ -687,8 +835,8 @@ def ribbon_plot(
             median = np.nanpercentile(curves, 50, axis=0)
             high = np.nanpercentile(curves, 75, axis=0)
 
-    ax.fill_between(axis_x, low, high, color=color, alpha=0.2, linewidth=0, label="IQR")
-    ax.plot(axis_x, median, color=color, linewidth=plt.rcParams["lines.linewidth"], label=label or "median")
+    ax.fill_between(axis_x, low, high, color=color, alpha=0.18, linewidth=0, label="IQR")
+    ax.plot(axis_x, median, color=color, linewidth=plt.rcParams["lines.linewidth"] * 1.2, label=label or "median")
     # The ribbon spans the whole axis, so the legend gets headroom rather than a corner.
     legend_with_headroom(ax, ncol=2, headroom=0.2)
     style_axes(ax)
@@ -793,11 +941,13 @@ def heatmap_with_colorbar(
     )
     if separator_row is not None:
         ax.axhline(float(separator_row) + 0.5, color=COLOR_BLACK, linewidth=plt.rcParams["axes.linewidth"])
-    colorbar = fig.colorbar(image, ax=ax, fraction=0.03, pad=0.015, aspect=30)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02, aspect=25)
     if colorbar_label:
         colorbar.set_label(colorbar_label, fontsize=plt.rcParams["axes.labelsize"])
     colorbar.ax.tick_params(labelsize=plt.rcParams["ytick.labelsize"], width=plt.rcParams["ytick.major.width"])
-    colorbar.outline.set_linewidth(plt.rcParams["axes.linewidth"])
+    # No outline: the colour ramp is its own edge, and a box round it is a second frame beside
+    # the panel's.
+    colorbar.outline.set_visible(False)
     style_axes(ax, grid="none")
     return image
 
@@ -811,17 +961,18 @@ def heatmap_with_colorbar(
 #: a three-cohort panel and as a sliver on an eight-subgroup one. Weighted in points it is the
 #: same mark on both, which is what lets the two figures be read against each other.
 #:
-#: The multiples are chosen so that under the refined ``lines.linewidth`` of $0.7$ they come out
-#: at the cfs seam's ``LINE_HEAVY`` ($2.0$) and ``LINE_THIN`` ($0.5$) -- the weights its
-#: ``distributions`` strip already draws an inter-quartile span and a range with. One visual
-#: vocabulary for "these are quartiles", across two figures built by different modules.
-INNER_BOX_BAR_WEIGHT_RATIO = 2.86
-INNER_BOX_WHISKER_WEIGHT_RATIO = 0.71
+#: The multiples are chosen so that under the refined ``lines.linewidth`` of $1.1$ they come out
+#: at about the cfs seam's ``LINE_HEAVY`` ($2.6$) and ``LINE_THIN`` ($0.8$) -- the weights its
+#: ``distributions`` strip draws an inter-quartile span and a range with. One visual vocabulary
+#: for "these are quartiles", across two figures built by different modules. The bar is narrow on
+#: purpose: a slab of ink down the middle of every body was what made the violins read as heavy.
+INNER_BOX_BAR_WEIGHT_RATIO = 2.4
+INNER_BOX_WHISKER_WEIGHT_RATIO = 0.72
 
 #: The median dot's diameter in points, and the weight of its outline as a multiple of the active
-#: ``lines.linewidth``. Sized to sit inside the bar it marks rather than to straddle it.
-INNER_BOX_MEDIAN_MARKERSIZE = 3.0
-INNER_BOX_MEDIAN_EDGE_RATIO = 0.55
+#: ``lines.linewidth``. Sized to sit just proud of the bar it marks.
+INNER_BOX_MEDIAN_MARKERSIZE = 3.6
+INNER_BOX_MEDIAN_EDGE_RATIO = 0.6
 
 #: The whisker rule: the most extreme observation within $1.5 \times$ the inter-quartile range of
 #: the quartiles -- Tukey's convention, and matplotlib's own default. Named rather than left
@@ -853,18 +1004,44 @@ def _draw_inner_box(ax: Any, centre: float, values: np.ndarray) -> None:
         [np.asarray(values, dtype=np.float64)], whis=INNER_BOX_WHISKER_IQR
     )[0]
     ax.vlines(
-        centre, box["whislo"], box["whishi"], color=COLOR_BLACK,
+        centre, box["whislo"], box["whishi"], color=INNER_BOX_COLOR,
         linewidth=weight * INNER_BOX_WHISKER_WEIGHT_RATIO, zorder=3,
     )
     ax.vlines(
-        centre, box["q1"], box["q3"], color=COLOR_BLACK,
+        centre, box["q1"], box["q3"], color=INNER_BOX_COLOR,
         linewidth=weight * INNER_BOX_BAR_WEIGHT_RATIO, zorder=3,
     )
     ax.plot(
         [centre], [box["med"]], marker="o", markersize=INNER_BOX_MEDIAN_MARKERSIZE,
-        markerfacecolor="white", markeredgecolor=COLOR_BLACK,
+        markerfacecolor="white", markeredgecolor=INNER_BOX_COLOR,
         markeredgewidth=weight * INNER_BOX_MEDIAN_EDGE_RATIO, zorder=4,
     )
+
+
+def _category_ticks(ax: Any, labels: Sequence[str]) -> None:
+    """Label a category axis, rotating the labels only when they would collide.
+
+    Three short cohort names at a slant read as a layout accident; eight subgroup stems flat on a
+    half-width panel overprint. The rule is the space each label gets: rotate once the longest
+    label needs more room than one slot of the axis gives it.
+
+    Args:
+        ax: Target axes, whose $x$ positions are ``1 .. len(labels)``.
+        labels: One label per category.
+    """
+    text = [str(label) for label in labels]
+    width_in = float(ax.get_position().width * ax.figure.get_size_inches()[0])
+    slot_in = width_in / max(len(text), 1)
+    size = plt.rcParams["xtick.labelsize"]
+    points = float(size) if isinstance(size, (int, float)) else 6.5
+    longest_in = max((len(label) for label in text), default=0) * points * _GLYPH_ADVANCE_EM / 72.0
+    rotate = longest_in > 1.1 * slot_in
+    ax.set_xticks(np.arange(len(text)) + 1.0)
+    ax.set_xticklabels(
+        text, rotation=25 if rotate else 0, ha="right" if rotate else "center",
+        rotation_mode="anchor" if rotate else "default", fontsize=size,
+    )
+    ax.tick_params(axis="x", length=0)
 
 
 def violin_panel(
@@ -925,8 +1102,8 @@ def violin_panel(
 
     ax.set_title(title)
     ax.set_ylabel(ylabel)
-    ax.set_xticks(np.arange(len(labels)) + 1.0)
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=plt.rcParams["xtick.labelsize"])
+    _category_ticks(ax, labels)
+    ax.set_xlim(0.4, len(labels) + 0.6)
 
     if not populated:
         _note_empty(ax)
@@ -940,15 +1117,17 @@ def violin_panel(
         positions=centres,
         showmedians=False,
         showextrema=False,
-        widths=0.8,
+        widths=0.7,
     )
     for position, body in zip(populated, parts["bodies"]):
         hue = (colors or {}).get(labels[position], color)
-        body.set_facecolor(hue)
-        body.set_alpha(0.55)
-        # Outlined in its own hue rather than black, so the body reads as one mark.
+        # The translucency on the face colour only, so the outline in the cohort's own hue stays
+        # at full strength and the body reads as one mark with a crisp edge. ``violinplot`` sets
+        # an artist-level alpha, which would fade the edge with the face, so it is cleared first.
+        body.set_alpha(None)
+        body.set_facecolor(to_rgba(hue, BODY_ALPHA))
         body.set_edgecolor(hue)
-        body.set_linewidth(0.4)
+        body.set_linewidth(plt.rcParams["lines.linewidth"] * 0.8)
 
     # The interior, one mark per populated group, drawn by the helper the binned panel shares --
     # a convention with an edge case worth not owning twice.
@@ -1105,10 +1284,10 @@ def binned_violin_panel(
                 showextrema=False,
             )
             for body in parts["bodies"]:
-                body.set_facecolor(colour)
-                body.set_alpha(0.55)
+                body.set_alpha(None)
+                body.set_facecolor(to_rgba(colour, BODY_ALPHA))
                 body.set_edgecolor(colour)
-                body.set_linewidth(0.4)
+                body.set_linewidth(plt.rcParams["lines.linewidth"] * 0.7)
             for position, values in zip(body_positions, bodies):
                 _draw_inner_box(ax, position, values)
         if point_x:
@@ -1206,7 +1385,9 @@ def significance_strip(
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("$-\\log_{10}$ Holm-adjusted $p$")
+    # The short form: the strip is a fraction of a panel's height on the windowed page, and the
+    # long "Holm-adjusted" phrase ran past both ends of it. The subscript names the correction.
+    ax.set_ylabel("$-\\log_{10}\\, p_{\\mathrm{Holm}}$")
 
     testable = [
         (position, value) for position, value in zip(positions, values) if np.isfinite(value)
@@ -1249,13 +1430,16 @@ def significance_strip(
     heights = -np.log10(
         np.clip(np.array([value for _, value in testable], dtype=np.float64), P_VALUE_FLOOR, 1.0)
     )
+    # A surviving window is drawn in the accent hue and a non-surviving one in the light grey of
+    # the structural shading, so the windows that matter are found by colour before the threshold
+    # line is read; the threshold still decides, and the colour only restates it.
+    threshold = -np.log10(float(alpha))
     ax.bar(
         [position for position, _ in testable],
         heights,
         width=SIGNIFICANCE_BAR_FRACTION * float(bin_width),
-        color=COLOR_BLUE,
-        alpha=0.85,
-        edgecolor=COLOR_BLACK,
+        color=[COLOR_BLUE if height > threshold else COLOR_LIGHT_GRAY for height in heights],
+        edgecolor="white",
         linewidth=HISTOGRAM_EDGE_WIDTH,
     )
     ax.axhline(
@@ -1299,9 +1483,11 @@ def grouped_violin_figure(
 ) -> Tuple[Any, Any]:
     r"""Build a figure with one violin panel per metric, each split across the same groups.
 
-    One row per metric rather than one figure per metric: the question a grouped variant answers
+    One panel per metric rather than one figure per metric: the question a grouped variant answers
     is whether the *cohorts* differ, and that is read by scanning several metrics for the same
-    group rather than by comparing two files.
+    group rather than by comparing two files. The panels are laid out by :func:`panel_grid`, two
+    to a row on a short cohort axis, and each is titled with its metric so a panel read on its own
+    still names what it shows.
 
     Args:
         values_by_metric: Ordered mapping from metric name to ``{group: values}``.
@@ -1314,27 +1500,30 @@ def grouped_violin_figure(
 
     Returns:
         ``(fig, axes)``, unsaved and unclosed -- the caller owns both, so it can assert on the
-        in-memory figure before it is written.
+        in-memory figure before it is written. ``axes`` is the 2-D grid of the panels drawn, in
+        metric order row-major, with any unused trailing slot removed from the figure.
     """
     metrics = dict(values_by_metric)
     colors = dict(colors) if colors is not None else group_colors(groups)
     reference_table = dict(references or {})
 
-    fig, axes = new_figure(max(len(metrics), 1), height_per_row=3.0)
-    for row, (metric, samples) in enumerate(metrics.items()):
+    # One column for a long cohort axis: eight subgroup violins need the full width to stay
+    # bodies rather than slivers.
+    n_cols = 1 if len(groups) > 4 else 2
+    fig, flat = panel_grid(max(len(metrics), 1), n_cols=n_cols, panel_height=PANEL_HEIGHT)
+    for index, (metric, samples) in enumerate(metrics.items()):
         reference = reference_table.get(metric)
         violin_panel(
-            axes[row, 0],
+            flat[index],
             {group: samples.get(group, []) for group in groups},
-            # No title without a prefix: the y label already names the metric, so a title would
-            # print it twice on every stacked panel.
-            title=f"{title_prefix}{metric}" if title_prefix else "",
-            ylabel=str(metric),
+            # The metric is the title, so the y label stays empty rather than printing it twice.
+            title=f"{title_prefix}{metric}",
+            ylabel="",
             colors=colors,
             reference=reference,
             reference_label="" if reference is None else f"{float(reference):g}",
         )
-    return fig, axes
+    return fig, np.asarray(flat, dtype=object).reshape(-1, 1)
 
 
 def multi_line_panel(
@@ -1379,20 +1568,21 @@ def multi_line_panel(
         return 0
 
     drawn = 0
-    # The Okabe-Ito hues in a fixed order, so a two- or three-line panel reads blue, vermillion,
-    # green. viridis runs out to a yellow that vanishes on white; it is kept only for a stack of
-    # more series than the qualitative set holds, where an ordered sequential map is the point.
+    # A label with a run-wide meaning takes its fixed style (``SERIES_STYLES``: the two forecast
+    # branches); every other series takes the qualitative hues in their fixed order, so a two- or
+    # three-line panel reads blue, vermillion, green. viridis runs out to a yellow that vanishes
+    # on white; it is kept only for a stack of more series than the qualitative set holds, where
+    # an ordered sequential map is the point.
     n_rows = int(field.shape[0])
-    sequential = plt.get_cmap("viridis")
     for row in range(n_rows):
         if not np.isfinite(field[row]).any():
             continue
-        colour = (
-            LINE_PALETTE[row] if n_rows <= len(LINE_PALETTE)
-            else sequential(row / max(n_rows - 1, 1))
-        )
         label = str(labels[row]) if row < len(labels) else f"group {row}"
-        ax.plot(axis_x, field[row], color=colour, linewidth=plt.rcParams["lines.linewidth"], label=label)
+        style = series_style(label, row, n_rows)
+        ax.plot(
+            axis_x, field[row], color=style["color"], linestyle=style["linestyle"],
+            zorder=style["zorder"], linewidth=plt.rcParams["lines.linewidth"], label=label,
+        )
         drawn += 1
     # Every curve spans the whole axis, so the legend gets headroom rather than a corner; the
     # column count grows with the group count so the strip stays one or two rows deep. A panel
@@ -1516,6 +1706,42 @@ def new_figure(n_rows: int, n_cols: int = 1, *, height_per_row: float = 2.2,
     return fig, axes
 
 
+def panel_grid(
+    n_panels: int,
+    *,
+    n_cols: int = 2,
+    panel_height: float = PANEL_HEIGHT,
+    width: float = FIGURE_WIDTH,
+) -> Tuple[Any, list]:
+    """Create a figure that wraps ``n_panels`` panels into rows of ``n_cols``.
+
+    The layout for a set of panels that do not share an axis -- the metrics of a grouped variant,
+    the distributions of one analysis -- and the replacement for stacking them as full-width
+    strips. Panels fill row-major, so ``figure.axes`` and the panel letters keep the order the
+    caller draws in; a trailing slot the last row does not need is removed rather than left as an
+    empty frame.
+
+    Args:
+        n_panels: How many panels to create. At least one is always created.
+        n_cols: Panels per row. Fewer panels than this give one row of that many.
+        panel_height: Height in inches of each row.
+        width: Total width in inches.
+
+    Returns:
+        ``(fig, axes)`` with ``axes`` a flat list of exactly ``max(n_panels, 1)`` axes.
+    """
+    count = max(int(n_panels), 1)
+    columns = max(min(int(n_cols), count), 1)
+    rows = int(np.ceil(count / columns))
+    fig, grid = plt.subplots(
+        rows, columns, figsize=(float(width), float(panel_height) * rows), squeeze=False
+    )
+    flat = list(grid.ravel())
+    for spare in flat[count:]:
+        fig.delaxes(spare)
+    return fig, flat[:count]
+
+
 def label_channel_blocks(ax: Any, n_scattering: int, n_total: int) -> None:
     """Mark the scattering / phase-harmonic boundary on a channel axis.
 
@@ -1577,7 +1803,9 @@ def render_figure(fig: Any, path: Any, *, tight: bool = True, crop: bool = True)
     label_panels(fig)
     if tight and not getattr(fig, _LAYOUT_DONE_ATTRIBUTE, False):
         try:
-            fig.tight_layout(rect=layout_rect(fig))
+            # Gutters wider than matplotlib's default, so a row of panels reads as a set of
+            # separate panels and a title never touches the x label of the panel above it.
+            fig.tight_layout(rect=layout_rect(fig), pad=0.6, h_pad=1.6, w_pad=2.0)
             fig.align_ylabels()
         except Exception:  # noqa: BLE001 - a layout warning must not lose a completed figure
             pass

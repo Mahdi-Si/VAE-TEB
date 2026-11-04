@@ -1,6 +1,6 @@
-"""P2 evaluation pipeline: the analysis registry end to end, T-E6 and T-E7 (SPEC §11.12-§11.14, §15).
+"""P2 evaluation pipeline: the analysis registry end to end, T-E6 and T-E7.
 
-:func:`make_run` fabricates a CONTRACT-shaped run directory (config, cohort tables, predictions,
+:func:`make_run` fabricates a contract-shaped run directory (config, cohort tables, predictions,
 thresholds, provenance) with a planted signal; ``test_report`` and ``test_verify`` reuse it.
 """
 from __future__ import annotations
@@ -171,7 +171,7 @@ def test_provenance_digest_mismatch_refuses(tmp_path):
 
 
 def test_first_detection_and_landmark_axis(tmp_path):
-    """A6 and the landmark axis (§11.5, §11.12 A6) on a run with second-stage onsets (labour onset at -6 h, second-stage
+    """A6 and the landmark axis on a run with second-stage onsets (labour onset at -6 h, second-stage
     onset at -1 h, so u = c_ss / 5 in the first stage and c_ss / 1 in the second): A6's sanity identity (first alarm vs
     M's latched state) passes on every axis; on to_delivery the pooled detected share of ``unhealthy`` is A's event
     sensitivity (every adverse GUID, two code paths); the landmark axis evaluates at its fixed bin edges in (-1, 1]

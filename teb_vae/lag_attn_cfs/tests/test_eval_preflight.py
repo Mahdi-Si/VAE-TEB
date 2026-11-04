@@ -1045,7 +1045,7 @@ def test_the_novelty_proxy_matches_the_gather_only_on_the_stored_clock_at_the_wr
     assert other_horizon["matches_scored_gather"] is False
     assert "H = 15" in other_horizon["tertile_note"]
 
-    # The shipped physical clock advances the slow channels' labels, which is the case the note
+    # The physical clock advances the slow channels' labels, which is the case the note
     # exists for: the tertiles then rank by the legacy stored-clock proxy.
     vae["causal_target_forecast_clock"] = "physical"
     physical = resolve_warmup_budget(preflight.config_view_for_budget(config))

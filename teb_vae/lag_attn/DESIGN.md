@@ -1,22 +1,20 @@
-# `teb_vae/lag_attn` — design record and contract
+# `teb_vae/lag_attn` — design contract
 
-This document is the standalone contract for the lag-attention VAE. It is written to be read on its
-own: the tensor interface, the geometry, the forward return dict, and what the flatten changed are
-all here. Measured evidence is cited to `knowledge/`, not copied. The architecture-deviation list
-is [in §8](#8-the-deviation-record); it used to live in code, and moved here when the structural
-snapshot it annotated was retired.
+This document is the standalone contract for the lag-attention VAE. It gives the tensor interface,
+the geometry, the forward return dict, the loss, and the design choices that the code fixes. The
+long-form description of each module is
+[`nets/vae-teb-lag-attn-model.md`](nets/vae-teb-lag-attn-model.md).
 
-It is the contract for the *model*. Reading a trained checkpoint back and asking whether it works
-is a separate pipeline with its own contract: [`eval/EVAL.md`](eval/EVAL.md) for what each analysis
-measures and which interpretation rules it enforces, and
-[`eval/FIGURE_GUIDE.md`](eval/FIGURE_GUIDE.md) for how to read what a run emits — starting with the
-seven traps that make a figure say something other than what it looks like.
+This is the contract for the *model*. The evaluation pipeline, which reads a trained checkpoint
+back, has its own contract: [`eval/EVAL.md`](eval/EVAL.md) describes what each analysis measures
+and which interpretation rules it enforces, and [`eval/FIGURE_GUIDE.md`](eval/FIGURE_GUIDE.md)
+describes how to read what a run emits.
 
 ## 1. What the model is
 
 `SeqVaeLagAttn` (`teb_vae/lag_attn/nets/model.py`) is a source-pure, causal, residual VAE for
 fetal-monitoring feature streams. It reads a target stream $Y$ (FHR features) and a source stream
-$U$ (uterine-pressure features), and at every decimated step $t$ forecasts the target's near future
+$U$ (uterine-pressure features). At every decimated step $t$ it forecasts the target's near future
 $Y^{+}_t = Y_{t+1:t+1+H_d}$ as a baseline prediction plus a source-conditioned residual:
 
 $$\hat{Y}^{\mathrm{full}}_t = \hat{Y}^{\mathrm{base}}_t + \Delta\hat{Y}^{\mathrm{src}}_t .$$
@@ -25,14 +23,14 @@ The latent $z_t$ carries only what the source adds. Its per-step KL,
 
 $$K_t = \mathrm{KL}\!\left(q(z_t \mid Y_{\le t}, U_{\le t}) \;\|\; p(z_t \mid Y_{\le t})\right),$$
 
-is reported as a transfer-entropy surrogate: at initialization $q \equiv p$ so $K_t = 0$, and every
-nat it later reports is earned by source conditioning rather than inherited from a random
-prior/posterior mismatch. A lag cross-attention over a sliding window of past source states supplies
-the residual, and the attention-weighted attribution of $K_t$ across lags is exposed as
-`te_lag_map`.
+is reported as a transfer-entropy surrogate. The delta heads of the posterior are zero-initialised,
+so at initialisation $q \equiv p$ and $K_t = 0$; any later nonzero $K_t$ comes from source
+conditioning that the model learned. A lag cross-attention over a sliding window of past source
+states supplies the residual, and the attention-weighted attribution of $K_t$ across lags is
+exposed as `te_lag_map`.
 
-The model is *source-pure*: the source pathway sees only $U$, never a cross-channel field, so a
-permutation of $U$ across the batch is a clean negative control (see
+The model is *source-pure*: the source pathway sees only $U$, never a cross-channel field. A
+permutation of $U$ across the batch is therefore a clean negative control (see
 `teb_vae/lag_attn/nets/controls.py`).
 
 ## 2. Input contract
@@ -46,34 +44,43 @@ permutation of $U$ across the batch is a clean negative control (see
 | `u_stream` | $(B, T, c_u)$ | source UP stream. $c_u = 58$ as `[up_st(43), up_ph(15)]` when `use_up_st=True`; $c_u = 15$ (`up_ph` only) when `False` |
 | `lag_band_mask` | $(L,)$ or $(T, L)$, bool | optional keep-mask in lag order; `True` keeps. `None` is a bit-exact no-op |
 
-The $c_y$ / $c_u$ widths are checked **against every batch**, at the data boundary rather than
-at construction: `SeqVaeLagAttnTask._build_source_stream` (via `_checked_source`) and
-`_build_target_streams` compare the configured values with the batch's actual per-field channel
-counts and raise `RuntimeError` naming both. Every batch, not just the first, because a run can
-be given a *list* of shards and they are not guaranteed to come from one pipeline revision.
-The widths are properties of the dataset, and the constructor cannot see one — an earlier
-version compared them against module constants, which went stale the moment the pipeline's
-phase-harmonic selection changed, and failed as an opaque shape error inside an `InputAdapter`.
+The task checks the $c_y$ / $c_u$ widths **against every batch**, at the data boundary rather than
+at construction. `SeqVaeLagAttnTask._build_source_stream` (via `_checked_source`) and
+`_build_target_streams` compare the configured values with the batch's per-field channel counts
+and raise `RuntimeError` naming both. The check runs on every batch because a run can read a list
+of shards, and the shards can come from different pipeline revisions. The widths are properties
+of the dataset, and the constructor cannot see the dataset.
 
-> **The number 58 is ambiguous across that change.** It is the current `use_up_st=true` width
-> ($43 + 15$) and was the old `use_up_st=false` width. Decide from `use_up_st` first, then set the
-> width; never migrate `c_u` by pattern-matching the number.
+> **The number 58 is ambiguous.** It is the current `use_up_st=true` width ($43 + 15$) and was
+> the width of the old phase-only selection. Decide from `use_up_st` first, then set the width;
+> never migrate `c_u` by pattern-matching the number.
 
-Both UP fields are first-class dataset entries; there is no slicing fallback. Four guards still
-run at construction — the ones that do not depend on the dataset: `num_heads * d_head ==
-d_model`, `max_lag >= 0`, `d_z % num_heads == 0` when `head_structured_latent=True`, and
-`c_y, c_u >= 1`. The last is not cosmetic: `nn.Linear(0, d_model)` is legal and returns its
-bias, so a zero width would build a model that trains to completion having never read that
-stream. `forward` carries no runtime shape assertion.
+Both UP fields are first-class dataset entries; there is no slicing fallback. The constructor runs
+the guards that do not depend on the dataset: `num_heads * d_head == d_model`, `max_lag >= 0`,
+`d_z % num_heads == 0` when `head_structured_latent=True`, and `c_y, c_u >= 1`. The last guard
+matters because `nn.Linear(0, d_model)` is legal and returns its bias, so a zero width would build
+a model that never reads that stream. `forward` carries no runtime shape assertion.
 
-Assembling `u_stream` from a batch is the task's job, not the caller's:
+Assembling `u_stream` from a batch is the task's job, not the caller's.
 `SeqVaeLagAttnTask._build_source_stream` (`teb_vae/lag_attn/task.py`) concatenates `[up_st, up_ph]`
-or returns `up_ph` alone and raises a clear error naming the missing field and the config key that
-fixes it.
+or returns `up_ph` alone. It raises a clear error that names the missing field and the config key
+that fixes it.
+
+**Causal input guard.** The stored features are two-sided wavelet transforms, so the value at step
+$t$ contains raw signal from after $t$. The config key `causal_reach_budget_s` sets a per-channel
+reach budget in seconds. The trainer resolves it (`channel_reach.resolve_stream_budgets`) into four
+constructor arguments: `target_keep_index`, `target_delays`, `source_keep_index` and
+`source_delays`. Inside `forward`, a `ChannelGate` (`nets/delays.py`) keeps the channels whose
+forward reach fits the budget and delays each survivor by
+$\delta_c = \lceil \mathrm{reach}_c / \Delta \rceil$ steps. The resolver raises if the maximum delay
+exceeds `warmup_period`. The batch must still carry the full declared widths, because the gather
+runs after the data-boundary check. With no budget, no gate is built and the model reads every
+channel with no delay. `AvailabilityInputAdapter` (`nets/encoders.py`) projects each gated stream
+and adds an availability term for the zero-filled delayed prefix.
 
 ## 3. Geometry
 
-Fixed by the preprocessing and the shipped config:
+The preprocessing and the shipped config fix these values:
 
 | Symbol | Value | Meaning |
 | --- | --- | --- |
@@ -90,8 +97,7 @@ Fixed by the preprocessing and the shipped config:
 | $M$ | $4$ | attention heads ($d_{\mathrm{head}} = 32$) |
 
 The tiny test geometry (`teb_vae/lag_attn/tests/conftest.py`) shrinks $T$, $d_{\mathrm{model}}$,
-$d_z$, $H_d$ and `max_lag` while keeping every channel count and every invariant, so it exercises
-each code path a production-scale model does.
+$d_z$, $H_d$ and `max_lag`. It keeps every channel count and every invariant.
 
 ## 4. Forward return dict
 
@@ -104,7 +110,7 @@ heads):
 | `logvar_prior` | $(B, T, d_z)$ | prior log-variance $\ell^p$ (smooth-bounded) |
 | `raw_logvar_prior` | $(B, T, d_z)$ | pre-bound prior log-variance (smooth bounding is not idempotent) |
 | `mu_post` | $(B, T, d_z)$ | posterior mean $\mu^q$ |
-| `logvar_post` | $(B, T, d_z)$ | posterior log-variance $\ell^q$ (residual around $\ell^p$) |
+| `logvar_post` | $(B, T, d_z)$ | posterior log-variance $\ell^q$ (residual around $\ell^p$ under `posterior_logvar_mode='residual'`) |
 | `z` | $(B, T, d_z)$ | sampled posterior latent |
 | `target_state` | $(B, T, d_{\mathrm{model}})$ | causal target encoder states $H^y$ |
 | `source_state` | $(B, T, d_{\mathrm{model}})$ | causal source encoder states $H^u$ |
@@ -118,163 +124,135 @@ heads):
 | `mu_full` | $(B, T, H_d, c_y)$ | full forecast mean $= \hat{Y}^{\mathrm{base}} + \Delta\hat{Y}^{\mathrm{src}}$ |
 | `logvar_full` | $(B, T, H_d, c_y)$ | full forecast log-variance |
 | `kld_per_t` | $(B, T)$ | per-step KL $K_t$ |
-| `kld_per_t_per_head` | $(B, T, M)$ | per-head KL groups (head-structured latent only) |
+| `kld_per_t_per_head` | $(B, T, M)$ | per-head KL groups (an additive decomposition only with a head-structured latent) |
 | `te_lag_map` | $(B, T, L)$ | attention-weighted lag attribution of $K_t$ |
 | `warmup_mask` | $(T,)$, bool | `True` outside the warmup region |
 | `mu_prior_sat_frac` | scalar | fraction of the prior mean near its $\tanh$ bound |
 | `delta_mu_sat_frac` | scalar | fraction of the posterior-delta mean near its bound |
 | `kld_active_frac` | scalar | fraction of latent dims with meaningful KL |
 
-`encode_only(y_st, y_ph, u_stream, *, sample_z=True)` runs the encoders, attention and latent heads
-but skips the decoders and diagnostics, returning the $11$-key subset: `mu_prior`, `logvar_prior`,
-`mu_post`, `logvar_post`, `z`, `target_state`, `source_state`, `decoder_state`, `attended_source`,
-`attended_source_heads`, `attn_weights`. With `sample_z=False`, `z` is the posterior mean rather
-than a reparameterized sample.
+`encode_only(y_st, y_ph, u_stream, sample_z=True, *, lag_band_mask=None)` runs the encoders, the
+attention and the latent heads. It skips the decoders and the diagnostics, and returns the $11$-key
+subset: `mu_prior`, `logvar_prior`, `mu_post`, `logvar_post`, `z`, `target_state`, `source_state`,
+`decoder_state`, `attended_source`, `attended_source_heads`, `attn_weights`. With
+`sample_z=False`, `z` is the posterior mean rather than a reparameterized sample.
 
 ## 5. Loss
 
-`compute_loss(forward_outputs, y_st, y_ph, *, beta, lambda_full, lambda_base, likelihood, sigma_obs,
-free_bits, detach_baseline_in_full, lambda_lag)` returns
+`compute_loss(forward_outputs, y_st, y_ph, *, weight, compute_kld_loss, beta, lambda_full,
+lambda_base, likelihood, sigma_obs, free_bits, detach_baseline_in_full, lambda_lag)` returns
 
 $$L = \lambda_{\mathrm{full}} L_{\mathrm{feat}} + \lambda_{\mathrm{base}} L_{\mathrm{base}}
-     + \beta L_{\mathrm{KL}} + \lambda_{\mathrm{lag}} L_{\mathrm{smooth}},$$
+     + \beta L_{\mathrm{KL}} + \lambda_{\mathrm{lag}} L_{\mathrm{smooth}}.$$
 
-over the valid anchor support $t \in [\mathrm{warmup}, T - H_d)$. $L_{\mathrm{base}}$ is
-load-bearing: without it, target-explainable variance could be pushed through the latent, inflating
-$K_t$ with information the source never supplied. The reported KL comes back as both `kld_train` (the
-free-bit-floored quantity that enters the loss) and `kld_raw` (the un-floored KL over the same
-support) — only `kld_raw` / `kld_per_t` may be read as the transfer-entropy surrogate. The task
-schedules $\beta$ per epoch (`SeqVaeLagAttnTask._resolve_beta`) and drives the whole objective
-through the framework's `compute_loss_and_metrics` seam.
+The two feature terms run over the valid anchor support $t \in [\mathrm{warmup}, T - H_d)$. The KL
+term runs over the support that `kld_support` selects. $L_{\mathrm{base}}$ is load-bearing: without
+it, the model could push target-explainable variance through the latent and inflate $K_t$ with
+information the source never supplied. The KL comes back as both `kld_train` (the free-bit-floored
+quantity that enters the loss) and `kld_raw` (the un-floored KL over the same support). Only
+`kld_raw` / `kld_per_t` may be read as the transfer-entropy surrogate. The task schedules $\beta$
+per epoch (`SeqVaeLagAttnTask._resolve_beta`) and drives the whole objective through the
+framework's `compute_loss_and_metrics` seam.
 
-## 6. What the flatten changed
+## 6. Fixed design choices
 
-This tree was flattened out of a three-level inheritance chain in the now-deprecated
-`model/vae_teb_prediction/` tree. Behaviour is preserved; the differences are deliberate and
-recorded. That predecessor is retained only as a frozen historical record — this model is
-standalone, is not a subclass of anything, and is not checkpoint-compatible with it.
+**Smooth bounding is unconditional.** Every log-variance passes through `smooth_bound`. The
+constructor has no `logvar_bound` or `posterior_logvar` argument; it is keyword-only with no
+`**kwargs`, so passing either raises `TypeError`.
 
-**Parity flags now unconditional (branches and flags deleted).** Smooth log-variance bounding and a
-residual posterior log-variance are the design, not options — passing `logvar_bound` or
-`posterior_logvar` to the constructor now raises `TypeError`. This supersedes §22 of
-`knowledge/vae-teb-lag-attn-v3-implemented-model.md`, which recorded every predecessor flag as
-defaulting to its parity value; that record describes the old tree and stays frozen.
+**The posterior log-variance has two modes.** `posterior_logvar_mode='residual'` (the constructor
+default and the shipped value) adds a bounded delta to the prior's pre-bound raw log-variance, so
+$q \equiv p$ exactly at initialisation. `'independent'` gives the posterior its own head. That
+head is seeded at the pre-image of log-variance $0$, which requires $0$ inside `logvar_clamp`. This
+model's prior head is not calibrated to log-variance $0$ at initialisation, so under
+`'independent'` the KL at initialisation is not exactly zero.
 
-**Parity axes kept as constructor kwargs** because they are real research axes, not parity toggles:
-`kld_support` $\in \{\text{full}, \text{anchor}\}$, `lambda_perm` and `perm_every_n_batches` (the
-source-permutation control; ships at `lambda_perm = 0` as a *readout*, see §7), and `use_entmax`
-(the entmax15-vs-softmax normalizer, which ships **on** — it is not optional, and the stale "entmax
-remains optional" claim in that knowledge doc must not be carried forward).
+**Research axes stay as constructor arguments.** These are `kld_support`
+$\in \{\text{full}, \text{anchor}\}$, `lambda_perm` and `perm_every_n_batches` (the
+source-permutation control; the shipped config sets `lambda_perm = 0`, so it is a readout only),
+`use_entmax` (constructor default `False`; the shipped config sets `true`), `source_dropout`, and
+`causal_norm`.
 
 **`compile_model = False` is a hard requirement, not a default.** The task forces it in its
-constructor. Three things in this net defeat TorchInductor independently: the `nn.LSTM` encoders, the
-`torch.utils.checkpoint` region in the attention (under `attention_grad_checkpoint`), and the
+constructor. Three things in this net defeat TorchInductor independently: the `nn.LSTM` encoders,
+the `torch.utils.checkpoint` region in the attention (under `attention_grad_checkpoint`), and the
 data-dependent boolean-mask indexing behind `kld_active_frac`, which runs on every forward.
 
-**The spike breaker ships as a non-finite guard only.** The framework breaker's relative test is
+**The spike breaker runs a non-finite guard and an additive test, with the relative test off.**
+The framework breaker's relative test is
 $\text{watched} > \text{multiplier} \cdot \max(\mathrm{EMA}, \mathrm{ema\_floor})$, which assumes a
 loss bounded below by zero. This model's `main_loss` is a Gaussian NLL with a learned observation
-variance and goes negative routinely; once the EMA is negative, $\max(\mathrm{EMA}, 0)$ is $0$ and
-every positive batch reads as a spike, so the run silently drops its hardest batches and no value of
-`ema_floor` rescues the relative test. The shipped config therefore sets `ema_floor: 1.0e9` — far
-above any reachable loss — which switches the relative test off while leaving the non-finite guard
-(which never consults the threshold) intact. That guard is the part worth keeping: it stops a NaN
-loss writing NaN gradients into every weight. Revisit if `main_loss` is measured positive at
-production scale.
+variance and can be negative. Once the EMA is negative, $\max(\mathrm{EMA}, 0)$ is $0$, so every
+positive batch reads as a spike. The shipped config therefore sets `ema_floor: 1.0e+9`, which
+switches the relative test off. The non-finite guard never consults the threshold, so it stays
+active and stops a NaN loss from writing NaN gradients into every weight. The shipped
+`additive_margin: 3.0` adds a sign-agnostic test: a batch is skipped when
+$\text{watched} > \mathrm{EMA} + \mathrm{margin}$, compared against the raw EMA.
+`max_consecutive_skips: 25` force-accepts the next finite batch after that many consecutive skips.
 
-## 7. Measured evidence (cited, not copied)
+## 7. Causal normalisation and the permutation control
 
-Two design choices rest on measurements recorded in
-`knowledge/vae-teb-lag-attn-v3-implemented-model.md`; they are cited rather than duplicated, so there
-is one source of truth:
+- **Causal normalisation.** A non-causal `GroupNorm` over a $(B, C, T)$ tensor pools statistics
+  across time, so $H^y[t]$ becomes a function of $Y_{>t}$. The "prior" then conditions on the
+  future, and $K_t$ is not a transfer-entropy surrogate. `causal_norm=True` replaces every encoder
+  `GroupNorm` with `CausalGroupNorm`, which normalises each timestep independently.
+- **The permutation control.** The shipped config runs the control as a *readout* at
+  $\lambda_{\mathrm{perm}} = 0$ rather than as a training term. `perm_kl_from_forward` reuses the
+  states that a completed forward already computed. The whole control therefore stays inside one
+  forward and one backward, so automatic optimisation (and with it gradient clipping,
+  accumulation, LR scheduling and the spike breaker) is kept.
 
-- **Causal normalization (§8.5).** A non-causal `GroupNorm` pools statistics across time, leaking the
-  future into $H^y[t]$: a measured relative leak of $11.5\%$ at $T{=}32$, falling to $0.0$ after the
-  causal `GroupNorm` replaces it. Without this, $K_t$ is not a transfer-entropy surrogate at all.
-- **The permutation control (§20.1).** A positive $\lambda_{\mathrm{perm}}$ collapsed the source
-  pathway in half the seeds tried, so the control ships as a *readout* at $\lambda_{\mathrm{perm}} =
-  0$ rather than as a training term. `perm_kl_from_forward` reuses the states a completed forward
-  already computed, keeping the whole control inside one forward and backward so automatic
-  optimization (and therefore gradient clipping, accumulation, LR scheduling and the spike breaker)
-  survives.
+## 8. Differences from the predecessor architecture
 
-## 8. The deviation record
+`SeqVaeLagAttn` is a flattened rebuild of an earlier three-level inheritance chain. It is not a
+subclass of anything and is not checkpoint-compatible with the predecessor. The rebuild made these
+intentional changes:
 
-This is the complete list of every intentional difference between the predecessor architecture
-and this rebuild. Behaviour is preserved; each entry says what changed and why it is not a
-defect.
-
-- **Encoder wrappers removed.** The two encoders were each wrapped in a 31-line class whose only
-  content was a `body` attribute holding the real encoder. The wrappers existed to shape
-  state-dict keys, which stopped mattering once checkpoint compatibility was dropped. Their
-  differing default kernels were never load-bearing: the model computes and passes kernels
-  explicitly. Effect: `{target,source}_encoder.body.X` → `{target,source}_encoder.X`. Parameters
+- **Encoder wrappers removed.** Each encoder was wrapped in a class whose only content was a `body`
+  attribute. State-dict keys changed from `{target,source}_encoder.body.X` to
+  `{target,source}_encoder.X`. The model passes the encoder kernels explicitly. Parameters are
   unchanged.
 - **Latent-statistics buffers removed.** `mu_post_running_{mean,var,count}` backed a
-  latent-normalisation mechanism with no consumer in this tree. It was also the only thing in the
-  model that imported `loguru` or `torch.distributed`, the only place a batch field name was read,
-  and it cost four device syncs per training step. Effect: 3 buffers gone. They are buffers, not
-  parameters, so the parameter count is unchanged.
-- **`raw_future_pred` removed.** The forward dict carried `raw_future_pred: None` — a non-tensor
-  in a dict of tensors — produced by a decoder that was a stub raising `NotImplementedError` and
-  was never constructed. Effect: one forward key gone. No parameters were ever involved.
-- **Construction flags removed.** `posterior_logvar` and `logvar_bound` selected between a parity
-  branch and the shipped behaviour. The shipped values (`"residual"` and `"smooth"`) are now the
-  only behaviour, so the flags are gone and passing either raises `TypeError`.
-- **Dead lag bank removed.** `LagMemoryBankBuilder` was constructed on every model and never
-  called; strided views over the projected keys replaced it. It held no parameters and no
-  buffers. Note it also carried the only `max_lag >= 0` check, which the rebuild re-established in
-  the model's constructor.
+  latent-normalisation mechanism with no consumer. The three buffers are gone; the parameter count
+  is unchanged.
+- **`raw_future_pred` removed.** The forward dict no longer carries this `None` entry, which came
+  from a stub decoder that was never constructed.
+- **Construction flags removed.** `posterior_logvar` and `logvar_bound` are gone (see §6).
+- **Dead lag bank removed.** `LagMemoryBankBuilder` was constructed and never called. Strided views
+  over the projected keys replace it. The `max_lag >= 0` check it carried now lives in the model's
+  constructor.
 
-**The structural assertion behind this list has been retired.** It was
-`teb_vae/lag_attn/tests/test_architecture_snapshot.py`, which compared the rebuild against
-captured snapshots of the predecessor (sorted state-dict keys and shapes, total and trainable
-parameter counts, and the forward and loss key sets) with everything not named above required to
-match exactly. Those snapshots were captured at the predecessor's input geometry — $c_y = 87$,
-$c_u = 101$ — and the model's input widths have since changed with the dataset (§3), so the
-comparison no longer has a common geometry to make. The capture script read the deprecated
-`model/vae_teb_prediction/` tree, which is frozen as a historical record and is not to be edited
-to follow the new widths. The test, its two fixtures, and `scripts/capture_v3_architecture.py`
-were therefore removed, and this section is now the record.
+No test asserts structural parity with the predecessor. A transposed weight or a reordered
+residual preserves every shape and count, so a shape-level comparison could not detect it.
 
-What that test could never catch, and what nothing catches now: a transposed weight or a
-reordered residual, both of which preserve every shape and count. The predecessor tree remains on
-disk, so a golden-tensor comparison against it stays available if a retrain ever diverges — at
-the old widths.
+## 9. Framework conventions
 
-## 9. Closeout — authoring checklist
+The framework's authoring checklist (`train/MODEL_MIGRATION_GUIDE.md` §3.9) maps onto this tree as
+follows:
 
-The framework's authoring checklist (`train/MODEL_MIGRATION_GUIDE.md` §3.9) verified item by item
-against this tree:
+| Item | Where |
+| --- | --- |
+| Files placed per §1.1 | `teb_vae/lag_attn/` — `nets/`, `task.py`, `trainer.py`, `configs/`, `tests/` |
+| Raw `nn.Module` has no Lightning, no config, no I/O | `nets/*.py`, enforced by `tests/test_nets_are_framework_free.py` |
+| Wrapper implements `compute_loss_and_metrics` | `task.py` — no `training_step` / `forward` / `configure_optimizers` override |
+| `super().__init__(base_model, ...)` — no grandparent bypass | `task.py` (`compile_model=False` passed as a kwarg) |
+| `self.model` for forward, `self.orig_model` everywhere else | `task.py` — `orig_model.compute_loss(...)` in the loss |
+| `on_save_checkpoint` calls `super()` first | `task.py::on_save_checkpoint` — `super()` then adds `model_kwargs` |
+| `create_model` checks the `load_checkpoint_strict` return value | `trainer.py::LagAttnTrainer.create_model` (`None` raises) |
+| `train_model` calls `build_trainer` | `trainer.py::LagAttnTrainer.train_model` |
+| `ModelCheckpoint(dirpath=self.model_checkpoint_dir, filename=...)` | `trainer.py` — `filename="lag-attn-{epoch:02d}"` |
+| DDP strategy via the un-prefixed `select_ddp_strategy` override | `trainer.py::LagAttnTrainer.select_ddp_strategy` — reads its inputs from config, not from the wrapper |
+| Required config keys | `configs/default.yaml`, checked by `tests/test_config_load.py` |
+| No hand seeding; `general_config.seed` is set | `configs/default.yaml` sets `seed` |
+| `use_distributed_sampler: true` and no self-built sampler | `configs/default.yaml`; data via `GraphDataModule` |
+| Entry point order ctor -> `setup_config()` -> `create_model()` -> `train_model()` | `trainer.py:main`, checked by `tests/test_main.py` |
 
-| Item | Verdict | Where |
-| --- | --- | --- |
-| Files placed per §1.1; nothing added to the §1.2 deviation table | yes | `teb_vae/lag_attn/` — `nets/`, `task.py`, `trainer.py`, `configs/`, `tests/` |
-| Raw `nn.Module` has no Lightning, no config, no I/O | yes | `nets/*.py`, enforced by `tests/test_nets_are_framework_free.py` |
-| Wrapper implements `compute_loss_and_metrics` and nothing else it did not have to | yes | `task.py` — no `training_step` / `forward` / `configure_optimizers` override |
-| `super().__init__(base_model, ...)` — no grandparent bypass | yes | `task.py` (`compile_model=False` passed as a kwarg) |
-| `self.model` for forward, `self.orig_model` everywhere else | yes | `task.py` — `orig_model.compute_loss(...)` in the loss |
-| `on_save_checkpoint` (overridden) calls `super()` first | yes | `task.py::on_save_checkpoint` — `super()` then adds `model_kwargs` |
-| `create_model` checks the `load_checkpoint_strict` return value | yes | `trainer.py::LagAttnTrainer.create_model` (`None` -> raises rather than training silently untrained) |
-| `train_model` calls `build_trainer`; no hand-rolled `pl.Trainer` | yes | `trainer.py::LagAttnTrainer.train_model` — first production caller of `build_trainer` |
-| `ModelCheckpoint(dirpath=self.model_checkpoint_dir, filename=...)` | yes | `trainer.py` — `dirpath=self.model_checkpoint_dir`, model-specific `filename="lag-attn-{epoch:02d}"` |
-| DDP strategy via the un-prefixed `select_ddp_strategy` override | yes | `trainer.py:191` — sources its inputs from config, not the wrapper |
-| Config has all fourteen effectively-required keys | yes | `configs/default.yaml`, asserted by `tests/test_config_load.py` |
-| No hand seeding; `general_config.seed` is set | yes | `configs/default.yaml` sets `seed`; no `manual_seed` / `seed_everything` in the tree |
-| `use_distributed_sampler: true` and no self-built sampler | yes | `configs/default.yaml`; data via `GraphDataModule` (no `world_size`) |
-| Entry point order ctor -> `setup_config()` -> `create_model()` -> `train_model()` | yes | `trainer.py:main`, asserted by `tests/test_main.py` |
-| The four verifications of §3.7 exist and pass | yes | the new-tree suite, incl. `tests/test_train_smoke.py` |
-
-Both live suites pass:
+Run the two suites from the repository root:
 
 ```
 .venv/Scripts/python.exe -m pytest train/tests -q
 .venv/Scripts/python.exe -m pytest teb_vae/lag_attn/tests -q
 ```
 
-(At closeout a third suite, the predecessor tree's `model/vae_teb_prediction/model/tests`, also
-passed. That tree is deprecated and its suite is no longer part of this model's gate.)
-
-`scripts/make_tiny_shard.py` is kept: it keeps the committed shard and stats fixtures reproducible,
-and is the only supported way to regenerate them when the dataset's channel widths change. Its
-companion `scripts/capture_v3_architecture.py` was removed along with the structural snapshot (§8).
+`scripts/make_tiny_shard.py` regenerates the committed shard and stats fixtures. Use it when the
+dataset's channel widths change.

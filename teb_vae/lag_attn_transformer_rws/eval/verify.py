@@ -20,8 +20,9 @@ thresholds for two models that exist to be compared under one.
     python -m teb_vae.lag_attn_transformer_rws.eval.verify --runs <dir-of-runs> --out RESULTS_arms.md
 
 What is local is which axes this model was swept on, and the comparison the package exists to make.
-The arm tables cover the twelve shipped ``sweep_*.yaml`` arms -- the source-window family, the two
-depth families, the stem arm, the feed-forward width and the reach budget -- and the cross-model
+The arm tables cover the swept axes of the shipped ``sweep_*.yaml`` arms -- the source-window
+family, the two depth families, the architecture arms, the feed-forward width, the prior-anchor
+weight and the reach budget -- and the cross-model
 table puts runs of *both* architectures side by side, keyed by the ``model_class`` each run recorded
 in its own ``run_context``.
 
@@ -115,8 +116,7 @@ SWEPT_D_FF = ("model_config", "VAE_model", "encoder_d_ff")
 SWEPT_REACH = shared.SWEPT_REACH
 
 #: So is the prior-anchor weight's: it names a term in the shared objective rather than anything
-#: this encoder owns. The arms that sweep it ship in **this** package, because the prior-variance
-#: collapse the anchor answers was measured on this architecture -- which is why the section is
+#: this encoder owns. The arms that sweep it ship in **this** package, which is why the section is
 #: rendered here as well as in the sibling.
 SWEPT_BETA_PRIOR = shared.SWEPT_BETA_PRIOR
 
@@ -477,8 +477,7 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
     lines += shared._table(
         ["`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
          # Spelled `abs(...)` rather than with bars: a cell is split on `|`, so a header written
-         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table. This
-         # is also the spelling this package's RESULTS.md derived-quantity block uses.
+         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table.
          f"`{D_BASE_COLUMN}`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`",
          f"`{KL_COLUMN}`", "`kld_active_frac` (final)", "Verdicts", "Run"],
         shared._sweep_rows(

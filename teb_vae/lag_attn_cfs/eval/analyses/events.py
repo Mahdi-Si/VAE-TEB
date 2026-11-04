@@ -71,7 +71,7 @@ DETECTION_FIGURE = "contraction_detection"
 #: Retained segments the detection figure draws, as many from every clinical class.
 DETECTION_SAMPLES_PER_CLASS = 2
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 CONDITIONED_FIGURE = "conditioned_coupling"
 
 #: Guards. Below either of these the conditioned comparison is a recorded skip rather than a
@@ -362,7 +362,7 @@ def build_detection_figure(
     after each onset in which an anchor counts as an event anchor shaded, and the stretch before
     the first decoded anchor greyed, since no anchor there can be conditioned on anything. The
     page carries one short key line; the event window length and the onset convention are in the
-    record (``event_lag_window_s``, ``onset_convention``) and ``FIGURE_GUIDE.md``.
+    record (``event_lag_window_s``, ``onset_convention``).
 
     Args:
         retained: The collection's retained arrays.
@@ -433,7 +433,7 @@ def build_conditioned_figure(per_recording: pd.DataFrame, *, window_s: Optional[
     and palette every other cohort figure in this evaluation uses, so two of them can be read
     side by side. ``groupby`` alone would order them alphabetically, putting acidosis first. Each
     violin names its recording count on its tick label; the event window it was cut at is in the
-    record and ``FIGURE_GUIDE.md``.
+    record.
 
     Args:
         per_recording: The long per-recording frame, one row per recording and readout.
@@ -443,9 +443,10 @@ def build_conditioned_figure(per_recording: pd.DataFrame, *, window_s: Optional[
         The figure; the caller renders and closes it.
     """
     metrics = [name for name, _ in CONDITIONED_READOUTS]
-    figure, axes = figures.new_figure(len(metrics))
+    # One panel per readout, two to a row: three short cohort violins do not need the full width.
+    figure, flat = figures.panel_grid(len(metrics))
     for index, metric in enumerate(metrics):
-        axis = axes[index, 0]
+        axis = flat[index]
         cut = per_recording[per_recording["metric"] == metric] if len(per_recording) else (
             per_recording
         )

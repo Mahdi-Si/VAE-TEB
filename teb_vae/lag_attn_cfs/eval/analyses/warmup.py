@@ -14,9 +14,8 @@ has a channel axis whose members become honest at different times:
 
 * **The source-lag warmth fractions.** How much of the lag attention mass lands on lags where each
   stored source block is warm. **A small value here is the expected finding, not a fault**, and
-  the emitted record says so: ``lag_attn_cfs/DESIGN.md`` section 8 records that the source blocks'
-  warm-ups are long against the lag window, so most of the searched lag range reads source steps
-  that are still settling. The number exists to be *measured* across arms, not to be passed.
+  the emitted record says so: the source blocks' warm-ups are long against the lag window, so most
+  of the searched lag range reads source steps that are still settling. The number exists to be *measured* across arms, not to be passed.
 
 * **The two geometry guards.** ``anchors_per_sample`` must be $T_{\mathrm{valid}} - F$ and
   ``target_warm_frac`` exactly $1.0$. Both are exact structural numbers rather than statistics, and
@@ -150,12 +149,11 @@ WARMTH_COLUMNS: Tuple[str, ...] = ("source_lag_warmth_frac_st", "source_lag_warm
 GROUPED_METRICS: Tuple[str, ...] = TERTILE_COLUMNS + WARMTH_COLUMNS
 
 #: The statement that travels with the warmth fractions, so a reader does not treat a small value
-#: as a defect. It cites the design record rather than restating its argument.
+#: as a defect.
 WARMTH_EXPECTATION = (
     "a small warmth fraction is the expected finding on this cell rather than a fault: the source "
     "blocks' causal warm-ups are long against the lag window, so most of the searched lag "
-    "range reads source steps that are still settling. See lag_attn_cfs/DESIGN.md section 8. The "
-    "number is here to be compared across arms, not to be passed."
+    "range reads source steps that are still settling. The number is here to be compared across arms, not to be passed."
 )
 
 #: The value ``target_warm_frac`` must take, and the only one it can take on a checkpoint built by
@@ -432,7 +430,10 @@ def build_tertile_figure(
     # The warmth panel only where the table carries a warmth fraction: it is a fraction of
     # attention mass, and a model with no attention over the lags has nothing to draw there.
     warmth = [name for name in WARMTH_COLUMNS if name in per_guid.columns]
-    figure, axes = figures.new_figure(2 if warmth else 1)
+    figure, axes = figures.new_figure(
+        1, 2 if warmth else 1, height_per_row=figures.PANEL_HEIGHT,
+        width=figures.FIGURE_WIDTH if warmth else 4.8,
+    )
     figures.violin_panel(
         axes[0, 0],
         {name: finite_column(per_guid, name) for name in TERTILE_COLUMNS},
@@ -443,7 +444,7 @@ def build_tertile_figure(
     )
     if warmth:
         figures.violin_panel(
-            axes[1, 0],
+            axes[0, 1],
             {name: finite_column(per_guid, name) for name in warmth},
             title="Warm-lag attention",
             ylabel="fraction of attention mass",

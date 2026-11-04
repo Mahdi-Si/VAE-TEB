@@ -5,12 +5,11 @@ its own: what a run does, how the modules compose, what each analysis measures a
 preconditions, what every `eval_config` key means, and which interpretation rules the code
 *enforces* rather than merely documents.
 
-Every factual claim below was checked against the code as it stands. Where a rule exists, this
-document leads with the rule and then names the concrete failure it prevents — that is the whole
-value of the file, and the reason a reader should be able to trust it without opening the source.
+Where a rule exists, this document leads with the rule and then names the concrete failure it
+prevents.
 
-For how to *read* the figures a run emits — and the seven traps that make a figure say something
-other than what it looks like — see [`FIGURE_GUIDE.md`](FIGURE_GUIDE.md). This document does not
+For how to *read* the figures a run emits — and the traps that make a figure say something other
+than what it looks like — see [`FIGURE_GUIDE.md`](FIGURE_GUIDE.md). This document does not
 duplicate it.
 
 ## Who this is for, and where to start
@@ -23,7 +22,7 @@ pointing it at the k-fold split for the first time.
 
 **Reading a run's output.** Read §9 (interpretation rules — the traps that make a number mean
 something else), §10 (what each analysis measures), §12 (reading `summary.json`), §13 (mechanically
-verifying a run), §18 (what is still open). Then `FIGURE_GUIDE.md` for the figures.
+verifying a run), §18 (known limitations). Then `FIGURE_GUIDE.md` for the figures.
 
 **Extending the pipeline.** Read §2 (architecture and the layering rules), §3 (data flow), §14
 (module reference), §15 (six recipes, each naming the test that fails if you skip a step), §16
@@ -54,7 +53,7 @@ mask **keeps** rather than removes, so it measures sufficiency and not necessity
 15. [Extending the pipeline](#15-extending-the-pipeline)
 16. [Test architecture](#16-test-architecture)
 17. [Operations](#17-operations)
-18. [Known limitations and open questions](#18-known-limitations-and-open-questions)
+18. [Known limitations](#18-known-limitations)
 
 ---
 
@@ -330,11 +329,12 @@ that looks like a transfer entropy but is not one is worse than no number.
 
 ## 5. The k-fold repoint, and what it changes
 
-`configs/eval.yaml` points `dataset_config.vae_test_datasets` at
-`k_fold_cross_validation_dataset/test/` — one HDF5 per canonical subgroup, all eight of
+`configs/eval.yaml` points `dataset_config.vae_test_datasets` at the k-fold split
+(`k_fold_cross_validation_dataset/fold_1/`) rather than at the pretraining test files
+`default.yaml` uses. It lists one `test/` HDF5 per canonical subgroup — all eight of
 `healthy_no_bg_no_cs`, `healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`, `acidosis_no_cs`,
-`acidosis_cs`, `hie_no_cs`, `hie_cs` — rather than at the pretraining test files `default.yaml`
-uses.
+`acidosis_cs`, `hie_no_cs`, `hie_cs` — plus the `hie_no_cs` and `hie_cs` files of the fold's
+`val/` and `train/` directories, twelve files in total.
 
 **This is a deliberate semantic change, not a bug fix.** "Test" in an eval run means all eight
 subgroups and all three clinical classes; "test" in a training run means the healthy-only
@@ -345,10 +345,9 @@ remains usable — override `vae_test_datasets` back to it in a variant config �
 paths self-skip below two classes rather than raising, so the same code runs against either and
 neither produces a one-violin figure that invites a comparison there is nothing to compare against.
 
-Both paths in the shipped config still carry the deliberate `REPOINT_ME_new_channel_selection`
-placeholder. Preflight **raises** on any resolved dataset path containing `REPOINT_ME`, and it runs
-that check *first*, before the existence guards, so the failure names the real cause instead of
-surfacing as a missing file the operator then goes looking for.
+Preflight **raises** on any resolved dataset path containing the `REPOINT_ME` placeholder, and it
+runs that check *first*, before the existence guards, so the failure names the real cause instead
+of surfacing as a missing file the operator then goes looking for.
 
 ---
 
@@ -362,33 +361,32 @@ about why.
 
 ### The `eval_config` block
 
-The table is `config_schema.VALID_KEYS` exactly; there are eight keys and no others. `bool` is
+The table is `config_schema.VALID_KEYS` exactly; there are nine keys and no others. `bool` is
 rejected everywhere an integer is expected — it is an `int` subclass in Python, so
 `caps: {attention: true}` would otherwise validate and then cap that analysis at one sample.
 
 The **Default** column is `config_schema.DEFAULTS`, which is what a variant config that omits the
-block — or omits that key — actually runs under. Two of them differ from the shipped value in a way
-that changes behaviour rather than tuning it, and both are marked below.
+block — or omits that key — actually runs under. One default differs from the shipped value in a
+way that changes behaviour rather than tuning it, and it is marked below.
 
 | Key | Type and bound | Default | Shipped | Meaning, and what a wrong value costs |
 | --- | --- | --- | --- | --- |
 | `seed` | int, $0 \le s < 2^{32}$ | `42` | `42` | Seeds torch, numpy and `random`. `forward` samples $z$ unconditionally, so the sampling is seeded rather than suppressed — evaluating a mean-$z$ model would report a forecast the model never actually makes. KL readouts are unaffected either way, being functions of $\mu$ and $\log\sigma^2$ only. The upper bound is numpy's, the binding one of the three libraries. |
-| `max_samples` | int $\ge 1$, or `null` | `null` | `null` | Prefix cap on loader iteration, overshooting by up to $B - 1$ because it is checked per batch. `--max-samples` is injected into the block **before** validation, so it passes the same `minimum=1` bound: `--max-samples 0` and `--max-samples -1` are rejected. Assigned after validation they bypassed it, and both evaluated exactly one batch — indistinguishable in the output from a legitimate `--max-samples 1`, so a `-1` meaning "no cap" silently became the smallest run the pipeline can do. |
+| `max_samples` | int $\ge 1$, or `null` | `null` | `null` | Prefix cap on loader iteration, overshooting by up to $B - 1$ because it is checked per batch. `--max-samples` is injected into the block **before** validation, so it passes the same `minimum=1` bound: `--max-samples 0` and `--max-samples -1` are rejected. |
 | `caps` | mapping of name to (int $\ge 1$ or `null`) | `{}` (no caps) | `predictions: 2000`, `attention: 2000`, `samples: 8` | Per-analysis retention caps, for the analyses that hold per-sample tensors or emit per-sample files. A cap of $0$ is **rejected** — it would retain nothing while still reporting success, which is indistinguishable from an analysis that found nothing. `null` means no cap. Cap *names* are deliberately not validated: the set grows with every analysis, and an unread name only ever narrows, so it is inert. `report.check_inert_caps` separately warns about a cap at or above `max_samples`, which never fires; those warnings land in `results.config_warnings` and the console table. |
 | `bands` | mapping of name to an inclusive `[lo, hi]` integer pair | `{}` (the ablation then raises) | four bands over $[0, 90]$ | Lag bands for the ablation, in model-lag units. `lo > hi` raises: an empty band produces an all-`False` keep mask, and `entmax15` — which the shipped config enables — raises on a zero-support row rather than degrading like `softmax`. `hi > max_lag` raises and names $L = \mathrm{max\_lag} + 1$. `max_lag` is read from `model_config.VAE_model`, i.e. the config's claim about the geometry; the checkpoint's is authoritative and is re-checked in preflight, but a band outside the config's own claim is already wrong this early. |
-| ~~`up_shift_secs`~~ | — | **removed** | — | **Removed on 2026-09-05.** The key mapped a lag index onto a "raw-file" timeline by undoing the dataset builder's UP shift. The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it. Every lag axis is $4\ell$ on the stored timeline, `metrics.lag_to_seconds` takes no offset, and a config naming the key is refused as unknown. |
-| `health_probe_floor` | float $\ge 0$ | **`0.0`** — a floor that can never fire | `0.01` | Floor on the load health probe's `residual_ratio`. Below it the probe **warns and records**; it never raises. A negative value is rejected: the quantity is a ratio of RMS magnitudes and non-negative by construction, so a negative floor could never fire and would read as an active check that is not one. **Chosen a priori and uncalibrated** — see §8 for the procedure to recalibrate it. |
+| `health_probe_floor` | float $\ge 0$ | **`0.0`** — a floor that can never fire | `0.01` | Floor on the load health probe's `residual_ratio`. Below it the probe **warns and records**; it never raises. A negative value is rejected: the quantity is a ratio of RMS magnitudes and non-negative by construction, so a negative floor could never fire and would read as an active check that is not one. The shipped value is set a priori; §8 gives the procedure to set it from a trained checkpoint. |
 | `saturation_flag_threshold` | float in $[0, 1]$ | `0.05` | `0.05` | Fraction of saturated elements above which `mu_prior_sat_frac` and `delta_mu_sat_frac` are flagged. Both are `tanh`-squashed to a configured scale, so a saturated element is one whose gradient has effectively vanished: a high reading is a mis-set hyperparameter, not a property of the data. On `delta_mu_scale` it additionally **caps every transfer-entropy number the run reports**, since the measured coupling is being clipped by the bound rather than by the model. The flag is applied to the `_masked` readings only (§9). A value outside $[0, 1]$ is rejected as either always-firing or never-firing. |
 | `ablation_batch_size` | int $\ge 1$, or `null` | `null` | `null` | Splits each loader batch into micro-batches for the lag ablation alone, which runs one forward per band on top of the attention window's dense clone. It bounds memory and does not change what is *measured* — though it is not exactly neutral: `forward` samples $z$ and the noise tensor's shape follows the batch, so splitting moves every absolute number by that sampling noise. Bands within one run are compared under common random numbers regardless, so the band-to-band differences — which are the measurement — are unaffected. |
-| `figure_format` | matplotlib filetype, or `null` | **`null`** — the `pdf` default | `svg` | Image format every figure of the run is written in (`pdf`, `svg`, `png`, `eps`, …). Validated at config load against the **installed** matplotlib's own list, so a typo is refused before the model is built and the message names the supported set. `null` keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf` — the format every committed figure manifest records. DPI applies only to rasterised content, so heatmap-bearing pages stay raster inside an `svg`. |
-| `max_hours_before_delivery` | float $\ge 0.5$, or `null` | **`null`** — no bound | `4.0` | How far before delivery a segment may be recorded and still be evaluated, in hours. **The bound is on the population, not on an axis**: it is applied to the delivery clock ($h = -\mathrm{epoch}/3600$) before anything is binned. It changes what every downstream number is computed over — cohort sizes, window counts, the trajectory and its tests all move — so a bounded run is **not** comparable with an unbounded one, and the resolved config dumped into the run directory is the only durable record of which this run was. Minimum one $0.5$ h bin, below which there is no whole window to draw. Here it reaches `kld_time_to_delivery`, the one analysis with a time-before-delivery axis. |
+| `figure_format` | matplotlib filetype, or `null` | `null` — the `pdf` default | `null` | Image format every figure of the run is written in (`pdf`, `svg`, `png`, `eps`, …). Validated at config load against the **installed** matplotlib's own list, so a typo is refused before the model is built and the message names the supported set. `null` keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf` — the format every committed figure manifest records. DPI applies only to rasterised content, so heatmap-bearing pages stay raster inside an `svg`. |
+| `max_hours_before_delivery` | float $\ge 0.5$, or `null` | `null` — no bound | `null` | How far before delivery a segment may be recorded and still be evaluated, in hours. **The bound is on the population, not on an axis**: it is applied to the delivery clock ($h = -\mathrm{epoch}/3600$) before anything is binned. It changes what every downstream number is computed over — cohort sizes, window counts, the trajectory and its tests all move — so a bounded run is **not** comparable with an unbounded one, and the resolved config dumped into the run directory is the only durable record of which this run was. Minimum one $0.5$ h bin, below which there is no whole window to draw. Here it reaches `kld_time_to_delivery`, the one analysis with a time-before-delivery axis. |
 
 **The bolded default is the one to watch in a variant config.** A config that omits
 `eval_config` entirely — or that overrides `caps` alone and drops the rest of the block, which the
 partial-block rule makes legal — runs with `health_probe_floor: 0.0`, so the load health probe's
 warning can never fire. That is the honest default for a schema that must accept a config having
 said nothing; it is not what the shipped run does. Every lag axis is the bare $4\ell$ on the
-stored timeline regardless of configuration.
+stored timeline regardless of configuration; no `eval_config` key adds an offset.
 
 **The cap names the code actually reads** are eleven, and since a name is never validated (§6, the
 `caps` row) a misspelling here is inert rather than loud: `forecast` and `predictions` (the scalar
@@ -400,22 +398,20 @@ frame and the heatmap accumulation, two independent plans in one analysis), `fre
 
 Four, all in `configs/eval.yaml`, all of which fail silently rather than loudly:
 
-- **`general_config.batch_size.test: 32`**, not the training 128. Under `no_grad` the activation
+- **`general_config.batch_size.test: 32`**, not the inherited training value. Under `no_grad` the activation
   retention that dominates training is gone, but the transients are not: the horizon core
   materialises $(B, T, H_d, d_{\mathrm{hidden}})$ tensors of roughly 590 MB at $B = 128$ and the
   attention window is cloned dense at roughly 1.79 GB, on top of which the permutation control adds
   a third decoder pass and the lag ablation one forward per band. `test` is the key
   `GraphDataModule` actually reads; a `batch_size` under `eval_config` would be a dead key — and is
-  now a rejected one — and the loader would quietly run at 128, which is the exact configuration
-  this bound exists to avoid. Results are batch-size-invariant (GroupNorm and LayerNorm, no
-  BatchNorm), so this costs only time.
+  now a rejected one — and the loader would quietly run at the inherited value. The model has no
+  BatchNorm, so the batch size changes only the runtime and the shape of the $z$ sampling noise.
 - **`dataloader_config.num_workers: 0`**, re-forced in code with a warning by
   `run.force_single_process_loader`, which additionally sets `persistent_workers: False`. Not
   tuning: `create_optimized_dataloader` hardcodes `persistent_workers=True` whenever
   `num_workers > 0`, and with spawn multiprocessing over a multi-file HDF5 dataset the workers
   degrade after the first full iteration, silently truncating the second pass to the first file's
-  index range. Eval makes many passes over one loader, so it meets that failure every time. In the
-  predecessor pipeline it presented as "only 1 class found".
+  index range. Eval makes many passes over one loader, so it would meet that failure every time.
 - **Inherited training-time filters, turned off explicitly**: `epoch_min: null`, `epoch_max: null`,
   `label: null`. Each *drops eval samples* rather than failing. `label` filters by exact float
   equality against the one-hot target and would quietly exclude whole subgroups — and, on
@@ -432,9 +428,7 @@ wholesale on merge. It adds `target`, `cs_label`, `bg_label` and `epoch`.
 ### Caps are subsamples, never prefixes
 
 The test loader is built `shuffle=False` over eight concatenated per-subgroup files, so a naive cap
-takes a **prefix** — file 0 alone, a single subgroup and a single class. That is precisely the
-predecessor's documented "only 1 class found" failure arriving by a second route, and its only
-recorded workaround was "do not use a cap". Every cap here is instead a seeded index subsample over
+takes a **prefix** — file 0 alone, a single subgroup and a single class. Every cap here is instead a seeded index subsample over
 the full index space, stratified by source file from the composition the loader probe recorded, and
 each capped analysis records the per-file composition it *actually* drew — so a skewed draw is
 visible rather than invisible, in the analysis's own summary and again in `results.coverage`.
@@ -455,11 +449,9 @@ Two thresholds are hard-coded on the same argument, and the argument is worth st
 operator who can raise a threshold can make any run pass it**, and both of these gate a verdict
 promoted to the top of `summary.json`.
 
-- `scalars.DEFAULT_COLLAPSE_THRESHOLDS` — `pred_gap: 1e-4`, `kld_raw: 1e-3`. An earlier form read
-  them from `eval_config['collapse_thresholds']`, a key `VALID_KEYS` rejects, so the branch was
-  unreachable *and* the comment claiming they were overridable was false in both directions at
-  once. Both are gone. Chosen a priori and worth revisiting against the first genuinely trained
-  checkpoint — as an edit here, recorded in the diff, not a per-run knob.
+- `scalars.DEFAULT_COLLAPSE_THRESHOLDS` — `pred_gap: 1e-4`, `kld_raw: 1e-3`. They are not read from
+  config: `eval_config['collapse_thresholds']` is not in `VALID_KEYS` and raises. The values
+  are set a priori. Change them as a code edit, recorded in the diff, not as a per-run knob.
 - `cross_subgroup.DEFAULT_ALPHA = 0.05` and `MIN_GROUP_SIZE = 3`, for the same reason.
 
 ---
@@ -479,10 +471,9 @@ torch.set_autocast_enabled("cuda", False)
 random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 ```
 
-fp32 everywhere, and **that means TF32 off too**. `MEMORY_AND_EFFICIENCY.md` warns that $K_t$ is a
-small difference of larger quantities and bf16 has 8 mantissa bits; TF32 matmul, which is on by
-default on Ampere and later, has 10 — the same argument with two bits more headroom, which is not
-enough to make it safe by inspection, so it is disabled explicitly rather than assumed away.
+fp32 everywhere, and **that means TF32 off too**. $K_t$ is a small difference of larger
+quantities, and bf16 has 8 mantissa bits; TF32 matmul has 10, which is not enough to make it safe
+by inspection, so it is disabled explicitly rather than assumed away.
 `"highest"` and the two `allow_tf32` flags are belt-and-braces: they are separate switches in torch
 and a future version could route around either alone. Autocast is disabled for **both** device
 types, because a stale flag on either would silently reintroduce reduced precision and disabling an
@@ -559,15 +550,11 @@ raises: a genuinely collapsed source pathway is a finding to report, not a run t
 full and baseline losses consume *different* log-variance heads and therefore differ even when
 $\Delta\mu_{\mathrm{src}}$ is identically zero.
 
-> **The shipped floor of `0.01` is a priori and uncalibrated.** It was chosen before any real
-> checkpoint was available, against no measured distribution of `residual_ratio`. To
-> **recalibrate**: run the pipeline against a genuinely trained checkpoint, read `preflight.json`'s
-> `health_probe.residual_ratio` and the per-anchor distribution in `residual/per_sample.csv`, and
-> set the floor an order of magnitude below the observed healthy value — low enough that a healthy
-> model never trips it, high enough that a dead pathway does. Record the measurement that justified
-> the new value here when it lands. Until then the floor is a hint, treat a fired warning as a
-> prompt to read the uplift and `kld_raw` for corroboration, and note that the weight-space check
-> in §4 is the one doing the real work.
+> **The shipped floor of `0.01` is set a priori.** To set it from data: run the pipeline against
+> a trained checkpoint, read `preflight.json`'s `health_probe.residual_ratio` and the per-anchor
+> distribution in `residual/per_sample.csv`, and set the floor an order of magnitude below the
+> healthy value. A fired warning is a prompt to read the uplift and `kld_raw`; the weight-space
+> check in §4 is the hard load check.
 
 ### Preconditions, recorded here and enforced elsewhere
 
@@ -591,29 +578,18 @@ distinct `RuntimeError` subclass, so that a failed step reading
 Carries `checkpoint`, `device`, `geometry`, `model_kwargs`, `objective`, `dataset_paths`, a
 `checks` block with one entry per hard guard (`repoint_placeholder`, `stat_path`,
 `declared_widths`, `objective_matches_config`, `weights_loaded`), and `preconditions`. `run.py` then
-adds `health_probe` and:
-
-```json
-"lag_seconds_convention": {
-  "step_seconds": 4.0,
-  "formula": "seconds = step_seconds * lag",
-  "timeline": "stored (canonical): the dataset builder's UP shift is part of the signal and is never undone downstream"
-}
-```
-
-This exists so that every lag figure's axis convention is recorded by the run that drew it. A run
-written before 2026-09-05 carries an `up_shift_secs` entry here instead; its seconds axes are on a
-"raw-file" timeline this pipeline no longer draws, and differ from the stored timeline by that
-entry's value.
+adds `health_probe` and a `lag_seconds_convention` block with three fields: `step_seconds` ($4.0$), `formula`
+(`"seconds = step_seconds * lag"`), and a `timeline` string that states the stored timeline is
+canonical. This block records, in the run itself, the axis convention every lag figure used.
 
 ---
 
 ## 9. Interpretation rules
 
-**Source specificity is read in prediction space.** The predecessor's acceptance criterion was
-$K_{\mathrm{shuffled}} < K_{\mathrm{true}}$, which the model documentation records as unachievable:
-a mismatched source is out of distribution and typically moves the posterior *more*. The pipeline
-reports both readouts but states the ordering
+**Source specificity is read in prediction space.** A KL-space criterion such as
+$K_{\mathrm{shuffled}} < K_{\mathrm{true}}$ does not test specificity: a mismatched source is out
+of distribution, and it can move the posterior as much as the matched one. The pipeline reports
+both readouts but states the ordering
 
 $$L_{\mathrm{feat}} < L_{\mathrm{base}} < L_{\mathrm{feat,\ shuffled}}$$
 
@@ -621,23 +597,17 @@ as the criterion. The KL-space reading is emitted with an explicit label and **c
 verdict** — `source_specificity_verdict` takes the three losses and nothing else, so the KL is not
 an argument to it.
 
-**The lag axis is the stored timeline, and it carries no offset.** The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it.
-The former `eval_config.up_shift_secs` key, which mapped a peak at lag $\ell$ onto a "raw-file"
-timeline, was removed on 2026-09-05 together with the sign debate that surrounded it; every lag
-figure now reads $\mathrm{seconds}(\ell) = 4\ell$. **The model-lag axis was exact throughout**,
-which is why it remains the axis to read first.
+**The lag axis is the stored timeline, and it carries no offset.** The stored UP/FHR timeline is
+canonical. Every lag figure reads $\mathrm{seconds}(\ell) = 4\ell$, and the model-lag axis is the
+axis to read first. The training-callback figures in `teb_vae/lag_attn/plotting.py` use the same
+bare $4\ell$. `nets/lag_report.py::lag_compensated_seconds` is a **different quantity**,
+$\Delta(\ell + \delta)$, which adds back the causal input delay $\delta$ of a reach-budgeted
+source; no eval figure draws it. Every run records the convention it used in
+`lag_seconds_convention` (§8).
 
-Two things are *not* fixed by this and are worth keeping straight. The **training-callback** figures
-in `teb_vae/lag_attn/plotting.py` are still fed `getattr(model, "delta_up_seconds", 0.0)` and the
-model has no such attribute, so their seconds axis is the bare $4\ell$ — no offset, therefore no
-sign error, but also no lead. And the sibling cells' `lag_compensated_seconds` is a **different
-quantity**, $\Delta(\ell + \delta)$ with no $\pm 20$ at all; it was correct before this
-correction and is untouched by it. Every run records the convention it used, with
-`sign_verified: true`, so a figure's caption can be checked against what the run actually did.
-
-**`kld_support='anchor'` makes the final $H_d$ anchors look decoupled.** They collapse toward the
-prior with nothing pulling back, which reads as a real drop in coupling and is not one. `latent`'s
-$K_t$ curve shades that region for exactly this reason.
+**`kld_support='anchor'` makes the final $H_d$ anchors look decoupled.** They are outside the KL
+support and have no forecast term, so nothing pulls their posterior away from the prior. A drop in
+$K_t$ there is not a drop in coupling. `latent`'s $K_t$ curve shades that region for this reason.
 
 **Masked and raw saturation readings differ, and both are reported.** The model's own in-forward
 diagnostics are computed differently from everything else it reports, in two different directions:
@@ -648,8 +618,8 @@ diagnostics logged every step. But they contradict this pipeline's rule that eve
 is masked exactly as the loss masks, so `latent` emits both, under `_raw` (the model's own) and
 `_masked` (recomputed over the supervised mask): `kld_active_frac_raw` / `kld_active_frac_masked`,
 `mu_prior_sat_frac_raw` / `mu_prior_sat_frac_masked`, `delta_mu_sat_frac_raw` /
-`delta_mu_sat_frac_masked`. They routinely disagree, and the disagreement is informative rather
-than a defect: a large gap means the diagnostic is dominated by steps the loss never scored. The
+`delta_mu_sat_frac_masked`. The two forms can disagree; a large gap means the diagnostic is
+dominated by steps the loss never scored. The
 `saturation_flag_threshold` is applied to the **masked** pair, because those describe the region
 the objective actually optimised.
 
@@ -657,16 +627,14 @@ the objective actually optimised.
 necessity, and reads exactly backwards if taken for a removal ablation. Stated in full under
 `lag_ablation` in §10.
 
-**Three quantities differing by $d_z = 24$ once shared one name.** `perm_control`'s KL columns are
-now `kld_true_per_t` / `kld_shuffled_per_t` and carry a `normalisation` string, because they are the
+**Three KL quantities differ by a factor of $d_z = 24$.** `perm_control`'s KL columns are
+`kld_true_per_t` / `kld_shuffled_per_t` and carry a `normalisation` string, because they are the
 $d_z$-summed per-step KL — $24\times$ `scalars`'s `kld_raw` and $24\times$ `latent`'s `kld_mean`,
 all three in one `summary.json`. Compare ratios, not levels.
 
-**$K_{\mathrm{shuffled}} \ge K_{\mathrm{true}}$ is the *expected* reading on a healthy model**, for
-the same reason the KL-space criterion was abandoned: a mismatched source is out of distribution and
-moves the posterior more, not less. `perm_control`'s summary therefore carries a
-`kl_space.shuffled_exceeds_true` boolean that sits at `true` on a good run. It is a description, not
-a check, and nothing consumes it as one.
+**`kl_space.shuffled_exceeds_true` is a description, not a check.** `perm_control`'s summary
+carries this boolean for the KL-space comparison. Because the KL-space readout measures influence
+rather than specificity, nothing consumes the boolean as a pass or fail criterion.
 
 ---
 
@@ -704,34 +672,28 @@ module that does not carry the signature above.
 
 ### probe
 
-The pipeline's only real input validator, and the artifact that would have caught the predecessor's
-hardest bug: a loader that silently truncated its second pass to the first file's index range,
-invisible in every other output and presenting only as "only 1 class found". Nothing else in a run
-reports per-file coverage, so nothing else can see that failure.
+The pipeline's only real input validator. It detects a loader that silently truncates a pass to
+the first file's index range. Nothing else in a run reports per-file coverage, so nothing else can
+see that failure.
 
 **Measures.** One pass over the loader, recording per-file counts, per-`cs_label` and per-`bg_label`
 counts, a per-clinical-class histogram, the `weight` distribution, a raw-`target` value summary, the
 batch field names, and the GUID and source-file vectors.
 
 The class histogram is keyed by clinical class **name**, through `labels.clinical_class_code`, which
-divides the per-step `weight` back out of the weight-scaled target. Keying on the raw stored value
-was a real defect: a fractional first valid step produced a key like `"0.75"` that
-`report.check_classes_present` counted as a distinct class, so one such recording permanently
-defeated the very coverage check the counter exists to feed.
+divides the per-step `weight` back out of the weight-scaled target. Keyed on the raw stored value,
+a fractional first valid step would produce a key like `"0.75"` that
+`report.check_classes_present` would count as a distinct class.
 
 `target_values` is a separate, deliberately different reduction: the class histogram records one
 value per recording, this records every value. The `target_not_truncated` sanity check needs the
 second and cannot be answered by the first, because a recording's first nonzero step is almost
-always in a full-weight region. `weight.binary` is the load-bearing field — it answers whether
-`weight` is ever fractional in production data, which decides whether the class-recovery division
-and that check matter at all (§18).
+always in a full-weight region. `weight.binary` records whether `weight` is ever fractional in the
+evaluated data, which decides whether the class-recovery division and that check matter at all.
 
 **It performs no forward.** `build_target_streams` is assembled for the batch size and for the
-width checks that function performs, and nothing else. An earlier form cached a per-sample `z_mean`
-through `encode_only` on the reasoning that the latent analyses could then skip a pass — but nothing
-ever read it: `latent` takes its own full pass and needs the per-step posterior, not a
-support-averaged coordinate. The cache cost an extra encode over the whole split on every run and
-saved nothing. It is gone; `IN_MEMORY_KEYS` is `("guids", "source_files")`.
+width checks that function performs, and nothing else. `IN_MEMORY_KEYS` is
+`("guids", "source_files")`.
 
 **Preconditions.** None. **Not selectable** via `--only` / `--skip`, for two structural reasons: it
 is the run's only coverage record, and it supplies the per-file grouping every stratified capped
@@ -831,8 +793,8 @@ tables are joined to the channel map, so a downstream plot against frequency nee
 **Measures.** $L_{\mathrm{base}} - L_{\mathrm{full}}$ per sample, absolute and relative, plus the
 fraction of samples where the residual pathway helped at all. This is the plainest statement that
 the source pathway does something. The relative form divides by the **magnitude** of the baseline
-loss, because under `gaussian_nll` a well-calibrated baseline loss is routinely negative and
-dividing by the signed value would flip the sign of the uplift on exactly the healthy runs.
+loss, because under `gaussian_nll` the baseline loss can be negative, and dividing by the signed
+value would then flip the sign of the uplift.
 
 **Preconditions.** None. Scored under the checkpoint's own objective, so an `mse`-trained and a
 `gaussian_nll`-trained checkpoint each get the loss they were optimised for.
@@ -857,9 +819,8 @@ it.
 
 **Measures.** `residual_ratio` — the masked RMS of `delta_mu_src` relative to the full forecast —
 per sample and per anchor, against the same `health_probe_floor` the preflight probe uses, so the
-run-level probe and this analysis cannot disagree about what "collapsed" means — a floor that is
-itself a priori and uncalibrated (§8), so the agreement is about the *definition*, not about the
-threshold being right. The ratio rather
+run-level probe and this analysis cannot disagree about what "collapsed" means. The floor itself
+is set a priori (§8). The ratio rather
 than the raw RMS because an absolute magnitude is uninterpretable without the scale of the thing it
 corrects.
 
@@ -902,11 +863,10 @@ mirrors `task.py::_resolve_beta` term for term, with the epoch taken from the ch
 top-level `epoch` key — not from a config key, which would be a second unverifiable claim about
 which epoch this checkpoint came from. A `linear_warmup` schedule with no recoverable epoch
 **raises** rather than reporting the ramp's start for a checkpoint hundreds of epochs past its end,
-and an unknown schedule kind raises in both implementations. On the shipped schedule at epoch $412$
-the effective $\beta$ is $0.1$ against a configured $0.001$ — a hundredfold difference, which also
-shifts `total_loss` and `main_loss` by $(\beta_{\mathrm{eff}} - \beta_{\mathrm{cfg}})L_{KL}$, in the
-one row whose whole purpose is to line up against training. The provenance is a named block so
-neither number can be read as the other:
+and an unknown schedule kind raises in both implementations. Whenever the effective $\beta$
+differs from the configured `kld_beta`, `total_loss` and `main_loss` shift by
+$(\beta_{\mathrm{eff}} - \beta_{\mathrm{cfg}})L_{KL}$. The provenance is a named block so neither
+number can be read as the other:
 
 ```text
 beta: {kld_beta_effective, kld_beta_configured, beta_schedule, checkpoint_epoch}
@@ -919,8 +879,8 @@ computes:
 
 $$\mathrm{rms} = \sqrt{\frac{\sum m\,v^2}{\max\left(\sum m,\ 1\right)}}$$
 
-Averaging finished per-sample RMS values is a different quantity and, by Jensen, always the smaller
-one — about $9\%$ low at realistic mask densities, in the direction that flatters the model.
+Averaging finished per-sample RMS values is a different quantity and, by Jensen, never the larger
+one.
 Omitting `weight` from the masks would additionally count steps over gaps in the recording, whose
 $\delta\mu$ the loss never scored, in both numerator and denominator.
 
@@ -949,8 +909,7 @@ just as importantly, reports whether there is a shape at all.
 pairwise total-variation distance between heads' lag profiles, `NaN` for a single head),
 `n_support_anchors`, per-head entropies, and the per-lag mass profile. The seconds conversion is a
 *summary* quantity, not a per-sample column: `median_argmax_lag_seconds` sits beside
-`median_argmax_lag` and carries the $\Delta_{UP}$ offset (§9) — a **lead**, $4\ell - 20$ s —
-where the lag itself is exact.
+`median_argmax_lag` and is $4\ell$ on the stored timeline (§9).
 
 **The two ceilings, and only one is reachable.** `argmax_lag` alone is not a finding — it names a
 peak whether or not one exists, and on a near-uniform row it names noise. The entropy separates the
@@ -984,8 +943,8 @@ read one sample at a time. The heatmap collector retains $(T, M, L)$ at about 43
 roughly 0.9 GB at the shipped cap: the largest retention in the pipeline and the first knob to lower
 when a run is tight on host memory.
 
-**Outputs.** `per_sample.csv`, `mass_by_lag.csv` — melted per-lag mass carrying both a `lag` column,
-which is exact, and a `lag_seconds_physical` column, which carries the $\Delta_{UP}$ offset (§9) —
+**Outputs.** `per_sample.csv`, `mass_by_lag.csv` — melted per-lag mass carrying a `lag` column and
+a `lag_seconds_physical` column ($4\ell$, §9) —
 `head_entropy.csv` (per-head mean/median/min/max); `attention.pdf`, and `attention_heatmaps.pdf`
 when any sample was retained — `None`, not an empty page, when none was. Plus the two grouped
 variants.
@@ -1065,7 +1024,7 @@ KL of $2$ nats spread over twenty-four dimensions is a very different model from
 two. Hence per-dimension KL against the active threshold, `n_active_dims`, `kld_mean`, `kld_sum` and
 `kld_dim_l2` — the four keys `metrics.kld_aggregates` returns. `kld_mean` is a per-step
 **per-dimension** mean; `perm_control` reports the same underlying quantity $24\times$ larger under a
-name that no longer collides, and §9 states the trap.
+a different name, and §9 states the trap.
 
 *Has the posterior moved at all?* `posterior_drift`, the mean-space companion, computed under the
 same masking as `task.py`'s `mu_post_prior_gap_rms`.
@@ -1088,7 +1047,7 @@ forgotten half: under `kld_support='anchor'` the final $H_d$ steps are outside t
 because their forecast window runs off the end of the sequence and nothing pulls their posterior
 away from the prior. Left unshaded, the KL falling to zero there reads as the model losing interest
 late in the recording. The per-dimension figures use symlog with $\mathrm{linthresh}$ at the active
-threshold itself, because a collapsed dimension sits at $10^{-8}$ and an active one at $10^{0}$.
+threshold itself, because the KL of collapsed and active dimensions can differ by many orders of magnitude.
 
 ### kld_time_to_delivery
 
@@ -1108,7 +1067,7 @@ difference appeared or vanished.
 
 **Measures.** Per (group, window) the median, quartiles and finite count of $\overline{K}$, for
 **both** the clinical-class axis (`healthy` / `acidosis` / `hie`) and the eight canonical
-subgroups. Both are drawn; only the class axis is **tested**, exactly as requested.
+subgroups. Both are drawn; only the class axis is **tested**.
 
 **The test is the `cross_subgroup` procedure, re-aimed at the time axis** and reusing the shared
 Layer-0 helpers in `stats.py`, so a $p$-value here means what it does there:
@@ -1144,8 +1103,8 @@ of the surviving class pairs). It emits its **own** trajectory rather than the s
 violin variant (see below).
 
 **Reading it.** The trajectory is the descriptive layer and the significance panel is the inferential
-one; read them together. A window that clears Holm with a `negligible` Cliff's delta is a real but
-inconsequential separation, common where one class has many segments in a window. The `pooled` row is
+one; read them together. A window that clears Holm with a `negligible` Cliff's delta is a
+statistically detectable but inconsequential separation. The `pooled` row is
 *not* the answer to "do the trajectories differ" — it is confounded by unequal time coverage and is
 labelled so on the record.
 
@@ -1204,12 +1163,11 @@ term is what makes it a specificity test rather than a sensitivity one. The **KL
 emitted with an explicit label and cannot flip that verdict — `source_specificity_verdict` takes the
 three losses and nothing else.
 
-**The KL-space reading runs the direction most readers do not expect, and that direction is
-healthy.** `KL_READOUT_LABEL` states it on the output itself: *influence, not specificity —
-$K_{\mathrm{shuffled}} \ge K_{\mathrm{true}}$ is expected on a healthy model, because a mismatched
-source is out of distribution and moves the posterior more, not less.* A
-`kl_space.shuffled_exceeds_true` of `true` in `summary.json` is therefore the ordinary outcome and
-not a failed check; `mean_kld_shuffled_ratio` is the same statement as a ratio.
+**The KL-space reading measures influence, not specificity.** `KL_READOUT_LABEL` puts that
+statement on the output itself: a mismatched source is out of distribution, so it can move the
+posterior, and the specificity criterion is the prediction-space ordering.
+`kl_space.shuffled_exceeds_true` in `summary.json` is therefore not a pass or fail check;
+`mean_kld_shuffled_ratio` is the same comparison as a ratio.
 
 **Column names carry their normalisation.** The CSV's KL-space columns are `kld_true_per_t` and
 `kld_shuffled_per_t`. Their summary counterparts are **nested**, under `kl_space` beside `label`:
@@ -1228,8 +1186,8 @@ Batches of fewer than two samples cannot be deranged; those are counted into
 `n_skipped_undersized_batches` and their columns are absent, never zero-filled — a zero would scale
 the mean of `feat_loss_shuffled` toward zero and invert the very ordering this control checks. On
 the same policy, `positive_shuffle_penalty_frac` excludes non-finite rows and reports
-`n_shuffle_penalty_scored` as the visible denominator: `np.nan > 0` is `False`, so unscored samples
-previously counted as evidence *against* a shuffle penalty.
+`n_shuffle_penalty_scored` as the visible denominator: `np.nan > 0` is `False`, so an unscored
+sample left in would count as evidence *against* a shuffle penalty.
 
 **Outputs.** `per_sample.csv` (the flattened per-step KL curves dropped before writing);
 `losses.pdf`, `kl_overlay.pdf`; the grouped variants. The verdict is promoted to `summary.json`'s
@@ -1238,7 +1196,7 @@ top level as `source_specificity`.
 **Reading it.** `losses.pdf` draws one line per sample across the three positions because the
 *paired* structure is the point: three independent box plots would hide a model where the ordering
 holds on average but is violated on most individual recordings. And `influential_not_specific` is a
-real finding, not a failed run — it is the outcome the control exists to detect.
+verdict about the checkpoint, not a failed run — it is the outcome the control exists to detect.
 
 ### lag_ablation
 
@@ -1297,10 +1255,9 @@ if the common support is empty — the last naming the band responsible and poin
 of a misconfigured band set.
 
 **Outputs.** `per_band.csv`, including the `unmasked` baseline row; `forecast_degradation.pdf`,
-`kl_change.pdf`. Each band row carries `seconds_lo` / `seconds_hi` beside its lag bounds, and those
-two — like every seconds-valued number in the run — carry the $\Delta_{UP}$ offset (§9), and are
-therefore leads of $4\ell - 20$ s rather than delays; the lag bounds are exact. No grouped variant, correctly — the output is per band, so there is no per-sample
-frame to group.
+`kl_change.pdf`. Each band row carries `seconds_lo` / `seconds_hi` beside its lag bounds; like
+every seconds-valued number in the run, they are $4\ell$ on the stored timeline (§9). No grouped
+variant — the output is per band, so there is no per-sample frame to group.
 
 ### samples
 
@@ -1339,8 +1296,7 @@ numbers, and *some* will look separated whether or not anything is there. Three 
 ordering between them is the argument, not an implementation detail:
 
 1. **Kruskal-Wallis** per metric across every subgroup — is there any difference at all?
-   Non-parametric because these distributions are skewed and heavy-tailed and an ANOVA's normality
-   assumption is not one this data supports.
+   Non-parametric, so it makes no normality assumption about skewed or heavy-tailed metrics.
 2. **Holm** across the metrics in the family — nine tests at $\alpha = 0.05$ produce a false
    positive about a third of the time by construction. Holm rather than Bonferroni because it is
    uniformly more powerful at the same family-wise error rate.
@@ -1348,13 +1304,13 @@ ordering between them is the argument, not an implementation detail:
    $\binom{8}{2} = 28$ pairwise tests on a metric whose omnibus test found nothing is the
    multiple-comparison problem with extra steps.
 
-**Cliff's delta comes back with every pair**, because a $p$-value is not an effect size. At eight
-subgroups a difference of no clinical consequence reaches significance readily; $\delta$ is the
+**Cliff's delta comes back with every pair**, because a $p$-value is not an effect size. With large
+cohorts a difference of no clinical consequence can reach significance; $\delta$ is the
 probability that a random member of one cohort exceeds a random member of the other, rescaled to
 $[-1, 1]$, and it is what says whether the cohorts actually separate. The conventional magnitude
 label (`negligible` / `small` / `medium` / `large`) is reported beside it, so "significant" is never
-quotable without it. `largest_effects` ranks by $|\delta|$ rather than by $p$, because at eight
-subgroups the smallest $p$ is usually the largest pair, not the largest difference.
+quotable without it. `largest_effects` ranks by $|\delta|$ rather than by $p$, because the $p$-value
+also scales with the group sizes, not only with the size of the difference.
 
 **The nine metrics are an explicit list**, not every numeric column found on disk:
 `forecast/per_sample.csv` alone carries hundreds of profile columns, and testing all of them would
@@ -1407,8 +1363,8 @@ Each variant is a long-form CSV — `group`, `metric`, `n`, `mean`, `q25`, `medi
 grouped violin figure, named `<stem>_by_<group_column>.{csv,pdf}` with `stem="per_sample"` by
 default (`te_lag` and `frequency_band` override it, as noted above). Long form rather than wide
 because a long table merges across two runs with no column renaming and does not change shape when
-an analysis gains a metric; quartiles rather than a standard deviation because these distributions
-are routinely skewed and the summary should describe the same shape the violin draws. `n` counts
+an analysis gains a metric; quartiles rather than a standard deviation because the summary should
+describe the same shape the violin draws, including a skewed one. `n` counts
 only the **finite** values, so a group of `NaN`s reports $n = 0$ rather than a mean of `NaN` over a
 population that looks healthy.
 
@@ -1419,9 +1375,9 @@ already wrote — the same reasoning that ruled out a per-GUID DataLoader.
 
 **The class is a ratio, not a value.** `target` is the class code *scaled by* the per-step `weight`,
 so a partially-valid step of an acidosis recording ($\mathrm{code} = 2$) at `weight = 0.5` stores
-`1.0` — indistinguishable from a fully-valid healthy step. Whether production shards ever *do* carry
-a fractional `weight` is an open question (§18); the division is correct either way, and the probe's
-`weight.binary` is the field that answers it. Reading `target` directly mislabels
+`1.0` — indistinguishable from a fully-valid healthy step. The division is correct whether or not a
+shard carries fractional `weight`, and the probe's `weight.binary` records which case a run met.
+Reading `target` directly mislabels
 exactly the boundaries of every segment. The dataset's own `label` filter has the same defect and is
 turned off in the eval config for that reason; `eval/labels.py` divides instead,
 
@@ -1450,17 +1406,14 @@ exactly what it produced before any of this existed.
 ## 11. The band partition
 
 `band_partition.py` builds the $c_y = 109$ channel map from the shard's **own** `sel_*` provenance
-attributes rather than by re-running the channel selector. The predecessor did the latter, and it
-can no longer work: its selector returns 44 phase channels against 66-channel data, and it omits the
-$f_s$ conversion, so its nominal $0.006$ Hz threshold is really $0.024$ Hz.
+attributes rather than by re-running the channel selector, so the map always describes the
+channels the shard actually stores.
 
-Two partitions: `clinical` (`slow_baseline` / `deceleration` / `variability` / `beat_to_beat`, at
-the same Hz boundaries the predecessor used, so a band label means the same thing in both trees) and
+Two partitions: `clinical` (`slow_baseline` / `deceleration` / `variability` / `beat_to_beat`) and
 `by_kind` over $k \in \{4, 6, 8\}$ where $k = \mathrm{round}(Q \log_2 p)$ and $Q = 4$.
 
-**There is no `ph_diag` kind, and that is expected.** A diagonal channel is $k = 0$, i.e.
-$\xi_i = \xi_j$, and the current selection's `k_steps` begins at 4. The predecessor's taxonomy
-carried one because its selection did.
+**There is no `ph_diag` kind.** A diagonal channel is $k = 0$, i.e. $\xi_i = \xi_j$, and the
+current selection's `k_steps` begins at 4.
 
 **The frequencies are used exactly as stored.** `_build_phase_selection` already multiplies
 kymatio's normalised $\xi$ by $f_s$, so a consumer that multiplied again would land a factor of four
@@ -1469,14 +1422,14 @@ the ordering matches the stored channel axis (boolean indexing preserves ascendi
 scattering channel $c \ge 1$ is order-1 filter $c - 1$, with channel $0$ the order-0 lowpass and no
 centre frequency.
 
-**Known limit, measured.** A scattering channel's centre frequency is recoverable only if some
-selected phase pair referenced its filter. Against the real selector, the $(0.008, 1.00)$ Hz
+**Known limit.** A scattering channel's centre frequency is recoverable only if some selected
+phase pair referenced its filter. With the production selection, the $(0.008, 1.00)$ Hz
 `fhr_ph` band references filters $3$ to $30$, leaving **14 of the 42 order-1 filters** unreferenced —
 the three fastest and the eleven slowest. The 14 scattering *channels* above them (filters are 42,
 channels are 43, since $c = f + 1$) are placed in an explicit `unknown` band and counted in
 `coverage`, rather than guessed at.
 
-The measured occupancy over the 109 target channels:
+The occupancy over the 109 target channels of the production selection:
 
 | Partition | Counts |
 | --- | --- |
@@ -1484,7 +1437,7 @@ The measured occupancy over the 109 target channels:
 | `by_kind` | `st_S0` 1, `st_S1` 42, `ph_k4` 24, `ph_k6` 22, `ph_k8` 20 |
 
 Those numbers are pinned by `tests/real_selection.py`, which carries the production selection as
-measured data — so a pipeline change that moved channels between bands fails the suite instead of
+data — so a pipeline change that moved channels between bands fails the suite instead of
 passing silently.
 
 **A frequency-resolved analysis must decide what to do with those 14 channels**, which are a third
@@ -1529,7 +1482,7 @@ steps ran that should not have.
 | `headline` | Eleven scalars and three verdicts, flattened out of the per-analysis blocks so a reader does not need to know which analysis produced which number: `feat_mse`, `feat_r2`, `uplift_rel`, `uplift_positive_frac`, `residual_ratio`, `kld_mean`, `kld_active_frac` (the **masked** one), `median_argmax_lag`, `attention_entropy_nats`, `nll_gain`, `crps`; plus `collapse`, `source_specificity` and `te_lag_map` (the attribution/diagnostic label). `null` where the producing analysis was skipped or failed. |
 | `sanity` | Five machine-checked verdicts — see below — plus `failed`, `n_failed`, `n_inconclusive`, `warning`. |
 | `coverage` | Effective $n$, per-file composition and capped-ness **per analysis**, plus a warning when two *uncapped* analyses ran on different populations. Metrics from two such analyses reconcile only by coincidence, and nothing else in the output shows it. |
-| `artifacts` | Every file the run emitted with its size, the PDF subset, and `n_excluded_stale`. This is what lets `FIGURE_GUIDE.md`'s coverage be checked without a hardcoded filename list, which would pass by construction. `summary.json` itself is excluded, since the manifest is built before it is written — recorded in a `note` field rather than left as a puzzle. |
+| `artifacts` | Every file the run emitted with its size, the figure subset (files in the run's `figure_format`), and `n_excluded_stale`. This is what lets `FIGURE_GUIDE.md`'s coverage be checked without a hardcoded filename list, which would pass by construction. `summary.json` itself is excluded, since the manifest is built before it is written — recorded in a `note` field rather than left as a puzzle. |
 | `preflight` | Every precondition checked, its verdict, the health probe, and the `lag_seconds_convention` block (§8). |
 | `config_warnings` | Inert caps — a cap at or above `max_samples` never fires, so the cap an operator is tuning does nothing. |
 | `collapse`, `source_specificity` | The two promoted verdicts. |
@@ -1561,7 +1514,7 @@ check needs, which is different from the check having passed.
 | Check | Fails when |
 | --- | --- |
 | `per_file_counts` | A configured shard contributed no samples. Inconclusive when the probe recorded no per-file counts. |
-| `classes_present` | Only one clinical class is present. Inconclusive on the healthy-only pretraining split, where a single class is correct. The histogram is keyed by clinical class **name** via `labels.clinical_class_code`, which divides the per-step weight back out; keyed on the raw stored value, a fractional first valid step produced a key like `"0.75"` that counted as a second class, so one such recording permanently defeated the check and a genuinely single-class split reported "2 class(es) present". |
+| `classes_present` | Only one clinical class is present. Inconclusive on the healthy-only pretraining split, where a single class is correct. The histogram is keyed by clinical class **name** via `labels.clinical_class_code`, which divides the per-step weight back out; keyed on the raw stored value, a fractional first valid step would produce a key like `"0.75"` and a single-class split would report two classes. |
 | `argmax_lag` | The attention is pinned at lag $0$ (the lag window is inert) **or** its entropy is at the ceiling (the peak is a rounding contest, not a selection). Two degenerate readings that fail in opposite directions. The ceiling divided by is `attention.mean_attainable_entropy_nats`, **not** $\log L$ — against $\log L$ the uniformity branch could never fire at production geometry (§10, `attention`). The record carries `attainable_entropy_nats`, `window_entropy_nats` and `entropy_ratio`. |
 | `headline_finite` | Any headline scalar is non-finite. The metrics return `NaN` by design for a fully-masked sample, so a `summary.json` of nothing but nulls is an ordinary thing for a broken run to produce — and it exits 0. This is the pipeline's quietest failure mode. `null` is not a failure; a *number* that is not finite is. |
 | `target_not_truncated` | Every `target` value is an exact integer *while* `weight` is fractional — the signature of the field having been written through an integer dtype, rounding the partially-valid segments. Read from `probe['target_values']`, which counts every step, and **not** from the per-recording class histogram, whose one value per recording sits in a full-weight region on almost every recording and would report "all integers" on perfectly healthy fractional-weight data. Inconclusive where `weight` is strictly binary (truncation is then not observable at all), where no raw target values or weight distribution were recorded, and where every target is zero. A non-finite target is a **fail**, not inconclusive: `NaN != round(NaN)`, so a field of `NaN` would otherwise count as "fractional" and pass. |
@@ -1685,10 +1638,7 @@ subsample_indices(n_total, cap, seed, *, groups=None) -> Optional[Tensor]
   **floor pass** giving one index per group while the cap lasts, over groups ordered largest first
   with ties broken by name; then a **remainder pass** distributing what is left in proportion to
   each group's *unclaimed* members, so a group can never exceed its own size and the floor is never
-  a candidate for trimming. The earlier form applied the floor inside a proportional expression and
-  repaired the overshoot by trimming the smallest groups — undoing the floor on precisely the groups
-  it protects, returning `[4,1,1,1,1,0,0,0]` for `sizes=[500,200,100,50,20,10,5,3]` at `cap=8` and
-  dropping the three rarest shards at exactly the shipped `caps.samples: 8`.
+  a candidate for trimming.
 
 ### `metrics.py`
 
@@ -1718,8 +1668,8 @@ normal_cdf; nominal_central_coverage; pit_values; gaussian_log_density
 crps_gaussian; coverage_indicator; homoscedastic_logvar
 # Attention / lag
 attention_diagnostics(attn_weights, support)
-lag_to_seconds(lag, *, step_seconds=STEP_SECONDS, up_shift_secs=0.0)
-lag_seconds_physical(lags, *, step_seconds=STEP_SECONDS, up_shift_secs=0.0)
+lag_to_seconds(lag, *, step_seconds=STEP_SECONDS)
+lag_seconds_physical(lags, *, step_seconds=STEP_SECONDS)
 ```
 
 **Two reductions, and they are different numbers.** This is the most common reader confusion in the
@@ -1742,9 +1692,8 @@ a perfect forecast has zero error — so a zero returned for "no data" is indist
 spectacular result and drags every downstream mean toward it. `NaN` is not: `np.isfinite` drops it,
 `pandas` excludes it from a `mean()`, and a violin omits it. `kld_aggregates` returns `kld_mean`,
 `kld_sum`, `kld_dim_l2` and `kld_per_dim_mean`, and all four are `NaN` on an empty KL support.
-`kld_dim_l2` is the one that had to be fixed to say so: it previously returned $0.0$, and since `latent.py` filters with
-`np.isfinite` — which drops a `NaN` but keeps a zero — an empty support dragged `mean_kld_dim_l2`
-down and put a spike at $0$ in the by-subgroup violins that reads as latent collapse. Two deliberate
+`latent.py` filters with `np.isfinite`, which drops a `NaN` but keeps a zero, so a zero returned
+for an empty support would drag `mean_kld_dim_l2` down and read as latent collapse. Two deliberate
 exceptions, both in the *pooled* family: `masked_pooled_mean` keeps `compute_loss`'s
 `clamp_min(1.0)`, and `kld_pooled` returns a zero scalar on an empty support, both to match the
 model exactly.
@@ -1782,13 +1731,12 @@ Further invariants worth knowing before writing a metric:
   forwards without a band mask; replace min(t+1, L) with the band's own per-anchor kept-lag count
   when a caller starts passing lag_band_mask through to this function.`
 - `lag_to_seconds` computes $\mathrm{seconds}(\ell) = s\ell$ on the stored timeline and takes
-  no offset: the dataset builder's UP shift is part of the signal (§9). `lag_seconds_physical`
-  is this arithmetic, unchanged, returned as `float64`.
+  no offset (§9). `lag_seconds_physical` is this arithmetic, unchanged, returned as `float64`.
 
 ### `config_schema.py`
 
 ```python
-VALID_KEYS: frozenset   # the 8 keys — see §6
+VALID_KEYS: frozenset   # the 9 keys — see §6
 DEFAULTS:   Dict[str, Any]
 validate_eval_config(config: Mapping) -> Dict[str, Any]
 ```
@@ -2035,10 +1983,10 @@ totals, so the draw is decided *before* iteration starts.
 - **`clinical_class` and `subgroup` are attached here, once**, because they are properties of the
   *sample* rather than of the question being asked of it. That is what makes a by-group variant a
   `groupby` on an existing column rather than a second pass over the loader.
-- Memory, at production geometry ($T = 300$, $c_y = 109$, $H_d = 15$, $M = 4$, $L = 91$, fp32):
+- Memory, at production geometry ($T = 300$, $c_y = 109$, $M = 4$, $L = 91$, fp32):
   `collect_predictions` retains $2 \times (T, c_y)$ **overlap-averaged** fields, $\approx 262$ KB
-  per sample — averaged rather than the raw $(A, H_d, c_y)$ per-anchor tensor, which is $1.9$ MB per
-  sample per field; `collect_attention` retains $(T, M, L)$, $\approx 436$ KB per sample, about
+  per sample — averaged rather than the raw $(A, H_d, c_y)$ per-anchor tensor, which is $H_d$
+  times larger per field; `collect_attention` retains $(T, M, L)$, $\approx 436$ KB per sample, about
   $0.9$ GB at the shipped cap of $2000$ and the first knob to lower when a run is tight;
   `collect_metrics` retains scalars only and is uncapped by default.
 - `_source_of` reads `source_file_basename`, which `CombinedHDF5Dataset` stamps on every sample, so
@@ -2061,9 +2009,8 @@ sequence_axis; as_columns; EMPTY_NOTE
   its final step.
 - `heatmap_with_colorbar`'s `cmap` defaults to `None` and **resolves from `symmetric`**: diverging
   `bwr` for signed fields, sequential `magma` for non-negative ones; an explicit `cmap` still wins.
-  The old always-`bwr` default rendered a non-negative field's *smallest* values saturated blue and
-  its mid-range white. The colourbar stayed correct throughout, so only the at-a-glance ranking —
-  which is what a heatmap is for — was backwards.
+  A diverging map on a non-negative field would draw its smallest values saturated and its
+  mid-range white, which reverses the at-a-glance ranking.
 - Nothing is reimplemented that already exists: `SAVE_DPI`, `apply_publication_style`, `style_axes`
   and `save_figure` come from `utils.style`; the conversions and colours from `figure_primitives`.
 
@@ -2073,7 +2020,7 @@ sequence_axis; as_columns; EMPTY_NOTE
 ROW_SPECS; OPTIONAL_ROWS; resolve_rows(available)
 class RowGrid(rows, t_max, *, width=14.0, height_per_row=2.6)
 build_sample_figure(*, outputs, y_st, y_ph, fhr_raw=None, up_raw=None, warmup, horizon,
-                    guid='unknown', epoch=None, step_seconds=4.0, up_shift_secs=0.0,
+                    guid='unknown', subgroup=None, epoch=None, step_seconds=4.0,
                     te_lag_label='attribution') -> Any
 ```
 
@@ -2089,18 +2036,12 @@ Three layout properties are load-bearing and none is obvious from a call site.
   raw trace is expected: `fhr` and `up` are optional `load_fields`.
 - **Heatmaps draw with `interpolation='none'`, not `'nearest'`.** In a vector backend `'none'`
   embeds the array unresampled, so one data cell is one cell; `'nearest'` resamples to the axes'
-  pixel size at `SAVE_DPI`, rasterising a $(c_y, T)$ field into tens of megapixels. Measured at
-  production geometry: $9.3$ s and $1.1$ MB per page against $3.7$ s and $290$ KB — and the
+  pixel size at `EVAL_SAVE_DPI`, rasterising a $(c_y, T)$ field into tens of megapixels, and the
   resampled version can merge adjacent channels, which on a per-channel diagnostic is the one
   artifact the row exists to rule out.
 
-- **`up_shift_secs` is forwarded to `attach_lag_seconds_axis` un-negated.** That helper maps
-  $\ell \mapsto s\ell + \Delta_{UP}$, which already *is* the raw-recording lead, so the negation
-  that used to stand at both lag-panel call sites reproduced the sign error in
-  `metrics.lag_to_seconds` instead of cancelling it — the two moved together, which is why every lag
-  figure in the repository agreed on a number $40$ s too large (§9). `test_sample_figure.py` pins
-  the forwarded offset rather than the drawn ticks, because the failure mode is a sign, not a
-  layout.
+Both lag panels call `attach_lag_seconds_axis` with an offset of $0$, so their seconds axis is the
+bare $4\ell$ (§9).
 
 The builders take numpy arrays and plain numbers rather than a batch and a model, so the module has
 no dependency on the runner and tests can drive it with synthetic tensors.
@@ -2154,7 +2095,7 @@ The output shape and the sanity checks are §12. Four properties of the wrapper 
 ### `run.py`
 
 ```python
-ANALYSIS_FUNCTIONS: Dict[str, Any]     # 13 entries, in run order
+ANALYSIS_FUNCTIONS: Dict[str, Any]     # 14 entries, in run order
 ANALYSES = tuple(ANALYSIS_FUNCTIONS)
 ANALYSIS_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {}
 RESULTS_DIRNAME = "eval_results"; RUN_ARGS: Dict[str, Any]
@@ -2245,8 +2186,9 @@ carries the panels and the colours but deliberately not the plumbing (`new_figur
 names an analysis imports directly.
 
 Write with `figures.render_figure`, which applies `tight_layout` (swallowing a layout warning
-rather than losing a completed figure), saves at `SAVE_DPI`, **closes the figure** and returns the
-path. **PDF only**: `build_manifest` filters on `.pdf`.
+rather than losing a completed figure), saves in the run's configured `figure_format` at
+`EVAL_SAVE_DPI`, **closes the figure** and returns the path. `build_manifest` counts figures by the
+active format's suffix, so write every figure through `render_figure`.
 
 Any figure that might not reach `render_figure` — a guard between construction and write, an
 exception — must be closed in a `finally`. A leaked figure is not a failure of the code that leaked
@@ -2304,8 +2246,8 @@ exercising every criterion in all three states.
 
 ## 16. Test architecture
 
-Forty files under `eval/tests/`, **771 tests**. The training-path suite
-(`teb_vae/lag_attn/tests/`) is 427 and is a separate gate.
+The eval suite lives under `eval/tests/`. The training-path suite (`teb_vae/lag_attn/tests/`) is a
+separate gate.
 
 ```bash
 .venv/Scripts/python.exe -m pytest teb_vae/lag_attn/eval/tests -q
@@ -2434,12 +2376,12 @@ python -m teb_vae.lag_attn.eval.run \
 to re-run `cross_subgroup`, which reads the per-sample CSVs the other analyses already wrote and
 needs no forward pass — which is also why it declares no dependency (§10).
 
-**The re-run is now non-destructive, but it is not additive.** `report.write` opens `summary.json`
+**The re-run is non-destructive, but it is not additive.** `report.write` opens `summary.json`
 with mode `'w'`, and `build_manifest(since=started_at)` classifies every earlier file as stale — so
 a one-analysis re-run produces a summary whose `headline` is almost entirely `null` and whose
-manifest lists a handful of files instead of forty-odd, counting the rest under `n_excluded_stale`.
+manifest lists only the files the re-run wrote, counting the rest under `n_excluded_stale`.
 The per-sample CSVs survive that; the sanity block, the coverage record, the resolved geometry and
-the two promoted verdicts exist **nowhere else**, so the loss was silent and total.
+the two promoted verdicts exist **nowhere else**.
 
 `run._preserve_prior_summary` therefore renames the prior `summary.json` and `preflight.json` aside
 before the new pass writes anything, as `summary.bak.<YYYY-MM-DD--[HH-MM-SS]>.json` and
@@ -2460,7 +2402,7 @@ In the order they fire. Each raises before any analysis writes anything.
 | Empty or out-of-range band | `eval_config.bands.<name> = [lo, hi] is empty (lo > hi)` / `... exceeds the model's max_lag=` | Bands are inclusive, in model-lag units, over $[0, \mathrm{max\_lag}]$. |
 | Bad `RUN_ARGS` key | `RUN_ARGS carries key(s) that are not command-line arguments:` | Use an argparse `dest`; put run settings in the YAML. |
 | Unknown analysis name | `--only names unknown analyses: [...]` | Names come from `ANALYSES`; `probe` and `band_partition` are not on it. |
-| `REPOINT_ME` placeholder | `dataset_config still carries the REPOINT_ME placeholder:` | Set `vae_test_datasets` to the real k-fold test directory **and** `stat_path` to the matching stats file. These are deliberate non-paths, not typos. |
+| `REPOINT_ME` placeholder | `dataset_config still carries the REPOINT_ME placeholder:` | Set `vae_test_datasets` to the real k-fold test files **and** `stat_path` to the matching stats file. A `REPOINT_ME` path is a deliberate non-path, not a typo. |
 | Missing normalisation stats | `dataset_config.stat_path must be set; ...` | Generate with `hdf5_dataset/calculate_dataset_stats.py` at `trim_minutes=1.0`, matching `dataloader_config.dataset_kwargs.trim_minutes`. The loader would otherwise only warn and silently disable normalisation. |
 | Width mismatch | `c_y=... but the shard gives ...` | The comparison is the **model's** widths, from the checkpoint's `model_kwargs`, against the shard's. Repoint the shards or evaluate the checkpoint that matches them. |
 | Objective disagreement | `the eval config's objective disagrees with the checkpoint's own hyper_parameters:` | The checkpoint is authoritative — it records what was actually trained. Fix the config, or point the run at the checkpoint the config describes. |
@@ -2474,9 +2416,7 @@ Two failures that are **not** hard: the health probe warns below `health_probe_f
 
 ---
 
-## 18. Known limitations and open questions
-
-### Deliberate limitations
+## 18. Known limitations
 
 - **Single checkpoint per run.** Comparison is a `pandas` merge over the emitted CSVs; the long-form
   by-group tables merge across two runs with no column renaming.
@@ -2490,7 +2430,7 @@ Two failures that are **not** hard: the health probe warns below `health_probe_f
 - **The stream-assembly logic is copied from `task.py`, not imported** — about twenty duplicated
   lines, accepted to keep Lightning out of the eval path. `test_parity.py` pins the copy against the
   task's behaviour on the same batch so the two cannot silently diverge.
-- **Figures are PDF only**, matching the repository convention and the existing figure tests.
+- **One figure format per run.** `eval_config.figure_format` selects it; the default is PDF.
 - **No empirical-TE matching, no formal causal-TE validation, no changepoint detection, no
   interactive Plotly.** The first has no empirical CSV for the current dataset; the next two need
   `statsmodels` and `ruptures`, neither installed nor declared; the last would be a second figure
@@ -2500,42 +2440,11 @@ Two failures that are **not** hard: the health probe warns below `health_probe_f
   (§10, `lag_ablation`).
 - **The attainable-entropy ceiling counts causal validity only**, carrying its own `lean-limit:`
   marker in §14.
-
-### Recently settled
-
-- **The `up_shift_secs` key is gone (2026-09-05).** It existed to undo the dataset builder's UP
-  shift on every lag axis, and its sign was argued twice. The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it.
-  The key was removed from the schema (a config naming it is refused as unknown), the offset
-  parameter was removed from `metrics.lag_to_seconds` / `lag_seconds_physical` and from every
-  analysis and figure, and the tests that asserted either sign were re-pointed at the bare $4\ell$.
-  **`lag_compensated_seconds` in the sibling cells is a different quantity,
-  $\Delta(\ell + \delta)$, and was never affected.**
-
-### Genuinely open
-
-None of these is a bug. Each is a fact about what this pipeline can and cannot currently assert.
-
-- **The training-callback figures still draw no seconds offset.** `teb_vae/lag_attn/plotting.py`
-  feeds `attach_lag_seconds_axis` a `getattr(model, "delta_up_seconds", 0.0)` and the model has no
-  such attribute, so a training-time lag panel's right-hand axis is the bare $4\ell$. That is not a
-  sign error — it is simply no offset — but it means a training figure and an eval figure of the
-  same checkpoint disagree by $20$ s, and only the eval one is a lead. The eval pipeline's own sign
-  is **settled**, not open: see the resolved entry below.
-- **`health_probe_floor: 0.01` is a priori and uncalibrated**, chosen before any real checkpoint
-  existed. It warns and never raises, and the weight-space load check does the real work. The
-  procedure to recalibrate it is in §8.
-- **Whether `weight` is fractional in the production HDF5 is an open question.** The dataset spec
-  lists it, the fixtures write $0.5$ edge weights, and `labels.clinical_class_code` divides the
-  weight back out on that assumption — but one review traced `MimoSequence.calc_sample_weights` to a
-  strictly $0/1$ indicator with the fractional paths unreachable from `prepare_data`. This decides
-  whether the class-recovery division and the `target_not_truncated` sanity check matter in
-  practice; the probe records `weight.binary` precisely so a real run answers it. One `h5py` read on
-  the production box settles it.
-- **Fourteen of the forty-three scattering channels have no recoverable centre frequency.** A
-  measured limit rather than an estimate: they are counted, named, placed in an explicit `unknown`
-  band, and excluded from every frequency-resolved statement rather than assigned to a neighbouring
-  one (§11). The fourteen are all order-1 channels, which is what
-  `coverage.n_scattering_without_frequency` counts. The order-0 lowpass has no centre frequency
-  either, but it is banded `slow_baseline` **on merit** — it carries the signal's slowest content —
-  rather than as a fallback for a missing value, so it is not one of the fourteen and does not make
-  them fifteen.
+- **The eval figures do not add the causal input delay.** Every eval seconds axis is the bare
+  $4\ell$. For a checkpoint built with a reach budget, the source content behind lag $\ell$ is
+  $\ell + \delta$ steps back; `nets/lag_report.py::lag_compensated_seconds` computes that quantity.
+- **Fourteen of the forty-three scattering channels have no recoverable centre frequency** with
+  the production selection. They are placed in an explicit `unknown` band and excluded from every
+  frequency-resolved statement (§11); `coverage.n_scattering_without_frequency` counts them. The
+  order-0 lowpass has no centre frequency either, but it is banded `slow_baseline` because it
+  carries the signal's slowest content, so it is not one of the fourteen.

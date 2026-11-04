@@ -81,7 +81,7 @@ ANALYSIS_DIRNAME = "coupling"
 PER_RECORDING_FILENAME = "coupling_per_recording.csv"
 SUMMARY_FILENAME = "coupling_summary.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 DISTRIBUTION_FIGURE = "pred_gap_distribution"
 PERCENT_FIGURE = "pred_gap_percent"
 

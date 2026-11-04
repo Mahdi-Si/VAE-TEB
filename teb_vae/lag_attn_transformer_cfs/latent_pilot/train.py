@@ -253,7 +253,7 @@ def build_bags(
 # The objective and the selection rule
 # =============================================================================
 def balanced_bce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    r"""The class-balanced binary cross-entropy of §5.2.
+    r"""The class-balanced binary cross-entropy.
 
     $$\mathcal L_{\rm cls} = \frac12 \sum_{c \in \{0, 1\}} \frac{1}{N_c}
     \sum_{i : y_i = c} \operatorname{BCEWithLogits}(\ell_i, y_i).$$
@@ -1537,7 +1537,7 @@ def _verify_teacher(gap: float, tolerance: float, guid: str) -> None:
 # The pilot checkpoint, and the base-model export beside it
 # =============================================================================
 #: The run's own checkpoint: the adapted weights, the classifier, and enough identity to refuse to
-#: be applied to the wrong model. Named as §8 names it.
+#: be applied to the wrong model.
 PILOT_CHECKPOINT_FILENAME = "pilot_checkpoint.pt"
 
 #: The base-model-compatible export, in a subdirectory of its own so the resolved configuration can

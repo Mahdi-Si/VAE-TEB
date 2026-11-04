@@ -38,11 +38,13 @@ Layout::
     nets/       the network: two imported mixins over an imported architecture
     task.py     the Lightning task, a diamond of two parents with an empty body
     trainer.py  the experiment driver, three re-pointed class attributes
+    adverse_finetune.py  fine-tuning and probing on one fold's classification pool
     configs/    YAML configs resolved through ``teb_vae.lag_attn.config``
-    eval/       four files: a binding, an override delta, a runner and a gate -- and no numeric
-                function, so both cfs cells are measured by one implementation
+    eval/       a binding, the override deltas, a runner, a gate and the quality-arm driver and
+                comparison -- and no numeric function, so both cfs cells are measured by one
+                implementation
+    latent_pilot/  the latent-class fine-tuning pilot
     tests/      fast hermetic pytest
-    RESULTS.md  the pre-registered criteria the headline run is scored against
 
 **Causality is bought with a warm-up.** A one-sided filter's output depends on assumed pre-recording
 history until $W_{0.95}$ has passed, and because the transform runs per $22$-minute segment that cost
@@ -67,8 +69,8 @@ physical delay.
 ``teb_vae.lag_attn_transformer_cfs.eval`` supplies a ``ModelBinding``, an override delta, a runner
 and a gate, and delegates every readout, every analysis and every verdict to
 ``teb_vae.lag_attn_cfs.eval`` -- which is what makes a difference between the two cfs cells'
-summaries attributable to the encoder rather than to two implementations. Since the final revision
-(``DESIGN.md``, amendment of 2026-09-23) a loss level is comparable against neither neighbour.
+summaries attributable to the encoder rather than to two implementations. A loss level is comparable
+against neither neighbour.
 ``lag_attn_cfs`` forecasts $10$ steps and scores every cell; this cell forecasts $30$ steps over
 $30 \times 76 = 2280$ cells, scores a fast phase channel over its first $5$ steps only, and scores
 the residual under an AR(1) innovation. ``lag_attn_transformer_fs`` scores $30 \times 78 = 2340$
@@ -84,10 +86,9 @@ $791$ s -- larger than the $148$ s lag search itself ($\ell \le 37$ steps); repl
 per-channel-pair physical lag built from ``causal_delay_s`` when a lag result is to be reported as
 a physiological delay rather than as a coefficient-time attribution.
 
-lean-limit: ``eval_config.clock_margin_min_nats`` ships at $0.15$ nats, so the availability-clock
-verdict is decided and the gate reads all ten verdicts. The value was calibrated on an earlier
-unaligned run of this cell under the legacy representation, which measured $0.160$ nats
-($[0.157, 0.164]$; ``LAG_READOUT_DIAGNOSIS.md``); replace it with a value derived from the spread
-of the coupling-minus-clock difference across recordings once a production run of the shipped
-geometry has written its ``source_null`` table.
+lean-limit: ``eval_config.clock_margin_min_nats`` ships unset (``null`` in both eval override
+files), so the availability-clock verdict is INCONCLUSIVE while $\Delta_{\mathrm{clock}}$, both
+interval ends and the positive fraction are still emitted. Set it from the spread of the
+coupling-minus-clock difference across recordings once a production run of the shipped geometry
+has written its ``source_null`` table.
 """

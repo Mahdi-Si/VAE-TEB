@@ -1,4 +1,4 @@
-"""The one end-to-end test (SPEC §15 T-X1, T-L2, §14.4): every stage on the three-fold fixture tree, run fold-parallel
+"""The one end-to-end test (T-X1, T-L2): every stage on the three-fold fixture tree, run fold-parallel
 over two CPU slots, then the selection lock and the dead-fold record on the finished run."""
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 from teb_vae.classifier.tests.conftest import SMOKE_CONFIG
 
-#: smoke.yaml trains the noind ablation: the fixture's has_tlo missingness is flagged in folds 2-3 (§7.3.4, L10).
+#: smoke.yaml trains the noind ablation: the fixture's has_tlo missingness is flagged in folds 2-3 (L10).
 UNITS = [f"{kind}|42|{k}" for k in (1, 2, 3) for kind in ("model", "shuffled", "noind")]
 
 
@@ -22,7 +22,7 @@ def _restore_loguru() -> None:
 
 
 def _auroc(m: pd.DataFrame, model_id: str, *, pooled: bool) -> float:
-    """Test GUID AUROC: the pooled OOF value, or the per-fold mean (the primary AUROC, SPEC §11.7)."""
+    """Test GUID AUROC: the pooled OOF value, or the per-fold mean (the primary AUROC)."""
     v = m[(m["model_id"] == model_id) & (m["split"] == "test") & (m["level"] == "guid")
           & (m["metric"] == "auroc") & m["subgroup"].isna() & m["policy_id"].isna() & (m["point"] == "n/a")]
     v = v[v["fold"] == "pooled"] if pooled else v[v["fold"] != "pooled"]
@@ -55,7 +55,7 @@ def test_end_to_end_fold_parallel(smoke_overrides, tmp_path):
 
     m = pd.read_parquet(run_dir / "evaluation" / "tables" / "metrics.parquet")
     assert _auroc(m, "model", pooled=False) > 0.9 and _auroc(m, "probe", pooled=False) > 0.9  # the planted late ST
-    assert _auroc(m, "shuffled", pooled=True) < 0.65  # the shuffled-label control (§10.9.3)
+    assert _auroc(m, "shuffled", pooled=True) < 0.65  # the shuffled-label control
     prov = json.loads((run_dir / "predictions" / "provenance.json").read_text())
     assert all(u["lock_written_at"] < u["test_written_at"] for u in prov["units"]) and not prov["missing_units"]
     assert verify.main([str(run_dir)]) == 0

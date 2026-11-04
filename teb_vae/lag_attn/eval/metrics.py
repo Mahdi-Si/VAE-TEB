@@ -1126,11 +1126,6 @@ def lag_to_seconds(lag: Any, *, step_seconds: float = STEP_SECONDS) -> Any:
 
     $$\mathrm{seconds}(\ell) = s\,\ell$$
 
-    **The stored timeline is canonical.** The dataset builder shifts the UP channel when it writes
-    the shards; that shift is part of how the stored signals are, and no downstream quantity adds
-    it back or subtracts it. An earlier revision carried an ``up_shift_secs`` term here that undid
-    the builder's shift; it was removed on purpose and must not return under another name.
-
     Args:
         lag: A lag index, or an array or tensor of them.
         step_seconds: Duration of one decimated step, $s$.
@@ -1149,8 +1144,8 @@ def lag_seconds_physical(lags: Any, *, step_seconds: float = STEP_SECONDS) -> "n
     tensor, an array, a list or a scalar and always returns ``float64``, because its consumers
     are a ``DataFrame`` column and a matplotlib axis and neither wants a torch tensor.
 
-    The arithmetic is :func:`lag_to_seconds`'s, unchanged: $s\ell$ on the canonical stored
-    timeline, with no dataset-shift term.
+    The arithmetic is :func:`lag_to_seconds`'s, unchanged: $s\ell$ on the stored timeline,
+    with no offset term.
 
     Args:
         lags: Lag indices, any shape.

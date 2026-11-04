@@ -10,9 +10,7 @@ in this order:
   high-passed UA and FHR, minus the same statistic on mismatched (UA of one recording, FHR of
   another) segment pairs, pooled per class and per stratum (hours before delivery, labour stage).
   Answers "is UA->FHR coupling stronger, or later, in the adverse recordings?" before any GPU time is
-  spent. Lags are on the **stored** timeline, which the dataset declares canonical (the UA channel is
-  stored 20 s early and nothing downstream corrects it), so a physiological reading adds that offset
-  in the head, not in the numbers.
+  spent. Lags are on the **stored** timeline.
 * ``finetune`` -- warm start from the pretrained checkpoint (``core_model_checkpoint``, strict load)
   on ``fold_<k>/train``, early stopping on ``fold_<k>/val``. The run's config is the pretrained one
   with five changes: the data, a **constant** beta at the pretrained run's final value (the trainer
@@ -388,7 +386,7 @@ def run_premise(*, kfold_root: str, fold: int, splits: Sequence[str],
         "subgroups": list(subgroups or []), "lag_s": [float(min_lag_s), float(max_lag_s)],
         "fs_out": fs_out, "detrend_s": detrend_s, "min_valid_frac": min_valid_frac,
         "min_pairs_s": min_pairs_s, "hour_edges": list(hour_edges), "n_boot": n_boot,
-        "seed": seed, "timeline": "stored (UA stored 20 s early; not corrected)"}, indent=2))
+        "seed": seed}, indent=2))
     logger.info(f"premise: wrote {out_dir}")
     return out_dir
 
@@ -427,7 +425,7 @@ def _premise_figure(per_group: Mapping[Tuple[str, str, str], Any], arrays: Mappi
             ax.set_title(f"{kind}: {label}", fontsize=9)
             ax.legend(fontsize=7)
     for ax in axes[-1]:
-        ax.set_xlabel("lag, FHR after UA (s, stored timeline)")
+        ax.set_xlabel("lag, FHR after UA (s)")
     for row in axes:
         row[0].set_ylabel("r - r_null")
     fig.tight_layout()

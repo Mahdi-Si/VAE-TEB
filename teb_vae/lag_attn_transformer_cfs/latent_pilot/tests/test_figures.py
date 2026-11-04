@@ -117,7 +117,7 @@ def test_a_projection_without_finite_variance_still_renders(tmp_path):
 
 
 def test_the_coverage_view_renders_on_the_same_map(tmp_path):
-    """The control §7.3 asks for: the same coordinates, coloured by ascertainment and by how late
+    """The coverage control: the same coordinates, coloured by ascertainment and by how late
     each recording was still observed."""
     frame, values = _bags()
     frame["bg_label"] = [True, False, None, True, True, False, None]

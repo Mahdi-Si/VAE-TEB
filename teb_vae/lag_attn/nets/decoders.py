@@ -27,6 +27,17 @@ gap it is read through stays a pure source readout and the log-variance path is 
 buys is that the mean head stops having to synthesise the level of a strongly autocorrelated
 coefficient out of $z$ before it can say anything about its motion, which is what a horizon-uniform
 objective was paying it to do at the near steps.
+
+**The optional multi-lag persistence skip.** With ``persistence_lags`` $P > 1$ the residual reads
+the target's last $P$ stored values, $y_{t}, y_{t-1}, \dots, y_{t-P+1}$, and adds
+$\sum_{p=0}^{P-1} w_{\tau,p,c}\, y_{t-p,c}$: a per-channel, per-horizon-step linear filter, which
+is a direct multi-step AR($P$) forecast of each channel from its own history. The lag-$0$ weight is
+the single-lag weight above, unchanged in shape and seed, and the extra lags start at zero, so a
+model built with $P > 1$ starts bitwise at the single-lag forecast. The reason for the skip is
+measured: a one-step persistence term cannot carry a coefficient's local trend, and a linear
+own-channel AR($6$) forecasts the first steps of the smooth coefficients far better than a latent
+that must encode every channel's slope through $d_z$ dimensions. The extra lags are target-only,
+so the skip keeps the gap a pure source readout for the same reason the lag-$0$ term does.
 """
 from __future__ import annotations
 
@@ -398,6 +409,9 @@ class BaselineFutureDecoder(nn.Module):
     #: without the residual, matching the convention every other optional term in this file uses.
     persistence_weight: Optional[nn.Parameter]
 
+    #: The extra-lag weights of the multi-lag skip, $(H_d, P - 1, C)$; ``None`` at $P = 1$.
+    persistence_lag_weight: Optional[nn.Parameter]
+
     def __init__(
         self,
         core: HorizonDecoderCore,
@@ -407,6 +421,7 @@ class BaselineFutureDecoder(nn.Module):
         dropout: float = 0.1,
         logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
         persistence_residual: bool = False,
+        persistence_lags: int = 1,
     ) -> None:
         r"""Initialize the baseline decoder.
 
@@ -425,8 +440,25 @@ class BaselineFutureDecoder(nn.Module):
                 :meth:`forward` requires the anchor's target vector. ``False`` -- the default --
                 builds **no** parameter at all, so the decoder is bitwise the one built before this
                 keyword existed rather than one carrying an inert tensor.
+            persistence_lags: $P$, the number of the target's own most recent stored values the
+                residual reads. At $1$ -- the default -- the residual is the single-lag term and no
+                further parameter exists. Above $1$ it builds ``persistence_lag_weight``
+                $(H_d, P - 1, C)$ at zero and :meth:`forward` takes a $(\ldots, P \cdot C)$
+                persistence input, lag-major, whose first $C$ entries are the lag-$0$ values.
+
+        Raises:
+            ValueError: If ``persistence_lags`` is below $1$, or above $1$ without
+                ``persistence_residual``.
         """
         super().__init__()
+        if int(persistence_lags) < 1:
+            raise ValueError(f"persistence_lags must be at least 1, got {persistence_lags}")
+        if int(persistence_lags) > 1 and not persistence_residual:
+            raise ValueError(
+                f"persistence_lags={persistence_lags} needs persistence_residual=True: the extra "
+                f"lags extend the persistence term and have no meaning without it"
+            )
+        self.persistence_lags = int(persistence_lags)
         self.core = core
         self.out_channels = int(out_channels)
         self.d_hidden = int(d_hidden)
@@ -460,6 +492,15 @@ class BaselineFutureDecoder(nn.Module):
             )
         else:
             self.persistence_weight = None
+        # A raw parameter at zero, for the reason the lag-0 weight is one: the generic
+        # initialisation would refill a Linear, and zero is what makes the multi-lag model start
+        # bitwise at the single-lag forecast.
+        if self.persistence_lags > 1:
+            self.persistence_lag_weight = nn.Parameter(
+                torch.zeros(self.core.horizon, self.persistence_lags - 1, self.out_channels)
+            )
+        else:
+            self.persistence_lag_weight = None
 
     def forward(
         self,
@@ -474,7 +515,8 @@ class BaselineFutureDecoder(nn.Module):
                 when the decoder was built with ``persistence_residual`` and refused otherwise. The
                 caller owns what it is; this module owns only the weighting. It enters the **mean**
                 head's output and nothing else, so the log-variance path is the one it was without
-                the residual.
+                the residual. Under ``persistence_lags`` $P > 1$ it is ``(B, T, P * C)``, the
+                values at lags $0, \dots, P - 1$ stacked lag-major on the last axis.
 
         Returns:
             ``(mu_base, logvar_base)``, both ``(B, T, H_d, C)``.
@@ -500,8 +542,19 @@ class BaselineFutureDecoder(nn.Module):
         feat = self.core.decode(h)
         mu_base = self.mean_head(feat)
         if self.persistence_weight is not None and persistence is not None:
+            channels = self.out_channels
+            if int(persistence.shape[-1]) != self.persistence_lags * channels:
+                raise ValueError(
+                    f"the persistence input has {int(persistence.shape[-1])} entries on its last "
+                    f"axis, but the decoder was built for persistence_lags="
+                    f"{self.persistence_lags} over {channels} channels"
+                )
             # (B, T, 1, C) against (H_d, C): the anchor's own vector, weighted per horizon step.
-            mu_base = mu_base + self.persistence_weight * persistence[..., None, :]
+            mu_base = mu_base + self.persistence_weight * persistence[..., None, :channels]
+            if self.persistence_lag_weight is not None:
+                # (B, T, P - 1, C) against (H_d, P - 1, C), summed over the lag axis.
+                older = persistence[..., channels:].unflatten(-1, (self.persistence_lags - 1, channels))
+                mu_base = mu_base + torch.einsum("...pc,hpc->...hc", older, self.persistence_lag_weight)
         logvar_base = smooth_bound(self.logvar_head(feat), *self.logvar_clamp)
         return mu_base, logvar_base
 

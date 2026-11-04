@@ -1,6 +1,6 @@
 # Evaluating the lag-slot transformer
 
-This guide explains how to evaluate a trained checkpoint, find its results, and decide what those results support. The model forecasts causal features: numerical summaries of the recorded signals that use only present and past information. Its main comparison is between a forecast using target history alone and a forecast that also uses source history.
+This guide explains how to evaluate a trained checkpoint, where each output is written, and how to read each output. The model forecasts causal features: numerical summaries of the recorded signals that use only present and past information. Its main comparison is between a forecast using target history alone and a forecast that also uses source history.
 
 Read sections 1–4 first for the workflow and the main scores. Sections 5–6 explain implementation limits and checks. Section 7 explains how to compare several trained models. For help reading individual plots, see [the figure guide](FIGURE_GUIDE.md).
 
@@ -32,7 +32,9 @@ Run this command from the repository root, replacing the checkpoint path:
 python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint output/<run>/model_checkpoints/<name>.ckpt
 ```
 
-To launch from an IDE, set `RUN_ARGS` at the bottom of `run.py` and use the Run button. A checkpoint is required. The runner checks for it after combining the command-line arguments with `RUN_ARGS`, so either launch method works.
+To launch from an IDE, set `RUN_ARGS` at the bottom of `run.py` and use the Run button. The runner combines the command-line arguments with `RUN_ARGS` before it checks them, so either launch method works. A checkpoint is required unless `--output-dir` names a finished run directory: the analyses then reread that directory's tables and build no model.
+
+Other flags: `--overrides` replaces the committed `configs/eval_overrides.yaml` delta, `--num-samples` replaces `eval_config.num_mc_samples`, `--device` selects the torch device, `--max-batches` stops early for a smoke run, and `--only` / `--skip` select analyses by name.
 
 ### What the scoring pass does
 
@@ -130,6 +132,8 @@ Average the likelihoods before taking their negative logarithm. Averaging the pe
 
 The likelihood average is unbiased, but its negative logarithm has upward bias at finite $K$. The biases of two arms need not cancel. The field `draw_concentration_full` reports the effective draw count $1/\sum_k\alpha_k^2$, where $\alpha_k$ is each draw's normalised likelihood weight. A value near one means a few draws dominate. This is a diagnostic, not proof of convergence; rescore finalists at several draw counts.
 
+A model with `latent_sampling: false` (the `default.yaml` setting) decodes both branches at their latent means. For such a model the evaluator decodes once with $\epsilon = 0$ and repeats that score over the $K$ draws, so the mixture score equals the exact score of the mean forecast.
+
 ### Calibration
 
 Calibration asks whether predicted uncertainty matches observed errors. It uses the cumulative distribution of the predictive mixture, accumulated in the same draw loop. An observation is inside a central interval with nominal coverage $q$ exactly when its cumulative probability lies in $[(1-q)/2,(1+q)/2]$. This cumulative probability is the probability integral transform, or PIT.
@@ -157,9 +161,9 @@ These subset scores do not generally add to the joint forecast-block score, beca
 - **Band margins are separate interventions.** The limiter acts after the proposals are summed. Two band-removal margins therefore need not add to the margin of removing both bands, the predictive gap, or the divergence.
 - **A margin describes this fitted model.** Reallocating proposals as $r_\ell\mapsto r_\ell+k_\ell(h_t)$ with $\sum_\ell k_\ell\equiv0$ leaves the full prediction unchanged but can change a single-lag removal result. Every summary must retain this qualification under `lag_readouts.qualification`; the acceptance gate checks for it.
 - **Missing exposure means no measurement.** A band with no available channels has nothing to remove. Its margin is `null`, and its usable anchor and channel counts are reported beside it.
-- **A lag is stored-coefficient time.** The recommended model adds only one stored sample of neural source receptive field, but upstream causal feature extraction already combines raw history within each coefficient. Lag readouts therefore do not measure a physiological delay. The encoder disclosure records both kinds of history dependence.
-- **A positive internal gap needs an external comparison.** Joint training can weaken the model's own base branch. Compare the full and base branches with an independently trained, frozen target-only model before interpreting the gap as an improvement.
-- **The gap has no acceptance threshold here.** It is reported with uncertainty. The first real runs are intended to establish what improvement is achievable; this evaluator does not impose an unmeasured threshold.
+- **A lag is stored-coefficient time.** The pointwise source stem (`source_stem: pointwise`, the default) adds only one stored sample of neural source receptive field, but upstream causal feature extraction already combines raw history within each coefficient. Lag readouts therefore do not measure a physiological delay. The encoder disclosure records both kinds of history dependence.
+- **The internal gap compares two branches of one model.** Joint training also updates the base branch. Compare the full and base branches with an independently trained, frozen target-only model (the acceptance protocol's `--reference`) as well.
+- **The gap has no acceptance threshold here.** The evaluator reports it with its interval and imposes no threshold.
 
 ### 4.1 Read lag results from broad bands to individual lags
 
@@ -173,7 +177,7 @@ Start with whole-band and joint removal results, then inspect individual lags. A
 
 Latent profiles average over anchors where the lag was available. A large proposal can have little effect on the bounded update when the limiter is saturated. The divergence drop can be negative if removing a proposal stops it from cancelling another proposal. None of these quantities allocates a fixed total among lags.
 
-The predictive profile covers a capped subset of the split; its segment and recording counts are saved with it. The `lag_readouts.lag_axis` block records stored steps before the anchor, seconds per step, and the model's input delay. The table `lag_profile.csv` includes all three readouts, one row per lag.
+The predictive profile covers a capped subset of the split; its segment and recording counts are saved with it. The `lag_readouts.lag_axis` block records the number of lags, seconds per stored step, and the model's causal input delay in stored steps (`delay_steps`). The table `lag_profile.csv` includes all three readouts, one row per lag.
 
 ## 5. The lag structure, and the family analyses this cell asks its own way
 
@@ -203,18 +207,18 @@ The six family analyses that cannot run here are recorded under `excluded_analys
 
 Read every lag-structure artifact under the qualification the suppression readouts carry: a reallocation $r_\ell \mapsto r_\ell + k_\ell(h_t)$ with $\sum_\ell k_\ell \equiv 0$ leaves the update, the divergence and every prediction unchanged while changing both profiles at every lag. A centroid says where the fitted head's proposals sit; it does not say the source at that lag was necessary. The `high_kl_anchors` hot-lag set is a top-share selection taken from the same map it summarises, and the analysis record says so (`hot_lags.circularity`).
 
-The shared collection pass is also unsuitable: it expects latent tensors indexed at every stored time step and requires eight attention-derived fields. This model indexes latent tensors by decoded anchor. It reuses architecture-independent components instead: checkpoint and task loading, configuration merging and validation, block scoring, log-mean-likelihood scoring, cross-recording permutation, recording-level bootstrapping, and summary assembly.
+The shared collection pass is also unsuitable: it expects latent tensors indexed at every stored time step and reads attention-derived fields. This model indexes latent tensors by decoded anchor. It reuses architecture-independent components instead: checkpoint and task loading, configuration merging and validation, block scoring, log-mean-likelihood scoring, cross-recording permutation, recording-level bootstrapping, and summary assembly.
 
 ## 6. Structural gates and their evidence
 
-These six checks establish required properties of the recommended architecture. The table links each property to tests in the package's own suite. Passing them establishes implementation behaviour; it does not establish predictive usefulness on real recordings.
+These six checks state required properties of the architecture. The table links each property to tests in the package's own suite. The tests check implementation behaviour, not predictive skill on real recordings.
 
 | Gate | Evidence |
 | --- | --- |
 | The prior sees no source values and retains every latent coordinate | `test_causality.py::test_the_metadata_clock_carries_no_source_value`, `::test_the_source_reaches_the_full_branch_and_never_the_base_branch`; `test_construct.py::test_the_metadata_clock_is_a_function_of_position_alone` |
 | Each source encoding is pointwise; each proposal reads one stored source time | `test_pointwise_source.py::test_the_encoding_is_pointwise_by_jacobian`, `::test_the_scalar_lift_stays_pointwise`; `test_lag_updates.py::test_a_proposal_reads_exactly_one_stored_source_time` |
 | No future value and no future validity mask enters prediction | `test_causality.py::test_resampling_the_strict_future_leaves_earlier_anchors_bitwise_unchanged`, `::test_no_future_validity_signal_can_enter_the_forward`, `::test_no_lag_reads_a_step_at_or_after_its_anchor` |
-| Source-disabled and all-unavailable inputs reproduce the prior; a valid observed zero need not | `test_invariants.py::test_every_selector_off_reproduces_the_prior`, `::test_every_lag_unavailable_reproduces_the_prior_and_stays_finite`, `::test_the_zero_initialised_model_reproduces_the_prior_for_arbitrary_inputs`, `::test_an_observed_standardized_zero_is_not_treated_as_absence` |
+| Source-disabled and all-unavailable inputs reproduce the prior | `test_invariants.py::test_every_selector_off_reproduces_the_prior`, `::test_every_lag_unavailable_reproduces_the_prior_and_stays_finite`, `::test_the_zero_initialised_model_reproduces_the_prior_for_arbitrary_inputs` |
 | The source has no route around the latent | `test_invariants.py::test_the_decoder_is_invoked_twice_with_the_latent_and_the_persistence_input_only`, `::test_the_two_decoder_calls_share_one_module_and_its_weights`; `test_forward_contract.py::test_no_attention_shaped_key_is_emitted` |
 | Shared noise, the divergence, the masks, the anchor indexing and the gradients behave as specified | `test_invariants.py::test_the_paired_sample_difference_matches_the_stated_formula`, `::test_the_predictive_gradient_reaches_the_final_source_projection_at_the_zero_start`, `::test_the_source_pathway_leaves_the_zero_start_after_a_few_steps`; `test_residual_kl.py::test_the_residual_divergence_equals_the_family_formula`; `test_objective.py::test_the_reconstruction_and_divergence_share_one_anchor_set`, `::test_the_objective_optimises_the_global_mean_under_uneven_ranks`; `test_forward_contract.py::test_the_anchor_axis_is_not_the_time_axis` |
 
@@ -231,7 +235,7 @@ Comparator variants change a specific architectural choice. Their `arm` block de
 | `source_values_withheld` | Withholds source values; it does not relax an architectural requirement. | Still apply. |
 | `source_disabled` | Has no source pathway to constrain. | Apply where relevant. |
 
-A band narrower than a convolution stem's receptive field cannot isolate that narrow interval of source history: neighbouring lag encodings summarise overlapping windows. Interpret the comparisons as a sequence of controlled changes. The attention reference versus pointwise attention tests the convolution; pointwise attention versus the candidate tests fusion; the candidate versus mean-only, capacity-control, and target-only variants tests the variance update, source values, and source pathway, respectively.
+A band narrower than a convolution stem's receptive field cannot isolate that narrow interval of source history: neighbouring lag encodings summarise overlapping windows. The acceptance plan declares the comparisons as a chain of single changes. Pointwise attention versus the attention reference isolates the source convolution. The candidate versus pointwise attention isolates the fusion. The candidate versus `sampled_latent`, `capacity_control` and `target_only` isolates latent sampling, the source values and the whole source pathway, respectively.
 
 `tests/test_arm_scoring.py` fits and scores the comparator variants on small fixtures and checks that these differences are recorded.
 
@@ -257,7 +261,7 @@ The output is `latent_probes.json`. The acceptance protocol associates it with a
 python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance --runs output/<development evaluations> --reference output/<frozen target-only>/eval_results/summary.json --output acceptance.json
 ```
 
-This pass reads evaluation directories under a root and groups runs by model variant and training seed. The file `configs/acceptance_plan.yaml` declares the minimum seeds, primary draw count, bootstrap resamples, five comparisons, and searchable lag bands. The acceptance record stores the plan's digest so later edits are visible. The pass needs only the standard library and the array library used for intervals unless figures are requested.
+This pass reads evaluation directories under a root and groups runs by model variant and training seed. The file `configs/acceptance_plan.yaml` declares the minimum seeds, primary draw count, bootstrap resamples, five comparisons, and searchable lag bands. The acceptance record stores the plan's digest so later edits are visible. The pass needs only the standard library, NumPy and PyYAML unless figures are requested. The optional `--confirmation` and `--confirmation-reference` flags name the evaluations of the reserved partition and their frozen reference; `--plan` names an alternative plan file.
 
 | Part of the protocol | How to interpret it |
 | --- | --- |
@@ -276,19 +280,16 @@ python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance --runs output/<develo
 
 The report includes variants and seeds, declared comparisons, internal and reference comparisons, controls, band-search intervals, draw-count stability, calibration, probes, and verdicts. The report and figures use the assembled record without recomputing its statistics. See [the figure guide](FIGURE_GUIDE.md) for the plots.
 
-### 7.3 Rescoring an existing 91-entry checkpoint with its tail removed jointly
+### 7.3 The 91-entry tail profile
 
-The shipped four bands measure the source pathway band by band, and band margins do not add:
-proposals interact through the sum, the limiter, the sample and the decoder, so the effect of
-removing every lag above a cutoff at once is its own measurement. The profile
-`configs/lag91_tail_diagnostic.yaml` declares that measurement as bands -- the cutoff pair
-`head_0_24` / `tail_25_90` and a keep-prefix family `beyond_<l>` that removes every lag above
-$\ell$ -- beside the shipped partition, at the acceptance plan's primary draw count. It is a copy
-of the committed delta with those two differences and is merged over the checkpoint's own resolved
-configuration in the same way; repoint its shard paths at the panel the checkpoint's shipped
-summary records.
+The profile `configs/lag91_tail_diagnostic.yaml` applies to a checkpoint with a 91-entry lag window (`max_lag: 90`). Band margins do not add: proposals interact through the sum, the limiter, the sample and the decoder. The effect of removing every lag above a cutoff at once is therefore a separate measurement. The profile declares that measurement as bands, beside the 91-entry partition `anchor` [0, 14], `near` [15, 44], `mid` [45, 67] and `far` [68, 90]:
 
-Run it three times on the same panel, at the primary count and the two stability counts:
+- `head_0_24` and `tail_25_90` split the window at lag 24. `tail_25_90` is the joint removal of every lag above 24.
+- `beyond_<l>` removes every lag above $\ell$. Its margin is the score of the kept prefix $0..\ell$ against the full branch.
+
+The profile sets `num_mc_samples: 32`, the acceptance plan's primary draw count. It merges over the checkpoint's own resolved configuration in the same way as `eval_overrides.yaml`. Its shard paths contain `REPOINT_ME`, so repoint them before a run.
+
+To score one checkpoint at the primary count and at the two stability counts on the same panel:
 
 ```bash
 python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt \
@@ -297,23 +298,14 @@ python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <same> --overri
 python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <same> --overrides <same> --num-samples 128
 ```
 
-Read, in this order, from each `summary.json` under `results`:
+Each `summary.json` holds these readouts under `results`:
 
-1. `lag_readouts.band_suppression.tail_25_90.margin_nats` with its paired interval: the joint
-   removal. Compare it with the sum of the `near`, `mid` and `far` margins from the same run; the
-   difference is the interaction the bands cannot show.
-2. `lag_readouts.band_suppression.beyond_<l>` in increasing $\ell$: the keep-prefix curve. Its
-   two ends are the reference identities the readout already carries -- an empty prefix is
-   `all`, which equals `silence`, and the whole window is `none`.
-3. `arm_scores.draw_concentration_full` and the per-recording `draw_concentration_full` column
-   at each draw count. A ranking that moves between 8 and 128 by more than the tail margin's
-   interval width is a draw-count effect, not a lag effect.
-4. `verdicts` and `eval.verify`: the predictive verdict is read from the paired interval; the
-   gate additionally refuses a summary whose verdict list disagrees with the interval it carries.
+1. `lag_readouts.band_suppression.tail_25_90.margin_nats` and its paired interval give the joint removal. The difference from the sum of the `near`, `mid` and `far` margins of the same run is the interaction that separate bands cannot show.
+2. `lag_readouts.band_suppression.beyond_<l>`, in increasing $\ell$, gives the keep-prefix curve. An empty prefix is `all`, which equals `silence`; the whole window is `none`.
+3. `arm_scores.draw_concentration_full` and the per-recording `draw_concentration_full` column show the effective draw count at each $K$.
+4. `verdicts` read the paired interval. `eval.verify` refuses a summary whose verdict list disagrees with the interval it carries.
 
-Keep the three summaries and their `per_recording.csv` tables; the acceptance pass does not read
-this profile, because its bands are outside the plan's declared family. Do not shorten
-`event_lag_window_s` for this profile: it is an event-conditioned reporting window, not the bank.
+The acceptance pass does not read this profile, because its bands are outside the plan's declared band families. Pass its summaries to `eval.verify` only. Do not shorten `event_lag_window_s` for this profile: it is an event-conditioned reporting window, not the lag bank.
 
 ### 7.4 What the score columns are
 
@@ -340,16 +332,14 @@ alone.
 The family's sufficiency probe is reported with `results.sufficiency_qualification` marking its
 interpretation unavailable: the probe conditions on the encoder state alone, without the metadata
 clock or the persistence path the production decoder has, so its gap is a probe fit rather than
-the bottleneck's cost. That repair is deferred.
+the bottleneck's cost. A probe that also conditions on the metadata clock and the persistence path is
+not implemented yet.
 
 ### 7.5 Selecting checkpoints on the predictive monitor
 
-A training run selects its checkpoints on whatever `advanced_config.callbacks.model_checkpoint.monitor`
-names. Shipped, that is `val/total_loss`: the one-draw weighted objective, which is not the
-estimator any summary reports. With `model_config.VAE_model.validation_mc_draws` set to a
-positive $K$, every dense validation batch is also scored as the unweighted $K$-draw predictive
-mixture of both branches under a noise bank keyed on the batch's segment identities and the run
-seed, and three further columns reach `metrics_history.csv`:
+A training run selects its checkpoints on the column that `advanced_config.callbacks.model_checkpoint.monitor` names. In `default.yaml` that column is `val/total_loss`, the one-draw weighted objective, with `val/nll_full_block` as the secondary monitor. The weighted objective is not the estimator that any summary reports.
+
+With `model_config.VAE_model.validation_mc_draws` set to a positive $K$, the task also scores every dense validation batch as the unweighted $K$-draw predictive mixture of both branches. The draws come from a noise bank keyed on the batch's segment identities and the run seed. Three further columns then reach `metrics_history.csv`:
 
 | Column | What it is |
 | --- | --- |
@@ -357,104 +347,55 @@ seed, and three further columns reach `metrics_history.csv`:
 | `val/pred_nll_base_mc` | the same for the base branch, under the identical draws |
 | `val/pred_gap_mc` | base minus full: the paired predictive gain the offline headline reads, at the training run's own $K$ |
 
-Two validation passes at the same weights report the same value, which is what lets the column
-rank checkpoints; the training-stage columns are never monitored, because a training batch is
-tiled and its anchor set changes every epoch. The weighted objective stays logged beside the
-monitor as the optimisation diagnostic, and `train/grad_clip_frac` is the fraction of each
-epoch's optimizer steps on which the clip bound, counted over every step.
+Because the noise bank is keyed on the batch content, two validation passes at the same weights report the same value, so the column can rank checkpoints. Training-stage columns are never monitored: a training batch is tiled and its anchor set changes every epoch. The weighted objective stays logged beside the monitor. `train/grad_clip_frac` is the fraction of the epoch's optimizer steps on which the gradient-clip bound applied, counted over every step.
 
-The arm profiles (`target_only.yaml`, `joint.yaml` and everything based on them) set $K = 8$ and
-point both the checkpoint and the early-stopping monitor at `val/pred_nll_full_mc`, with the
-weighted objective's own optimum kept by the secondary criterion. `default.yaml` keeps the legacy
-selection so the shipped run stays reproducible as configured. A monitor naming one of the three
-columns while the draw count is null is refused before the model is built.
+`target_only.yaml`, `joint.yaml` and every profile based on them set $K = 8$. They point both the checkpoint callback and early stopping at `val/pred_nll_full_mc`, with `val/total_loss` as the secondary monitor. The trainer refuses a monitor that names one of the three columns while `validation_mc_draws` is null, before it builds the model.
 
-### 7.6 The matched-arm comparison and the bank-length decision
+### 7.6 Train and score the comparator arms
 
-Six arms, one target-only initialisation, one selection rule, one scoring profile per bank. Run
-them in this order on the GPU box against the integer-operator production shards; every run
-writes its `resolved_config.yaml` beside its checkpoints, which is the durable record of what it
-was.
+Train each arm with the trainer and one profile from `configs/`:
 
-1. **Two target-only fits.** `target_only.yaml` at its shipped seed (role `-a`, the warm-start
-   donor) and once more at a different seed and tag (role `-b`, the frozen reference). Score both
-   with `eval_overrides.yaml`. Before reading anything else, record the paired predictive
-   difference between the two as the **bank-length noninferiority tolerance**: a shortened bank
-   whose interval against the 91-entry candidate lies within that seed-to-seed spread is
-   competitive, one whose interval lies below it is not. Write the tolerance down first; a
-   tolerance chosen after the comparison is read is not a tolerance.
-2. **The two banks.** `joint.yaml` (91 entries) and `lag25.yaml` (25 entries), both with
-   `target_warm_start_checkpoint` repointed at the `-a` checkpoint. Score `joint.yaml` with
-   `eval_overrides.yaml` and `lag25.yaml` with `lag25_eval_overrides.yaml`, both at the plan's
-   primary $K = 32$; then the finalists at 8 and 128 on the same panel, and read the effective-draw
-   quantiles of both branches at each count.
-3. **The decision.** Read `lag25.yaml` against `joint.yaml` on the arm scores, both paired
-   against the `-b` reference: the predictive interval against the predeclared tolerance, the
-   mixture calibration by horizon and block, the base drift against the reference, and the
-   measured resources at the declared batch and draw counts. Record the decision in the run log
-   below. No arm is promoted on `pred_gap_weighted`, on `mean_pred_gap`, or on its own internal
-   gap alone.
-4. **The two controls.** Set `base:` of `capacity_control.yaml` and `sampled_latent.yaml` to the
-   chosen bank profile -- `lag25.yaml` if the shortened bank was competitive, `joint.yaml`
-   otherwise -- repoint their warm start at `-a`, train, and score under the chosen bank's
-   evaluation profile.
-5. **One extra run.** The chosen arm again with `lambda_base: 0.5`, the shipped run's value,
-   so the reconstruction weighting is compared against an external reference rather than assumed.
+```bash
+python -m teb_vae.lag_slot_transformer_cfs.trainer --config teb_vae/lag_slot_transformer_cfs/configs/<profile>.yaml
+```
 
-Then assemble the record:
+Every run writes `resolved_config.yaml` beside its checkpoints. Every source-enabled profile has `target_warm_start_checkpoint: REPOINT_ME_...`, so repoint it before the run.
+
+| Profile | Base | Change from its base |
+| --- | --- | --- |
+| `target_only.yaml` | `default.yaml` | `source_disabled: true`. Train it twice with two seeds and tags: role `-a` is the warm-start donor, role `-b` is the frozen reference. |
+| `joint.yaml` | `default.yaml` | Warm-starts from a target-only checkpoint and enables the predictive monitor. It inherits `max_lag: 37` (38 lag entries). |
+| `lag25.yaml` | `joint.yaml` | `max_lag: 24` (25 lag entries). |
+| `pointwise_attention.yaml` | `joint.yaml` | `lag_fusion: attention`. |
+| `attention_reference.yaml` | `pointwise_attention.yaml` | `source_stem: conv`. |
+| `sampled_latent.yaml` | `joint.yaml` | `latent_sampling: true`, `train_mc_draws: 16`. |
+| `capacity_control.yaml` | `joint.yaml` | `source_values_withheld: true`, `center_proposals: false`. |
+
+Repoint each warm start at the `-a` checkpoint. Score a 25-entry run with `lag25_eval_overrides.yaml`, which declares hand-set bands for that window. Score the other runs with `eval_overrides.yaml`, whose `partition_width` derives the bands from the checkpoint's own `max_lag`. Score the arms of one comparison at the plan's primary $K = 32$, and score finalists again at 8 and 128 on the same panel.
+
+Then assemble the record against the `-b` reference:
 
 ```bash
 python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance --runs output/<development evaluations> \
     --reference output/<target-only -b>/eval_results/summary.json --output acceptance.json --report acceptance.md
 ```
 
-The acceptance pass groups the runs by arm, reads each under its own window's band family, and
-refuses a pairing across two windows or two input policies; it does not compare `lag25.yaml`
-with `joint.yaml` directly, because their lag readouts are declared for different windows. That
-comparison is the arm-score one above, on the common target set, and it is recorded by hand.
+The acceptance pass groups the runs by arm and reads each run under the band family of its own lag window. It refuses a pairing across two lag windows or two input policies. It therefore does not compare two bank lengths directly, because their lag readouts are declared for different windows.
 
-**Run log.** One entry per arm, appended here as the runs complete. Every field is required;
-"not measured" is a value.
+### 7.7 Input-ablation profiles
 
-| Field | What to write |
-| --- | --- |
-| arm, profile, tag, seed | as configured |
-| initialisation | the warm-start checkpoint's path and SHA-256, or "fresh" |
-| effective loss weights | `lambda_full`, `lambda_base`, `beta_prior`, the resolved $\beta$ ramp, channel and horizon weights as resolved |
-| data budget | shards, epochs trained, batch size, optimizer steps, the selected epoch and what selected it |
-| selection | `validation_mc_draws`, the monitor, and `val/pred_nll_full_mc` at the selected epoch |
-| external-base drift | `base_minus_reference_nats` against the `-b` reference, with its interval |
-| predictive | `mc_pred_gap` and `pred_gap_mc_nats` with intervals at $K = 32$, and at 8 and 128 for a finalist; effective-draw quantiles of both branches |
-| calibration | mixture coverage at the three levels, pooled and by horizon and block |
-| resources | peak training memory, dense-evaluation memory and throughput at the declared batch and draw counts |
-| decision | promote / reject / inconclusive, and the one sentence that says why |
+Four profiles zero an order-zero scattering coefficient at the model's input boundary. The forecast labels keep the original coefficients, so the model still forecasts the zeroed coordinate.
 
-No entries yet: the runs need the GPU box and the production shards.
+| Profile | Base | Ablation | Warm-start donor and reference |
+| --- | --- | --- | --- |
+| `lag25_s0_up.yaml` | `lag25.yaml` | `zero_up_scattering_s0: true` | `target_only.yaml` |
+| `lag25_s0_fhr.yaml` | `lag25.yaml` | `zero_fhr_scattering_s0: true` | `target_only_s0_fhr.yaml` |
+| `lag25_s0_both.yaml` | `lag25.yaml` | both switches | `target_only_s0_fhr.yaml` |
+| `target_only_s0_fhr.yaml` | `target_only.yaml` | `zero_fhr_scattering_s0: true` | none; train roles `-a` and `-b` as for its parent |
 
-### 7.7 The input-ablation factorial on the chosen bank
+Warm-start each source-enabled ablation from the `-a` checkpoint of the target-only profile that shares its FHR input policy, and read it against the `-b` reference of that profile. A reference that can read the FHR level would credit the source with a gap that the ablation itself opened. To use the 38-entry bank instead, rebase the three source-enabled ablation profiles on `joint.yaml`; each profile is a one- or two-leaf delta.
 
-Four cells: neither switch (the chosen bank's own run above), the source switch
-(`lag25_s0_up.yaml`), the target switch (`lag25_s0_fhr.yaml`) and both (`lag25_s0_both.yaml`),
-plus the target-only reference under the target switch (`target_only_s0_fhr.yaml`, roles `-a` and
-`-b` as for the parent). If the bank-length decision kept 91 entries, rebase the three ablation
-profiles on `joint.yaml` first; each is a one- or two-leaf delta and moves nothing else.
-
-Warm-start every source-enabled ablation from the target-only checkpoint that shares its FHR
-policy: `lag25_s0_up.yaml` from the ordinary `-a` donor, the two arms that zero the FHR
-coefficient from `target_only_s0_fhr.yaml`'s `-a`. Read each against the reference that shares its
-policy, for the reason the profiles state: a reference that could read the level would credit the
-source with closing a gap the ablation itself opened.
-
-Score every cell at $K = 32$ under the chosen bank's evaluation profile. The summary's
-`causality.effective_inputs` names the ablated coordinates; read the resolved axes so the
-ablated coefficient's own score and the remaining channels' score are reported side by side, and
-never let a loss of level context hide inside the aggregate. Record one run-log entry per cell
-with the fields of 7.6 and, in the decision, whether each switch is kept for the confirmation
-stage and why. Zeroing a coefficient at the input does not establish that its information is
-absent from correlated coefficients; the decision is about the forecast under the policy, not
-about the coefficient's physiology.
-
-No entries yet: the runs need the GPU box and the production shards.
+The summary's `causality.effective_inputs` names the ablated coordinates. The resolved axes report the ablated coefficient's own score beside the score of the remaining channels. Zeroing a coefficient at the input does not remove its information from correlated coefficients.
 
 ## 8. Settings
 
@@ -463,7 +404,7 @@ Set evaluation choices in `configs/eval_overrides.yaml`. The merged configuratio
 | Setting | Meaning |
 | --- | --- |
 | `eval_config.seed` | Seeds latent draws and cross-recording pairing as independent random streams. |
-| `eval_config.num_mc_samples` | Number of latent draws $K$. Finalists are evaluated at $8$, $32$, and $128$. |
+| `eval_config.num_mc_samples` | Number of latent draws $K$. The committed delta sets $8$; the acceptance plan reads primary comparisons at $32$ and rescores finalists at $8$, $32$ and $128$. |
 | `eval_config.bootstrap_resamples` | Number of recording-level resamples used for intervals. |
 | `eval_config.occlusion_bands` | Inclusive lag bands removed by suppression, in stored steps before the anchor. The reserved entry `partition_width` is an integer instead of a pair: the run cuts the checkpoint's own lag window into contiguous bands of that width, named `lags_<lo>_<hi>`, so the committed delta loads on any bank length. Bands declared beside it, such as the two fixed cross-bank bands, are kept as written. The dumped `resolved_config.yaml` records the bands a run resolved to. |
 | `eval_config.caps.lag_profile` | Segment cap for single-lag predictive scoring. Omitting it skips that profile with a recorded reason. |
@@ -477,4 +418,4 @@ Set evaluation choices in `configs/eval_overrides.yaml`. The merged configuratio
 
 ## 9. Scope of this guide
 
-This document describes evaluation machinery and how to interpret its outputs. It does not report completed training experiments or establish empirical acceptance. Those conclusions require real-data runs, comparisons across variants and seeds, synthetic checks, and evaluation on reserved recordings.
+This document describes the evaluation machinery and how to read its outputs. It reports no training or evaluation results.

@@ -173,7 +173,7 @@ RAW_FIELDS: Mapping[str, str] = {"target": "fhr", "source": "up"}
 #: centred at $t-\kappa\tau_c$ for the channel's composed one-sided group delay $\tau_c$, so a lag
 #: is a distance between stored coefficients and not a physiological delay. The input and forecast
 #: rows state their own content offset on their x axis; the derivation lives in the module
-#: docstring and the evaluation's ``FIGURE_GUIDE.md``.
+#: docstring.
 #: Asserted as a string by the suite, so it cannot be dropped by an edit that keeps the figure
 #: rendering.
 LAG_TIME_CAVEAT = "Lag is stored-coefficient time, not a physiological latency."

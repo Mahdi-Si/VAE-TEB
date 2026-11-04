@@ -735,8 +735,7 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
     lines += _table(
         ["`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
          # Spelled `abs(...)` rather than with bars: a cell is split on `|`, so a header written
-         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table. This
-         # is also the spelling both RESULTS.md tables and their derived-quantity blocks use.
+         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table.
          "`d_base_mc_nats`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`",
          "`source_conditioned_kl_raw`", "`kld_active_frac` (final)", "Verdicts", "Run"],
         _sweep_rows(

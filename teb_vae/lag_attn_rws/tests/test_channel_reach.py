@@ -54,9 +54,9 @@ def test_the_low_pass_reach_matches_the_published_figure():
 
 
 def test_the_causal_scattering_channel_count_matches_the_published_figure():
-    """27 of 43 ``fhr_st`` channels reach no further than the 120 s horizon. Published in the
-    analysis document and asserted by the probe's own self-test, so this is an independent
-    check rather than a restatement of this module's arithmetic."""
+    """27 of 43 ``fhr_st`` channels reach no further than the 120 s horizon. The probe's own
+    self-test asserts the same count, so this is an independent check rather than a restatement
+    of this module's arithmetic."""
     blocks = block_reach_seconds()
 
     within = sum(1 for value in blocks["fhr_st"] if value <= _HORIZON_S)

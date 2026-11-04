@@ -1,6 +1,6 @@
 r"""The run checker is what turns a registered criterion into a verdict, so it is what needs testing.
 
-``RESULTS.md`` registers five tier-1 criteria before the headline run and three of them are
+The checker carries seven tier-1 criteria, fixed before the headline run, and four of them are
 statements about *every logged row*; one is a $10^{-6}$ relative recomposition of two channel-axis
 splits against each other, which nobody can honestly check by reading a multi-thousand-row CSV. The
 checker exists so the verdict is produced by code -- and a checker nobody tests is a verdict nobody
@@ -18,7 +18,8 @@ asserted directly and are easy to lose in a rewrite:
 
 The anchor band is derived from the run's own resolved configuration rather than hard-coded, which
 the geometry test exercises with a configuration none of the shipped arms uses: a checker carrying
-the shipped $[4, 5]$ and $136$ as literals would pass a horizon arm for the wrong reason.
+one geometry's band and dense anchor count as literals would pass a horizon arm for the wrong
+reason.
 """
 from __future__ import annotations
 

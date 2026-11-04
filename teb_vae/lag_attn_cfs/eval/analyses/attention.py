@@ -83,7 +83,7 @@ PER_HEAD_FILENAME = "attention_per_head.csv"
 ENTROPY_FILENAME = "attention_entropy.csv"
 PER_RECORDING_FILENAME = "attention_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 PROFILE_FIGURE = "attention_profile"
 HEATMAP_FIGURE = "lag_heatmap"
 
@@ -388,7 +388,9 @@ def build_profile_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    # Side by side on one lag axis: the head-averaged profiles and the heads behind them are read
+    # against each other lag by lag, which two half-width panels at one height make direct.
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT)
     seconds = compensated_seconds_axis(n_lags, delay_steps)
     axis = axes[0, 0]
     figures.multi_line_panel(
@@ -416,14 +418,14 @@ def build_profile_figure(
         for head in heads
     ]
     figures.multi_line_panel(
-        axes[1, 0], seconds,
+        axes[0, 1], seconds,
         np.vstack(curves) if curves else np.zeros((0, n_lags)),
         [f"head {head}" for head in heads],
         title="Attention over lags, per head",
         xlabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         ylabel="attention weight",
     )
-    _shade_truncated(axes[1, 0], seconds, truncation)
+    _shade_truncated(axes[0, 1], seconds, truncation)
     figures.caveat_note(figure)
     return figure
 

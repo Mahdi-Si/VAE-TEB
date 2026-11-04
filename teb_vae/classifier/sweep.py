@@ -1,4 +1,4 @@
-r"""Run a list of classifier configs one after another, then compare the finished runs (SPEC §13.3, §17).
+r"""Run a list of classifier configs one after another, then compare the finished runs.
 
     python -m teb_vae.classifier.sweep --configs teb_vae/classifier/configs/regularised.yaml \
         teb_vae/classifier/configs/src_mu_prior.yaml ... \
@@ -38,7 +38,7 @@ from teb_vae.classifier.config import load, resolve_path  # noqa: E402
 from teb_vae.classifier.run import compare  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.launch import resolve_launch_args  # noqa: E402
 
-#: ``compare`` takes 2-6 runs (§11.8): a longer sweep is compared in groups of the reference plus this many others.
+#: ``compare`` takes 2-6 runs: a longer sweep is compared in groups of the reference plus this many others.
 COMPARE_OTHERS = 5
 #: A run enters the comparison when these exist (its ``evaluate`` finished), whatever its exit code.
 FINISHED = ("predictions/guids.parquet", "evaluation/tables/metrics.parquet")
@@ -60,7 +60,7 @@ def main(*, configs: Sequence[str], overrides: Optional[List[str]] = None, stage
         stage: The stage each run executes (``all`` for a full run).
         folds: Comma-separated fold ids overriding ``run.folds`` in every run.
         device: ``run.device`` override (not digested).
-        devices: Comma-separated device slots (fold-parallel train and predict, §14.4).
+        devices: Comma-separated device slots (fold-parallel train and predict).
         out: The comparison directory; default ``<out_root>/compare-<stamp>-<tag>`` under the first config's
             ``run.out_root``.
         tag: A short name for the comparison directory.
@@ -106,7 +106,7 @@ def main(*, configs: Sequence[str], overrides: Optional[List[str]] = None, stage
 
 def build_parser() -> argparse.ArgumentParser:
     """Every default is None so :data:`RUN_ARGS` fills what the command line leaves out."""
-    parser = argparse.ArgumentParser(description="Run several classifier configs and compare them (SPEC §17).")
+    parser = argparse.ArgumentParser(description="Run several classifier configs and compare them.")
     parser.add_argument("--configs", nargs="+", metavar="YAML", help="configs in run order; the first is the reference")
     parser.add_argument("--set", dest="overrides", action="append", metavar="KEY.PATH=VALUE")
     parser.add_argument("--stage", choices=["cohort", "extract", "train", "predict", "evaluate", "report", "verify", "all"])
@@ -127,9 +127,8 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: launch the command line wins per key; a key left at None here is simply not set.
 RUN_ARGS: Dict[str, Any] = {
     # Configs in run order (relative to the repo root). The first is the comparison's reference. This list is the
-    # first batch of the 2026-10-07 plan (SPEC §17): the regularised baseline, then one source, representation,
-    # context and label ablation each (lab_time_matched: the stage confound, added 2026-10-08); every other
-    # configs/*.yaml of §13.3 can be appended (the adapt_*.yaml ones are slow).
+    # regularised baseline, then one source, representation, context and label ablation each
+    # (lab_time_matched: the stage confound); every other configs/*.yaml can be appended (the adapt_*.yaml ones are slow).
     "configs": [
         "teb_vae/classifier/configs/regularised.yaml",
         "teb_vae/classifier/configs/src_mu_prior.yaml",

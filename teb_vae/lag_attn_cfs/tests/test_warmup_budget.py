@@ -15,9 +15,9 @@ shipped figure-level function around the shared budget panel, because that funct
 ``describe_streams``, which builds the production two-sided Morlet bank and refuses these channel
 widths.
 
-The offline half also prices the shipped source clock -- the source-reference tradeoff table and
+The offline half also prices the dual-reference source clock -- the source-reference tradeoff table and
 the band-lag arithmetic it is read on -- and checks the content lag derived from the actual gathers
-against the reference identity, on the canonical stored timeline.
+against the reference identity, on the stored timeline.
 """
 from __future__ import annotations
 
@@ -388,7 +388,7 @@ _PLANTED_MAX_LAG = 90
 # =================================================================================================
 # The source-reference tradeoff
 #
-# The measurement that priced the shipped source clock, and the properties that make its table
+# The computation that priced the dual-reference source clock, and the properties that make its table
 # readable. Three quantities move against each other -- how many source channels survive, how fresh
 # the freshest survivor is, and where a physiological delay lands on the lag axis -- and the pin was
 # chosen where they cross. What is checked here is not the pin (a number is a decision, and it lives
@@ -511,8 +511,8 @@ def test_the_band_lags_are_the_physical_lag_identity_solved_for_the_lag(source_p
     r"""The arithmetic, against the identity written out here rather than against the function that
     computes it.
 
-    $\ell = (\tau^{\mathrm{phys}} - \mathrm{offset}) / \Delta - 1 - h$, on the canonical stored
-    timeline with no dataset-shift term. The low end is the *fastest* delay at the *furthest*
+    $\ell = (\tau^{\mathrm{phys}} - \mathrm{offset}) / \Delta - 1 - h$, on the stored timeline.
+    The low end is the *fastest* delay at the *furthest*
     horizon step and the high end is the slowest at the first, because $\ell$ falls with $h$ --
     getting that pairing backwards would report a band that clears both edges when it does not,
     and the whole reference decision rests on which edges it clears.
@@ -561,15 +561,14 @@ def test_the_table_prints_every_candidate_with_its_verdict(source_points):
 # The content lag from the ACTUAL gathers (CFS-05)
 # =================================================================================================
 def test_the_gather_derived_content_lag_reproduces_the_reference_identity_up_to_rounding():
-    r"""$L_{j,c}(\ell,h) = \Delta(\ell+1+h+s_c+d^u_j) + \kappa(\tau_j - \tau_c)$ on the canonical
+    r"""$L_{j,c}(\ell,h) = \Delta(\ell+1+h+s_c+d^u_j) + \kappa(\tau_j - \tau_c)$ on the
     stored timeline, computed from the resolved shifts rather than from the two references.
 
     Under the dual reference and physical clock the reference identity gives a nearest separation,
     a union and an every-horizon window. The gathers themselves round $s_c$ and $d^u_j$ to the
     $\Delta$ grid per channel, so the actual pair separations spread by up to two steps around
     those figures: the reference values must sit inside the gather-derived spread, and the
-    gather-derived corners must sit within that spread of the reference corners. No dataset-shift
-    term appears anywhere.
+    gather-derived corners must sit within that spread of the reference corners.
     """
     from teb_vae.lag_attn_cfs.causal_warmup import ALIGNMENT_DELAY_FACTOR, resolve_warmup_budget
     from teb_vae.lag_attn_cfs.tests.conftest import causal_config

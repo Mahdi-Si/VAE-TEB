@@ -1,4 +1,4 @@
-"""T-E1 to T-E4 for the metric engine of metrics.py (SPEC §11.4, §11.7, §15)."""
+"""T-E1 to T-E4 for the metric engine of metrics.py."""
 from __future__ import annotations
 
 
@@ -36,7 +36,7 @@ def test_threshold_free_matches_sklearn(seed):
     assert out["logloss"] == pytest.approx(log_loss(y, p))
     assert out["brier"] == pytest.approx(brier_score_loss(y, p))
     assert out["scaled_brier"] == pytest.approx(1 - out["brier"] / (y.mean() * (1 - y.mean())))
-    # McClish pAUC from the raw partial area (Appendix B)
+    # McClish pAUC from the raw partial area
     fpr, tpr, _ = roc_curve(y, s, drop_intermediate=False)
     stop = np.searchsorted(fpr, alpha, side="right")
     t_a = np.interp(alpha, fpr[stop - 1:stop + 1], tpr[stop - 1:stop + 1])
@@ -122,9 +122,8 @@ def test_bootstrap_reproducible_stratified_and_counts_undefined():
 
 
 def test_shuffled_interval_uses_the_fold_spread():
-    """Criterion 7 (§11.15): the t interval over the folds, not the pooled bootstrap CI. The per-fold test AUROCs of
-    run 2026-10-07--17-52's shuffled control hold 0.5 (its pooled CI [0.510, 0.539] did not); one finite fold falls
-    back to the pooled value and CI."""
+    """Criterion 7: the t interval over the folds, not the pooled bootstrap CI. The t interval of these
+    per-fold test AUROCs holds 0.5 while the pooled CI does not; one finite fold falls back to the pooled value and CI."""
     folds = [0.488, 0.486, 0.601, 0.535, 0.603, 0.642, 0.609, 0.572, 0.407, 0.57]
     point, lo, hi = M.shuffled_interval(folds, 0.524, 0.510, 0.539)
     assert point == pytest.approx(0.5513) and lo == pytest.approx(0.4997, abs=1e-4) and hi == pytest.approx(0.6029,
@@ -132,7 +131,7 @@ def test_shuffled_interval_uses_the_fold_spread():
     assert M.shuffled_interval([0.6, np.nan], 0.524, 0.510, 0.539) == (0.524, 0.510, 0.539)
 
 
-# --- T-E5: row weights (§11.7 fold weighting) ----------------------------------------------------
+# --- T-E5: row weights (fold weighting) ----------------------------------------------------
 def _weighted_case(n=300, seed=4):
     """Binary labels with tied scores, a 3-class split of the positives, class probabilities, and 2-row units."""
     y, s = _data(n=n, seed=seed)

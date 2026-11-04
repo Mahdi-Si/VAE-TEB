@@ -275,7 +275,7 @@ ATTRIBUTION_CAVEAT = (
 
 #: The one line an attribution **figure** carries in place of :data:`ATTRIBUTION_CAVEAT`: the two
 #: claims a reader must not make from a map or a lag profile. The argument for each stays in
-#: :data:`ATTRIBUTION_CAVEAT` (``summary.json``, ``ATTRIBUTION.md``) and in
+#: :data:`ATTRIBUTION_CAVEAT` (written to ``summary.json``) and in
 #: :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT`.
 ATTRIBUTION_NOTE = "Model sensitivity, not a causal effect or a physiological latency."
 
@@ -1701,8 +1701,7 @@ def input_norm(values: np.ndarray) -> Optional[Any]:
     return mcolors.Normalize(vmin=low, vmax=high if high > low else low + 1.0)
 
 
-#: How the example maps' colour scales are shared. Stated in ``ATTRIBUTION.md`` and the figure
-#: guide; the figures that draw them no longer print it.
+#: How the example maps' colour scales are shared. The figures that draw them do not print it.
 SHARED_SCALE_NOTE = (
     "colour scales are shared by every class example: the input coefficients one linear scale per "
     "stream (1st to 99th percentile of the read cells of all examples), each attribution map one "

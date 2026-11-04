@@ -1,4 +1,4 @@
-r"""Figures and ``summary.md`` of a classifier run (SPEC §11.10-§11.11; the P2 and P4 subsets).
+r"""Figures and ``summary.md`` of a classifier run (the P2 and P4 subsets).
 
 ``report`` runs after :func:`teb_vae.classifier.metrics.evaluate` and draws **every** figure from
 tables only: ``evaluation/tables/*`` (``metrics``, ``roc_points``, ``thresholds``, ``alarms``,
@@ -14,11 +14,10 @@ Pages with one panel per model wrap into a grid (:func:`_panels`); pages with se
 one note line (what a hollow marker means; the exclusion counts are in ``inclusion.csv``).
 
 Figure text is kept to one title, short panel titles, axis labels, one key under the panels (:class:`_Once`,
-:func:`_key`) and at most one note line; counts, statistics and definitions live in the tables, ``summary.md`` and
-``SPEC.md``.
+:func:`_key`) and at most one note line; counts, statistics and definitions live in the tables and ``summary.md``.
 
 Every per-fold test value (thin fold lines, fold bands, ``fold_<k>/`` pages, fold means in ``summary.md``) is on the
-weighted fold population of SPEC §11.7: a test GUID that $K$ folds' test splits hold weighs $1/K$ in each
+weighted fold population: a test GUID that $K$ folds' test splits hold weighs $1/K$ in each
 (:func:`_fold_w`); val is unweighted. An evaluation without ``results.fold_weighting`` is drawn as it is and labelled
 unweighted (:func:`_fold_phrase`).
 
@@ -53,7 +52,7 @@ COHORT_CLOCKS = "cohort/cohort_clocks"
 ROC_GUID = "roc/roc_guid"
 PR_GUID = "roc/pr_guid"
 THRESHOLD_DRIFT = "thresholds/threshold_drift"
-# P4 (§11.12 blocks M, R2-R8, T3, T4, A); ``{axis}`` over ``eval.time_axes``, ``{policy}`` over :func:`_m1_policies`.
+# P4 (blocks M, R2-R8, T3, T4, A); ``{axis}`` over ``eval.time_axes``, ``{policy}`` over :func:`_m1_policies`.
 METRIC_TYPES = "metric_types/metric_types_{axis}_{policy}"
 SEGMENT_INSTANTANEOUS = "metric_types/segment_instantaneous_{axis}"
 ROC_CHECKPOINTS_CUMULATIVE = "roc/roc_checkpoints_cumulative"
@@ -538,17 +537,17 @@ def _unit_square(ax: Any, diagonal: bool = True) -> None:
     ax.set_aspect("equal", adjustable="box")
 
 
-# ---- fold weighting (SPEC §11.7) ----
+# ---- fold weighting ----
 # Every fold's test split holds the same augmented healthy GUIDs (``shared_test``), so a fold's own test set is not
-# the pooled population (77 % shared healthy GUIDs against 25 % pooled in the 2026-10-07 run). Every per-fold test
+# the pooled population. Every per-fold test
 # value is on the weighted fold population instead: a row weighs $w = 1/K$, $K$ the number of folds whose test split
 # holds its GUID ($w = 0$ for a shared GUID under ``data.shared_test_policy: exclude``); val stays unweighted. The
 # metrics tables carry it (``results.fold_weighting``); the curves report draws from the prediction tables apply it
 # here (:func:`_fold_w`).
 def _fold_weighted(T: Dict[str, Any]) -> bool:
     """Whether the evaluation's per-fold rows are on the weighted fold population (``results.fold_weighting`` of
-    ``evaluation/summary.json`` is ``inverse_k``). An evaluation made before 2026-10-08 has no flag: its per-fold rows
-    hold every shared test GUID in every fold."""
+    ``evaluation/summary.json`` is ``inverse_k``). An evaluation without the flag holds every shared test GUID in every fold
+    in its per-fold rows."""
     return (T["summary"].get("results") or {}).get("fold_weighting") == "inverse_k"
 
 
@@ -586,8 +585,7 @@ def _fold_def(T: Dict[str, Any], c: Dict[str, Any], short: bool = False) -> str:
     if short:
         return (f"Per-fold test values: {'shared test GUIDs left out' if excl else 'a shared test GUID weighs 1/K'} "
                 "(see §3).")
-    return ("Per-fold test values (fold mean ± SD, min-max, per-fold columns) are on the weighted fold population (SPEC "
-            "§11.7): " + ("a shared test GUID weighs 0, as pooling drops it" if excl else
+    return ("Per-fold test values (fold mean ± SD, min-max, per-fold columns) are on the weighted fold population: " + ("a shared test GUID weighs 0, as pooling drops it" if excl else
                           "a shared test GUID weighs 1/K in each of the K folds whose test split holds it")
             + ", so the fold means are comparable with the pooled values. Per-fold val values are unweighted.")
 
@@ -753,7 +751,7 @@ def _threshold_drift(T: Dict[str, Any], c: Dict[str, Any], **_: Any) -> Any:
 #: The rate lines: sensitivity ○, specificity □, FPR △, in :data:`figstyle.RATE_COLORS`.
 RATES = (("sens", "sensitivity", figstyle.RATE_COLORS["sens"], "o"), ("spec", "specificity", figstyle.RATE_COLORS["spec"], "s"),
          ("fpr", "FPR", figstyle.RATE_COLORS["fpr"], "^"))
-#: The three metric types as row labels (their populations are defined in ``SPEC.md``, "Metric types").
+#: The three metric types as row labels.
 TYPE_LABEL = {"instantaneous": "Instantaneous", "committed_cumulative": "Committed\ncumulative",
               "committed_overall": "Committed\noverall"}
 AXIS_LABEL = {"to_delivery": "hours before delivery", "from_onset": "hours since labour onset",
@@ -1368,7 +1366,7 @@ def _alarms(T: Dict[str, Any], c: Dict[str, Any], *, what: str, split: str = "te
                 curve_ax.plot(p["t"].astype(float), p["value"].astype(float), color=color, lw=fs.LINE_REGULAR,
                               marker="o", ms=2.5, mew=0, alpha=0.85, label=pid)
             p = aa.loc[aa["policy_id"] == pid].dropna(subset=[col])
-            # a fold page of a weighted evaluation: the fold's GUIDs at their §11.7 fold weight (alarms.parquet `w`; a
+            # a fold page of a weighted evaluation: the fold's GUIDs at their fold weight (alarms.parquet `w`; a
             # shared test GUID 1/K, 0 under `exclude`), as the engine's weighted median; pooled rows are each GUID once
             hw = (p["w"].astype(float).to_numpy() if fold is not None and "w" in p else np.ones(len(p)))
             v, hw = p[col].astype(float).to_numpy()[hw > 0], hw[hw > 0]
@@ -1670,8 +1668,8 @@ def _three_class_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 
 
 def _subgroups_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
-    """§9: the subgroup table (block S, §11.6: :func:`_s_table_md`)."""
-    return ["## 9. Subgroups (§11.6)", "", *_s_table_md(T, c)]
+    """§9: the subgroup table (block S: :func:`_s_table_md`)."""
+    return ["## 9. Subgroups", "", *_s_table_md(T, c)]
 
 
 def _highlights_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
@@ -1739,7 +1737,7 @@ def _tripod_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
         ("Data flow (recordings, exclusions)", yes(len(T["fold_summary"])),
          "§2; `cohort/fold_summary.csv`, `evaluation/tables/inclusion.csv` (L14)"),
         ("Outcome definition and timing", "yes",
-         f"task `{lab['task']}` (§6.3 class mapping), head `{lab['head']}`, training labels `{lab['strategy']}`, "
+         f"task `{lab['task']}` (class mapping), head `{lab['head']}`, training labels `{lab['strategy']}`, "
          f"evaluation window `{lab['eval_window']}`; the outcome is assessed at delivery"),
         ("Predictors and timing of prediction", "yes",
          f"source `{c['source']['kind']}`, stride {(C.get('C12') or {}).get('stride_s', 'n/a')} s; context "
@@ -1763,7 +1761,7 @@ def _tripod_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 
 
 def _vs_frozen_md(R: Dict[str, Any]) -> List[str]:
-    """§4 addendum (§10.1): each ``model`` seed (and its ensemble) minus its ``frozen`` baseline at the same seed (block
+    """§4 addendum: each ``model`` seed (and its ensemble) minus its ``frozen`` baseline at the same seed (block
     ``VF``); nothing when the run has no frozen unit."""
     t = pd.DataFrame((R.get("VF") or {}).get("table") or [])
     if t.empty:
@@ -1775,7 +1773,7 @@ def _vs_frozen_md(R: Dict[str, Any]) -> List[str]:
         "pooled test [95% CI]": [_ci(v, (lo, hi)) for v, lo, hi in zip(t["value"], t["ci_lo"], t["ci_hi"])],
         "model value": t["run_value"], "frozen value": t["reference_value"], "p (bootstrap)": t["p_value"],
         "p DeLong": t.get("p_delong"), "p NB": t.get("p_nb")})
-    return ["### Δ vs frozen (§10.1)", "",
+    return ["### Δ vs frozen", "",
             "Each `model` seed (and its seed ensemble) of the online regime minus the frozen-feature head trained at the "
             "same seed, on the pooled OOF test GUIDs both scored (unpaired rows: `inclusion.csv`, analysis VF), paired "
             "patient-cluster bootstrap; AUROC of `score_final_cal`, sens/spec at the primary policy on each model's own "
@@ -1783,7 +1781,7 @@ def _vs_frozen_md(R: Dict[str, Any]) -> List[str]:
 
 
 def _comparator_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
-    """§3 addendum: the pre-specified healthy comparators (family ``healthy_comparator``, §11.6.1), primary model,
+    """§3 addendum: the pre-specified healthy comparators (family ``healthy_comparator``), primary model,
     GUID level: every adverse GUID against all healthy, against the blood-gas (BG+) healthy and against the no-gas
     (BG-) healthy; AUROC and the primary policy's sensitivity and specificity, pooled test with CI, per-fold mean ± SD
     and the (optimistic) validation value. Empty when the family was not evaluated."""
@@ -1806,7 +1804,7 @@ def _comparator_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
                          "fold mean ± SD": f"{_cell(per.mean())} ± {_cell(per.std())} (k={per.size})" if per.size else "-",
                          "val (optimistic)": _s_cell(v[v["fold"] == "pooled"])})
     return ["### Healthy comparator (pre-specified)", "",
-            "The adverse GUIDs against three healthy populations (§11.6.1 `healthy_comparator`): `all_healthy` (every "
+            "The adverse GUIDs against three healthy populations (`healthy_comparator`): `all_healthy` (every "
             "healthy GUID), `bg_healthy` (healthy GUIDs with a blood gas: a gas was drawn, so the labour raised concern) "
             "and `no_bg_healthy` (no gas). Train and val healthy GUIDs are mostly BG+, the augmented test healthy GUIDs "
             "mostly BG-, so the headline above depends on which population is meant; report both. "
@@ -1816,7 +1814,7 @@ def _comparator_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 def _np_cost_md(R: Dict[str, Any], c: Dict[str, Any], thr: pd.DataFrame) -> List[str]:
     """§5 addendum: what the NP umbrella primary policy costs against the empirical cap of the same α, basis and
     point, for the primary model at GUID level (pooled test sensitivity and FPR of both), with the validation
-    negatives n₀ the order statistic was taken over: the price shrinks as n₀ grows (RESEARCH, Thresholds)."""
+    negatives n₀ the order statistic was taken over: the price shrinks as n₀ grows."""
     ev = c["eval"]
     p = next((x for x in ev["thresholds"] if x["id"] == ev["primary_policy"]), None)
     if not p or p.get("method") != "np_umbrella":
@@ -1841,11 +1839,11 @@ def _np_cost_md(R: Dict[str, Any], c: Dict[str, Any], thr: pd.DataFrame) -> List
     return [f"- NP cost: `{p['id']}` (δ {p.get('delta')}) against `{q['id']}` at the same α {p['alpha']}: pooled test "
             f"sensitivity {s_np:.3f} vs {s_e:.3f} ({100 * (s_np - s_e):+.1f} points) at FPR {f_np:.3f} vs {f_e:.3f}. "
             f"The umbrella's order statistic was taken over n₀ ≈ {n0:.0f} validation negatives per fold; its price "
-            f"shrinks as n₀ grows (RESEARCH, Thresholds).", ""]
+            f"shrinks as n₀ grows.", ""]
 
 
 def summary_md(run_dir: Path, T: Dict[str, Any], c: Dict[str, Any]) -> Path:
-    """``summary.md``: the §11.11 sections 1-12, in order, each under a stable ``## <n>. `` heading (verify
+    """``summary.md``: the sections 1-12, in order, each under a stable ``## <n>. `` heading (verify
     criterion 12). Sections 6, 7, 9 and 10 come from one function each (:func:`_calibration_md`,
     :func:`_three_class_md`, :func:`_subgroups_md`, :func:`_highlights_md`), which blocks K, X, S, H and E fill."""
     R = T["summary"].get("results") or {}
@@ -2032,7 +2030,7 @@ def report(run_dir: Any, cfg: Any) -> int:
 # Every figure reads the block S tables: ``subgroups.parquet`` (``T["subgroups"]``: S1 counts and rates, S4 deltas, S5
 # pair AUROCs, K3 reliability points), the S2/X10 rows of the time-resolved table (``T["tr"]`` with ``subgroup`` set)
 # and the R11 curves in ``roc_points``. They draw the primary model (``metrics.primary_model``) and, for rates, the
-# primary policy; members run worst cohort first (``metrics.member_order``) in the §11.6.2 colours (:func:`_member_style`).
+# primary policy; members run worst cohort first (``metrics.member_order``) in the colours (:func:`_member_style`).
 # §9 (:func:`_subgroups_md`) and the S3/S5 part of §10 of summary.md read the same rows.
 from teb_vae.classifier.metrics import (  # noqa: E402
     BASELINES, CLASSES, EMPTY_FAMILIES, K3_FAMILIES, RESTRICTED, ROC_FAMILIES, S2_FAMILIES, SINGLE_CLASS_FAMILIES,
@@ -2051,9 +2049,9 @@ PER_CLASS_SUBGROUPS = "multiclass/per_class_subgroups_{axis}"
 SUBGROUP_FAMILY = "subgroups/family_{family}_to_delivery"
 FOLDS_SUFFIX = "_folds"  # the fold-band twin of a time-resolved subgroup figure (S2, S5, S8)
 #: S8 families, one page each: the clinical classes and their CS / BG splits (the previous pipeline's diagnosis, CS,
-#: BG and healthy BG x CS plots). Acidosis and HIE have no BG split: every adverse GUID is BG+ (§2.3, EMPTY_FAMILIES).
+#: BG and healthy BG x CS plots). Acidosis and HIE have no BG split: every adverse GUID is BG+ (EMPTY_FAMILIES).
 FAMILY_PAGES = ("class", "class_x_cs", "healthy_x_bg", "healthy_bg_x_cs", "cs", "bg")
-#: §11.6.2 fixed member palettes, defined once: cs/bg as the previous pipeline, the stages, a sequential 3-step tertile
+#: Fixed member palettes, defined once: cs/bg as the previous pipeline, the stages, a sequential 3-step tertile
 #: palette, unknown grey, and ``unhealthy`` (acidosis or HIE) between the two class colours. Class and shard members
 #: take ``figures_seam.group_colors``; anything else the shared line palette.
 MEMBER_COLORS = {"cs_pos": figstyle.BLUE, "cs_neg": figstyle.VIOLET, "bg_pos": figstyle.ORANGE, "bg_neg": figstyle.TEAL,
@@ -2062,7 +2060,7 @@ MEMBER_COLORS = {"cs_pos": figstyle.BLUE, "cs_neg": figstyle.VIOLET, "bg_pos": f
 
 
 def _member_style(family: str, value: str, members: List[str]) -> tuple:
-    """(colour, linestyle) of one member (§11.6.2): class and shard colours (``group_colors``; class_x_cs and restricted
+    """(colour, linestyle) of one member: class and shard colours (``group_colors``; class_x_cs and restricted
     pairs by their class, the cs- member a lighter shade of its class), the bg colour for the healthy bg cells (in
     ``healthy_bg_x_cs`` the cs- cell a lighter shade of its bg colour, so the four cells are four colours),
     :data:`MEMBER_COLORS`, else the shared line palette in member order. The line style is always solid: members are
@@ -2130,18 +2128,18 @@ def _member_lines(ax: Any, x: pd.DataFrame, family: str, members: List[str], *, 
     fs.style_axes(ax)
 
 
-#: The ``*_folds`` subgroup figures read the weighted per-fold counts of S2 (§11.7: a shared test GUID at weight 1/K in
+#: The ``*_folds`` subgroup figures read the weighted per-fold counts of S2 (a shared test GUID at weight 1/K in
 #: each of its K folds): per rate, its numerator metric row (``tp``, ``fp``: the row's ``value``) and its denominator
 #: column (``n_pos``, ``n_neg``); specificity is one minus the FPR ratio.
 FOLD_COUNTS = {"sens": ("tp", "n_pos"), "fpr": ("fp", "n_neg"), "spec": ("fp", "n_neg")}
 #: The one note line of a ``*_folds`` figure (it replaces :data:`UNDER_BIN`, whose hollow rule is the pooled one).
 #: The line is the all-fold rate of the weighted fold counts: every GUID once, but a shared test GUID as the mean of its
 #: K folds' decisions, where the pooled OOF rows (`first_fold`) keep fold 1's decision alone, so it can differ slightly
-#: from the pooled figures (0.5 % of the specificity/FPR cells outside the band in run 2026-10-07--17-52).
+#: from the pooled figures.
 FOLD_BAND_NOTE = ("Line: all folds, each GUID once (a shared test GUID: mean of its K folds' decisions); {band}: per-fold "
                   "test rates, a shared GUID at 1/K per fold. Hollow: median fold under {n} GUIDs of a class; black "
                   "ring: no estimate")
-FOLD_BAND_MISSING = ("Per-fold rows unweighted (an evaluation made before 2026-10-08: shared test GUIDs in every fold): "
+FOLD_BAND_MISSING = ("Per-fold rows unweighted (an evaluation without fold weighting: shared test GUIDs in every fold): "
                      "pooled line only; re-run --stage evaluate for the fold band")
 
 
@@ -2304,9 +2302,9 @@ def _time_page(fig: Any, grid: Any, c: Dict[str, Any], d: pd.DataFrame, axis: st
 def _subgroups_vs_time(T: Dict[str, Any], c: Dict[str, Any], *, axis: str, split: str = "test",
                        fold: Optional[str] = None, tertiles: bool = False, folds: bool = False) -> Any:
     """S2: rows = subgroup families (the clinical S2 families, or with ``tertiles`` the tertile families; val and per
-    fold the class family, the §11.10 core set), columns = the three metric types, one solid line per member and rate
+    fold the class family, the core set), columns = the three metric types, one solid line per member and rate
     under the primary policy on the bin grid: sensitivity (●) where it holds adverse GUIDs, specificity (■) and FPR
-    (▲) where it holds healthy ones (§11.6); primary model. ``folds`` (pooled test, the ``*_folds`` stem): each pooled
+    (▲) where it holds healthy ones; primary model. ``folds`` (pooled test, the ``*_folds`` stem): each pooled
     line over its min–max band across the folds' test sets (:func:`_member_fold_lines`, without the thin fold lines:
     the S8 pages draw those, one rate per panel)."""
     d = _s_rows(T, c, axis, split, fold, ovr=False, all_folds=folds)
@@ -2653,8 +2651,8 @@ def _s_table_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
     tests = _s_primary(_sel(T.get("subgroup_tests", pd.DataFrame()), kind="omnibus"))
     sig = tests[tests["significant"].fillna(False).astype(bool)] if len(tests) else tests
     return [f"Primary model `{pm[0]}` (seed {pm[1]}), pooled test, GUID level; policy `{pid}` on its basis population. "
-            "Healthy-only members report specificity, adverse-only members sensitivity, mixed ones both plus AUROC "
-            f"(§11.6). Underpowered: fewer than {ev['min_subgroup_n']} GUIDs of a needed class (`eval.min_subgroup_n`); "
+            "Healthy-only members report specificity, adverse-only members sensitivity, mixed ones both plus AUROC. "
+            f"Underpowered: fewer than {ev['min_subgroup_n']} GUIDs of a needed class (`eval.min_subgroup_n`); "
             "the value is withheld and the estimate shown. Every model, split and fold: `tables/subgroups.parquet`.", "",
             _md(pd.DataFrame(rows)), "",
             f"Documented, not computed: {'; '.join(f'`{k}` ({v})' for k, v in EMPTY_FAMILIES.items())}.",
@@ -2695,7 +2693,7 @@ def _s_highlights_md(T: Dict[str, Any], c: Dict[str, Any]) -> List[str]:
 
 AXIS_BUILDERS[SUBGROUPS_VS_TIME] = _subgroups_vs_time
 EXPECTED_WHEN[SUBGROUPS_VS_TIME] = lambda c: bool(set(S2_FAMILIES) & set(subgroup_families(c)))
-CORE_EXTRA.append(SUBGROUPS_VS_TIME)  # val/ and fold_<k>/ draw the class family only (§11.10 core set)
+CORE_EXTRA.append(SUBGROUPS_VS_TIME)  # val/ and fold_<k>/ draw the class family only (core set)
 AXIS_BUILDERS[SUBGROUPS_TERTILES_VS_TIME] = partial(_subgroups_vs_time, tertiles=True)  # S2, the tertile families
 EXPECTED_WHEN[SUBGROUPS_TERTILES_VS_TIME] = lambda c: bool(set(TERTILE_FAMILIES) & set(subgroup_families(c)))
 _BUILDERS[SUBGROUP_FOREST] = _subgroup_forest
@@ -3719,7 +3717,7 @@ def _heat(fig: Any, ax: Any, field: np.ndarray, text: np.ndarray, *, title: str,
 def _confusion_binary(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", fold: Optional[str] = None,
                       **_: Any) -> Any:
     """X1: per model, every threshold policy's confusion (rows: GUID-level policies, then segment-level ones) as TP |
-    FN | FP | TN counts on the policy's own basis population (pooled: summed over folds, §11.7), coloured and annotated
+    FN | FP | TN counts on the policy's own basis population (pooled: summed over folds), coloured and annotated
     with the rate within the true class (sensitivity, miss rate, FPR, specificity). A 3-class run's binary policies
     threshold the collapsed adverse score."""
     d = _sel(T["metrics"], split=split, fold=_one(fold))
@@ -3753,7 +3751,7 @@ def _confusion_binary(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "tes
 
 def _confusion_3class(T: Dict[str, Any], c: Dict[str, Any], *, split: str = "test", fold: Optional[str] = None,
                       **_: Any) -> Any:
-    """X2: rows = models; the argmax 3x3 confusion at GUID level: the pooled counts (OOF, summed over folds, §11.7),
+    """X2: rows = models; the argmax 3x3 confusion at GUID level: the pooled counts (OOF, summed over folds),
     their row-normalised form (recall on the diagonal), and the mean ± SD over folds of the per-fold row-normalised
     matrices (:func:`~teb_vae.classifier.metrics.fold_mean_rownorm`, every fold equal); ``fold``: that fold's two
     matrices."""
@@ -4970,7 +4968,7 @@ def comparison_md(R: List[Dict[str, Any]], Q: pd.DataFrame, out: Path, *, pid: s
          f"`comparison.parquet` and `figures/{COMPARE_FOREST}`.", "",
          "## Ablation table", "",
          f"Config columns: only the keys whose values differ across the runs ({len(arms)}). AUROC: the per-fold mean ± "
-         "SD is primary, the pooled OOF AUROC secondary (§11.7).", "",
+         "SD is primary, the pooled OOF AUROC secondary.", "",
          *_table(header, rows), "",
          "## Paired Δ vs the reference, all GUIDs", "",
          *(_table(["run", "policy", "metric", "reference", "run", "Δ [95% CI]", "p", "DeLong p", "NB p", "N"], per)

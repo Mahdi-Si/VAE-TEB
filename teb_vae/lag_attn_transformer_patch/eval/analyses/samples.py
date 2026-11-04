@@ -1,4 +1,4 @@
-r"""``samples`` -- the raw-trace diagnostic page; port, owner E1-F (``notes/EVAL_PLAN.md`` §2).
+r"""``samples`` -- the raw-trace diagnostic page; port.
 
 **Question.** What does the model forecast, in clinical units, against the trace a clinician
 reads? The page draws the raw FHR and UP on one row, the level forecast in bpm with its ±2σ band

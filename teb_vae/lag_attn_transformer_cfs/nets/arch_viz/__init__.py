@@ -1,7 +1,6 @@
 """Architecture visualisation of :class:`~teb_vae.lag_attn_transformer_cfs.nets.model.SeqVaeLagAttnTrfCfs`.
 
-``README.md`` beside these files says how to repeat this for another model. Two files do the
-work and one is their product:
+Two files do the work and one is their product:
 
 * ``extract_arch.py`` -- builds the production model, traces one forward pass and writes
   ``arch.json``: every torch call with its real input/output shapes, every module with its real

@@ -1,4 +1,4 @@
-"""Config schema, ``base:`` chains, ``--set`` overrides and digest (SPEC §13; the schema half of T-F1)."""
+"""Config schema, ``base:`` chains, ``--set`` overrides and digest (the schema half of T-F1)."""
 from __future__ import annotations
 
 import json
@@ -41,7 +41,7 @@ def test_a_run_dir_of_another_schema_version_is_refused(tmp_path, monkeypatch):
 
 
 def test_landmark_axis_is_evaluation_only_and_left_out_of_the_digest():
-    """``rel_second_stage_norm`` (§11.5) is no threshold basis; ``eval.norm_bin`` must divide 1; neither enters the
+    """``rel_second_stage_norm`` is no threshold basis; ``eval.norm_bin`` must divide 1; neither enters the
     digest, so a run dir made before the axis existed still resumes and re-evaluates."""
     with pytest.raises(ValueError, match="evaluation only"):
         config.load(DEFAULT, ["classifier.eval.thresholds=[{id: np30, policy: fpr_cap, alpha: 0.3, method: empirical, "

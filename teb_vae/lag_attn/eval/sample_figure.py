@@ -28,9 +28,8 @@ The figure degrades to one fewer row.
 Every heatmap here draws with ``interpolation='none'`` rather than ``'nearest'``, which is both
 faster and more truthful. In a vector backend ``'none'`` embeds the array unresampled, so one
 data cell is one cell; ``'nearest'`` resamples to the axes' pixel size at ``SAVE_DPI``, which on
-a page this wide means rasterising a $(c_y, T)$ field into tens of megapixels. Measured on the
-production geometry that is $9.3$ s and $1.1$ MB per page against $3.7$ s and $290$ KB -- and
-the resampled version can merge adjacent channels, which on a per-channel diagnostic is the one
+a page this wide means rasterising a $(c_y, T)$ field into tens of megapixels. The resampled
+version is slower and larger, and it can merge adjacent channels, which on a per-channel diagnostic is the one
 artifact the row exists to rule out.
 
 The figure builders here take numpy arrays and plain numbers rather than a batch and a model,

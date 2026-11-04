@@ -885,8 +885,8 @@ _COLORBAR_WIDTH_RATIO = 0.012
 #: title-strip legend, no more.
 _ROW_GAP = 0.38
 
-#: The series colours of a line panel, in column order: the Okabe-Ito set the evaluation figures
-#: share, so the first series of every panel is the same blue.
+#: The series colours of a line panel, in column order: the qualitative hues the evaluation
+#: figures share, so the first series of every panel is the same blue.
 LINE_COLOURS: Tuple[str, ...] = (
     figures.COLOR_BLUE, figures.COLOR_ORANGE, figures.COLOR_GREEN, figures.COLOR_PURPLE,
 )

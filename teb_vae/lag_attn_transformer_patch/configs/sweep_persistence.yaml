@@ -1,4 +1,4 @@
-# Arm (plan B.9): Does the level leave the latent?
+# Arm: Does the level leave the latent?
 base: default.yaml
 
 general_config:

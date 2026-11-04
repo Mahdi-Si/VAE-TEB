@@ -1,18 +1,18 @@
 # Figure guide
 
-One entry per PDF the evaluation emits: what it shows, what its axes are, and how it is misread. Each is written under the filename the run produces, inside the analysis subdirectory named in its heading.
+This guide has one entry per figure the evaluation emits: what it shows, what its axes are, and how it is misread. Each entry is written under the filename the run produces, inside the analysis subdirectory named in its heading. `figure_manifest.json` lists the same files. Figures are PDF unless `eval_config.figure_format` selects another format.
 
 A rule that applies to every figure here: **an empty panel is a statement, not a bug.** A panel that found no finite value draws the words `no finite values` rather than an empty frame, and that means the analysis measured nothing rather than that the plotting failed.
 
-A second rule applies to every *lag* axis this pipeline will ever draw: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$, the residual physiological delay after the model's own input delay $\delta$ is added back.
+A second rule applies to every *lag* axis: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$, the lag index plus the model's own causal input delay $\delta$, converted to seconds.
 
-A third applies to every figure that resolves a quantity **by cohort**, and it is the one an operator is most likely to assume rather than check.
+A third rule applies to every figure that resolves a quantity **by cohort**.
 
-**The order is clinical, not alphabetical.** Cohorts run left to right in ascending severity: `healthy`, `acidosis`, `hie` on the class axis, and on the subgroup axis `healthy_no_bg_no_cs`, `healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`, `acidosis_no_cs`, `acidosis_cs`, `hie_no_cs`, `hie_cs`. One function decides it — `cohort.ordered_groups` — and every figure and every CSV row order in this pipeline reads it, so a table can be read against the figure beside it row for row. A cohort the order does not know (a non-canonical shard stem) is drawn **after** the ones it does rather than dropped.
+**The order is clinical, not alphabetical, and it runs worst first.** Cohorts run left to right in descending severity: `hie`, `acidosis`, `healthy` on the class axis, and on the subgroup axis `hie_cs`, `hie_no_cs`, `acidosis_cs`, `acidosis_no_cs`, `healthy_bg_cs`, `healthy_bg_no_cs`, `healthy_no_bg_cs`, `healthy_no_bg_no_cs`. One function decides it, `cohort.ordered_groups` (bound to `lag_attn.eval.labels.ordered_groups`), and every figure and every CSV row order in this pipeline reads it, so a table can be read against the figure beside it row for row. A cohort the order does not know (a non-canonical shard stem) is drawn **after** the ones it does rather than dropped.
 
-**The colour is the severity.** Green for healthy, amber for acidosis, red for HIE, and each subgroup a shade of its own class — light to dark in the order above, so the shading carries the ordering too and a violin's hue says which class it belongs to before its label is read. The mapping is a table rather than an assignment pass, so a cohort keeps its colour whichever other cohorts a figure happens to contain, and two figures over different subsets can be laid side by side.
+**The colour is the severity.** Green for healthy, amber for acidosis, red for HIE (`figures_seam.CLINICAL_CLASS_COLORS`), and each subgroup a shade of its own class. The shades run light to dark in the order of `labels.CANONICAL_SUBGROUPS`, which is the reverse of the display order. The mapping is a table rather than an assignment pass, so a cohort keeps its colour whichever other cohorts a figure contains.
 
-Two consequences worth stating. This palette is **this evaluation's**, not the repository's: the shared `utils.style` mapping paints `healthy` blue and is used by the `lag_attn` sibling and by `model/transformer_experiment`, so a figure from this pipeline and a training-callback figure of the same cohort are **different colours** and must be read by legend, not by hue. And a colour ordering is not a result: it makes a difference easy to see, and `cross_subgroup` is the analysis that says whether the difference survives being asked properly.
+Two consequences follow. This palette is **this evaluation's**, not the repository's: the shared `utils.style` mapping paints `healthy` blue and is used by the `lag_attn` sibling and by `model/transformer_experiment`, so a figure from this pipeline and a training-callback figure of the same cohort are **different colours** and must be read by legend, not by hue. And a colour ordering is not a test: `cross_subgroup` is the analysis that tests whether a cohort difference holds.
 
 ---
 
@@ -27,9 +27,9 @@ The recording is a fetal heart-rate trace (**FHR**) and a uterine-pressure trace
 - the **base** forecast, from a belief built out of the FHR history alone;
 - the **full** forecast, from a belief that also read the UP history.
 
-Everything this evaluation reports is some version of *"how much better was the second one"*. If UP genuinely tells you something about the FHR two minutes ahead, the full forecast is better and the two beliefs differ. If it does not, they coincide and every number below is zero.
+Most of what this evaluation reports is some version of *"how much better was the second one"*. When the two beliefs coincide, every coupling number below is zero.
 
-The belief is a 48-dimensional Gaussian, and there are two of them per anchor:
+The belief is a $d_z$-dimensional diagonal Gaussian ($d_z = 64$ in `configs/default.yaml`; a run reads its own value from the checkpoint), and there are two of them per anchor:
 
 | Name | Symbol | What it is |
 |---|---|---|
@@ -71,7 +71,7 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 | `nll_persistence_block` | baseline: repeat the last **observed** FHR sample for two minutes | nats per anchor |
 | `nll_climatology_block` | baseline: predict the population mean ($z = 0$) | nats per anchor |
 | `nll_segment_mean_block` | baseline: predict this segment's own mean | nats per anchor |
-| `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the 48-dim bottleneck | nats per anchor |
+| `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the $d_z$-dimensional bottleneck | nats per anchor |
 
 **"nats per anchor" is the unit to internalise.** One score is a sum over all 480 raw samples of one forecast block, then averaged across the anchors that were scored. So it is a *large* number — hundreds — under every predictor including a perfect one, because it is 480 terms added up. Its absolute size says nothing; only differences and ratios between predictors are readable. Divide by 480 for a per-raw-sample figure, but note that this is a flat rescale and **not** a mean over unmasked samples, so it under-reports on any anchor with masked forecast steps.
 
@@ -81,7 +81,7 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 |---|---|---|
 | `pred_gap` | $D_{\mathrm{base}} - D_{\mathrm{full}}$ on the **single-draw** path. Positive = UP helped. | nats per anchor |
 | `mc_pred_gap` | the same difference on the marginalised scores. **This is the headline coupling number.** | nats per anchor |
-| `delta_suff_nats` | $D_{\mathrm{base}} - D_{\mathrm{oracle}}$: what the 48-dim bottleneck *costs* the forecast | nats per anchor |
+| `delta_suff_nats` | $D_{\mathrm{base}} - D_{\mathrm{oracle}}$: what the $d_z$-dimensional bottleneck *costs* the forecast | nats per anchor |
 | `mse_skill` | $1 - \mathrm{MSE}_{\mathrm{model}}/\mathrm{MSE}_{\mathrm{baseline}}$. $1$ = perfect, $0$ = no better than the baseline, negative = worse. | dimensionless |
 | `advantage_nats_per_anchor` | the NLL-space analogue of skill, and a **difference**, not $1 -$ a ratio — a log score has no natural zero | nats per anchor |
 | `pred_gap_rmse_pct` | $100\left(1 - \mathrm{RMSE}_{\mathrm{full}}/\mathrm{RMSE}_{\mathrm{base}}\right)$: the percentage of the FHR-only forecast's error the UP removed. **Scale-free** — the same number in $z$ units and in bpm. | percent |
@@ -109,7 +109,7 @@ Scores mix accuracy and confidence. These are pure accuracy, computed **per scor
 
 `forecast_difference_sq` is not `pred_gap`: two forecasts can differ everywhere and score identically. One measures *movement*, the other measures *improvement*.
 
-**$z$-units versus bpm.** The loader z-scores FHR, so the model works in standard deviations, not heartbeats. Wherever the normalisation statistics are available a figure converts to **bpm** and says so in its axis label; where they are not, the label says `normalised`. Roughly, $0.1$ $z$-unit $\approx 1$ bpm. Levels convert affinely (scale **and** shift); spreads, RMSEs and differences convert by scale only.
+**$z$-units versus bpm.** The loader z-scores FHR, so the model works in standard deviations, not heartbeats. Wherever the normalisation statistics are available a figure converts to **bpm** and says so in its axis label; where they are not, the label says `normalised`. Levels convert affinely (scale **and** shift); spreads, RMSEs and differences convert by scale only.
 
 ### The KL family — how much the belief moved
 
@@ -120,24 +120,24 @@ $K_t = \mathrm{KL}(q_t \Vert p_t)$ measures how far reading UP moved the belief 
 | `source_conditioned_kl_raw` | $K_t$ averaged over the scored anchors. **The** KL readout. | nats per anchor |
 | `source_conditioned_kl_shuffled_raw` | the same under a **stranger's** UP — the control | nats per anchor |
 | `kld_per_t` | $K_t$ *before* averaging: one value per anchor | nats per anchor |
-| `kld_per_dim` | $K_t$ split across the 48 latent dimensions; sums back to the total | nats per anchor |
+| `kld_per_dim` | $K_t$ split across the $d_z$ latent dimensions; sums back to the total | nats per anchor |
 | `kld_per_head` | $K_t$ split across the 4 attention heads; sums back to the total | nats per anchor |
 | `source_kl_lag_map` | $K_t$ split across the 91 lags; sums back to the total | nats per anchor |
 | `active_dims` | how many latent dimensions carry more than `KLD_ACTIVE_EPS` nats | count |
 | `top_dimension_share` | the largest dimension's fraction of the total — near $1$ means one dimension carries everything | fraction |
 
-Three warnings this pipeline repeats because each has cost a result somewhere:
+Three warnings apply to every KL readout:
 
 1. **Only the `_raw` (unfloored) KL is a rate.** A floored variant exceeds it by construction and would hide a collapsed source pathway.
 2. **The KL is inflated whenever the prior variance sits on its clamp**, because $K_t$ carries $(\mu^q - \mu^p)^2/\sigma_p^2$ and a pinned $\sigma_p^2$ divides by an arbitrarily small number. Check the `prior_variance_not_pinned` verdict before quoting a KL. `pred_gap` is immune to this, which is why the two travel together.
-3. **A bigger KL under a stranger's UP is healthy, not broken.** A stranger's source is out of distribution, so it moves the posterior *more*. Specificity is judged on the **scores** ($D_{\mathrm{full}} < D_{\mathrm{shuffled}}$), never on the KL.
+3. **A bigger KL under a stranger's UP is not a failure.** A stranger's source is out of distribution, so it can move the posterior *more* than the matched source does. Specificity is judged on the **scores** ($D_{\mathrm{full}} < D_{\mathrm{shuffled}}$), never on the KL.
 
 ### Belief movement, in the latent
 
 | Name | Plain meaning |
 |---|---|
 | `delta_mu_sq` / `delta_mu_rms` | how far $\mu^q$ sits from $\mu^p$, **per latent coordinate** |
-| `mu_post_prior_gap_sq` / `_rms` | the same distance as a whole vector (summed over $d_z$ first) — larger by $\sqrt{48}$ |
+| `mu_post_prior_gap_sq` / `_rms` | the same distance as a whole vector (summed over $d_z$ first) — larger by $\sqrt{d_z}$ |
 | `mu_prior_rms` | the size of the prior belief itself, for scale |
 
 ### Attention — where in the past the model looked
@@ -181,7 +181,7 @@ The clamp is `logvar_clamp: [-5, 3]`, and "pinned" means within 5% of the range 
 | Word | Means |
 |---|---|
 | **segment** | one 20-minute window of a recording: $T = 300$ anchors |
-| **recording** / `guid` | one delivery, contributing up to ~37 segments. **Every statistic in this pipeline is per recording**, never per segment. |
+| **recording** / `guid` | one delivery, contributing many segments. **Every statistic in this pipeline is per recording**, never per segment. |
 | `epoch` (as a column) | the segment's start time in **seconds relative to delivery**, negative before it — not a training epoch |
 | **anchor** $t$ | one 4-second step; the point a forecast is made from |
 | **horizon step** $\tau$ | how far ahead within one forecast, $0..29$. Step $0$ is $4$ s ahead, not $0$. |
@@ -205,7 +205,9 @@ Anchors are **not independent**: consecutive anchors' forecast windows overlap i
 
 **Every class contrast is out of distribution.** The checkpoint trains on healthy-with-background recordings only, so acidosis, HIE *and* both healthy-no-background subgroups are unseen. A difference between cohorts here is a difference in how the model generalises, not held-out clinical discrimination.
 
-## The shipped numbers
+## Geometry constants
+
+The values below are those of `configs/default.yaml`; a run reads its own geometry from the checkpoint.
 
 | Symbol | Value | What it is |
 |---|---|---|
@@ -213,7 +215,7 @@ Anchors are **not independent**: consecutive anchors' forecast windows overlap i
 | $H$ | 30 | horizon steps = 2 minutes |
 | $R$ | 16 | raw samples per horizon step (4 Hz × 4 s) |
 | $H \cdot R$ | 480 | raw samples in one forecast block |
-| $d_z$ | 48 | latent dimensions |
+| $d_z$ | 64 | latent dimensions |
 | $L$ | 91 | lag bins = ~6 minutes of UP history |
 | $M$ | 4 | attention heads |
 | warm-up | 30 | unscored leading anchors |
@@ -230,13 +232,13 @@ Anchors are **not independent**: consecutive anchors' forecast windows overlap i
 
 These have no entry of their own because they are not one figure. Every analysis that writes a per-recording table declares it, and the **runner** fans one violin figure per cohort axis over whatever was declared -- so the set of them grows with the analyses and each is named after the table it resolves. One panel per metric, one violin per cohort, in the clinical order and palette described at the top of this file.
 
-**Axes.** One row per metric; the metric's own units on the vertical axis, cohorts across in ascending severity. The CSV beside each figure carries its rows in that same order, so the two are read together rather than reconciled.
+**Axes.** One row per metric; the metric's own units on the vertical axis, cohorts across, worst first. The CSV beside each figure carries its rows in that same order, so the two are read together rather than reconciled.
 
 **Terms on these figures.** Which metrics appear depends on which analysis declared the table:
 
 | From | Metrics drawn |
 |---|---|
-| `coupling` | `mc_pred_gap`, `pred_gap`, `source_conditioned_kl_raw`, `source_conditioned_kl_shuffled_raw`, `pred_gap_rmse_pct` |
+| `coupling` | two pages: `mc_pred_gap`, `pred_gap`, `pred_gap_rmse_pct`; and `source_conditioned_kl_raw`, `source_conditioned_kl_shuffled_raw` |
 | `forecast` | `sq_error_base`, `sq_error_full`, `nll_full_block`, `signed_error_full` |
 | `perm_control` | `mc_nll_base_block`, `mc_nll_full_block`, `mc_nll_shuffled_block` |
 | `latent` | `source_conditioned_kl_raw`, `logvar_prior_floor_frac`, `mean_logvar_prior` |
@@ -244,12 +246,13 @@ These have no entry of their own because they are not one figure. Every analysis
 | `attention` | `attention_entropy_nats`, `attention_entropy_attainable_nats` |
 | `calibration` | `mean_logvar_full`, `logvar_full_floor_frac`, `logvar_full_ceil_frac` |
 | `residual` | `forecast_difference_sq`, `delta_mu_sq`, `mu_post_prior_gap_sq` |
+| `coherence` | `coherence_full_lf`, `gain_full_lf`, `delta_coherence_lf`, `residual_normalised_full_lf` |
 | `sufficiency` | `delta_suff_nats`, `nll_oracle_block`, `mc_nll_base_block` |
 | `events` | `difference` (event-minus-control, per readout) |
 
 All of them are defined in **Terminology** above.
 
-**How they are misread.** Every violin holds one value per **recording**, not per segment, so a cohort with eight recordings is eight points however many segments they contributed -- the width of a violin is not evidence. A cohort split that produces fewer than two groups emits **no figure at all** and records a skip: on the healthy-only pretraining population that is the ordinary outcome, and the pooled output beside it is untouched. And a visible separation here is not a result: `cross_subgroup` is the analysis that says which separations survive being asked properly, and it tests a deliberately short list rather than everything drawn here.
+**How they are misread.** Every violin holds one value per **recording**, not per segment, so a cohort with eight recordings is eight points however many segments they contributed -- the width of a violin is not evidence. A cohort split that produces fewer than two groups emits **no figure at all** and records a skip: on the healthy-only pretraining population that is the ordinary outcome, and the pooled output beside it is untouched. And a visible separation here is not a test: `cross_subgroup` is the analysis that tests cohort differences, and it tests a deliberately short list rather than everything drawn here.
 
 ---
 
@@ -289,7 +292,7 @@ All of them are defined in **Terminology** above.
 
 ## `forecast/horizon_skill.pdf`
 
-**In plain terms.** *"How far ahead can it actually see?"* A single block score lumps all two minutes of the forecast into one number. This unpacks it: how good is the forecast 4 seconds ahead, 30 seconds ahead, two minutes ahead. Expect the error to rise with lead time — a forecast that is as good at 120 s as at 4 s is usually predicting a flat line. The gap panel is where UP's contribution lives: if UP helps at all, it should help most at the lead times where the FHR-only branch is losing.
+**In plain terms.** *"How far ahead can it actually see?"* A single block score lumps all two minutes of the forecast into one number. This unpacks it: how good is the forecast 4 seconds ahead, 30 seconds ahead, two minutes ahead. The gap panel resolves UP's contribution by lead time.
 
 **What it shows.** $D_{\mathrm{base}}(\tau)$ and $D_{\mathrm{full}}(\tau)$, their gap, and each branch's RMSE, against lead time.
 
@@ -356,11 +359,11 @@ All of them are defined in **Terminology** above.
 - **middle violins** — the two error-space percentages. They are one ratio under a root and so can never disagree about the sign; their separation is arithmetic, not a finding.
 - **bottom violin** — `pred_gap_mc_likelihood_pct`: $100(e^{\Delta/480}-1)$, the extra probability density placed on each observed raw sample.
 
-**How it is misread.** Four ways. The two spaces are on **separate axes on purpose** — a per-sample density ratio and an error reduction routinely differ by an order of magnitude, and reading the bottom panel's scale off the middle one will be wrong. The likelihood percentage divides by the **fixed** 480-sample block rather than by each anchor's own scored-sample count, so it under-reports wherever forecast steps are masked; it is a floor, not an estimate — and an **empty bottom panel means the checkpoint was scored under `mse`**, where the quantity is undefined, not that the source added nothing. The middle panel's two violins are **not two results** — `pred_gap_mse_pct` exceeds `pred_gap_rmse_pct` whenever both are positive, by construction and not because the model did better on one. And none of these is `pred_gap` divided by a block score: that ratio is not defined here, for the reason given under *Gaps* above, and a reader reconstructing it from `d_base_mc_nats` will get a number that changes sign with its own denominator.
+**How it is misread.** Four ways. The two spaces are on **separate axes on purpose** — a per-sample density ratio and an error reduction can differ by an order of magnitude, and reading the bottom panel's scale off the middle one will be wrong. The likelihood percentage divides by the **fixed** 480-sample block rather than by each anchor's own scored-sample count, so it under-reports wherever forecast steps are masked; it is a floor, not an estimate — and an **empty bottom panel means the checkpoint was scored under `mse`**, where the quantity is undefined, not that the source added nothing. The middle panel's two violins are **not two results** — `pred_gap_mse_pct` exceeds `pred_gap_rmse_pct` whenever both are positive, by construction and not because the model did better on one. And none of these is `pred_gap` divided by a block score: that ratio is not defined here, for the reason given under *Gaps* above, and a reader reconstructing it from `d_base_mc_nats` will get a number that changes sign with its own denominator.
 
 ## `latent/kl_spectrum.pdf`
 
-**In plain terms.** *"How much of the 48-dimensional belief is actually doing anything?"* The model has 48 latent coordinates in which to record what UP told it. This bar chart shows how much each one carries, tallest first. A healthy spectrum has several bars above the line; a spectrum with one tall bar and 47 flat ones means the model compressed everything UP said into a single number, and a spectrum entirely below the line means UP is being ignored. The bars add up to the headline KL, so this is that number taken apart rather than a new one.
+**In plain terms.** *"How much of the $d_z$-dimensional belief carries source information?"* The model has $d_z$ latent coordinates in which to record what UP told it. This bar chart shows how much each one carries, tallest first. Several bars above the line mean the source information is spread over several dimensions; one tall bar means it sits in a single dimension; a spectrum entirely below the line means the source moves no dimension past the activity threshold. The bars add up to the headline KL, so this is that number taken apart rather than a new one.
 
 **What it shows.** The per-dimension KL $\bar K_d$, sorted descending, with the activity threshold `KLD_ACTIVE_EPS` marked.
 
@@ -368,7 +371,7 @@ All of them are defined in **Terminology** above.
 
 **Terms on this figure.**
 
-- **bars** — `kld_per_dim`, the KL split across the 48 latent coordinates; they sum to `source_conditioned_kl_raw`.
+- **bars** — `kld_per_dim`, the KL split across the $d_z$ latent coordinates; they sum to `source_conditioned_kl_raw`.
 - **x position** — a **rank**, not a coordinate. "Dimension 0" here is the largest contributor; `latent_spectrum.csv` maps rank back to the real latent index.
 - **dashed horizontal** — `KLD_ACTIVE_EPS`, the threshold a dimension must clear to be counted in `active_dims`.
 - Read `prior_variance_not_pinned` before quoting the total: an inflated KL makes every bar taller by the same arbitrary factor.
@@ -377,7 +380,7 @@ All of them are defined in **Terminology** above.
 
 ## `lag_kl/lag_kl_profile.pdf`
 
-**In plain terms.** *"How far back in the uterine-pressure trace did the useful information sit?"* The model's belief-shift is split across the 91 possible delays and plotted against how many seconds ago that was. A peak at 40 s means the UP activity that mattered for forecasting happened about 40 seconds before the anchor — which is what a contraction-then-deceleration story would predict. Two curves are drawn because early anchors physically cannot look far back: the **raw** curve is the honest split of the total, the **corrected** one is the fair comparison between delays, and the bottom panel is the evidence count that separates them.
+**In plain terms.** *"How far back in the uterine-pressure trace did the useful information sit?"* The model's belief-shift is split across the 91 possible delays and plotted against how many seconds ago that was. A peak at 40 s means the UP activity that mattered for forecasting happened about 40 seconds before the anchor. Two curves are drawn because early anchors physically cannot look far back: the **raw** curve is the honest split of the total, the **corrected** one is the fair comparison between delays, and the bottom panel is the evidence count that separates them.
 
 **What it shows.** Top: the per-lag KL attribution $\widetilde K_\ell$ in two forms on one axis -- the **raw** attribution, which divides every bin by the same anchor total and therefore sums over lags to the headline `source_conditioned_kl_raw`, and the **support-corrected** one, which divides each bin by the anchors at which that lag was causally valid. Each form's argmax is marked. Bottom: the contributing-anchor count per lag, which is the only thing that differs between them.
 
@@ -388,7 +391,7 @@ All of them are defined in **Terminology** above.
 - **raw curve** — `lag_profile`: `source_kl_lag_map` averaged over anchors, every bin divided by the *same* anchor count. Sums over lags to `source_conditioned_kl_raw`.
 - **corrected curve** — `lag_profile_support_corrected`: each bin divided by the anchors at which that lag actually existed. Over the trained range lags 0-30 have 240 contributing anchors while lag 90 has 180, a 25% under-weight that biases the raw argmax short.
 - **bottom panel** — `lag_support`, the per-lag anchor count. It is the only difference between the two curves above.
-- **x axis** — compensated lag in seconds, $\tau = 4(\ell + \delta)$. Not the original-sensor figure; see the rule at the top of this file.
+- **x axis** — compensated lag in seconds, $\tau = 4(\ell + \delta)$; see the rule at the top of this file.
 - **argmax markers** — the peak of each curve. Check `degenerate` in `lag_kl_summary.csv` first: a flat profile has an argmax that names a bin, not a delay.
 
 **How it is misread.** The two curves are not two measurements of one quantity: only the raw one is a decomposition of the KL, and only the corrected one is a fair comparison *between* lags. Where their argmaxes disagree, the difference is the short-lag bias -- a finding about the geometry, not about the model. And an argmax is not by itself a reading: `lag_kl_summary.csv` carries the peak width, the mass near the peak, any secondary peaks, and a mechanical `degenerate` flag, and a profile flagged degenerate has an argmax that names a bin rather than a delay.
@@ -457,17 +460,17 @@ All of them are defined in **Terminology** above.
 
 **Terms on this figure.**
 
-- **the histogram** — the decoder's per-raw-sample log-variance. $0$ on this axis means $\sigma = 1$ $z$-unit ($\approx 10$ bpm).
+- **the histogram** — the decoder's per-raw-sample log-variance. $0$ on this axis means $\sigma = 1$ $z$-unit.
 - **dotted verticals** — the clamp itself, $[-5, 3]$. The bound is a sigmoid, so mass never reaches them exactly.
 - **dashed verticals** — the **margins**, 5% of the clamp range in from each end ($0.4$ nats). What falls beyond them is what `logvar_full_floor_frac` and `logvar_full_ceil_frac` count.
 - Related: `mean_logvar_full` is the average of this distribution — and a single mean is equally consistent with a healthy spread and with half the mass pinned on each end, which is why the two fractions ship beside it.
-- The **ceiling** failure is the dangerous one to miss: it reads as a healthily *falling* NLL while `pred_gap` quietly goes to zero.
+- Mass on the **ceiling** is easy to miss, because it can coexist with a falling NLL while `pred_gap` goes to zero.
 
-**How it is misread.** The dashed lines, not the dotted ones, are what "pinned" means. The bound is a sigmoid, so the asymptote is never reached and mass exactly *at* a clamp would be invisible; every fraction this pipeline reports counts what lies within 5% of the clamp range of an end, which on the shipped $[-5, 3]$ is $0.4$ nats. The two ends also fail in opposite directions: mass on the floor is an over-confident decoder whose squared NLL term explodes, mass on the ceiling is one that has given up and is predicting noise -- which reads as a healthy *falling* NLL while `pred_gap` goes to zero.
+**How it is misread.** The dashed lines, not the dotted ones, are what "pinned" means. The bound is a sigmoid, so the asymptote is never reached and mass exactly *at* a clamp would be invisible; every fraction this pipeline reports counts what lies within 5% of the clamp range of an end, which on the default $[-5, 3]$ is $0.4$ nats. The two ends also fail in opposite directions: mass on the floor is an over-confident decoder whose squared NLL term explodes, mass on the ceiling is one that has given up and is predicting noise, which can coexist with a falling NLL while `pred_gap` goes to zero.
 
 ## `coherence/coherence_lead_time.pdf`
 
-**In plain terms.** *"Which rhythms does the forecast get right, and how fast does it lose them?"* A fetal heart-rate trace is several things at once — a slowly drifting baseline, decelerations over a minute or two, beat-to-beat wobble. A single error number averages all of them together. This map splits them apart: every row is one rhythm (a frequency), every column is one distance into the future, and the colour says how much of that rhythm the forecast reproduces there. A healthy model is bright at the bottom (slow things, which persist) and fades upward and rightward.
+**In plain terms.** *"Which rhythms does the forecast get right, and how fast does it lose them?"* A fetal heart-rate trace is several things at once — a slowly drifting baseline, decelerations over a minute or two, beat-to-beat wobble. A single error number averages all of them together. This map splits them apart: every row is one rhythm (a frequency), every column is one distance into the future, and the colour says how much of that rhythm the forecast reproduces there.
 
 **What it shows.** Top panel: the coherence $\gamma^2$ between the truth and the source-conditioned forecast, as a field over frequency and lead time. Bottom panel: the same field for the source-conditioned forecast minus the target-only one — what the UP added, per frequency and per lead time. This is `coupling`'s `pred_gap` resolved into the two axes it hides.
 
@@ -555,7 +558,7 @@ against frequency at the nearest lead time, and against lead time in the LF band
 
 Each panel carries **two** things per class. The **filled histogram** is one point per 20-minute segment — what was asked for. The **strip floating above it** is one point per recording, drawn as a median dot, a thick inter-quartile bar and a thin full-range line. If the strip is much narrower than the histogram below it, most of the width you are looking at is the *same baby measured thirty times*, not differences between babies. That comparison is the reason both are drawn.
 
-The two levels take **different forms on purpose**. There are hundreds to thousands of segments per cohort, so a density is a fair picture of them; there are six to forty recordings, and a forty-bin histogram over six values is a row of spikes that estimates nothing, grabs the panel's y-axis and flattens the distribution you came to read. The strip says the one thing the recording level is there to say — how wide the between-recording spread is — and says it robustly at $n = 6$.
+The two levels take **different forms on purpose**. A cohort holds many more segments than recordings, so a density is a fair picture of the segments. A forty-bin histogram over a handful of recordings is a row of spikes that estimates nothing and takes the panel's y-limit with it. The strip shows the between-recording spread, and it stays readable at small $n$.
 
 **What it shows.** Eight rows, one per metric. Within each row, one filled step-density per clinical class at segment level on a shared bin grid, and one per-recording strip per class above them, in the clinical order and palette described at the top of this file.
 
@@ -598,21 +601,21 @@ The two levels take **different forms on purpose**. There are hundreds to thousa
 
 **In plain terms.** *"Does the predictive gain come and go over time?"* Two time scales of **one** readout, stacked. The top panel zooms in on **one 20-minute segment**: is UP more useful early or late within a window? The bottom panel zooms out to **a whole delivery**, gluing that recording's segments end to end on a real clock, so you can see the gain rise and fall over hours. The band around the top line is the spread across recordings, not uncertainty about the average.
 
-**What it shows.** Top: `mc_pred_gap` against **time in segment**, as a median with an inter-quartile ribbon over recordings -- each anchor first averaged within a recording, so a recording contributing thirty-seven segments does not decide the shape. Bottom: one recording's segments assembled end to end on the absolute time axis, with overlapping timesteps averaged rather than drawn twice.
+**What it shows.** Top: `mc_pred_gap` against **time in segment**, as a median with an inter-quartile ribbon over recordings -- each anchor first averaged within a recording, so a recording contributing many segments does not decide the shape. Bottom: one recording's segments assembled end to end on the absolute time axis, with overlapping timesteps averaged rather than drawn twice.
 
 **Axes.** Top: seconds into the trimmed segment; nats per anchor. Bottom: hours before delivery, inverted so delivery is at the right; nats per anchor.
 
 **Terms on this figure.**
 
 - **top panel** — `mc_pred_gap` per anchor (how much UP improved the forecast at each anchor).
-- **line** — the **median** over recordings; **ribbon** — the inter-quartile range (25th to 75th percentile) over recordings. Each recording is reduced to one value per anchor first, so a recording contributing 37 segments does not decide the shape.
+- **line** — the **median** over recordings; **ribbon** — the inter-quartile range (25th to 75th percentile) over recordings. Each recording is reduced to one value per anchor first, so a recording contributing many segments does not decide the shape.
 - **bottom panel** — one recording's segments assembled on `t_abs = epoch + 4t`, hours before delivery, x axis inverted so delivery sits at the right.
 - **`n_contributing`** — how many segments were averaged at each absolute timestep where they overlap. **`gap_before_s`** — a break in the data; the line stops rather than interpolating.
 - The recording drawn is the **longest** one, not a representative one; its GUID and subgroup are the bottom panel's title.
 
 **How it is misread.** The shape of the top panel is **structural before it is physiological**: the warm-up prefix carries no loss term, the lag support is truncated until $t \ge L - 1$, and the last $H$ anchors are never scored -- so a profile that rises or falls at either end is the geometry rather than the model. On the bottom panel a **break is a break**: where a recording has a gap the line stops rather than being interpolated across, and a step at a segment join is an artifact of assembly, which is what `whole_delivery_boundaries.csv` exists to identify.
 
-**Why it is one readout.** The bottom panel is a single axis in nats per anchor, and $K_t$ sitting on it beside `pred_gap` is routinely orders of magnitude larger — so a shared page draws the gap as a flat line along the bottom of the KL's range and reports a real movement as nothing. $K_t$ has its own page beside this one.
+**Why it is one readout.** The bottom panel is a single axis in nats per anchor, and $K_t$ sitting on it beside `pred_gap` can be orders of magnitude larger — so a shared page draws the gap as a flat line along the bottom of the KL's range and reports a real movement as nothing. $K_t$ has its own page beside this one.
 
 ## `trajectory/trajectory_profile_kl.pdf`
 
@@ -686,7 +689,7 @@ The same three panels for `source_conditioned_kl_raw`. Read exactly as the page 
 - **x axis** — `hours_from_second_stage` $= \texttt{second\_stage\_onset}/3600$, taken from the shard **without a sign flip**, unlike the delivery clock's $-\mathrm{epoch}/3600$.
 - **dotted vertical at zero** — the onset of the second stage.
 
-**How it is misread.** **The sign is the opposite convention from the delivery clock's**, and the dotted line at zero marks the onset: negative is *before* it, positive after it. **The positive side is short by construction** — the second stage begins a couple of hours before delivery, so windows after onset hold far fewer recordings than windows before it, and the annotated $n$ is what says which is which. And the population is a **subset**: a recording with no recorded onset is dropped and counted in `second_stage_eligibility.csv`, so this figure describes fewer recordings than any other figure in the run.
+**How it is misread.** **The sign is the opposite convention from the delivery clock's**, and the dotted line at zero marks the onset: negative is *before* it, positive after it. **The positive side is short by construction**: a recording ends at delivery, so the axis after onset extends only as far as the second stage lasts, and the annotated $n$ shows how many recordings each window holds. And the population is a **subset**: a recording with no recorded onset is dropped and counted in `second_stage_eligibility.csv`, so this figure describes fewer recordings than any other figure in the run.
 
 ## `second_stage/second_stage_trajectory_kl.pdf`
 
@@ -712,7 +715,7 @@ The same figure for `source_conditioned_kl_raw` on this clock, on its own axis. 
 
 **Every heatmap row reads more severe against less severe, as the axis order does.** The pair naming comes from the shared pairwise helper, which names a pair in the order it receives the cohorts and receives them worst first — so the rows run `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, and Cliff's delta is signed against that. Reorienting a pair by eye flips its sign against the number in `second_stage_pairwise.csv`.
 
-**A bar that is absent and a cross at zero are different statements.** No bar with no cross means the window was tested and its $p$ came out at or near 1; a cross means fewer than two classes had enough recordings there and nothing was tested — which on the positive side of this axis is the common case rather than the exception, because it is short by construction.
+**A bar that is absent and a cross at zero are different statements.** No bar with no cross means the window was tested and its $p$ came out at or near 1; a cross means fewer than two classes had enough recordings there and nothing was tested — which is more likely on the positive side of this axis, because it is short by construction.
 
 ## `second_stage/second_stage_windows_kl.pdf`
 
@@ -720,11 +723,11 @@ The same three panels for `source_conditioned_kl_raw` on this clock. Read exactl
 
 ## `cross_subgroup/subgroup_heatmap.pdf`
 
-**In plain terms.** *"The grouped violins look different — is that real, or am I fooling myself?"* Eight cohorts each with a mean always produce a highest and a lowest; across eight metrics that is sixty-four numbers, and some will look separated whatever the truth. This figure applies the discipline. The **top** panel asks, per metric, "is there any difference at all across the cohorts?" — bars past the dashed line survived the multiple-comparison correction. The **bottom** panel asks, only for the survivors, "how *big* is the difference between each pair?" A metric can clear the line and still be negligible below, and at eight cohorts that is the common case.
+**In plain terms.** *"The grouped violins look different — is that real, or am I fooling myself?"* Eight cohorts each with a mean always produce a highest and a lowest; across eight metrics that is sixty-four numbers, and some will look separated whatever the truth. This figure applies the discipline. The **top** panel asks, per metric, "is there any difference at all across the cohorts?" — bars past the dashed line survived the multiple-comparison correction. The **bottom** panel asks, only for the survivors, "how *big* is the difference between each pair?" A metric can clear the line and still be negligible below.
 
 **What it shows.** Top: $-\log_{10}$ of the Holm-adjusted $p$ of the omnibus test per metric, against the $\alpha$ line. Bottom: Cliff's delta for every pair of every metric that survived Holm.
 
-**Axes.** Top: $-\log_{10} p$, one bar per metric. Bottom: metrics down, cohort pairs across, colour symmetric about zero. The pair columns are ordered by where their two cohorts fall in the clinical order, so a cohort's pairs sit together and the healthy pairs sit left.
+**Axes.** Top: $-\log_{10} p$, one bar per metric. Bottom: metrics down, cohort pairs across, colour symmetric about zero. The pair columns are ordered by where their two cohorts fall in the clinical order, so a cohort's pairs sit together and the HIE pairs sit left.
 
 **Terms on this figure.**
 
@@ -733,13 +736,13 @@ The same three panels for `source_conditioned_kl_raw` on this clock. Read exactl
 - **Kruskal-Wallis** — a rank-based "do these groups differ at all" test, used because these distributions are skewed and heavy-tailed.
 - **Holm** — a step-down correction across the eight metrics **as one family**, so testing eight things does not manufacture a significant one.
 - **bottom cells** — **Cliff's delta** for a pair of cohorts: $P(X > Y) - P(X < Y)$, running from $-1$ to $+1$. $0$ = the two distributions overlap completely. Magnitude labels follow Romano: $<0.147$ negligible, $<0.330$ small, $<0.474$ medium, above that large.
-- **colour** — diverging, symmetric about zero, because the sign is meaningful. Which cohort is `left` is set alphabetically by the shared pairwise test; read the label for the sign.
+- **colour** — diverging, symmetric about zero, because the sign is meaningful. Which cohort is `left` is set by the clinical order: the shared pairwise test names a pair in the order it receives the cohorts, worst first. Read the label for the sign.
 - **empty bottom panel** — a **result** (nothing survived Holm), not a missing figure.
 - Every test consumes **one value per recording**, so a bar reflects tens of observations, not the thousands of segments behind them.
 
-**How it is misread.** The two panels answer different questions and only the second is about size. A metric can clear the $\alpha$ line and be negligible on the lower panel, which at eight cohorts is the common case rather than the exception. The lower panel is **empty by design** when nothing survived Holm -- that is a result, not a missing figure. Every test behind it consumes one value per **recording**, so a bar's height reflects tens of observations rather than the thousands of segments they were reduced from, and a signed delta's direction is only interpretable next to the `higher_is_better` column in `cross_subgroup_significance.csv`.
+**How it is misread.** The two panels answer different questions and only the second is about size. A metric can clear the $\alpha$ line and be negligible on the lower panel. The lower panel is **empty by design** when nothing survived Holm -- that is a result, not a missing figure. Every test behind it consumes one value per **recording**, so a bar's height reflects tens of observations rather than the thousands of segments they were reduced from, and a signed delta's direction is only interpretable next to the `higher_is_better` column in `cross_subgroup_significance.csv`.
 
-And the `<left> vs <right>` naming inside each column runs the same way the column ordering does: which cohort of a pair is `left` comes from the shared pairwise test, which names a pair in the order it receives the cohorts and receives them in the clinical one, and Cliff's delta is signed against that naming. So a column reads `healthy vs acidosis` in the healthy-first position, and a positive delta means the less severe cohort runs higher -- read the label, not the position, for the sign all the same.
+And the `<left> vs <right>` naming inside each column runs the same way the column ordering does: which cohort of a pair is `left` comes from the shared pairwise test, which names a pair in the order it receives the cohorts and receives them in the clinical one, and Cliff's delta is signed against that naming. So a column reads, for example, `hie vs healthy`, and a positive delta means the more severe cohort runs higher. Read the label, not the position, for the sign all the same.
 
 ## `events/deceleration_skill.pdf`
 
@@ -760,11 +763,11 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 - Rates are **per event**, not per anchor — fixing the horizon step is what makes that exact, because exactly one anchor places a given raw sample at a given step.
 - A hit rate of **zero** on a checkpoint that has not learned to forecast is the expected reading, not a broken detector. `n_forecast_events` tells the two apart: a model predicting a flat line produces no events to match and no false alarms either.
 
-**How it is misread.** The horizontal axis does **not** span the whole two-minute horizon, and the part it omits is not missing data. The ported detector drops any event within 30 s of either end of what it is given, so a 480-sample block leaves a 240-sample interior and half the horizon is unsearchable by construction; `deceleration_skill.csv` carries the usable interval it was computed over. Every rate is **per event**, not per anchor: consecutive anchors' blocks overlap in 29 of their 30 steps, so an anchor-level rate would count one physiological deceleration once per anchor, and fixing the horizon step is what removes that -- exactly one anchor places a given raw sample at a given step. The `pseudo_replication_factor` in the JSON is that ratio, measured. A hit rate of zero on a checkpoint that has not learned to forecast is the expected reading rather than a detector failure, and the `n_forecast_events` column is what distinguishes the two: a model forecasting a flat line produces no events to match and no false alarms either.
+**How it is misread.** The horizontal axis does **not** span the whole two-minute horizon, and the part it omits is not missing data. The ported detector drops any event within 30 s of either end of what it is given, so a 480-sample block leaves a 240-sample interior and half the horizon is unsearchable by construction; `deceleration_skill.csv` carries the usable interval it was computed over. Every rate is **per event**, not per anchor: consecutive anchors' blocks overlap in 29 of their 30 steps, so an anchor-level rate would count one physiological deceleration once per anchor, and fixing the horizon step is what removes that -- exactly one anchor places a given raw sample at a given step. The `pseudo_replication_factor` in the JSON is the number of usable horizon steps. A hit rate of zero on a checkpoint that has not learned to forecast is the expected reading rather than a detector failure, and the `n_forecast_events` column is what distinguishes the two: a model forecasting a flat line produces no events to match and no false alarms either.
 
 ## `events/contraction_triggered.pdf`
 
-**In plain terms.** *"After a contraction, does the model expect the heart rate to dip?"* This is the textbook obstetric pattern the whole model is built around. Find every uterine contraction, line up the two minutes that follow each one, and average. The truth curve shows whether the dip really happens in this population; the two forecast curves show whether the model expected it. The grey band is the crucial part: it is the same average taken at **random** moments, so it shows what a dip of this depth looks like when nothing is going on. **A dip is only a finding if it leaves the band.**
+**In plain terms.** *"After a contraction, does the model expect the heart rate to dip?"* Find every uterine contraction, line up the two minutes that follow each one, and average. The truth curve shows the average recorded response; the two forecast curves show the average forecast response. The grey band is the crucial part: it is the same average taken at **random** moments, so it shows what a dip of this depth looks like when nothing is going on. **A dip is only a finding if it leaves the band.**
 
 **What it shows.** The truth, both forecast branches and their difference, averaged over the forecast blocks that follow a detected uterine contraction, each drawn over a **count-matched random-trigger null band**. The band is the null draws' mean $\pm 2$ standard deviations, so it brackets the null mean at every point; the shaded vertical span is the response window the dip statistic is taken over.
 
@@ -782,7 +785,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 
 ## `events/conditioned_coupling.pdf`
 
-**In plain terms.** *"Is UP more useful right after a contraction than at a quiet moment?"* If the model's coupling is real physiology rather than a general correlation, it should be strongest when something is actually happening in the uterus. So: measure the coupling at anchors near a contraction, measure it again at the same number of anchors picked from quiet stretches **of the same recording**, and subtract. The violins are those differences, one value per recording. **Zero is the null**, because the quantity drawn is already a subtraction — a violin above zero says the coupling really does concentrate around contractions.
+**In plain terms.** *"Is UP more useful right after a contraction than at a quiet moment?"* The analysis measures the coupling at anchors near a contraction, measure it again at the same number of anchors picked from quiet stretches **of the same recording**, and subtract. The violins are those differences, one value per recording. **Zero is the null**, because the quantity drawn is already a subtraction — a violin above zero says the coupling is larger near contractions.
 
 **What it shows.** Both coupling readouts restricted to anchors within `event_lag_window_s` of a detected contraction, minus the same readouts on count-matched control anchors drawn from the same recordings -- one violin per clinical class, per readout, on per-recording values.
 
@@ -801,7 +804,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 
 ## `sufficiency/sufficiency.pdf`
 
-**In plain terms.** *"How much is the 48-number bottleneck costing us?"* Everything the model knows about the future has to squeeze through a 48-dimensional latent. This asks what would happen if it did not have to: a separate probe decoder is trained to forecast straight from the encoder's full internal state, skipping the bottleneck. The distance between that probe's score and the model's own is the price of the compression. It sits on the same axis as `pred_gap`, so the two are directly comparable: *what UP added* versus *what the bottleneck took away*. The lower panel is not decoration — it says whether the probe finished training, and an unfinished probe understates the cost.
+**In plain terms.** *"How much is the $d_z$-dimensional bottleneck costing us?"* Everything the model knows about the future has to pass through a $d_z$-dimensional latent. This asks what would happen if it did not have to: a separate probe decoder is trained to forecast straight from the encoder's full internal state, skipping the bottleneck. The distance between that probe's score and the model's own is the price of the compression. It sits on the same axis as `pred_gap`, so the two are directly comparable: *what UP added* versus *what the bottleneck took away*. The lower panel is not decoration — it says whether the probe finished training, and an unfinished probe understates the cost.
 
 **What it shows.** Two panels. The upper one is three violins over the **held-out** recordings -- $D_{\mathrm{oracle}}$, $D_{\mathrm{base}}$ and $D_{\mathrm{full}}$ -- ticked `oracle`, `base`, `full`, with the two gaps defined as $\Delta_{\mathrm{suff}} = D_{\mathrm{base}} - D_{\mathrm{oracle}}$, what the latent bottleneck costs the forecast, and `pred_gap` $= D_{\mathrm{base}} - D_{\mathrm{full}}$, the coupling readout, each with its bootstrap interval over recordings. The lower one is the probe's own fit: held-out and fit score against optimizer step, for the comparison probe and for the doubled-width refit the capacity check uses.
 
@@ -821,7 +824,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 
 **It is an estimate, not a bound.** Two biases oppose and neither is measured. The probe conditions on `target_state` rather than on the raw target history, so it inherits the encoder's own information loss and the gap is *understated* by whatever the encoder already discarded. But it is fitted on the evaluation population while $D_{\mathrm{base}}$ comes from a model trained on the disjoint, healthier pretraining cohort, so part of the gap is a domain shift the probe does not suffer and it is *overstated* by that. Both sentences travel in the emitted JSON beside the number.
 
-**The lower panel is a precondition, not a decoration.** A held-out curve still descending at its right-hand edge is a probe that has not finished, and an unfinished probe understates the gap -- the run's `convergence.converged` flag says so mechanically, and on a small population it will routinely be `false`. Read the upper panel only once the lower one has flattened.
+**The lower panel is a precondition, not a decoration.** A held-out curve still descending at its right-hand edge is a probe that has not finished, and an unfinished probe understates the gap -- the run's `convergence.converged` flag says so mechanically. Read the upper panel only once the lower one has flattened.
 
 **Only the held-out recordings are drawn.** $D_{\mathrm{base}}$ here is *not* the run's headline `d_base_mc_nats`, which is computed over the whole split; it is the same quantity restricted to the recordings the probe never saw, so that all three violins and both gaps share one denominator.
 
@@ -838,7 +841,7 @@ These have no fixed filename, so like the grouped variants they are documented a
 | 1 | the raw **FHR** (the thing being forecast) and the raw **UP** (the source) on one time axis |
 | 2 | the **forecast**, tiled across the recording: both branches with their $\pm 2\sigma$ bands against the truth |
 | 3 | the **prior latent state** $\mu^p_t$ over the source-derived shift $\mu^q_t - \mu^p_t$ |
-| 4 | the **per-dimension KL** — which of the 48 coordinates carried UP's information, over time |
+| 4 | the **per-dimension KL** — which of the $d_z$ coordinates carried UP's information, over time |
 | 5 | $K_t$ (`kld_per_t`) — how much UP moved the belief at each anchor |
 | 6 | the head-averaged **lag attention** with its argmax marked |
 | 7 | `source_kl_lag_map` — the KL attributed across lags |
@@ -847,7 +850,7 @@ Both lag panels carry the compensated-seconds axis described at the top of this 
 
 **The forecast row is tiled, not zoomed -- and the tiling is the figure's, not the model's.** The pass decodes every valid anchor at stride $1$, and every number in `per_sample.csv` is scored over all of them; the row merely selects which of those forecasts to draw. One anchor forecasts $H \cdot R$ raw samples, so the windows drawn are the anchors spaced $H$ apart starting at the first trained one -- consecutive, non-overlapping, with a thin dashed vertical at every edge. Drawn at the model's own stride, adjacent windows would overlap by $29/30$ and the panel would show each instant thirty times. Each window is decoded from one latent and never sees the window before it, which is what those edges are there to say. The span before the first window and whatever tail will not fit another whole one are blank by construction.
 
-**Rows 3-7 show the trained anchors only.** The warm-up prefix is cut from all five and the untrained tail from all but the attention, so no column the objective never scored can set a colour scale. This is a property of the panels alone -- no metric, table or headline in this evaluation is computed from the cut arrays. The axes still span the whole recording -- the rows stay column-aligned with the two above them -- and the empty margins are marked in grey. A reader comparing an older page to a new one should expect the colour ranges to differ for this reason alone.
+**Rows 3-7 show the trained anchors only.** The warm-up prefix is cut from all five and the untrained tail from all but the attention, so no column the objective never scored can set a colour scale. This is a property of the panels alone -- no metric, table or headline in this evaluation is computed from the cut arrays. The axes still span the whole recording -- the rows stay column-aligned with the two above them -- and the empty margins are marked in grey.
 
 **Which pages exist.** `stratified/` holds a seeded, shard-stratified draw over the whole split, so a cap at or above the shard count reaches every shard. Beside it, one directory per headline metric and tail -- `pred_gap_low/`, `pred_gap_high/`, and the same for the block score and the KL -- holds the segments at the extremes of that metric. `sample_pages.csv` is the manifest of what was drawn.
 

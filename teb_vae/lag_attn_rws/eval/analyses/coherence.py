@@ -97,7 +97,7 @@ COHORT_SPECTRUM_FILENAME = "coherence_cohort_spectrum.csv"
 SOURCE_FILENAME = "coherence_source.csv"
 SEAM_FILENAME = "coherence_seam.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 LEAD_TIME_FIGURE = "coherence_lead_time"
 SPECTRUM_FIGURE = "coherence_spectrum"
 BANDS_FIGURE = "coherence_bands"
@@ -1424,7 +1424,7 @@ def run_coherence_analysis(
     # count, and a recording count here would read as a population disagreement with all of them.
     # A segment counts when it held at least one Welch window at any lead time -- which is
     # *stricter* than the per-step mask the block scores use, so this can legitimately fall below
-    # `forecast`'s count. That is the whole-window drop rule, and `EVAL.md` says so.
+    # `forecast`'s count. That is the whole-window drop rule.
     window_counts = vectors.get(f"{VECTOR_PREFIX}n_windows")
     scored_segments = (
         int((np.nansum(np.asarray(window_counts, dtype=np.float64), axis=1) > 0.0).sum())

@@ -95,7 +95,7 @@ PER_RECORDING_FILENAME = "coupling_per_recording.csv"
 SUMMARY_FILENAME = "coupling_summary.csv"
 AGREEMENT_FILENAME = "coupling_estimator_agreement.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 DISTRIBUTION_FIGURE = "pred_gap_distribution"
 PERCENT_FIGURE = "pred_gap_percent"
 
@@ -586,10 +586,10 @@ def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
     if low is None or high is None or not np.isfinite(low) or not np.isfinite(high):
         return
     axis.axvspan(
-        float(low), float(high), color=figures.COLOR_ORANGE, alpha=0.25, zorder=0,
+        float(low), float(high), color=figures.COLOR_LIGHT_GRAY, alpha=0.55, zorder=0,
         label="95% CI of the mean",
     )
-    axis.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.legend_strip(axis)
 
 
 #: The estimator pairs whose per-recording agreement is reported, ``(x, y)``: the foregrounded
@@ -663,8 +663,8 @@ def _draw_agreement_panel(
     a pair of histograms cannot show that: each histogram says how many recordings sit above zero
     under its own estimator, and nothing about whether they are the same recordings. Here the
     four quadrants are the finding. The title carries Spearman's $\rho$ over recordings; the share
-    of recordings on which the two agree in sign is in the record (``same_sign_share``) and in
-    ``FIGURE_GUIDE.md``. Both are descriptive.
+    of recordings on which the two agree in sign is in the record (``same_sign_share``). Both are
+    descriptive.
 
     Args:
         ax: Target axes.
@@ -692,9 +692,10 @@ def _draw_agreement_panel(
         figures.style_axes(ax)
         return 0
     x, y = x[both], y[both]
+    # Points ringed in the surface colour, so coincident recordings stay countable.
     ax.scatter(
-        x, y, s=6, color=ESTIMATOR_COLORS.get(y_estimator, figures.COLOR_BLUE), alpha=0.45,
-        linewidths=0, zorder=3,
+        x, y, s=16, color=ESTIMATOR_COLORS.get(y_estimator, figures.COLOR_BLUE), alpha=0.75,
+        edgecolors="white", linewidths=0.5, zorder=3,
     )
     # The identity and the two zero lines: the identity says whether one estimator is a shifted
     # copy of the other, the zeros cut the quadrants the sign agreement is counted in.
@@ -711,7 +712,7 @@ def _draw_agreement_panel(
     agreement = pair_agreement(per_guid, x_estimator, y_estimator)
     ax.set_title(f"{title}, $\\rho$ = {agreement['spearman_rho']:.2f}")
     ax.legend(fontsize=figures.FONT_LABEL, loc="best")
-    figures.style_axes(ax)
+    figures.style_axes(ax, grid="xy")
     return int(x.size)
 
 
@@ -742,12 +743,18 @@ def build_distribution_figure(
 
     rows_by_metric = {str(row.get("metric")): row for row in gap_rows}
     n_estimators = len(PRED_GAP_COLUMNS)
-    heights = [2.6] * n_estimators + [3.0, 3.4]
-    figure = plt.figure(figsize=(9.0, float(sum(heights))))
-    grid = figure.add_gridspec(len(heights), 2, height_ratios=heights)
+    # Two rows: the estimators' histograms side by side on top, then the estimators against each
+    # other -- the violin and the two agreement scatters -- underneath. Each histogram keeps its
+    # own x axis, because the estimators can differ in scale by an order of magnitude.
+    # Twelve grid columns, so the top row divides evenly for one to four estimators and the
+    # bottom row into its three panels whatever the estimator count is.
+    columns = 12
+    span = columns // max(n_estimators, 1)
+    figure = plt.figure(figsize=(figures.FIGURE_WIDTH * 1.25, 2 * figures.PANEL_HEIGHT + 0.4))
+    grid = figure.add_gridspec(2, columns)
 
     for index, (name, column, _path) in enumerate(PRED_GAP_COLUMNS):
-        axis = figure.add_subplot(grid[index, :])
+        axis = figure.add_subplot(grid[0, span * index:span * (index + 1)])
         row = rows_by_metric.get(name, {})
         figures.histogram_panel(
             axis,
@@ -761,7 +768,7 @@ def build_distribution_figure(
         _shade_mean_interval(axis, row)
 
     figures.violin_panel(
-        figure.add_subplot(grid[n_estimators, :]),
+        figure.add_subplot(grid[1, 0:4]),
         {name: finite_column(per_guid, column) for name, column, _ in PRED_GAP_COLUMNS},
         title="pred_gap by estimator",
         ylabel="nats per anchor",
@@ -770,11 +777,11 @@ def build_distribution_figure(
         reference_label="no improvement",
     )
     _draw_agreement_panel(
-        figure.add_subplot(grid[n_estimators + 1, 0]), per_guid,
+        figure.add_subplot(grid[1, 4:8]), per_guid,
         x_estimator="pred_gap_mc_nats", y_estimator=PRIMARY_PRED_GAP,
     )
     _draw_agreement_panel(
-        figure.add_subplot(grid[n_estimators + 1, 1]), per_guid,
+        figure.add_subplot(grid[1, 8:12]), per_guid,
         x_estimator="pred_gap_train_path_nats", y_estimator=PRIMARY_PRED_GAP,
     )
     return figure
@@ -798,7 +805,7 @@ def build_percent_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(3)
+    figure, axes = figures.new_figure(1, 3, height_per_row=figures.PANEL_HEIGHT + 0.2)
     headline = next(
         (row for row in percent_rows if row.get("metric") == HEADLINE_PERCENT), {}
     )
@@ -815,7 +822,7 @@ def build_percent_figure(
     _shade_mean_interval(axis, headline)
 
     figures.violin_panel(
-        axes[1, 0],
+        axes[0, 1],
         {name: finite_column(per_guid, name) for name in ERROR_SPACE_PERCENTS},
         title="Error space",
         ylabel="error removed (%)",
@@ -827,7 +834,7 @@ def build_percent_figure(
     # measured" on the page rather than dropping a panel and changing the figure's shape. Both
     # likelihood-space percentages share the panel: same expression, two estimators.
     figures.violin_panel(
-        axes[2, 0],
+        axes[0, 2],
         {name: finite_column(per_guid, name) for name in LIKELIHOOD_SPACE_PERCENTS},
         title="Likelihood space",
         ylabel="extra density (%)",

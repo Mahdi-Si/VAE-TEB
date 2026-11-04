@@ -854,7 +854,7 @@ def _gate_section(
     r"""Section 1 of the report: which arm reproduced the shard, and how well.
 
     Arm A is the shard, so which arm is the reference follows from which transform wrote it, and
-    so does what else can be said. The S15.3 paragraphs describe production's spectral truncation
+    so does what else can be said. The phase-smoothing paragraphs describe production's spectral truncation
     of $\hat\phi$ -- an analytic projection, and therefore not a causal operator -- so on a causal
     shard there is no such deviation to measure and the paragraphs are omitted rather than
     interpolated from absent keys.
@@ -884,7 +884,7 @@ The interior is steps `{validation['interior_slice']}` — after the loader's 1-
 model's 30-step warm-up. Storage is float32 and the reference is float64, so single-precision
 agreement is the tightest the stored data can express.
 
-The S15.3 phase-smoothing deviation is not measured here. It is the gap between production's
+The phase-smoothing deviation is not measured here. It is the gap between production's
 spectral truncation and the documented $\\Re\\{{(\\cdot)\\star\\phi\\}}$, and that truncation is
 the analytic (positive-frequency) projection — a non-causal operation the causal chain deliberately
 does not offer, so on this shard there is nothing for it to be a deviation from.
@@ -905,7 +905,7 @@ model's 30-step warm-up. Three of the four blocks agree to float32 storage preci
 tightest agreement the stored data can express. The `fhr_ph` residual is larger and concentrated
 near the segment start.
 
-The S15.3 deviation is measured rather than assumed. Production truncates the spectrum where the
+The phase-smoothing deviation is measured rather than assumed. Production truncates the spectrum where the
 documented operator periodises it, so the stored phase block is the *analytic projection* of the
 smoothed product rather than $\\Re\\{{(\\cdot) \\star \\phi\\}}$. Over the
 {len(delay['fhr_ph']['lag_steps'])} stored `fhr_ph` channels the ratio between the two operators —

@@ -1,4 +1,4 @@
-# Planted-delay instrument, not an arm (P5-01): the shard couples raw UP to raw FHR at 45 steps
+# Planted-delay instrument, not an arm: the shard couples raw UP to raw FHR at 45 steps
 # (180 s), so the lag readout has a ground truth. max_lag 60 puts the informative band [15, 44]
 # inside the search; tiny.yaml's 8 would not. Its stats file is trim_minutes 1.0, as the loader is.
 base: tiny.yaml

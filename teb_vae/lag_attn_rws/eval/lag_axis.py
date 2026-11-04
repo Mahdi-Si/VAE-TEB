@@ -2,16 +2,13 @@ r"""The lag axis, and reading a per-lag vector against it. One implementation, t
 
 A lag index $\ell$ is not seconds. The figure to report is the **compensated** one,
 $\tau_\ell = 4(\ell + \delta)$, where $\delta$ is the causal input delay the source channels are
-read with -- so a peak at lag $\ell$ refers to source content $\ell + \delta$ steps back. The
-other seconds figure, which *subtracts* the $20$ s the preprocessing already removed -- it advanced
-the source trace, so undoing that moves the figure down -- exists only to locate a finding in the
-original sensor files and appears in no analysis.
+read with -- so a peak at lag $\ell$ refers to source content $\ell + \delta$ steps back.
 
 This module exists because two analyses draw that axis and a third will. The historical failure
 was exactly this shape: two consumers computed the same quantity their own way, one of them read
 the delay under a name that did not exist, and the two reports of one run disagreed by up to a
-whole horizon -- $H$ steps -- with nothing raising. The conversion itself lives in ``nets/lag_report``
-and is shared with the training figure; what lives here is the *axis* built from it, and the two
+whole horizon -- $H$ steps -- with nothing raising. The conversion itself lives in
+:mod:`teb_vae.lag_attn.nets.lag_report` and is shared with the training figure; what lives here is the *axis* built from it, and the two
 helpers for laying a per-lag vector alongside that axis.
 
 ``NaN`` rather than zero for a bin the pass did not produce, in both helpers. A lag whose value

@@ -5,8 +5,8 @@
 # which lag matters. At 1.0 it is -slope_h * ell, a monotone penalty in the lag, so a freshly built
 # model prefers lag 0 before it has read anything.
 #
-# THIS ARM IS ONE HALF OF A TWO-SIDED QUESTION, and it is the only way to answer it. Every lag
-# profile this family has measured peaks at lag 0, and a decaying seed predicts exactly that on its
+# THIS ARM IS ONE HALF OF A TWO-SIDED QUESTION, and it is the only way to answer it. A lag profile
+# that peaks at lag 0 has several possible causes, and a decaying seed predicts exactly that on its
 # own -- independently of the data, of the K/V memory and of the alignment. Run against the default,
 # on a fixture whose informative lag is known, the pair separates "the data says lag 0" from "the
 # initialisation says lag 0"; neither run alone can.

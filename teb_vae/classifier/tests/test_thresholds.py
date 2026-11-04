@@ -1,4 +1,4 @@
-"""T-T1, T-T2 and the basis builders of thresholds.py (SPEC §11.3, §15)."""
+"""T-T1, T-T2 and the basis builders of thresholds.py."""
 from __future__ import annotations
 
 import math
@@ -102,7 +102,7 @@ def test_basis_committed_and_instantaneous_known_answers():
     assert _by_class(*T.basis_scores(seg, guids, "segment")) == ([0.3, 0.4, 0.9], [])
 
 
-# --- the landmark-registered second-stage axis (§11.5) ------------------------------------------
+# --- the landmark-registered second-stage axis ------------------------------------------
 def _labour(guid: str, ends_h, onset_h: float, ss_h: float) -> pd.DataFrame:
     """Segments of one GUID ending at ``ends_h`` (h rel. delivery), with labour onset at ``onset_h`` and second-stage
     onset at ``ss_h`` (NaN: unknown), in the cohort's columns (``ss_rel_h`` at the segment start, ``tlo_end_h`` at

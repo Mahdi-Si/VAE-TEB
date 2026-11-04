@@ -148,9 +148,8 @@ def test_the_record_scores_every_lag_readout_and_not_only_the_gated_one() -> Non
 def test_the_pass_line_is_the_one_the_recorded_gates_were_measured_on() -> None:
     """``recovered`` and the exit code stay wired to the pooled support-corrected argmax alone.
 
-    The new readouts are reported beside it, never folded into it: every gate already written into
-    ``RESULTS.md``'s identifiability table was read on this criterion, and widening it would make
-    those rows incomparable with the next ones rather than extending them.
+    The other readouts are reported beside it, never folded into it: earlier gates were read on
+    this criterion, and widening it would make them incomparable with the next ones.
     """
     record = lag_recovery_check.recovery_record(
         _synthetic_results(), band=_SYNTHETIC_BAND, delay_steps=7

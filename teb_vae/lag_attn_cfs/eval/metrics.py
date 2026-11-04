@@ -2134,10 +2134,10 @@ def source_lag_warmth_per_sample(
 
     This is the readout that sizes the compromise the design makes on the source. Lag attention
     searches $L$ lags back from an anchor, into a region where much of the source is still inside
-    its own warm-up, and the design keeps every source channel rather than gating them. So the
-    residual is measured instead of resolved, and a **small** value here is the expected finding
-    rather than a failure -- ``lag_attn_cfs/DESIGN.md`` section 8 is the record, and the emitted
-    analysis says so, so a reader does not treat it as a fault.
+    its own warm-up, and the design gates the source only at the anchor floor, not at the far
+    lags. So the residual is measured instead of resolved, and a **small** value here is the
+    expected finding rather than a failure -- the emitted analysis says so, so a reader does not
+    treat it as a fault.
 
     The model's own ``_source_lag_warmth`` is the definition and reduces a whole batch to two
     scalars; this opens the batch axis and nothing else, and the **mass-weighted** recombination of
@@ -3688,8 +3688,7 @@ def availability_clock_verdict(
     caveat = (
         "the null zeroes the source stream, which floors its variation but is not literally the "
         "availability pattern alone -- the encoder is nonlinear, so this difference is a slightly "
-        "weaker statement than 'the coupling exceeds the clock'; see lag_attn_cfs/DESIGN.md "
-        "section 8."
+        "weaker statement than 'the coupling exceeds the clock'."
     )
     if coupling is None or clock is None:
         return Verdict(

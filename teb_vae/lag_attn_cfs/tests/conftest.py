@@ -62,8 +62,8 @@ TWO_SIDED_SHARD = FIXTURES / "tiny_shard.hdf5"
 #: pipeline independently believes in rather than on an arbitrary cut.
 SHIPPED_BUDGET_STEPS = 134
 
-#: The shipped anchor floor, which under the shipped alignment is the **input-warmth** requirement
-#: rather than the scored-target one. Unaligned, $F = B - 1 = 133$ is the smallest value the pairing
+#: The shipped anchor floor, which under the aligned arm this fixture config builds is the
+#: **input-warmth** requirement rather than the scored-target one. Unaligned, $F = B - 1 = 133$ is the smallest value the pairing
 #: admits: a forecast at anchor $t$ reads target time $t + 1$ at the earliest, so $t + 1 \ge W'_c$
 #: for every kept channel needs $F \ge B - 1$ and nothing more. Aligned, a channel is honest at
 #: $W'_c + d_c$ and the floor must additionally clear $\max_c(W'_c + d_c) = 134$ on both streams --
@@ -71,10 +71,10 @@ SHIPPED_BUDGET_STEPS = 134
 #: never more.
 SHIPPED_WARMUP_PERIOD = 134
 
-#: The shipped alignment: every channel of both streams re-indexed onto the slowest kept target
-#: channel's clock, $402.1604$ s, resolved from the shards' own ``causal_delay_s`` rather than
-#: written here. ``None`` is the unaligned comparison arm, which stays reachable at one key and is
-#: what several tests below name explicitly.
+#: The alignment this fixture config builds: every channel of both streams re-indexed onto the
+#: slowest kept target channel's clock, $402.1604$ s, resolved from the shards' own
+#: ``causal_delay_s`` rather than written here. ``None`` is the unaligned arm that default.yaml
+#: ships; it stays reachable at one key and several tests below name it explicitly.
 SHIPPED_ALIGN_REFERENCE = "target_max"
 
 #: The phase-harmonic operator the committed fixture was built by, and therefore the one a run
@@ -145,7 +145,7 @@ def causal_config(
         "sequence_length": SHIPPED_SEQUENCE_LENGTH,
         "horizon": SHIPPED_HORIZON,
         "warmup_period": SHIPPED_WARMUP_PERIOD,
-        # The two shipped alignment keys. Stated here rather than defaulted in the resolver, and
+        # The two alignment keys. Stated here rather than defaulted in the resolver, and
         # overridable per test: the unaligned arm is `causal_align_reference=None`, and a test
         # planting a legacy shard names `causal_leg_alignment=None` or the value that shard has.
         "causal_align_reference": SHIPPED_ALIGN_REFERENCE,
@@ -326,7 +326,7 @@ TINY_SOURCE_ALIGN_DELAYS = tuple(
 
 #: The anchor floor an aligned tiny model needs. Under a shift the floor must clear
 #: $\max_c(W'_c + d_c)$ rather than $\max_c W'_c - 1$, so it moves by exactly one step here -- the
-#: same one anchor the shipped reference costs.
+#: same one anchor the target_max reference costs.
 TINY_ALIGNED_WARMUP_PERIOD = max(TINY_TARGET_WARMUP_STEPS)
 
 

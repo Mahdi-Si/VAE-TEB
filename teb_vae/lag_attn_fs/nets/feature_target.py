@@ -113,13 +113,20 @@ class FeatureForecastTarget:
         scores a forecast of this model, training and evaluation alike, passes this dict. A cell that
         built neither gets ``None`` for both, which is the factorised all-cells score, bitwise.
 
+        A cell built with ``forecast_ar_max`` $\phi_{\max} < 1$ gets
+        $\phi_c = \phi_{\max}\tanh(a_c)$; at the default $1$ no multiplication is applied.
+
         Returns:
             ``{'cell_mask': ..., 'ar_coef': ...}``.
         """
         ar_logit = getattr(self, "target_ar_logit", None)
+        ar_coef = None if ar_logit is None else torch.tanh(ar_logit)
+        ar_max = float(getattr(self, "forecast_ar_max", 1.0))
+        if ar_coef is not None and ar_max != 1.0:
+            ar_coef = ar_max * ar_coef
         return {
             "cell_mask": getattr(self, "target_cell_mask", None),
-            "ar_coef": None if ar_logit is None else torch.tanh(ar_logit),
+            "ar_coef": ar_coef,
         }
 
     def _default_decoder_out_channels(self) -> int:

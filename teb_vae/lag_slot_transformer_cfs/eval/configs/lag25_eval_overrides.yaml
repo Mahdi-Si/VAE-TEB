@@ -92,8 +92,7 @@ eval_config:
   # declared for a window of 25 entries.
   #
   # The first four PARTITION the window, and separate the anchor's own stored step from its
-  # neighbours because the 91-entry run's evidence put nearly the whole effect on that one
-  # coefficient: a band that folded it in with the next few steps would hide whether anything
+  # neighbours: a band that folded it in with the next few steps would hide whether anything
   # beyond it carries an effect at all.
   #   instant       [0, 0]     the anchor's own stored step
   #   recent        [1, 4]     the next four steps, 4..16 s back

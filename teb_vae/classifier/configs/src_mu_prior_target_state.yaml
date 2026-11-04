@@ -1,5 +1,5 @@
-# Source ablation (SPEC §17 item 1): mu_prior plus the 128-d target encoder state, which sits before the collapsed
-# latent bottleneck (§2.6). If this beats mu_prior alone by a margin, the bottleneck is the limit and adaptation of the
+# Source ablation: mu_prior plus the 128-d target encoder state, which sits before the collapsed
+# latent bottleneck. If this beats mu_prior alone by a margin, the bottleneck is the limit and adaptation of the
 # posterior (adapt_*.yaml) is the next step.
 base: regularised.yaml
 

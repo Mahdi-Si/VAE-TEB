@@ -77,12 +77,10 @@ __all__ = ["LagResidualTrfCfsPlotCallback", "PAGE_DPI"]
 #: image to the axes' size in *device* pixels, so at $600$ dpi a map of a few hundred columns is
 #: upsampled to eight thousand, once per row, twice per save.
 #:
-#: MEASURED at the production geometry on one CPU, for a single page: $23.5$ s at $600$ dpi with
-#: the shared helper's tight bounding box, against $4.0$ s here. The written PDF is the same size
-#: to within a few percent -- $244$ kB against $216$ kB -- because the file is dominated by vector
-#: text and lines, so the extra twenty seconds bought no detail at all. On rank zero inside a
-#: distributed fit that time is not merely this callback's: every other rank waits at the next
-#: collective until it finishes.
+#: The written PDF is dominated by vector text and lines, so a higher resolution and the shared
+#: helper's tight bounding box add save time and no detail. On rank zero inside a distributed fit
+#: that time is not merely this callback's: every other rank waits at the next collective until
+#: it finishes.
 PAGE_DPI = 200
 
 #: Stage prefix the framework gives a validation metric on its way out. The readouts are named

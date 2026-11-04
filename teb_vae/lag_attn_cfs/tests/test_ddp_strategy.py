@@ -148,7 +148,7 @@ def test_under_mse_the_starved_set_is_exactly_the_decoder_logvar_head(
 # The start embedding: a construction-time hazard rather than a width
 # --------------------------------------------------------------------------------------
 def test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams():
-    r"""The shipped aligned configuration builds it, and the reason it is not a hazard.
+    r"""The aligned fixture configuration builds it, and the reason it is not a hazard.
 
     Both streams reach warm-up zero on their own -- the target because ``fhr_st``'s fastest channels
     are honest from step $0$, the source because ``up_st``'s are -- but the adapter is fed

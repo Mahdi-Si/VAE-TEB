@@ -37,7 +37,7 @@ travel with it:
 2. ``tests/test_eval_sibling_agreement.py`` re-derives the shared arithmetic through both
    packages on identical stub inputs and asserts equality.
 3. ``divergences.json`` beside this file classifies every one of the sibling's modules as
-   ``equivalent``, ``divergent`` or ``absent``, and the register in ``EVAL.md`` mirrors it.
+   ``equivalent``, ``divergent`` or ``absent``.
 4. ``tests/test_eval_self_contained.py`` carries ``teb_vae.lag_attn_rws.eval`` on its **forbidden**
    list: this package must not reach sideways into the pipeline it was forked from, because a
    half-fork is worse than either whole.

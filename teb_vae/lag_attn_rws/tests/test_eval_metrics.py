@@ -358,17 +358,14 @@ def test_latent_health_reports_the_top_dimensions_share():
     assert health["kld_per_dimension"] == [9.0, 0.5, 0.5]
 
 
-def test_the_lag_report_carries_the_stored_timeline_seconds_only():
-    """One seconds figure, on the canonical stored timeline. There is deliberately no
-    "original sensor" twin: the builder's UP shift is part of the stored signal and is never
-    undone downstream, so a key that undid it would be a wrong number under a plausible name."""
+def test_the_lag_report_carries_the_compensated_seconds():
+    """The lag report carries the argmax lag step and its compensated seconds figure."""
     aggregate = Aggregate(lag_profile=[0.1, 0.9, 0.2], attention_profile=[0.5, 0.2, 0.3])
 
     summary = lag_summary(aggregate)
 
     assert summary["kl_argmax_lag_step"] == 1
     assert summary["kl_lag_compensated_seconds"] == pytest.approx(4.0)
-    assert "kl_lag_original_sensor_seconds" not in summary
     assert summary["attention_argmax_lag_step"] == 0
 
 

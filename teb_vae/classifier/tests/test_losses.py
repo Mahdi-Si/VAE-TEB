@@ -1,4 +1,4 @@
-"""Losses (SPEC §10.2-§10.3): known answers, weighting schemes, GUID-equal composition, guards."""
+"""Losses: known answers, weighting schemes, GUID-equal composition, guards."""
 from __future__ import annotations
 
 import math

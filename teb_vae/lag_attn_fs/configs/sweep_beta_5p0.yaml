@@ -1,18 +1,14 @@
-# Calibration arm: converged KL weight beta_schedule.end = 5.0, the scale-matched value -- and the
-# value this package shipped BEFORE the sweep ran.
+# Calibration arm: converged KL weight beta_schedule.end = 5.0, the scale-matched value.
 #
 # 5.0 is where the sibling's ratio of KL weight to reconstruction scale lands: 2340/480 = 4.875, and
 # 5.0 is the round value beside it. The DIRECTION is the part that is easy to get backwards -- a
 # larger reconstruction at fixed beta makes beta*KL relatively WEAKER, so the scale-matched value is
-# ABOVE the inherited 1.0, not below it. The rate column of the sweep confirms that direction: the
-# latent narrows monotonically as beta rises.
+# ABOVE the inherited 1.0, not below it.
 #
-# What the scale-matching argument INFERRED from the direction is what this arm refuted. It reasoned
-# that the inherited beta would leave the latent over-open, carrying target information a permutation
-# control might not catch. On the committed HIE shard this arm is third of four on the base forecast,
-# the forecast gap at both horizon ends, the latent width and that very control (RESULTS.md), and
-# default.yaml moved to sweep_beta_1p0's value as a result. The file stays pinned at 5.0 so the
-# hypothesis is re-measurable at production scale rather than reconstructed from this comment.
+# The scale-matching argument holds that the inherited beta leaves the latent over-open, carrying
+# target information a permutation control might not catch. This arm tests that hypothesis against
+# the shipped 1.0 (`sweep_beta_1p0.yaml`) on the base forecast, the forecast gap at both horizon
+# ends, the latent width and that very control.
 #
 # beta_prior moves with beta, holding beta_prior/beta = 0.1. The anchor's restoring force saturates
 # at beta_prior/2 per dimension while the reconstruction it opposes is what grew, so freezing it

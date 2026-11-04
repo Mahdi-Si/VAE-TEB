@@ -65,7 +65,10 @@ from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
     resolve_warmup_budget,
 )
 from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs  # noqa: E402
-from teb_vae.lag_attn_cfs.scored_horizon import resolve_target_scored_horizon  # noqa: E402
+from teb_vae.lag_attn_cfs.scored_horizon import (  # noqa: E402
+    resolve_target_scored_horizon,
+    resolve_target_scored_start,
+)
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import (  # noqa: E402
     CausalFeatureForecastTarget,
 )
@@ -91,14 +94,14 @@ PHASE_KEY_FIELDS: Tuple[str, ...] = ("guid", "epoch")
 #: provenance column that must read exactly $1.0$: it is resolved at construction and the
 #: constructor already refuses a violating budget-and-floor pairing, so any other value means the
 #: checkpoint was built by code predating that refusal. ``anchors_per_sample`` must sit at its
-#: geometry-derived value -- $[10, 11]$ at the shipped training tiling and exactly the effective
-#: anchor span at the dense evaluation stride ($51$ under the shipped forecast clock) -- and a
+#: geometry-derived value -- $[31, 32]$ at the shipped training tiling and exactly the effective
+#: anchor span at the dense evaluation stride ($156$ under the shipped stored clock) -- and a
 #: value off that band means the geometry broke rather than that the model learned something.
 #:
 #: The other eight are results. The two ``source_lag_warmth_frac`` columns size the compromise the
 #: design makes on the source: lag attention searches back into a region where much of the source is
-#: still inside its own warm-up, and the design keeps every source channel rather than gating them,
-#: so the residual is measured instead of resolved. The three warm-up tertiles recompose to
+#: still inside its own warm-up, and the design gates the source only at the anchor floor, not at
+#: every lag, so the residual is measured instead of resolved. The three warm-up tertiles recompose to
 #: ``pred_gap`` over the same denominator exactly as the block split does, cutting the channel axis
 #: by filter speed rather than by stored block -- which the block split cannot, since both stored
 #: blocks span nearly the same rebased warm-up range.
@@ -121,6 +124,9 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     "pred_gap_novel_lo",
     "pred_gap_novel_mid",
     "pred_gap_novel_hi",
+    # The source-null KL the objective charges under `lambda_source_null`; logged on both stages
+    # when the weight is set and absent (an empty column) when it is not.
+    "source_null_kl_penalty",
 )
 
 #: The two readouts that run on validation batches only, beside the permutation control's three:
@@ -129,7 +135,12 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
 #: Each costs an extra pass per step (a source encode, a decode), and -- more importantly -- each is
 #: a *readout* that never enters the objective. Tracking a ``train/`` variant would produce a column
 #: that is NaN in every row of every run.
-_CAUSAL_VAL_ONLY_SUFFIXES: Tuple[str, ...] = ("kld_source_null", "pred_gap_mean")
+#: ``coupling_minus_clock`` is derived from the first and the objective's KL, so it shares their stage.
+_CAUSAL_VAL_ONLY_SUFFIXES: Tuple[str, ...] = (
+    "kld_source_null",
+    "pred_gap_mean",
+    "coupling_minus_clock",
+)
 
 
 class LagAttnCfsTrainer(LagAttnRwsTrainer):
@@ -189,6 +200,11 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         scored = resolve_target_scored_horizon(self.config)
         if scored is not None:
             model_kwargs["target_scored_horizon"] = scored
+        # The first scored step per channel, from the shards' novelty curve and one config key. It
+        # is added only when the key is set, so a model class without the keyword never sees it.
+        start = resolve_target_scored_start(self.config)
+        if start is not None:
+            model_kwargs["target_scored_start"] = start
         return model_kwargs
 
     def causal_standing_message(self) -> str:
@@ -552,8 +568,8 @@ def _check_floor_pairs_with_budget(
     The same two inequalities the constructor enforces, over the *survivors*, checked here so a
     mis-paired configuration fails before a run directory exists. The distinction between the
     configured threshold and the survivors' own maximum is load-bearing: a threshold of $151$ keeps
-    the identical $98$ channels whose slowest still waits $134$ steps, so a floor derived from the
-    threshold would sit $17$ steps too high and cost two tiles for nothing.
+    the identical $76$ channels whose slowest still waits $134$ steps, so a floor derived from the
+    threshold would sit $17$ steps too high and cost anchors for nothing.
 
     The resolved **input shifts** are passed as well as the warm-up, because the two requirements
     do not move together: the scored-target half is taken over $W'_c - s_c$ -- the forecast

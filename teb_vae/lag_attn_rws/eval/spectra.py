@@ -95,9 +95,9 @@ FS_RAW = events.FS_RAW
 #: samples so the "a window is a whole number of anchors" property holds by construction at any
 #: geometry, which is what makes the gap rule an exact ``all()`` instead of a tolerance.
 #:
-#: $32$ steps is $128$ s at the shipped geometry, giving $\Delta f = 7.8125$ mHz. The trade is
-#: stated in ``EVAL.md``: a longer window resolves the deceleration band better and is far more
-#: likely to straddle a dropout, since a window touching one is dropped whole.
+#: $32$ steps is $128$ s at the shipped geometry, giving $\Delta f = 7.8125$ mHz. The trade: a
+#: longer window resolves the deceleration band better and is far more likely to straddle a
+#: dropout, since a window touching one is dropped whole.
 NPERSEG_STEPS = 32
 HOP_STEPS = 16
 
@@ -113,7 +113,7 @@ HOP_STEPS = 16
 #: directory. Two reasons, both specific to this analysis: that table's $0.25$ Hz edge is exactly
 #: the decoder's token-seam frequency, and a band boundary is the worst place for an artifact to
 #: sit; and it has no LF/MF split, which is the distinction a spectral statement about the forecast
-#: most needs. ``EVAL.md`` carries the crosswalk between the two.
+#: most needs.
 #:
 #: **The VLF band starts at $0$, not at the literature's $0.003$ Hz, and that is a real choice.**
 #: The per-window mean is removed, but the Hann taper leaves a residue -- $\sum_n w_n (x_n - \bar

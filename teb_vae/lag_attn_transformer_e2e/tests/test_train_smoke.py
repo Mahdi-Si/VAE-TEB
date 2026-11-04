@@ -123,7 +123,7 @@ def test_the_gradient_norm_is_finite_and_non_zero(fit):
 
     Deliberately *not* compared against the sibling's number: the gradient scale through a new
     front-end path is unknown, ``gradient_clip_val`` is inherited and marked provisional for exactly
-    that reason, and it is re-derived from this metric on the first production run. A comparison
+    that reason, and it is re-derived from this metric on a production run. A comparison
     here could fail a correct implementation and would carry no information either way.
     """
     driver, trainer = fit

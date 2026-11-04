@@ -1,4 +1,4 @@
-r"""The raw-signal substrate every new patch analysis shares (plan D6). Import it; do not re-implement it.
+r"""The raw-signal substrate every new patch analysis shares. Import it; do not re-implement it.
 
 Raw signals here are the loader's own: ``fhr`` and ``up`` z-scored at 4 Hz, ``(B, L)`` with
 ``L = T * R`` (``R = model.raw_per_step = 16``), and ``weight`` the decimated FHR validity ``(B, T)``.

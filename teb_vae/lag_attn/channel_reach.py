@@ -399,8 +399,7 @@ if __name__ == "__main__":
             f"  {_name:>8} {_array.size:>4} {_array.min():>8.1f} "
             f"{np.median(_array):>8.1f} {_array.max():>9.1f}"
         )
-    # Widths computed, not written: this table is the source DESIGN.md's is regenerated from, so
-    # a hardcoded denominator would print a stale figure straight into the design record after a
+    # Widths computed, not written: a hardcoded denominator would print a stale figure after a
     # phase-selection change.
     _streams = stream_reach_seconds()
     _c_y, _c_u = len(_streams["target"]), len(_streams["source"])

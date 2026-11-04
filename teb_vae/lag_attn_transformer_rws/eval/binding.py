@@ -36,7 +36,8 @@ DEFAULT_OVERRIDES_PATH = Path(__file__).resolve().parent / "configs" / "eval_ove
 
 #: Constructor keys reconciled against the checkpoint's own ``model_kwargs``.
 #:
-#: The sibling's thirteen, minus ``causal_norm`` and plus this architecture's seven. ``causal_norm``
+#: The sibling's fourteen, minus ``causal_norm`` and plus this architecture's seven, which gives
+#: twenty. ``causal_norm``
 #: is not merely irrelevant here: the constructor does not accept it, so a config carrying it is
 #: already a ``TypeError`` at rebuild and reconciling it could only ever compare a key against
 #: nothing.

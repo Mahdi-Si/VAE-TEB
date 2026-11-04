@@ -68,7 +68,7 @@ PIT_FILENAME = "calibration_pit.csv"
 LOGVAR_FILENAME = "calibration_logvar.csv"
 PER_RECORDING_FILENAME = "calibration_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 PIT_FIGURE = "pit_reliability"
 LOGVAR_FIGURE = "logvar_distribution"
 
@@ -328,18 +328,20 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     Returns:
         The figure.
     """
-    figure, axes = figures.new_figure(2)
+    # Side by side, the reliability panel nearly square: a diagonal is read as a diagonal only
+    # when the two axes are drawn at one scale.
+    figure, axes = figures.new_figure(1, 2, height_per_row=figures.PANEL_HEIGHT + 0.3)
     axis = axes[0, 0]
     centers = finite_column(pit, "bin_center")
     density = finite_column(pit, "density")
     if centers.size and np.isfinite(density).any():
         width = float(finite_column(pit, "bin_right")[0] - finite_column(pit, "bin_left")[0])
         axis.bar(
-            centers, density, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85,
-            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+            centers, density, width=width, color=figures.COLOR_BLUE, alpha=0.9,
+            edgecolor="white", linewidth=figures.HISTOGRAM_EDGE_WIDTH,
         )
         axis.axhline(
-            1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
+            1.0, color=figures.COLOR_BLACK, linestyle="--", linewidth=figures.LINE_REGULAR,
             label="calibrated",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
@@ -352,7 +354,7 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     axis.set_ylabel("density")
     figures.style_axes(axis)
 
-    axis = axes[1, 0]
+    axis = axes[0, 1]
     counts = finite_column(pit, "count")
     if counts.size and counts.sum() > 0.0:
         # From the origin: the empirical CDF of the PIT is 0 at 0, and a curve starting at the
@@ -361,8 +363,13 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         edges = np.concatenate([finite_column(pit, "bin_left")[:1], finite_column(pit, "bin_right")])
         axis.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linestyle=":",
                   linewidth=figures.LINE_REGULAR, label="calibrated")
+        # The departure from the diagonal shaded, so its size and side read before the curve is
+        # traced: above the diagonal is mass in the lower tail, below it mass in the upper one.
+        axis.fill_between(edges, edges, empirical, color=figures.COLOR_BLUE, alpha=0.15, linewidth=0)
         axis.plot(edges, empirical, color=figures.COLOR_BLUE,
                   linewidth=figures.LINE_EMPHASIS, label="observed")
+        axis.set_xlim(0.0, 1.0)
+        axis.set_ylim(0.0, 1.0)
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
@@ -389,7 +396,7 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
     Returns:
         The figure.
     """
-    figure, axes = figures.new_figure(1)
+    figure, axes = figures.new_figure(1, height_per_row=figures.PANEL_HEIGHT, width=4.8)
     axis = axes[0, 0]
     centers = finite_column(histogram, "bin_center")
     fraction = finite_column(histogram, "fraction")
@@ -398,8 +405,8 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
             finite_column(histogram, "bin_right")[0] - finite_column(histogram, "bin_left")[0]
         )
         axis.bar(
-            centers, fraction, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85,
-            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+            centers, fraction, width=width, color=figures.COLOR_BLUE, alpha=0.9,
+            edgecolor="white", linewidth=figures.HISTOGRAM_EDGE_WIDTH,
         )
     else:
         axis.text(

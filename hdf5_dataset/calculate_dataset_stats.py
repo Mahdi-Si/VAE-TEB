@@ -75,9 +75,6 @@ class DatasetStatsCalculator:
       asinh stats. Selected on the 0.008-0.05 Hz contraction band crossed with
       harmonic steps k in {4, 6, 8}.
 
-    See ``hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md`` for the selection
-    rationale.
-
     **The causal valid region.** A one-sided filter reads only the past, so
     until its warm-up has passed a channel's output is a function of the
     assumed pre-recording history rather than of the recording. Accumulating

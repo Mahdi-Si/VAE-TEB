@@ -682,7 +682,7 @@ def _content_lag_record(resolved: Any, geometry: Mapping[str, int]) -> Optional[
         "every_horizon_s": list(summary.every_horizon_s),
         "pair_spread_s": summary.pair_spread_s,
         "convention": (
-            "L = 4 (l + 1 + h + s_c + d_j) + 0.875 (tau_j - tau_c) on the canonical stored "
+            "L = 4 (l + 1 + h + s_c + d_j) + 0.875 (tau_j - tau_c) on the stored "
             "timeline, from the actual gathers; approximate content lead, not a physiological delay"
         ),
     }
@@ -956,7 +956,7 @@ def check_warmup_budget_matches_checkpoint(
         # without re-resolving the budget.
         "max_target_input_shift_s": float(SECONDS_PER_STEP * resolved.target.max_align_delay),
         "max_source_input_shift_s": float(SECONDS_PER_STEP * resolved.source.max_align_delay),
-        # The source-to-label content separation from the ACTUAL gathers, on the canonical stored
+        # The source-to-label content separation from the ACTUAL gathers, on the stored
         # timeline: nearest, union over lags and horizon elements, and the every-horizon window,
         # all in seconds, plus the per-pair rounding spread. Approximate content leads under the
         # kappa convention, never exact physiological timestamps.

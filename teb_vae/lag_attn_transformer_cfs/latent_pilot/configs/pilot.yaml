@@ -16,8 +16,7 @@
 # WHERE A RUN WRITES: `<run_root>/<fold>/seed_<seed>/<run_id>/`, and nowhere else. That
 # directory holds the protocol and stage state, the
 # cohort tables, the extracted latents and the frozen scaler, the fits and the pilot checkpoint, the
-# selection lock, the metrics and per-recording tables, the figures and `report.md`. The full list
-# is in the design document's execution guide.
+# selection lock, the metrics and per-recording tables, the figures and `report.md`.
 #
 # Nothing here may reconfigure the checkpoint. The architecture, the channel contract, the trim, the
 # forecast clock, the horizon, the latent width and the anchor stride are read from the checkpoint's

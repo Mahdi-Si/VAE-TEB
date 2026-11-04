@@ -2,9 +2,8 @@
 #
 # The shipped default carries lambda_ms 0.1, lambda_deriv 0.1 and lambda_boundary 0.05. This arm
 # turns all three off together, because they were shipped together and price one decision: whether
-# shaping the forecast MEAN beyond the per-sample likelihood is what the over-smoothed forecast
-# needed. Pricing them individually would be three more arms answering a question nobody has yet
-# asked, and the first production run's per-term magnitudes are what would tell us which one to ask.
+# shaping the forecast MEAN beyond the per-sample likelihood earns its place. Pricing them
+# individually would be three more arms; a run's per-term aux columns say which one to price.
 #
 # What it isolates. The factorized Gaussian NLL scores every raw sample independently, so its
 # optimum is the conditional mean and a fully parallel decoder is free to emit an over-smoothed

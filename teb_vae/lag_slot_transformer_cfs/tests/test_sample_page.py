@@ -631,10 +631,8 @@ def test_the_page_is_saved_directly_below_the_publication_resolution(tmp_path, m
     Every heatmap here is a small array -- one column per decoded anchor -- and matplotlib
     resamples each to the axes' size in device pixels, so the publication resolution multiplies
     the draw cost for a file of about the same size. A tight bounding box costs a second full
-    draw on top, and this page sets its margins explicitly. MEASURED at the production geometry: a
-    plotted epoch cost $49.6$ s through the shared helper and $12.7$ s through this one. On rank
-    zero inside a distributed fit, that is time every other rank spends waiting at the next
-    collective.
+    draw on top, and this page sets its margins explicitly. On rank zero inside a distributed fit,
+    that draw time is time every other rank spends waiting at the next collective.
     """
     callback = LagResidualTrfCfsPlotCallback(tmp_path, num_examples=1, file_format="png")
     figure = plt.figure()

@@ -8,8 +8,7 @@ anchors). That distribution says *how much* source information the posterior car
 delivery** and asks whether the trajectory differs between the clinical classes.
 
 **The time axis comes from the ``epoch`` field**, which the dataset stores as the segment start
-time in **seconds relative to delivery, negative before delivery**
-(``hdf5_dataset/dataset_explained_research.md``). Each 20-minute segment is placed into a
+time in **seconds relative to delivery, negative before delivery**. Each 20-minute segment is placed into a
 $30$-minute-wide *time-before-delivery* bin, and the per-segment $\overline{K}$ is summarised
 within each (bin, group) cell.
 

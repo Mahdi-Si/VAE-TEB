@@ -1,7 +1,7 @@
-r"""``channel_skill`` -- the forecast resolved by target channel and by lead time; new, owner E1-F.
+r"""``channel_skill`` -- the forecast resolved by target channel and by lead time; new.
 
 It replaces ``spectral_skill``, which needs a filter-frequency channel axis. The patch target has two
-named channels, ``level`` and ``variability`` (``notes/EVAL_PLAN.md`` §2).
+named channels, ``level`` and ``variability``.
 
 **Question.** How much does each channel carry of the source gain, how good is each in clinical
 units, and up to what lead time does the level forecast beat persistence?

@@ -1,6 +1,6 @@
 # Prior-anchor arm: beta_prior = 1.0, one order ABOVE the shipped 0.1.
 #
-# The strongest anchor in the sweep, two orders above the shipped weight and at parity with the
+# The strongest anchor in the sweep, one order above the shipped weight and at parity with the
 # converged source-divergence weight (beta_schedule.end = 1.0). At this weight the prior's scale
 # term and the coupling term enter the objective at equal footing, so this arm bounds the sweep
 # from above: if even unit weight cannot hold the floor fraction down, the anchor's form -- not

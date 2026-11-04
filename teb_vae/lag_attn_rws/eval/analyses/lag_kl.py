@@ -27,8 +27,7 @@ whether the profile is degenerate by a stated mechanical criterion rather than b
 
 **The lag is the compensated one.** $\tau = 4(\ell + \delta)$ seconds, with $\delta$ read from the
 model's own accessor and converted by the module both the training figure and this analysis
-share. The original-sensor figure -- which undoes the $20$ s preprocessing already removed, by
-*subtracting* it, because the preprocessing advanced the source trace -- appears nowhere here: it locates a finding in the raw files and is not the physiological delay.
+share.
 """
 from __future__ import annotations
 
@@ -64,7 +63,7 @@ PER_RECORDING_FILENAME = "lag_kl_per_recording.csv"
 STRATIFIED_PROFILE_FILENAME = "lag_kl_stratified_profile.csv"
 STRATIFIED_PEAKS_FILENAME = "lag_kl_stratified_peaks.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 PROFILE_FIGURE = "lag_kl_profile"
 
 #: Fraction of the peak a bin must reach to count as part of it. Half, so the reported width is

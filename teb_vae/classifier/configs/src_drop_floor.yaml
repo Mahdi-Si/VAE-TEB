@@ -1,5 +1,5 @@
 # Source ablation: every default key, but the channels whose train std sits under the scale floor are dropped per
-# fold (SPEC §8.5 source.drop_floor_channels; the probe's scaler drops them too). Same cache as the baseline.
+# fold (source.drop_floor_channels; the probe's scaler drops them too). Same cache as the baseline.
 base: regularised.yaml
 
 classifier:

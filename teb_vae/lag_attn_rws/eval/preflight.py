@@ -130,16 +130,16 @@ SCHEDULE_KEYS: Tuple[str, ...] = ("kld_beta", "beta_schedule")
 #:
 #: It deliberately carries **no** number. How far the longest-reaching channel looks ahead is a
 #: property of the production filter bank, it is recomputed into ``max_channel_reach_s`` on every
-#: run, and the figure quoted elsewhere in this repository is already about $9$ s stale against
-#: the bank that actually ships -- so a literal here would be one more copy to go out of date.
+#: run, so a literal here would be one more copy to go out of date.
 NOT_CAUSAL_STATEMENT = (
     "The source-conditioned KL is a coupling readout, NOT a transfer entropy and NOT causal. "
     "The input features come from two-sided filters whose forward reach is bounded by a "
     "95%-energy quantile rather than by a hard support, so a feature at step t carries energy "
     "from its own future under every configured budget -- max_channel_reach_s records how far "
-    "the longest-reaching channel of this feature bank looks ahead, and under the shipped "
-    "causal_reach_budget_s: null no channel is pruned and no delay is applied at all. No number "
-    "in this run may be labelled a transfer entropy."
+    "the longest-reaching channel of this feature bank looks ahead. Under the shipped "
+    "causal_reach_budget_s: 120 only the channels whose reach fits the budget are kept, and each "
+    "kept channel is delayed by its own reach, which bounds the leak to the 5% energy tail but "
+    "does not close it. No number in this run may be labelled a transfer entropy."
 )
 
 

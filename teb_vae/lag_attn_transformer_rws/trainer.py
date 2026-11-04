@@ -97,12 +97,11 @@ class LagAttnTrfRwsTrainer(LagAttnRwsTrainer):
           ``compute_loss``, which the task reaches through ``orig_model``. Only the forward is
           compiled, so that indexing never enters the graph.
 
-        **Compilation is not numerically free, and that is why every config here ships it off.**
-        Inductor may reassociate float arithmetic, and this family's headline readout is
-        ``pred_gap`` -- a difference of order $10^{-1}$ between two block NLLs of order $10^{2}$,
-        a relative scale of about $10^{-4}$. Before adopting a compiled run, compare ``pred_gap``
-        on one fixed batch against the eager value; a difference there is a difference in the
-        number the model exists to produce, not a rounding detail.
+        **Compilation is not numerically free.** Inductor may reassociate float arithmetic, and
+        this family's headline readout is ``pred_gap`` -- a small difference between two much
+        larger block NLLs. When the compile setting changes, compare ``pred_gap`` on one fixed
+        batch against the eager value; a difference there is a difference in the number the model
+        exists to produce, not a rounding detail.
 
         Returns:
             ``True`` when the config asks for compilation.

@@ -1,4 +1,4 @@
-r"""``raw_shift`` -- does the lag readout move with the UP content? (E1-I).
+r"""``raw_shift`` -- does the lag readout move with the UP content?
 
 **Question.** Shift raw UP against FHR and re-patchify. A model whose lag reads *content* moves its
 lag centroid one-for-one with whole-patch shifts; one that attends at fixed lags does not move.

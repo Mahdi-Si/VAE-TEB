@@ -1,4 +1,4 @@
-r"""``occlusion`` -- port; owner E1-O (``notes/EVAL_PLAN.md`` §2, decision D5).
+r"""``occlusion`` -- the forecast cost of removing UP at a band of lags; port.
 
 **Question.** What is the forecast worth without the UP at a band of lags? There are three arms, each
 scored against an untouched reference at the same anchor and under the same latent noise:
@@ -65,7 +65,7 @@ HEADLINE: Tuple[Tuple[str, str], ...] = (
     ("occlusion_zero_peak_band_delta_nats", "zero_delta_total_nats"),
 )
 
-#: The D5 arms, primary first.
+#: The three arms, primary first.
 ARMS: Tuple[str, ...] = ("baseline", "zero", "missing")
 PRIMARY_ARM = "baseline"
 
@@ -206,7 +206,7 @@ def run_occlusion_analysis(
     output_dir: Any,
     probe: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Score every configured band under the three D5 arms, resolved by horizon step.
+    """Score every configured band under the three arms, resolved by horizon step.
 
     ``eval_config.occlusion_bands`` names the bands; ``caps.occlusion`` bounds the segments (absent
     means every segment, as in CFS). Needs ``context.task`` and ``context.loader`` and records a skip

@@ -1,7 +1,7 @@
 r"""The training task for the patch-input cell.
 
-* **Parent.** :class:`~teb_vae.lag_attn_transformer_crws.task.SeqVaeLagAttnTrfCrwsTask` (plan C.3,
-  C6), which already carries the run seed, the class-default ``_stage`` that ``VaeSource`` relies on
+* **Parent.** :class:`~teb_vae.lag_attn_transformer_crws.task.SeqVaeLagAttnTrfCrwsTask`,
+  which already carries the run seed, the class-default ``_stage`` that ``VaeSource`` relies on
   when it calls ``_build_forward_inputs`` outside a step, the stage-setting
   ``compute_loss_and_metrics``, the bound anchor-phase members and the step-granular LR ramp. Only
   the two members that name the input layout and the four page seams are written here.

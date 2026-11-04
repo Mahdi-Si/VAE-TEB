@@ -1,7 +1,7 @@
 r"""Stage 2: a strictly-causal, raw-signal, event-locked test of contraction$\to$deceleration.
 
-The Stage-0 probes answered "does UP predict future FHR *features*?" across every representation and
-found nothing. This is a different, more physiologically direct question, at the level the mechanism
+The Stage-0 probes ask "does UP predict future FHR *features*?" across every representation. This
+is a different, more physiologically direct question, at the level the mechanism
 actually lives: **does a uterine contraction causally precede a fetal-heart-rate deceleration?**
 Contractions transiently reduce placental perfusion and the fetus responds with a deceleration
 delayed by roughly $20$-$120\,$s. That response is a *transient event* in the raw FHR trace, which the
@@ -23,18 +23,15 @@ Events are detected with the repo's own detectors
 (``model_raw/testing/causal_te_validation/events.py``), so the definitions match the causal-TE
 validation suite.
 
-**The $-20\,$s UP pre-shift.** The pipeline advances the UP trace $20\,$s earlier than FHR before
-storage, so a contraction detected in the raw UP is $\approx 20\,$s "early": the *detected*
-onset-to-deceleration lag is the true physiological delay plus $\approx 20\,$s. The lag window is
-widened accordingly and the report states the peak-response lag so the offset can be read back.
+The report states the peak-response lag, the detected onset-to-dip time on the stored timeline.
 
 Reading the result:
 
 * **NO_COUPLING** -- the CTA dip is inside the null band and the coincidence lift is $\approx 1$: no
-  time-locked deceleration response follows contractions. Combined with the Stage-0 feature nulls,
+  time-locked deceleration response follows contractions. Combined with a Stage-0 feature null,
   this is a maximally-defensible negative -- accept it.
 * **COUPLING_PRESENT** -- a dip significantly deeper than the null at a plausible lag: the coupling is
-  real at the raw-signal level even though it is not extractable from the model's features. That is a
+  real at the raw-signal level even if it is not extractable from the model's features. That is a
   *representational* finding -- the model's scattering/phase inputs are the wrong basis for it.
 
 Run (from the repo root):
@@ -270,17 +267,16 @@ def detect_decelerations(
 
     return {"onset_raw": onsets, "nadir_raw": nadirs, "end_raw": ends}
 
-# The physiological contraction->deceleration delay is 20-120 s; the -20 s UP pre-shift adds ~20 s to
-# the *detected* lag, so the response window is widened to 20-160 s post-onset. The pre window is the
-# quiet baseline each snippet is corrected against.
+# The physiological contraction->deceleration delay is 20-120 s. The pre window is the quiet
+# baseline each snippet is corrected against.
 _FS = 4.0                     # raw sampling rate (Hz)
 _PRE_SECONDS = 30.0           # baseline window before the contraction onset
-_POST_SECONDS = 170.0         # extent after onset (covers the widened response window plus margin)
+_POST_SECONDS = 150.0         # extent after onset (covers the response window plus a 20 s margin)
 # Where the deceleration response is searched, post detected onset. The physiological delay is
-# 20-120 s from the contraction; the detector's onset is the rising edge (a few tens of seconds
-# before the peak) and the -20 s UP pre-shift adds ~20 s, so the *detected* onset-to-dip lag spans
-# roughly 10-150 s. The low end is kept small so a short effective lag is not missed.
-_LAG_WINDOW_SECONDS = (10.0, 150.0)
+# 20-120 s from the contraction, and the detector's onset is the rising edge (a few tens of seconds
+# before the peak), so the detected onset-to-dip lag spans roughly 10-130 s. The low end is kept
+# small so a short effective lag is not missed.
+_LAG_WINDOW_SECONDS = (10.0, 130.0)
 _N_SHUFFLE = 300              # null draws
 # A CTA dip clears the null only if it is beyond this z (deeper) AND at least this many bpm deep, so a
 # statistically-significant but physiologically-trivial dip is not called coupling.
@@ -663,7 +659,6 @@ def run_probe(samples: Sequence[RawSample], config: ProbeConfig) -> Dict[str, ob
         "coincidence_hits": int(hits),
         "coincidence_total": int(total),
         "lag_window_seconds": list(config.lag_window_seconds),
-        "up_preshift_note_seconds": 20.0,
         "z_threshold": _Z_THRESHOLD,
         "min_dip_bpm": _MIN_DIP_BPM,
     }
@@ -687,8 +682,7 @@ def format_report(results: Dict[str, object]) -> str:
         f"recordings={results['n_recordings']}  contractions={results['n_contractions']}  "
         f"decelerations={results['n_decelerations']}"
     )
-    lines.append(f"lag window = {results['lag_window_seconds']} s post-onset "
-                 f"(includes the ~{int(num('up_preshift_note_seconds'))} s UP pre-shift)")
+    lines.append(f"lag window = {results['lag_window_seconds']} s post-onset")
     lines.append("")
     lines.append("  Contraction-triggered FHR average (deepest dip in the lag window):")
     lines.append(f"     observed dip        = {num('dip_bpm'):+.3f} bpm  at lag {num('dip_lag_seconds'):.0f} s")
@@ -747,8 +741,8 @@ def _fabricate_raw_samples(
     fs = 4.0
     r = int(1200 * fs)                       # 1200 s
     steps = np.arange(r, dtype=np.float32)
-    # 90 s from the *fabricated* onset t0. The detector's onset lands ~30 s later than t0 (it walks
-    # back only to the rising edge), so the detected onset-to-dip lag is ~60 s -- inside the window.
+    # 90 s from the *fabricated* onset t0. The detector's onset lands later than t0 (it walks back
+    # only to the rising edge), so the detected onset-to-dip lag is shorter -- inside the window.
     inject_lag = int(90 * fs)
     con_width = int(50 * fs)
     dec_width = int(30 * fs)
@@ -805,7 +799,8 @@ def self_test() -> int:
     if coupled["verdict"] != "coupling_present":
         print(f"FAIL: coupled data -> {coupled['verdict']} (expected coupling_present)")
         ok = False
-    # The injected lag is 45 s; the detected onset-to-dip lag should land in a plausible band.
+    # The injected lag is 90 s from the fabricated onset, and the detected onset lands later; the
+    # detected onset-to-dip lag should land in a plausible band.
     if not (20.0 <= float(coupled["dip_lag_seconds"]) <= 120.0):  # type: ignore[arg-type]
         print(f"FAIL: coupled dip lag {coupled['dip_lag_seconds']} s is implausible")
         ok = False

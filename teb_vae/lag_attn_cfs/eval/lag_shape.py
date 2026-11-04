@@ -308,8 +308,8 @@ def restrict_to_band(
     r"""Cut a profile and its axis down to one inclusive lag band.
 
     The point of restricting is that a statistic taken over the whole window is diluted by the
-    lags that carry nothing: all $L$ bins are reduced together, and a diagnosed run put most of
-    the KL in an availability clock that is readable at every one of them. A statistic on a band
+    lags that carry nothing: all $L$ bins are reduced together, and much of the KL can sit in an
+    availability clock that is readable at every one of them. A statistic on a band
     is the same reduction asked of the lags a partition says are worth asking about.
 
     **Two statistics must not be taken on the result, and this function cannot stop them.**

@@ -2286,8 +2286,6 @@ def lag_summary(
         "kl_lag_compensated_seconds": float(
             lag_compensated_seconds(kl_argmax, delay_steps=delay_steps)
         ),
-        # No sensor-timeline twin of the figure above: the stored UP/FHR timeline is canonical
-        # and the builder's shift is never undone downstream.
         "kl_argmax_lag_step_support_corrected": corrected_argmax,
         "kl_lag_compensated_seconds_support_corrected": (
             None

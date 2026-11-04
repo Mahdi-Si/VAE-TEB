@@ -2,8 +2,7 @@
 #
 # The one width in this encoder that is free to move. At d_model = 128 the shipped feed-forward
 # hidden width is 4x the model width, the ratio a Transformer block conventionally carries; 384 is
-# 3x, and it is the lower bracket on the capacity revision that raised this key from 256. The
-# question is whether the block's position-wise capacity, not its depth, is what binds -- a
+# 3x, and it is the lower bracket on the shipped width. The question is whether the block's position-wise capacity, not its depth, is what binds -- a
 # distinction the depth arms cannot answer because adding a block adds attention and feed-forward
 # capacity together.
 #

@@ -18,7 +18,11 @@ Local, because each is a fact about *this* model that no shared module can compu
 * :mod:`.run` -- the command line, which supplies the binding and a ``prog=`` string and enumerates
   its own flags for one reason: ``--only`` and ``--skip`` must name *this* model's registry;
 * :mod:`.verify` -- the acceptance gate, delegated in full, beside this cell's own sweep table
-  (``anchor_stride``) and the cross-cell table the two cfs cells are read down.
+  (``anchor_stride``) and the cross-cell table the two cfs cells are read down;
+* :mod:`.linear_baselines` -- the checkpoint's forecast against persistence, trend and ridge
+  forecasters fitted on half of the evaluation recordings. The baselines are reference forecasters
+  rather than readouts of the model, which is why they are fitted here and not in the shared
+  pipeline.
 
 Everything else -- the preflight guards, the probe, the collection pass, every registered analysis
 (the shared ones and the cfs parent's own, merged through the binding), the readouts, the verdict

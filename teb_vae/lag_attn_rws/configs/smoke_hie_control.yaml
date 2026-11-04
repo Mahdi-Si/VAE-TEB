@@ -1,32 +1,24 @@
 # The unanchored control for the local prior-anchor validation.
 #
-# Two deltas against smoke_hie.yaml, and they are one decision: reproduce the starting condition
-# the prior-variance collapse was actually measured in. `beta_prior: 0.0` removes the scale
-# anchor from the objective, and `head_init_calibration: false` reverts the prior head to the
-# uncalibrated start -- three nats below the anchor's optimum -- which is where the reported
-# production run began. Anchoring the objective while starting the head at the optimum would
-# measure the two together and attribute the result to whichever is named first.
+# Two deltas against smoke_hie.yaml, and they are one decision: start without the prior-scale
+# protections. `beta_prior: 0.0` removes the scale anchor from the objective, and
+# `head_init_calibration: false` reverts the prior head to the uncalibrated start -- three nats
+# below the anchor's optimum. Anchoring the objective while starting the head at the optimum
+# would measure the two together and attribute the result to whichever is named first.
 #
 # The key governs the DECODER output-head calibration as well (see sweep_init_off.yaml), so this
-# arm also starts its decoder off the trivial unit-variance predictor. That half is NOT what the
-# reported run did: its checkpoint records head_init_calibration true, and at the commit it ran
-# from that key drove the decoder calibration alone -- the prior-scale half did not yet exist. So
-# the reported start is decoder-calibrated and prior-uncalibrated, a combination no setting of
-# this one key can express. `false` matches it on the prior half, which is the half under test,
-# and diverges on the decoder half, which is why the base-forecast question is answered against
-# the calibrated bp0 control instead and RESULTS.md says so.
+# arm also starts its decoder off the trivial unit-variance predictor. No setting of this one key
+# gives a decoder-calibrated, prior-uncalibrated start. `false` is right on the prior half, which
+# is the half under test, and differs on the decoder half, so answer the base-forecast question
+# against a calibrated beta_prior: 0.0 control instead.
 #
-# What this arm no longer reproduces. It inherits default.yaml through smoke_hie.yaml, and that
-# file now ships three keys the reported run did not have: base_decode: mean,
-# posterior_logvar_mode: independent and causal_reach_budget_s: 120. So this is the unanchored
-# control FOR THE CURRENT BOTTLENECK, not a rerun of the reported configuration -- the anchor
-# comparison against smoke_hie.yaml is still clean, because both arms inherit all three equally,
-# but no absolute number here is comparable with the reported run's. Two consequences worth
-# stating: `head_init_calibration: false` now also costs the exact-zero-KL start, because
-# 'independent' recovers it only through that key (54 nats/step on the tiny model, against 0 in
-# the default); and the collapse this arm was written to start inside is what 'mean' and
-# 'independent' were added to prevent, so a run that does not collapse is the fix working rather
-# than the control failing. To rerun the reported configuration instead, pin `base_decode: sample`,
+# It inherits default.yaml through smoke_hie.yaml, so it carries base_decode: mean,
+# posterior_logvar_mode: independent and causal_reach_budget_s: 120. The anchor comparison
+# against smoke_hie.yaml is clean, because both arms inherit all three equally. Two
+# consequences: `head_init_calibration: false` also costs the exact-zero-KL start, because
+# 'independent' recovers it only through that key; and 'mean' and 'independent' exist to prevent
+# the prior collapse, so a run that does not collapse is the fix working rather than the control
+# failing. To start from the configuration without those fixes, pin `base_decode: sample`,
 # `posterior_logvar_mode: residual` and `causal_reach_budget_s: null` in the block below.
 #
 #   python -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/smoke_hie_control.yaml

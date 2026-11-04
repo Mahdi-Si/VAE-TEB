@@ -75,10 +75,10 @@ if not __package__ and _REPO_ROOT not in sys.path:
 
 # --- Defaults ---------------------------------------------------------------------------------
 # Lag sets are in decimated steps (4 s each). The UP lags concentrate on the physiological
-# contraction->deceleration band (20-120 s = lags 5-30), shifted by the pipeline's -20 s UP
-# pre-shift, plus a couple of shorter/longer probes; the history lags span the FHR autocorrelation
-# the baseline must exhaust before the source can add anything. Horizon offsets sample near / mid /
-# far of the 30-step (2 min) forecast so uplift can be read per-offset, not just pooled.
+# contraction->deceleration band (20-120 s = lags 5-30), plus a couple of shorter/longer probes;
+# the history lags span the FHR autocorrelation the baseline must exhaust before the source can add
+# anything. Horizon offsets sample near / mid / far of the 30-step (2 min) forecast so uplift can be
+# read per-offset, not just pooled.
 _DEFAULT_HIST_LAGS: Tuple[int, ...] = (0, 1, 2, 4, 8, 16, 32)
 _DEFAULT_UP_LAGS: Tuple[int, ...] = (0, 3, 5, 8, 10, 15, 20, 25, 30, 40)
 _DEFAULT_HORIZON_OFFSETS: Tuple[int, ...] = (1, 5, 15, 29)

@@ -13,7 +13,7 @@ Start with `headline_arms` for overall predictive performance, then `pred_gap_re
 - **Read missing-data messages.** An unavailable result is labelled with a reason. Target-only models have no band or lag profile, and normalised fusion has no additive latent profile. An absent measurement should not be read as zero.
 - **Lag axes show stored-coefficient time.** Lag $\ell$ identifies a source coefficient stored $\ell$ steps before the anchor. The seconds axis converts stored steps to seconds. Upstream causal feature extraction combines raw history within each coefficient, so these axes do not measure physiological delay. Every lag figure carries one line saying so.
 
-The plots use the shared style in `teb_vae/lag_attn/eval/figures.py`: double-column width, a 5.5–7 pt serif type scale, hairline frames and data lines, histogram bars with a thin dark outline, open frames, legends above the data, and the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. A figure carries at most one short note line, a 6 pt footnote in reserved space below the axes; panel titles are short noun phrases. The longer qualifications, and whatever a title no longer spells out, are written here and in the records.
+The plots use the shared style in `teb_vae/lag_attn/eval/figures.py`: double-column width, panels that share no axis two or three to a row, a 6.5–8.5 pt serif type scale, open slate frames with a value-axis grid, histogram bars separated by white gaps, legends above the data, a six-hue palette checked for colour-vision separation, and fixed forecast-branch styles (target-only dashed slate, source-conditioned solid vermillion). Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. A figure carries at most one short note line, a 6 pt footnote in reserved space below the axes; panel titles are short noun phrases. The longer qualifications, and whatever a title no longer spells out, are written here and in the records.
 
 ## Scoring figures
 
@@ -27,7 +27,7 @@ These figures are saved in `eval_results/figures/`. Filenames use the configured
 
 **Right panel:** The first row shows the predictive gap, base minus full. Other rows show intervention minus full, each with the paired interval of its per-recording differences. A positive intervention margin means the model predicts worse after that intervention. Three rows check exact identities: `suppress:none` is zero, while `suppress:all` and `silence` equal the predictive gap.
 
-**Interpretation:** The footnote reads: lower score is better, and a positive margin means worse prediction under the intervention. The predictive gap is necessary and not sufficient evidence for the pathway, so it is read beside an independently trained target-only reference. An internal gap can grow because joint training weakens the base branch. Use the acceptance figures to compare both branches with a separately trained, frozen target-only reference. Assess margins using the right panel's paired intervals.
+**Interpretation:** The footnote reads: lower score is better, and a positive margin means worse prediction under the intervention. The predictive gap compares two branches of one jointly trained model, and joint training also updates the base branch. Use the acceptance figures to compare both branches with a separately trained, frozen target-only reference. Assess margins using the right panel's paired intervals.
 
 ### `pred_gap_recordings`
 
@@ -118,8 +118,8 @@ One page per drawn sample, from a single forward pass, written by the training c
 
 - **Forecast, selected channels:** three target channels chosen by their $2\sigma$ coverage (worst, middle, best), stacked with a lane offset and labelled by declared channel and coverage. The mean and $\pm2\sigma$ band of each branch are stitched across the drawn windows, the first anchor winning; the shaded span is the anchor the error map below draws, and the dotted grid is the sparser set a training step tiles. The field rows below it are the family's own.
 - **Forecast score per window:** each drawn window's block score, reduced exactly as the objective reduces it (its likelihood, the channel and horizon weights, the coverage floor), base against full. Green fill is where the source helps; the insets show per-channel error and $2\sigma$ coverage on the channel axis of the rows above.
-- **Latent prior and source shift:** the target-only mean $\mu^p$ over the shift $\mu^q-\mu^p$ on one colour scale. The design claim is that the shift is small beside the prior.
-- **Divergence per latent dimension** and **total divergence $K_t$:** per-coordinate and summed divergence at the decoded anchors; a collapse into one or two coordinates shows in the first.
+- **Latent prior and source shift:** the target-only mean $\mu^p$ over the shift $\mu^q-\mu^p$ on one colour scale.
+- **Divergence per latent dimension** and **total divergence $K_t$:** per-coordinate and summed divergence at the decoded anchors.
 - **Proposal norm:** $\lVert r^\mu_{t,\ell}\rVert_2$ per anchor and lag, before the sum, the scaling and the limiter.
 - **Source channels available:** the denominator the proposal and divergence-drop rows are read against.
 - **Divergence drop:** $K_t-K_t^{\setminus\ell}$, the fall in the divergence when that lag's proposals alone are removed. A reliance reading, not an attribution; grey cells carried no source at all.
@@ -147,7 +147,7 @@ These figures are drawn from the two sidecars the collection pass writes (the pe
 
 **Panels:** One heatmap per clinical class of the class's share of the proposal norm by lag (down) and window (across), on one colour scale; then one panel per tested centroid (`centroid_s_proposal`, `centroid_s_drop`) with the median over recordings per window and its inter-quartile ribbon, the recording count on every point. Each heatmap title gives the class and its recording count; the class legend is on the first trajectory panel.
 
-**Interpretation:** A class whose mass moves down the lag axis as delivery approaches is a class whose fitted head reads a different past later in labour. The heatmap answers *where*; the band page answers *how much*. The delivery clock reads right-to-left toward delivery; the second-stage clock is signed, negative before onset, and admits recordings with an onset only.
+**Interpretation:** The heatmap shows *where* on the lag axis a class's proposal mass sits in each window; the band page shows *how much* mass each band carries. The delivery clock reads right-to-left toward delivery; the second-stage clock is signed, negative before onset, and admits recordings with an onset only.
 
 ### `proposal_clocks/proposal_<clock>_windows`
 
@@ -159,7 +159,7 @@ These figures are drawn from the two sidecars the collection pass writes (the pe
 
 **Panels:** One row per declared band and one column per profile: the band's proposal-norm mass (latent units) and its signed divergence drop (nats per anchor) per class against the clock.
 
-**Interpretation:** The magnitude the share heatmaps divide out. A line moving between rows is the informative past moving; a line moving within a row is that band's magnitude changing. The band's signed drop is summed signed, so a cancelled proposal reduces it; compare it with the same band's suppression margin on `band_margins_<clock>`.
+**Interpretation:** These panels show the magnitude that the share heatmaps divide out. The band's signed drop is summed signed, so a cancelled proposal reduces it; compare it with the same band's suppression margin on `band_margins_<clock>`.
 
 ### `band_clocks/band_margins_<clock>`
 
@@ -171,19 +171,19 @@ These figures are drawn from the two sidecars the collection pass writes (the pe
 
 **Panels:** (a) The pooled per-anchor divergence per class on a log axis, with the `high` and `top` thresholds. (b) The mean proposal profile of every selection (`all`, `high`, `rest`, `top`, `gain`), hot lags shaded. (c) The share of each divergence decile's anchors whose largest proposal sits at each lag. (d) Per recording, the high-anchor share inside a contraction window minus outside it, by class.
 
-**Interpretation:** One set of thresholds for the whole run, so every class is cut at the same divergence. The hot-lag set is chosen from the same map it summarises; a share on it describes the run's own selection. A flat picture in (c) says the largest proposal's lag is a property of the geometry rather than of the coupling.
+**Interpretation:** One set of thresholds for the whole run, so every class is cut at the same divergence. The hot-lag set is chosen from the same map it summarises; a share on it describes the run's own selection.
 
 ### `high_kl_anchors/high_kl_usefulness`
 
 **Panels:** (a) Mean forecast gain by divergence decile, pooled and per class. (b) Each recording's mean gain on its high anchors against its rest anchors, joined, with the paired difference, its bootstrap interval and the Wilcoxon $p$ (the pair count is in the usefulness record). (c) Mean gain by the anchor's largest-proposal lag, anchor counts on the bars. (d) The overlap of the high and gain selections against the share independence would give; the anchor counts of the two selections are in the usefulness record.
 
-**Interpretation:** A large divergence says the latent moved, not that the forecast improved. Positive in (b) means the anchors carrying the divergence are the anchors where the source bought forecast. Two selections naming the same anchors in (d) is one finding; two that do not is the other.
+**Interpretation:** A large divergence means that the latent moved, not that the forecast improved. A positive difference in (b) means that a recording's high-divergence anchors have a larger forecast gain than its other anchors. Panel (d) shows how far the divergence-selected and gain-selected anchors coincide.
 
 ### `high_kl_anchors/high_kl_<clock>` and `high_kl_<clock>_windows`
 
 **Panels:** The tested readouts of the selection (`high_anchor_frac`, `high_centroid_s`) per window and class, and their windows page.
 
-**Interpretation:** Read as `proposal_<clock>` and its windows page. The high-anchor fraction is the share of a segment's anchors above the run's threshold; a class whose fraction rises toward delivery is a class whose latent moves more there.
+**Interpretation:** Read as `proposal_<clock>` and its windows page. The high-anchor fraction is the share of a segment's anchors above the run's threshold.
 
 ### Family figures written by this cell
 

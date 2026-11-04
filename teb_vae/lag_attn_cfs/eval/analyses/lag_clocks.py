@@ -1400,10 +1400,15 @@ def build_features_figure(clock: Clock, rows: Sequence[Dict[str, Any]]) -> Any:
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(max(len(DRAWN_STATISTICS), 1), height_per_row=3.0)
+    # Two statistics to a row on one shared clock: the panels share no y axis, and a column of
+    # seven full-width strips put the comparison of two statistics at one hour pages apart.
+    figure, flat = figures.panel_grid(
+        max(len(DRAWN_STATISTICS), 1), panel_height=figures.PANEL_HEIGHT + 0.3,
+        width=figures.FIGURE_WIDTH * 1.4,
+    )
     for index, statistic in enumerate(DRAWN_STATISTICS):
         _draw_feature_panel(
-            axes[index, 0],
+            flat[index],
             clock,
             rows,
             statistic,

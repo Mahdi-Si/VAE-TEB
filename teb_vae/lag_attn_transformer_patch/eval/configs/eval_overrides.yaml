@@ -6,7 +6,7 @@
 #   2. clock_margin_min_nats: null -- 0.15 was set from the CFS availability-clock spread; a patch
 #      model has no availability clock (the null arm is "flat UP"), so the verdict stays
 #      INCONCLUSIVE until a patch run measures its own spread.
-#   3. caps for the new analyses (`<analysis>_*`; each E1 owner states its production cost).
+#   3. caps for the new analyses (`<analysis>_*`; each cap's comment states its forward or IG-call count).
 #   4. occlusion_bands are the transformer-CFS bands, already inside max_lag 37 (lags 0..37).
 # The holdout shards and statistics are the CFS causal k-fold split: only fhr, up and weight are
 # model inputs, and the same shards keep a patch run comparable with a CFS one on population.
@@ -40,7 +40,7 @@ eval_config:
   max_samples: null
   caps:
     # Shared (the transformer-CFS values).
-    waveforms: 512                      # E1-F: 330 KB/segment at C = 2 (~170 MB); per-channel calibration, STV, channel_skill horizon
+    waveforms: 512                      # 330 KB/segment at C = 2 (~170 MB); per-channel calibration, STV, channel_skill horizon
     attention: 64
     pages: 24
     pages_per_class: 10
@@ -49,24 +49,24 @@ eval_config:
     attribution_cohort_segments: 150
     occlusion: 512
     time_shift: 512
-    # New analyses (EVAL_PLAN.md §2). Provisional sizes from the maps; each owner may retune.
-    raw_attribution_segments: 24        # x 4 anchors x 10 IG calls (3 readouts x {raw/patch, key/value} + 4 heads), 128 steps: ~3.6 s/anchor, ~6 min (1660 Ti)
+    # New analyses. Provisional sizes; retune each one to its production cost.
+    raw_attribution_segments: 24        # x 4 anchors x 10 IG calls (3 readouts x {raw/patch, key/value} + 4 heads), 128 steps
     raw_attribution_ig_steps: 128
-    fhr_drivers_segments: 24            # x 4 anchors x 8 IG-equivalents (7 variants, src_effect is 2 forwards), 128 steps: ~4.6 s/anchor, ~7.5 min (1660 Ti)
+    fhr_drivers_segments: 24            # x 4 anchors x 8 IG-equivalents (7 variants, src_effect is 2 forwards), 128 steps
     fhr_drivers_ig_steps: 128
-    impulse_response_segments: 128      # x 2 backgrounds x (1 + 5 injections) = 1536 segment-forwards, ~1 min (1660 Ti)
+    impulse_response_segments: 128      # x 2 backgrounds x (1 + 5 injections) = 1536 segment-forwards
     impulse_response_injections: 5
-    raw_shift_segments: 256             # x 51 arms = 13056 segment-forwards, ~6 min (1660 Ti, 28 ms each)
+    raw_shift_segments: 256             # x 51 arms = 13056 segment-forwards
     delay_map_segments: 512
-    delay_map_anchors: 16               # x (1 + L = 39) single-lag arms per row (~0.8 ms/row-arm on a GTX 1660 Ti: ~5 min)
+    delay_map_anchors: 16               # x (1 + L = 39) single-lag arms per row
     event_locked_segments: 256
     decelerations_segments: 256
-    event_locked_ig_events: 64        # x 6 offsets x 2 readouts: ~768 rows (~20 min on one GPU at 512 steps)
-    event_locked_ig_steps: 512        # planted: at 128, 140/396 rows over the 1e-2 completeness tolerance; at 512, 5 rows (max 0.136)
+    event_locked_ig_events: 64        # x 6 offsets x 2 readouts = 768 IG rows
+    event_locked_ig_steps: 512        # the resting-tone IG path is rougher than the zero path; read ig_completeness
     decelerations_pair_window_s: 120  # contraction peak -> deepest nadir pairing window
-    latent_descriptors_segments: 512    # 1 dense forward/segment + ridge: ~1 min on a GTX 1660 Ti
-    signal_loss_segments: 1024          # observational census, 1 dense forward/segment: ~30 s
-    signal_loss_inject_segments: 64     # x 4 anchors x 13 forwards (12 gap edits + clean): ~1.5 min
+    latent_descriptors_segments: 512    # 1 dense forward/segment + ridge
+    signal_loss_segments: 1024          # observational census, 1 dense forward/segment
+    signal_loss_inject_segments: 64     # x 4 anchors x 13 forwards (12 gap edits + clean)
   prior_shuffle_min_nats: 1.0
   min_active_dims: 2
   event_lag_window_s: 120.0

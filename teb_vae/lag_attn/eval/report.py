@@ -168,9 +168,9 @@ def build_headline(results: Dict[str, Any]) -> Dict[str, Any]:
 def build_manifest(output_dir: Any, since: Optional[float] = None) -> Dict[str, Any]:
     """List every file the run emitted, with its size.
 
-    Not bookkeeping. It is what lets every emitted figure be checked for a ``FIGURE_GUIDE.md``
-    entry without hardcoding a filename list -- a hardcoded list would pass by construction and
-    would stop covering the moment an analysis gained a figure.
+    Not bookkeeping. It is what lets every emitted figure be checked without hardcoding a
+    filename list -- a hardcoded list would pass by construction and would stop covering the
+    moment an analysis gained a figure.
 
     Written before ``summary.json`` itself, so the summary is the one file the manifest cannot
     list; that is stated here rather than left as a puzzle for whoever diffs the two.

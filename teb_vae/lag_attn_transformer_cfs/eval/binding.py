@@ -131,6 +131,12 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     # numbers under another's name. ``target_scored_horizon``, the other density term, is a resolved
     # vector with no config key and is re-resolved and compared in the reconciliation instead.
     "forecast_ar_residual",
+    # Part of the density for the same reason: the bound sets every evaluated innovation's
+    # coefficient, so a config disagreeing about it would report one likelihood under another's name.
+    "forecast_ar_max",
+    # Changes what the forecast is, as ``persistence_residual`` does: the decoder's mean carries a
+    # linear filter over the target's last P stored values rather than over the last one alone.
+    "persistence_lags",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",

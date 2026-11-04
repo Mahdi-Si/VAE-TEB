@@ -76,7 +76,7 @@ SKILL_FILENAME = "forecast_skill.csv"
 HORIZON_FILENAME = "forecast_horizon.csv"
 ANCHOR_FILENAME = "forecast_anchor_profile.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` will name them.
+#: The figure stems.
 BASELINE_FIGURE = "baseline_comparison"
 ANCHOR_FIGURE = "anchor_profile"
 OVERLAY_FIGURE = "forecast_overlay"

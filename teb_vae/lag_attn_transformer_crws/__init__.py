@@ -35,13 +35,11 @@ forward four keys and silently build an all-defaults model.
 
 Layout::
 
-    DESIGN.md   the as-built record: which parent supplies which half, and the measured budget
     nets/       the network: one imported mixin over an imported architecture
     task.py     the Lightning task, a diamond of two parents with an empty body
     trainer.py  the experiment driver, three re-pointed class attributes
     configs/    YAML configs resolved through ``teb_vae.lag_attn.config``
     tests/      fast hermetic pytest
-    RESULTS.md  the pre-registered criteria the headline run is scored against
 
 **Neither side of the objective contains its own future.** An input coefficient at decimated step
 $t$ is a function of $\{x(s) : s \le t\}$ and of nothing else, because the causal dataset variant
@@ -60,10 +58,11 @@ causal input channel still lags by its composed group delay, $13.3$ to $791.0$ s
 target carries no group delay at all, so the caveat that reaches a lag-resolved reading here is
 one-sided rather than two-sided -- it attaches to the inputs alone.
 
-**Nats from this cell are comparable to no sibling outside this row.** The raw block is
-$H \cdot R = 15 \times 16 = 240$ samples against ``lag_attn_transformer_rws``'s $480$, and the tiled
-anchor set decodes about $10.1$ anchors per step against a dense $240$. A loss level is comparable
-against ``lag_attn_crws``, which ships the identical geometry, and against nothing else.
+**A per-anchor block score is comparable across the input edge; a per-step loss is not.** The raw
+block is $H \cdot R = 30 \times 16 = 480$ samples, the same block as ``lag_attn_transformer_rws``'s.
+The tiled anchor set, however, decodes far fewer anchors per step than that cell's dense range, so
+a per-step loss level is comparable only against ``lag_attn_crws``, which ships the identical
+geometry.
 
 **There is no evaluation package.** Every number this cell reports is a scalar from one run's own
 ``train_results/metrics_history.csv``, so no reported difference carries an uncertainty. Stated here

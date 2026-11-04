@@ -51,7 +51,7 @@
 # cells can never have it.
 #
 # What is still NOT comparable is the loss-scale constants, and the reason is the other axis: this
-# cell decodes about 4.57 anchors per step against roughly 240, so `gradient_clip_val` and
+# cell decodes about 4.5 anchors per step against roughly 240, so `gradient_clip_val` and
 # `additive_margin` are re-derived below rather than transferred. A block score is per anchor; a
 # gradient statistic is per step. `sweep_horizon_15.yaml` is the arm that gives the block back up.
 #
@@ -107,23 +107,14 @@ model_config:
       end: 1.0
       warmup_epochs: 50
     # nats per latent dim per step; 0.0 disables the floor. Deliberately zero: a positive floor
-    # is a laundering subsidy the sibling measured (KL filled whether or not it is source-driven),
+    # is a laundering subsidy (the floor fills KL whether or not it is source-driven),
     # and with the zero-KL start plus the beta warm-up, collapse is guarded structurally.
     free_bits: 0.0
     # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
     # conditional prior's log-variance off its clamp floor: nothing else in the objective
-    # penalises a NARROW prior, and the first production run pinned 99.2% of prior coordinates on
-    # the -5 floor within one epoch (0.118 at epoch 0, 0.812 at epoch 1). Constant, not a
-    # schedule -- the collapse completes between epoch 0 and epoch 1, so any warm-up would arrive
-    # after the damage.
-    #
-    # 0.1, not the 1.0e-2 this shipped at first. That value was a guess, and the dev-box arms on
-    # the committed HIE shard (teb_vae/lag_attn_rws/RESULTS.md -- the study belongs to the raw-signal
-    # cell this one inherits the weight from, and is not repeated here) measured it on the wrong
-    # side of a threshold: at
-    # 1.0e-2 the prior still finished on its floor (logvar_prior_floor_frac 0.955 against an
-    # unanchored 0.978) having only been delayed 6.7x in optimizer steps, while at 0.1 it held at
-    # 0.046 with kld_active_frac 0.69 against 0.25 in every collapsed arm.
+    # penalises a NARROW prior, and without it the prior's log-variance can fall onto the -5 clamp
+    # floor within the first epoch. Constant, not a schedule: a collapse that fast would complete
+    # before any warm-up arrived. The value is inherited from the raw-signal cell.
     #
     # A threshold rather than a dial, and that is why the bracket matters more than the midpoint:
     # the restoring force d/dlv_p is 0.5*(exp(lv_p) - 1), which SATURATES at 0.5*beta_prior as the
@@ -131,10 +122,8 @@ model_config:
     # sharpens. So a weight either exceeds that pressure or is eventually overrun by it, and no
     # weight merely slows the descent to an acceptable rate.
     #
-    # Still provisional in one respect the comment must not hide: that measurement is one shard,
-    # in-sample, on the convolutional-recurrent architecture. The transformer package's
-    # sweep_beta_prior_* arms bracket this value on both sides and are what confirm or revise it
-    # on the architecture the collapse was actually measured on.
+    # Provisional: the transformer package's sweep_beta_prior_* arms bracket this value on both
+    # sides and are what confirm or revise it.
     beta_prior: 0.1
 
     # --- Reconstruction likelihood --------------------------------------------
@@ -156,8 +145,8 @@ model_config:
     #
     # The first two are the comparison model's, at its weights, and they transfer for the reason the
     # target does: this block is raw samples on the same grid, so an L1 over pooled trajectories and
-    # a Huber over first differences mean here exactly what they mean there. The block is half as
-    # long, which the coarsest pooling rate of 16 still divides 15 times.
+    # a Huber over first differences mean here exactly what they mean there. The block has the same
+    # length, and the coarsest pooling rate of 16 divides its 480 samples 30 times.
     #
     # UNITS: these are L1 and Huber quantities on z-scored raw samples, not nats. `total_loss` is
     # therefore a weighted MIXED-UNIT criterion; the pure-nats readouts are the NLL metrics
@@ -183,17 +172,18 @@ model_config:
     d_model: 128
     # The latent must carry the whole FHR predictive state, and it is the decoder's ONLY input --
     # there is no state bypass here -- so it is the model's narrowest point. 64 = 4 groups of 16,
-    # divisible by num_heads as the head-structured posterior requires. Raised from 48 with the
-    # decoder widths below: the first production run's forecasts were judged over-smoothed, and the
-    # encoders held 1.35 M parameters against a 0.3 M decoder reading a 48-vector. Sweep axis.
+    # divisible by num_heads as the head-structured posterior requires. Raised from 48 together
+    # with the decoder widths below, so that the decoder side is not the narrow end of the model.
+    # Sweep axis.
     d_z: 64
     # H = 30 decimated steps = 2 min forecast, matching every other cell of the grid -- including
     # the raw-signal sibling this cell's block is now identical to, so a loss LEVEL is comparable
     # across that edge where before only a sign and a trajectory were.
     #
     # It is paid for in anchors, and the tradeoff is geometric rather than clinical. Anchors live in
-    # [F, T - H), so doubling H shortens T_valid from 270 to 270 and the dense anchor count from 136
-    # to 136; with the stride moving to 30 the decoded tiles per sample fall from ~4.53 to ~4.53.
+    # [F, T - H), so doubling H from 15 to 30 shortens T_valid from 285 to 270 and the dense anchor
+    # count from 151 to 136; with the stride moving from 15 to 30 the decoded tiles per sample fall
+    # from ~10.1 to ~4.53.
     # The floor is unaffected -- it comes from the INPUT warm-up, not from the target, which is the
     # one thing this cell's floor argument does not share with the causal-feature pair. The horizon
     # remains one of the two levers on the warm-up cost. `sweep_horizon_15.yaml` is the arm that
@@ -235,8 +225,8 @@ model_config:
     #
     # What the policy costs is anchors: 136 against the 240 a floor at the model's own 30-step
     # warm-up would give. That is the largest single lever this configuration leaves on the table
-    # and it is recorded in DESIGN.md rather than shipped as an arm, because it changes what the run
-    # CLAIMS rather than what the data supports.
+    # and it is not shipped as an arm, because it changes what the run CLAIMS rather than what the
+    # data supports.
     warmup_period: 134
     sequence_length: 300
     c_y: 102               # 36 (fhr_st) + 66 (fhr_ph); the two-sided widths are 43 and 66
@@ -253,11 +243,10 @@ model_config:
     # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
     # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
     #
-    # This exists because the measured failure is specific to the source pathway: over epochs
-    # 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent displacement at 0.084,
-    # both unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
-    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
-    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    # This exists for a failure that is specific to the source pathway: the map from the source to
+    # delta_mu can memorise while the KL and the latent displacement stay constant, so the held-out
+    # predictive gain falls at an unchanged rate. A rate-based lever (beta) cannot reach a failure
+    # that happens at constant rate.
     #
     # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
     # particular rate here, and putting an unvalidated one in the headline run would confound it.
@@ -290,9 +279,8 @@ model_config:
     # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
     # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast,
     # so its gradient on the prior log-variance points down without limit and nothing opposes it
-    # from below. The 125-epoch anchored run has logvar_prior_floor_frac climbing 0.017 -> 0.496
-    # and still rising at epoch 125; the beta_prior anchor slowed that and did not stop it,
-    # because the anchor's restoring force saturates at beta_prior/2 per dimension while the
+    # from below. The beta_prior anchor slows that descent and cannot stop it, because the
+    # anchor's restoring force saturates at beta_prior/2 per dimension while the
     # reconstruction's opposing pressure grows as the decoder sharpens.
     #
     # Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p), which
@@ -321,9 +309,9 @@ model_config:
     # This is the second of the two paths that collapse the prior's scale, and the one that
     # survives base_decode: mean. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior +
     # delta), so the full branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor:
-    # D_1 drags the prior's log-variance down alongside its own. Measured on the tiny model, the
-    # full branch's reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head
-    # under 'residual' and exactly 0 under 'independent'.
+    # D_1 drags the prior's log-variance down alongside its own. The full branch's reconstruction
+    # alone puts a non-zero gradient on the prior log-variance head under 'residual' and exactly 0
+    # under 'independent'.
     #
     # With both keys shipped, the prior's log-variance receives gradient from KL(q||p) -- which
     # pulls it UP, to cover the posterior -- and from the beta_prior anchor, and from nothing that
@@ -335,10 +323,9 @@ model_config:
     # is what the whole coupling readout rests on.
     #
     # With head_init_calibration FALSE the init KL is not small: two independently initialised
-    # heads disagree by whatever their init happens to give, measured on the tiny model at 54
-    # nats/step mean and 142 nats/step max, against exactly 0 under 'residual' with or without the
-    # calibration. That matters because the readout rests on K_t == 0 at init -- unearned
-    # divergence on that scale is indistinguishable from coupling in every downstream figure. Any
+    # heads disagree by whatever their init happens to give, against exactly 0 under 'residual'
+    # with or without the calibration. That matters because the readout rests on K_t == 0 at
+    # init -- unearned divergence is indistinguishable from coupling in every downstream figure. Any
     # arm that sets head_init_calibration: false therefore inherits a broken zero-KL start from
     # this key and should pin posterior_logvar_mode: residual unless the arm is about that start.
     # The ablate-one arm is a one-key override of this file: posterior_logvar_mode: residual.
@@ -412,8 +399,7 @@ model_config:
     #
     #     tau_phys(l, h) = 4 s * (l + 1 + h) + kappa * tau_ref,
     #
-    # on the canonical stored timeline (the dataset builder's UP shift is part of the signal and
-    # no term undoes it), which is MINIMISED at l = h = 0 and grows with the lag. At `target_max`
+    # which is MINIMISED at l = h = 0 and grows with the lag. At `target_max`
     # (402.1604 s) the smallest lead the attention can express is 355.9 s, so the 20-120 s contraction-to-
     # deceleration band is unreachable at EVERY lag index -- and raising `max_lag` cannot help,
     # because it only makes the lead longer. The feature-target cells do not have this problem:
@@ -427,10 +413,8 @@ model_config:
     #
     # WHAT IT BUYS. The alignment shift carries the centroid factor kappa = 0.875, so the aligned
     # stream's common effective delay is kappa * 42.2066 = 36.93 s, not 42.21 s. Reachable lead
-    # [40.9, 516.9] s on the canonical stored timeline, so 79 of the 100 s band sits inside the lag
-    # axis: l + h = 0 lands at 40.9 s and l + h = 19 at 116.9 s, with l + h = 20 the first index
-    # past the band at 120.9 s. (Earlier text quoted [20.9, 496.9] s with a -20 s dataset-shift
-    # term; that term is gone -- the builder's UP shift is part of the signal.)
+    # [40.9, 516.9] s, so 79 of the 100 s band sits inside the lag axis: l + h = 0 lands at 40.9 s
+    # and l + h = 19 at 116.9 s, with l + h = 20 the first index past the band at 120.9 s.
     #
     # WHAT IT COSTS. Both streams drop hard: target-input 102 -> 38 (17 fhr_st + 21 fhr_ph),
     # source 51 -> 17 (17 up_st + 0 up_ph). EVERY band-reachable reference loses all fifteen
@@ -535,9 +519,7 @@ model_config:
     # WHY. A deep causal state at lag 0 already contains a processed image of the states at every
     # larger lag, so by the data-processing inequality the near lags dominate the searched window
     # whatever the attention would prefer -- and a lag readout taken over such keys and values
-    # cannot express a delay it is looking straight at. Measured on the planted-delay fixture, where
-    # the informative lags are known and are [15, 44] and nowhere else, both architectures put their
-    # support-corrected argmax at lag 0 with the deep state as memory. A bounded stem makes a key at
+    # cannot express a delay it is looking straight at. A bounded stem makes a key at
     # lag l a summary of a neighbourhood of l, which is what an attention over lags needs it to be.
     #
     # BOTH K AND V MOVE, and that is not a detail. Localising the keys alone would leave the lag-0
@@ -556,8 +538,8 @@ model_config:
     # LONGER than the 91-step lag window and longer than the 300-step sequence. Dropping the LSTM
     # therefore removes unbounded recurrence and leaves a convolution memory that is still not
     # local, so on THIS architecture the arm does not yet separate a lag-0 key from a whole-prefix
-    # one. The conv-Transformer cell's stem is 21 steps and is local; this one is not, and the
-    # measured lag profile is to be read with that in front of it.
+    # one. The conv-Transformer cell's stem is 21 steps and is local; this one is not, and a lag
+    # profile from this arm is to be read with that in front of it.
     #
     # `encoder` is the deep source state and is bitwise the model that shipped before this key
     # existed; `adapter` is the sharpest arm, the projected stream itself at one step of reach, and
@@ -573,9 +555,8 @@ model_config:
     #
     # WHY FLAT SHIPS. At scale 1.0 the seed is -slope_h * ell, a monotone penalty in the lag, so a
     # freshly built model already prefers lag 0 by construction and the reported argmax cannot
-    # distinguish "the data says lag 0" from "the initialisation says lag 0". Every profile this
-    # family has measured on ground truth peaks at 0, and a decaying seed is one of the several
-    # causes that predicts that on its own. Flat removes the initialisation from the list, at no
+    # distinguish "the data says lag 0" from "the initialisation says lag 0". A lag-0 peak has
+    # several possible causes, and a decaying seed predicts one on its own. Flat removes the initialisation from the list, at no
     # cost in expressiveness: the same parameter, reached by the same gradient, starting from a
     # position that asserts nothing about which lag matters.
     #
@@ -596,20 +577,18 @@ model_config:
     # arrived by step t. That is PROVABLY INERT here: the constructor refuses any anchor floor below
     # max_c(W'_c + d_c), which is exactly the last step at which the staircase changes, so every
     # SCORED anchor sees the same all-ones vector and a constant through a LayerNorm and a linear
-    # map is an offset the head's biases already span. Measured: 18 distinct rows over t in [0, 300)
-    # and exactly ONE over the scored [134, 270), with the resulting projection learning to a weight
-    # RMS fifty times below every other matrix in the head and kld_source_null unmoved.
+    # map is an offset the head's biases already span.
     #
     # What survives past the floor is the source ENCODER'S MEMORY of the warm-up transient -- h_u at
     # t >= F still carries the pattern of channels arriving one by one, because the encoder is
     # convolutional-recurrent. So the prior is conditioned on the encode of a ZEROED source stream:
-    # the same tensor the source-null control feeds the posterior. It varies at every scored anchor
-    # (136 of 136), and it carries ZERO information about the source's VALUES -- the stream it
+    # the same tensor the source-null control feeds the posterior. It varies at every scored anchor,
+    # and it carries ZERO information about the source's VALUES -- the stream it
     # encodes is exactly zero, identical for every recording and under every intervention.
     #
-    # WHY IT IS ON. kld_source_null -- the KL that survives zeroing the source -- measured 3.72 of
-    # 4.56 nats on the conv-LSTM cell and 11.48 of 12.48 on the conv-Transformer cell over the
-    # planted fixture, i.e. four fifths to nine tenths of the attributed coupling. With both branches
+    # WHY IT IS ON. Without it, kld_source_null -- the KL that survives zeroing the source -- can
+    # carry most of the attributed coupling, because only the posterior sees the clock. With both
+    # branches
     # given the same deterministic input the divergence between them is learnable to zero, and
     # kld_source_null becomes the check that the cancellation worked rather than the estimate of the
     # contamination.
@@ -631,7 +610,7 @@ model_config:
 
     # --- Shared horizon decoder core -------------------------------------------
     # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
-    # horizon axis is 31 tokens -- more than twice this cell's 15 horizon tokens.
+    # horizon axis is 31 tokens -- more than this cell's 30 horizon tokens.
     #
     # Held at the comparison model's depth deliberately, and the parameter economy of depth 3 is not
     # taken: keeping it removes a confound from the input-representation comparison, which is the
@@ -652,20 +631,18 @@ model_config:
     # reverts the bundle with a config edit and no code change.
     #
     # Break the near-degeneracy of the horizon tokens at init, so per-block FiLM has token-specific
-    # structure to modulate. 0.8, and it carries across the halved token count by MEASUREMENT rather
-    # than by inheritance: the quantity the value is chosen against is the post-initialisation
-    # CORRELATION between two horizon tokens, which is a function of the embedding's scale against
-    # the broadcast projected latent's and does NOT depend on how many tokens there are. Measured on
-    # this architecture at both horizons: mean off-diagonal correlation 0.445915 at H = 15 against
-    # 0.447476 at H = 30. The halved token count moved the third decimal place.
+    # structure to modulate. 0.8, and it carries across horizon lengths: the quantity the value is
+    # chosen against is the post-initialisation CORRELATION between two horizon tokens, which is a
+    # function of the embedding's scale against the broadcast projected latent's and does NOT
+    # depend on how many tokens there are.
     horizon_embed_std: 0.8
     # Calibrate BOTH distribution heads onto their trivial starting points at init. One key, two
     # halves, and setting it false reverts both:
     #   * the shared decoder output heads onto mu=0/sigma=1 -- without it the raw-target NLL
-    #     starts ~15 nats/sample above that predictor's ~1.4 level;
+    #     starts far above that trivial predictor's level;
     #   * the prior head's log-variance onto exactly 0, i.e. sigma_p = 1, which is the scale
-    #     anchor's optimum -- without it the prior starts about 3 nats below it and, at
-    #     beta_prior: 0.0, reaches its clamp floor 3.3x sooner in optimizer steps.
+    #     anchor's optimum -- without it the prior starts below that optimum and, at
+    #     beta_prior: 0.0, reaches its clamp floor sooner in optimizer steps.
     # There is deliberately no key for one half alone: an arm reverting the prior calibration to
     # reproduce the pre-anchor start reverts the decoder calibration with it.
     head_init_calibration: true
@@ -776,34 +753,20 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # RE-DERIVED at this cell's loss scale, and it moved DOWN by 5x. The two reasons it had to move
-    # pull in opposite directions -- the block matches (480 raw samples against 480), which lowers the
-    # gradient, while the decoded anchors per step fall by roughly a factor of 24 (about 4.57 against
-    # 240), which raises its variance -- so neither is a rescaling of the other and the value is
-    # MEASURED rather than scaled. `configs/smoke_causal.yaml` is that measurement: 600 optimizer
-    # steps at these widths over the committed causal fixture, with the clip parked at 1.0e+9 so
-    # nothing rescaled the steps the norms were drawn from.
-    #
-    # RE-MEASURED AT H = 30, where the block doubled from 240 raw samples to 480: q50 3347, q90 6952,
-    # q95 8499, q99 11806, max 19370. 12000 is the smallest round value above q99, which is the
-    # family's own rule. It sits well below the observed maximum, so on a healthy run of this
-    # objective the clip essentially does not bind -- correct for a blow-up guard.
-    #
-    # The move from 1000 is a factor of 12 for a block that doubled, and the two causes compound in
-    # the same direction here rather than opposing: the block scales the summed loss and its
-    # gradient, and the decoded anchors per step fell from ~4.57 to ~4.57, so that larger block is
-    # averaged over fewer than half as many anchors. The comparison model's 5000 came from its own
-    # 1018-epoch production run (q50 2775, q99 4681, max 7313) and now sits BELOW this cell's value
-    # rather than above it.
+    # RE-DERIVED at this cell's loss scale rather than transferred. Two causes act on it: the block
+    # (480 raw samples, as in the comparison model) sets the summed loss and its gradient, and the
+    # decoded anchors per step (about 4.5 against 240) set how many anchors that gradient is
+    # averaged over, which raises its variance. Neither is a rescaling of the other, so the value is
+    # MEASURED rather than scaled: `configs/smoke_causal.yaml` runs 600 optimizer steps at these
+    # widths over the committed causal fixture, with the clip parked at 1.0e+9 so nothing rescales
+    # the steps the norms are drawn from. The family's rule takes the smallest round value above the
+    # q99 of that pre-clip `train/grad_norm`, so on a healthy run of this objective the clip
+    # essentially does not bind -- correct for a blow-up guard.
     #
     # PROVISIONAL, and the caveat is not decoration: 4 in-sample windows taken as one batch is a
     # thinner tail than a production run's and 32x smaller than the shipped batch of 128, so the
-    # distribution describes a memorised window rather than the production objective. The same
-    # measurement at batch 1 -- four distinct single-sample batches over the same 600 optimizer
-    # steps, so the batch-to-batch component is present at its largest -- reads q50 737, q99 3045,
-    # max 4944. That regime is 128x smaller than the shipped batch and is recorded rather than used.
-    # Re-derive from the headline run's own `train/grad_norm` column, which samples one optimizer
-    # step per epoch.
+    # distribution describes a memorised window rather than the production objective. Re-derive from
+    # the headline run's own `train/grad_norm` column, which samples one optimizer step per epoch.
     gradient_clip_val: 12000.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
@@ -839,17 +802,13 @@ advanced_config:
   #
   # The relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a loss bounded
   # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 480 raw samples and
-  # averaged over roughly ten anchors, and a confident decoder's per-sample NLL is negative, so the
+  # averaged over roughly 4.5 anchors, and a confident decoder's per-sample NLL is negative, so the
   # summed block crosses zero as soon as the forecast is any good -- and once the EMA is negative the
   # relative test degenerates to "skip every positive batch". So ema_floor sits far above any
   # reachable loss, which switches the relative test off, and additive_margin carries the finite
   # blow-up detection: skip when watched > EMA + margin, against the RAW EMA, so it works in the
-  # negative-loss regime.
-  #
-  # The 600-step instrumented run did not get there -- main_loss stayed inside [+148, +648] with the
-  # whole shard in one batch and [+34, +863] at batch 1 -- which sizes how far four in-sample windows
-  # are from that regime rather than showing the design is unnecessary. The sign-agnostic block is
-  # what makes the crossing a non-event when it happens.
+  # negative-loss regime. The sign-agnostic block is what makes the zero crossing a non-event when
+  # it happens.
   spike_breaker:
     enabled: true
     multiplier: 5.0
@@ -868,38 +827,25 @@ advanced_config:
     ema_floor: 1.0e+9
     # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables it.
     #
-    # MEASURED, and it MOVED: 5.0e+2 against the comparison model's 1.0e+3. The margin is stated in
-    # nats of the summed block and transfers across neither the block size nor the anchor count, and
-    # this cell changes both. The statistic is the breaker's OWN -- `main_loss` minus the EMA it
-    # carried into the step, at this file's `ema_decay`, which is exactly what the additive test
-    # compares -- rather than the epoch-to-epoch movement, because at ~10 decoded anchors per step
-    # the two are no longer close.
+    # RE-DERIVED rather than transferred from the comparison model's 1.0e+3. The margin is stated
+    # in nats of the summed block and transfers across neither the block size nor the anchor count.
+    # The statistic is the breaker's OWN -- `main_loss` minus the EMA it carried into the step, at
+    # this file's `ema_decay`, which is exactly what the additive test compares -- rather than the
+    # epoch-to-epoch movement, because at ~4.5 decoded anchors per step the two are no longer close.
     #
-    # RE-MEASURED AT H = 30, over 600 steps after the breaker's own 100-batch priming window: with
-    # the whole shard in one batch the excursion above the EMA reached q99 1.0, max 10.4; at batch 1,
-    # where the batch-to-batch component is present at its largest, q50 -207, q90 157, q95 276,
-    # q99 488, max 1713.
+    # TWO BOUNDS CONSTRAIN THIS VALUE, and at this block they can cross. The margin must clear the
+    # worst excursion on the smoke fixture, or the breaker skips ordinary batches -- which reads in
+    # the log exactly like a model that keeps blowing up. It must also stay under the magnitude the
+    # objective can reach, or no finite loss could exceed EMA + margin and the additive test would
+    # be decoration. The reconstruction-only bound is ~2 * 480 * 1.58 ~ 1.5e+3. Where the two
+    # cross, the margin clears the excursion: a breaker that fires on healthy batches actively
+    # degrades training, while an insensitive one only fails to catch a blow-up the non-finite guard
+    # would still catch. The reconstruction-only bound UNDERSTATES what this objective reaches,
+    # because the KL, the prior anchor and the live `lambda_ms` and `lambda_deriv` shape terms all
+    # add positive magnitude, so the test can still fire at 2.5e+3.
     #
-    # THE TWO BOUNDS THIS VALUE SITS BETWEEN HAVE CROSSED AT THIS BLOCK, and that is the thing to
-    # read here rather than the number. The margin must clear the worst measured excursion, or the
-    # breaker skips ordinary batches -- which reads in the log exactly like a model that keeps
-    # blowing up. It must also stay under the magnitude the objective can reach, or no finite loss
-    # could exceed EMA + margin and the additive test would be decoration. At H = 15 those were
-    # 248 and ~7.6e+2 and a value sat comfortably between them. At H = 30 the reconstruction-only
-    # bound is ~2 * 480 * 1.58 ~ 1.5e+3 while the worst excursion is 1713: there is no value that
-    # satisfies both.
-    #
-    # 2.5e+3 clears the excursion, by 1.46x. That is the bound that was chosen, because a breaker
-    # that fires on healthy batches actively degrades training while an insensitive one only fails
-    # to catch a blow-up the non-finite guard would still catch. It sits at 1.65x the
-    # reconstruction-only bound -- which UNDERSTATES what this objective reaches, because the KL,
-    # the prior anchor and this cell's live `lambda_ms` and `lambda_deriv` shape terms all add
-    # positive magnitude that bound omits. The observed `main_loss` spans [-1484, +1808] across the
-    # two regimes, roughly 3.3e+3, so the test can still fire.
-    #
-    # Re-derive from a production run's own `main_loss` column rather than from this fixture if the
-    # breaker starts skipping batches whose other columns look healthy. PROVISIONAL for the same
-    # reason as the clip above: four in-sample windows are a thinner tail than a production run's.
+    # PROVISIONAL for the same reason as the clip above. Re-derive from a production run's own
+    # `main_loss` column if the breaker starts skipping batches whose other columns look healthy.
     additive_margin: 2.5e+3
     # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch
     # and hard-re-seed the EMA to it. 0 disables the hatch.
@@ -915,10 +861,8 @@ advanced_config:
       experiment_name: seqvae-teb-lag-attn-crws
       # THE ARM IS IN THE NAME, both here and in the variant tag below, and that is a second
       # guard rather than a label. A run whose config drifted between machines trains one arm
-      # while its records name another, and no metric says so -- which is exactly how a
-      # headline evaluation came to be read as the aligned arm having trained unaligned. The
-      # alignment arm is the axis that failure ran along, so it is the axis the name carries: one
-      # reference of 42.21 s, which is already source-only here because this cell's target is
+      # while its records name another, and no metric says so. The alignment arm is the axis the
+      # name carries: one reference of 42.21 s, which is already source-only here because this cell's target is
       # the raw signal and carries no delay to align.
       run_name: lag_attn_crws_ref42
       artifact_location: null
@@ -936,9 +880,8 @@ advanced_config:
         variant: lag_attn_crws_ref42
 
   callbacks:
-    # ON, and the patience is the number rather than the flag. A 5000-epoch budget against a run
-    # whose composite optimum landed at epoch 336 of 709 spends most of its wall clock past the
-    # point where the criterion stopped improving, and every epoch after it is a fresh chance for
+    # ON, and the patience is the number rather than the flag. A 5000-epoch budget can spend most
+    # of its wall clock past the point where the criterion stops improving, and every epoch after it is a fresh chance for
     # the source pathway to drift while nothing is being learned. 50 VALIDATION epochs is wide
     # enough that the beta ramp's plateau and the milestone LR drops both pass inside it -- both
     # are stretches where `val/total_loss` legitimately stalls -- and narrow enough to end a run
@@ -954,10 +897,10 @@ advanced_config:
       monitor: "val/total_loss"
       save_top_k: 3
       mode: "min"
-      # A SECOND criterion, and it exists because the two optima are not the same epoch: on the
-      # diagnosed H = 15 run the composite `val/total_loss` bottomed at epoch 336 and
-      # `val/nll_full_block` -- the conditioned forecast alone, the quantity every forecast readout
-      # is built on -- at epoch 278. Keeping only the first means the weights that forecast best are
+      # A SECOND criterion, and it exists because the two optima need not be the same epoch: the
+      # composite `val/total_loss` and `val/nll_full_block` -- the conditioned forecast alone, the
+      # quantity every forecast readout is built on -- can bottom at different epochs. Keeping only
+      # the first means the weights that forecast best are
       # not on disk and nothing recovers them once the epoch has passed, while the run's own metrics
       # record that they existed.
       #

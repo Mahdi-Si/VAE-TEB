@@ -1,5 +1,5 @@
 r"""Measure what the scattering front end keeps, what it anticipates, and what the
-uplift estimator can resolve -- the evidence behind ``UP_FHR_coupling_representation_analysis.md``.
+uplift estimator can resolve.
 
 Unlike the Stage 0 and Stage 2 probes this module needs **no dataset**. Everything here is
 either a property of the production filter bank ($J=11$, $Q=4$, $T=16$, `shape` $=5280$,
@@ -8,35 +8,31 @@ whose ground truth we inject ourselves. That is deliberate: the claims it checks
 about the *representation and the estimator*, not about the cohort, and they should stay
 auditable on a laptop with no access to ``/data1``.
 
-Four measurements, matching the sections of the analysis document:
+The module computes five quantities:
 
-1. **Low-pass fidelity** (doc S6.1). Does $S_0 = x \star \phi$ keep a realistic
-   deceleration? Answer: $96.9\%$ of its depth, with zero timing shift. This is the
-   measurement that retired the "the representation is blind to the coupling" hypothesis.
+1. **Low-pass fidelity** (:func:`measure_representation`). The fraction of a synthetic
+   deceleration's depth that $S_0 = x \star \phi$ keeps, and the shift of its nadir.
 
-2. **Band envelopes** (doc S6.2). Does $\phi$ or the $\times 16$ decimation damage the
-   deceleration band? Answer: gain $\ge 0.988$, nothing aliased. Only $2$ of $42$ channels
-   lose envelope structure to the decimation.
+2. **Band envelopes** (:func:`measure_representation`). The gain of $\phi$ at each band's
+   envelope bandwidth, and which channels the $\times 16$ decimation aliases.
 
-3. **Forward reach** (doc S7.2). The wavelets are two-sided, so a feature step reads raw
-   signal from its own future. Answer: $28.4\%$ of the target block and $50\%$ of the
-   source block read past the $H_d = 120$ s forecast horizon, and a deceleration is
-   $81.5\%$ visible in the $0.0082$ Hz channel $120$ s before its nadir. This is a
-   validity problem for any transfer-entropy reading, not merely a power problem.
+3. **Forward reach** (:func:`measure_anticipation`). The wavelets are two-sided, so a
+   feature step reads raw signal from its own future. The probe counts the channels of each
+   stored block whose reach passes the $H_d = 120$ s forecast horizon, and the fraction of a
+   deceleration that each channel already shows $120$ s before its nadir.
 
-4. **The masking law** (doc S8.2, ``--masking-law``). With a coupling calibrated to the
-   measured $-4.4$ bpm contraction-triggered average, the *source-specific* uplift is flat
-   at $\approx 2.1\%$ while the *measured* uplift collapses to $\approx 0$ as nuisance
-   source columns are added, tracking a variance floor $\approx p_{extra}/N_{fit}$. At the
-   Stage 0 probe's own design width that floor exceeds its $1\%$ detection threshold.
+4. **The masking law** (:func:`measure_masking_law`, ``--masking-law``). A known-answer
+   sweep: one simulated coupling, with pure-noise columns added to the source block. It
+   reports the *source-specific* uplift, the *measured* uplift and the added-column
+   variance floor $\approx p_{extra}/N_{fit}$ at each design width.
 
-A fifth quantity is pure arithmetic and needs no measurement: the critical KL weight
-$\beta^\star = \lambda_{full} d_z / (H_d c_y)$ above which no amount of transfer entropy in
-the data can pay for the latent rate it would cost (doc S5).
+5. **The critical KL weight** (:func:`critical_beta`). Pure arithmetic: the weight
+   $\beta^\star = \lambda_{full} d_z / (H_d c_y)$ above which no amount of transfer entropy in
+   the data can pay for the latent rate it would cost.
 
-Every headline number the document quotes is asserted here, so this doubles as a
-regression check on the pipeline geometry: change $J$, $Q$, $T$ or the horizon and the
-assertions that no longer hold are the claims that need rewriting.
+:func:`self_test` asserts the deterministic values of quantities 1, 2, 3 and 5, so it doubles
+as a regression check on the pipeline geometry: change $J$, $Q$, $T$ or the horizon and the
+assertions that fail name the values that changed.
 """
 
 from __future__ import annotations
@@ -180,10 +176,9 @@ def deceleration(t: np.ndarray, nadir_s: float, depth_bpm: float = 20.0,
 # 1 + 2. What the representation keeps
 # =============================================================================================
 def measure_representation(bank: FilterBank) -> Dict[str, Any]:
-    """Low-pass fidelity and band-envelope survival (doc S6.1--S6.2).
+    """Low-pass fidelity and band-envelope survival.
 
-    Answers the question the previous version of the analysis got wrong: does the
-    scattering front end discard the contraction->deceleration response? It does not.
+    Asks whether the scattering front end discards the contraction->deceleration response.
     $S_0$ is stored unmasked as ``fhr_st`` channel $0$ and receives no log/asinh transform,
     so it is an affine function of the $4$ s locally-averaged FHR in bpm.
 
@@ -243,12 +238,12 @@ def measure_representation(bank: FilterBank) -> Dict[str, Any]:
 def select_phase_pairs(bank: FilterBank, f_min: float, f_max: float,
                        k_steps: Sequence[int] = (4, 6, 8),
                        rel_tol: float = 0.05) -> List[Tuple[int, int]]:
-    """Rebuild a stored phase-harmonic channel selection (doc S7.5 of the dataset reference).
+    """Rebuild a stored phase-harmonic channel selection.
 
     A pair $(i, j)$ with $\\xi_i \\le \\xi_j$ is kept when both endpoints lie in the band and
     the ratio $p = \\xi_j/\\xi_i$ sits within a **relative** tolerance of some
     $2^{k/Q}$. Reproducing the shipped counts ($66$ for ``fhr_ph``, $15$ for ``up_ph``)
-    from the documented rule alone is what licenses trusting the reach numbers below --
+    from this rule alone is what licenses trusting the reach numbers below --
     hence the assertions in :func:`self_test`.
 
     Args:
@@ -276,7 +271,7 @@ def select_phase_pairs(bank: FilterBank, f_min: float, f_max: float,
 
 
 def measure_anticipation(bank: FilterBank) -> Dict[str, Any]:
-    """Forward reach per stored block, and how early a deceleration becomes visible (doc S7.2).
+    """Forward reach per stored block, and how early a deceleration becomes visible.
 
     A phase-harmonic channel multiplies $z_i$ and $z_j$ at the same $t$ and then $\\phi$-
     smooths, so its forward reach is the slower wavelet's reach plus the low-pass reach.
@@ -339,11 +334,9 @@ def measure_anticipation(bank: FilterBank) -> Dict[str, Any]:
 # =============================================================================================
 @dataclass
 class MaskingConfig:
-    """Settings for the known-answer masking-law experiment (doc S8.2).
+    """Settings for the known-answer masking-law experiment.
 
-    The document's table used ``n_recordings=600``; the default here is smaller so the
-    module stays runnable as a check. The qualitative result -- flat source-specific
-    uplift, collapsing measured uplift -- is stable across both.
+    The default ``n_recordings`` is small so the module stays runnable as a check.
     """
 
     n_recordings: int = 240
@@ -411,7 +404,7 @@ def _ridge_mse(x: np.ndarray, y: np.ndarray, train: np.ndarray, test: np.ndarray
 
 
 def measure_masking_law(bank: FilterBank, cfg: MaskingConfig) -> Dict[str, Any]:
-    """Known-answer sweep: measured uplift vs source-design width (doc S8.2).
+    """Known-answer sweep: measured uplift vs source-design width.
 
     One estimator, one dataset, one true coupling. Only the number of columns in the source
     block changes -- a lean causal source ($S_0^U$ at the configured lags) padded with pure
@@ -433,9 +426,9 @@ def measure_masking_law(bank: FilterBank, cfg: MaskingConfig) -> Dict[str, Any]:
     sy, su = np.stack(sy), np.stack(su)
 
     # Calibration: the injected coupling's own contraction-triggered average, so the
-    # simulated effect size can be compared with the Stage 2 measurement (-4.43 bpm at 29 s).
+    # simulated effect size can be compared with the Stage 2 contraction-triggered average.
     pre = (np.arange(-30, 0) * FS).astype(int)
-    win = np.arange(int(10 * FS), int(150 * FS))
+    win = np.arange(int(10 * FS), int(130 * FS))
     snips = [fhr_all[k][int(c * FS) + win] - fhr_all[k][int(c * FS) + pre].mean()
              for k in range(n) for c in onsets_all[k]
              if int(c * FS) + win[-1] < N_RAW and int(c * FS) + pre[0] >= 0]
@@ -493,7 +486,7 @@ def measure_masking_law(bank: FilterBank, cfg: MaskingConfig) -> Dict[str, Any]:
 
 
 # =============================================================================================
-# 5. The critical KL weight (arithmetic, doc S5)
+# 5. The critical KL weight (arithmetic)
 # =============================================================================================
 def critical_beta(lambda_full: float = LAMBDA_FULL, d_z: int = D_Z,
                   horizon: int = HORIZON_STEPS, c_y: int = C_Y) -> Dict[str, float]:
@@ -559,7 +552,7 @@ def format_report(results: Dict[str, Any]) -> str:
     add("Representation-capacity probe  (J=11, Q=4, T=16, shape=5280, fs=4 Hz, H_d=120 s)")
     add("=" * 86)
 
-    add("\n1. Does the low-pass keep a realistic deceleration?  (doc S6.1)")
+    add("\n1. Does the low-pass keep a realistic deceleration?")
     add(f"   depth raw {rep['dec_depth_raw_bpm']:.3f} bpm -> after phi "
         f"{rep['dec_depth_after_phi_bpm']:.3f} bpm "
         f"({100*rep['dec_depth_retained_frac']:.1f}% retained), "
@@ -568,7 +561,7 @@ def format_report(results: Dict[str, Any]) -> str:
     add(f"   S1 sign blindness |  |x*psi| - |(-x)*psi|  |_max = "
         f"{rep['s1_sign_blindness_max_abs_gap']:.3e}  (exactly 0: only S0 sees polarity)")
 
-    add(f"\n2. Do phi or the x{DECIMATION} decimation damage the bands?  (doc S6.2)")
+    add(f"\n2. Do phi or the x{DECIMATION} decimation damage the bands?")
     add(f"   decimated-grid Nyquist = {rep['nyquist_decimated_hz']:.4f} Hz")
     add(f"   {'band':>14} {'n':>3} {'env bw (Hz)':>20} {'min phi gain':>13} {'aliased':>8}")
     for name, b in rep["bands"].items():
@@ -576,7 +569,7 @@ def format_report(results: Dict[str, Any]) -> str:
             f"{b['env_bw_lo_hz']:>9.5f}-{b['env_bw_hi_hz']:<10.5f} "
             f"{b['min_phi_gain_at_env_bw']:>13.3f} {b['n_aliased']:>4}/{b['n_filters']:<3}")
 
-    add("\n3. How far into the future does each feature step read?  (doc S7.2)")
+    add("\n3. How far into the future does each feature step read?")
     add(f"   phi (S0) forward reach = {ant['phi_reach_s']:.2f} s  -- essentially causal")
     add(f"   {'block':>8} {'past +120s':>12} {'reach range (s)':>20}")
     for name, b in ant["per_block"].items():
@@ -589,7 +582,7 @@ def format_report(results: Dict[str, Any]) -> str:
     for k, v in ant["already_visible_one_horizon_early"].items():
         add(f"      {k:>12}: {v:.3f}")
 
-    add("\n4. Can the objective report a calibrated TE?  (doc S5)")
+    add("\n4. Can the objective report a calibrated TE?")
     add(f"   beta* = lambda_full * d_z / (H_d * c_y) = {D_Z}/{HORIZON_STEPS*C_Y} = "
         f"{beta['beta_star']:.3e}")
     add(f"   shipped beta_end = {beta['beta_end']} = {beta['ratio']:.1f} x beta*  "
@@ -599,10 +592,9 @@ def format_report(results: Dict[str, Any]) -> str:
 
     if "masking_law" in results:
         ml = results["masking_law"]
-        add("\n5. What can the pooled uplift estimator resolve?  (doc S8.2)")
+        add("\n5. What can the pooled uplift estimator resolve?")
         add(f"   injected coupling calibration: D* = {ml['calibration_dip_bpm']:.2f} bpm at "
-            f"tau = {ml['calibration_lag_s']:.0f} s over {ml['n_contractions']} contractions "
-            f"(Stage 2 measured -4.43 bpm at 29 s)")
+            f"tau = {ml['calibration_lag_s']:.0f} s over {ml['n_contractions']} contractions")
         add(f"   {ml['n_recordings']} recordings, {ml['n_rows']} rows, "
             f"{ml['n_train_per_fold']} train rows/fold")
         add(f"   {'p_extra':>8} {'coupled %':>16} {'decoupled % (floor)':>22} "
@@ -612,18 +604,17 @@ def format_report(results: Dict[str, Any]) -> str:
                 f"{r['decoupled_pct']:>15.2f}+-{r['decoupled_se']:<5.2f} "
                 f"{r['source_specific_pct']:>13.2f}+-{r['source_specific_se']:<5.2f} "
                 f"{r['predicted_floor_pct']:>7.2f}")
-        add("   The source-specific column is flat: the coupling is fully recoverable at every")
-        add("   width. The measured (coupled) column collapses because the floor grows as p/N.")
+        add("   source-specific = coupled - decoupled; p/N = predicted added-column floor.")
     add("=" * 86)
     return "\n".join(out)
 
 
 def self_test() -> int:
-    """Assert every headline number the analysis document quotes.
+    """Assert the deterministic values of the filter-bank and KL-weight quantities.
 
     These are regression checks on the pipeline geometry as much as on this module: if the
-    filter bank, the horizon or the stream widths change, the assertions that fail are
-    exactly the document claims that need rewriting.
+    filter bank, the horizon or the stream widths change, the assertions that fail name the
+    values that changed.
 
     Returns:
         Process exit code.
@@ -680,11 +671,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="Also run the known-answer uplift sweep (slow: simulates and "
                              "transforms every recording).")
     parser.add_argument("--n-recordings", type=int, default=MaskingConfig.n_recordings,
-                        help="Recordings for the masking-law sweep (the document used 600).")
+                        help="Recordings for the masking-law sweep.")
     parser.add_argument("--seed", type=int, default=MaskingConfig.seed)
     parser.add_argument("--json-out", default=None, help="Write the results dict as JSON.")
     parser.add_argument("--self-test", action="store_true",
-                        help="Assert the document's headline numbers and exit.")
+                        help="Assert the deterministic headline values and exit.")
     args = parser.parse_args(argv)
 
     if args.self_test:

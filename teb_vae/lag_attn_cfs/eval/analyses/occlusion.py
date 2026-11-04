@@ -720,7 +720,7 @@ def build_horizon_figure(per_horizon: pd.DataFrame, bands: Dict[str, Tuple[int, 
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(1)
+    figure, axes = figures.new_figure(1, height_per_row=figures.PANEL_HEIGHT, width=5.4)
     axis = axes[0, 0]
     if per_horizon.empty:
         figures.multi_line_panel(
@@ -852,8 +852,8 @@ def cost_record(
             "band count; a pass with a different band count extrapolates as "
             "seconds = n_samples * n_arms * seconds_per_arm_per_segment. peak_allocated_bytes is "
             "the CUDA allocator's process peak up to the end of this pass and is null on any "
-            "other device. See EVAL.md's occlusion section for how to choose caps.occlusion "
-            "from this block and the per-band standard errors beside it."
+            "other device. Choose caps.occlusion from this block and the per-band standard "
+            "errors beside it."
         ),
     }
 
@@ -993,7 +993,10 @@ def build_clock_figure(
         The figure.
     """
     names = list(bands)
-    figure, axes = figures.new_figure(max(len(names), 1), 1)
+    # Two bands to a row on one shared clock: the bands are compared at a given hour, and a
+    # column of full-width strips put the comparison three panels apart.
+    figure, flat = figures.panel_grid(max(len(names), 1))
+    axes = [[panel] for panel in flat]
     subset = (
         frame[
             (frame["clock"] == "time_to_delivery")
@@ -1032,14 +1035,14 @@ def build_clock_figure(
             f"{name.capitalize()}, "
             f"{float(lag_compensated_seconds(span[0], delay_steps=delay_steps)):g}-"
             f"{float(lag_compensated_seconds(span[1], delay_steps=delay_steps)):g} s",
-            fontsize=figures.FONT_SMALL,
         )
         panel.set_ylabel("nats per anchor")
         panel.invert_xaxis()
         figures.style_axes(panel)
-    axes[-1][0].set_xlabel("Time before delivery (hours)")
+    for row in axes[-2:]:
+        row[0].set_xlabel("Time before delivery (hours)")
     if groups:
-        axes[0][0].legend(loc="best", fontsize=figures.FONT_TINY)
+        axes[0][0].legend(loc="best")
     figures.caveat_note(figure)
     return figure
 

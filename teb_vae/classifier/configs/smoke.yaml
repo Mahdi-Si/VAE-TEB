@@ -1,4 +1,4 @@
-# Smoke run on the generated fixture tree (SPEC §13.3, §15): CPU, folds 1-2, ST/PH source, tiny budgets.
+# Smoke run on the generated fixture tree: CPU, folds 1-2, ST/PH source, tiny budgets.
 #
 #   python -m teb_vae.classifier.tests.fixtures.make_fixture --out output/classifier_fixture
 #   python -m teb_vae.classifier.run --config teb_vae/classifier/configs/smoke.yaml --stage all
@@ -17,7 +17,7 @@ classifier:
     covariates: {static_csv: output/classifier_fixture/static_covariates.csv,
                  timed_csv: output/classifier_fixture/timed_covariates.csv}
     # The fixture's has_tlo missing rate differs across classes by > 0.10 in folds 2-3 (L10): train the noind
-    # ablation (§7.3.4), which verify criterion 10 requires then.
+    # ablation, which verify criterion 10 requires then.
     auto_ablate_missing: true
   source:
     kind: hdf5
@@ -35,7 +35,7 @@ classifier:
   eval:
     bootstrap: {resamples: 50}
     # The fixture's val split holds 6 healthy GUIDs per fold, fewer than the 9 the NP umbrella needs at
-    # alpha 0.3 / delta 0.05, so np30 falls back to empirical there, flagged `fallback: true` (§11.3).
+    # alpha 0.3 / delta 0.05, so np30 falls back to empirical there, flagged `fallback: true`.
     # Lists replace on merge: the rest is default.yaml's policy set unchanged.
     thresholds:
       - {id: np30, policy: fpr_cap, alpha: 0.30, method: np_umbrella, delta: 0.05, allow_fallback: true,

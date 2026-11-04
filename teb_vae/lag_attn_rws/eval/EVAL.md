@@ -1,8 +1,8 @@
 # The evaluation contract
 
-What a run of `teb_vae.lag_attn_rws.eval` is, what it leaves behind, what each analysis means,
-and how the output is misread. `FIGURE_GUIDE.md` beside this file documents every emitted PDF;
-this document is everything that is not a figure.
+This document describes a run of `teb_vae.lag_attn_rws.eval`: what it reads, what it writes, what
+each analysis computes, and which readings the computation does not support. `FIGURE_GUIDE.md`
+beside this file documents every emitted figure; this document covers everything else.
 
 ## What a run is
 
@@ -14,10 +14,22 @@ python -m teb_vae.lag_attn_rws.eval.run --checkpoint <run>/model_checkpoints/<na
 
 The configuration is the checkpoint's own `resolved_config.yaml` — found beside it, never a
 second config file — with the committed `eval/configs/eval_overrides.yaml` delta deep-merged
-over it. The delta repoints the shards at the shared k-fold holdout split, adds the five
-clinical `load_fields`, and carries the `eval_config` block; both the original and the merged
-value of every overridden key are recorded in the summary. Preflight then refuses the run
-outright when the merged result contradicts the checkpoint.
+over it. `--overrides` names a different delta. The committed delta does four things:
+
+1. It points `vae_test_datasets` at one HDF5 per subgroup under
+   `k_fold_cross_validation_dataset/fold_1/` (the `test/` shard of each subgroup, plus the `val/`
+   and `train/` shards of `hie_cs` and `hie_no_cs`).
+2. It adds the six clinical `load_fields`: `target`, `epoch`, `cs_label`, `bg_label`,
+   `time_from_labor_onset` and `second_stage_onset`.
+3. It sets `general_config.batch_size.test: 32` and `cache_size: 0`.
+4. It carries the `eval_config` block.
+
+The summary records both the original and the merged value of every overridden key. Preflight
+then refuses the run when the merged result contradicts the checkpoint.
+
+Running `run.py` with no command line reads the `RUN_ARGS` dict at the bottom of the module. Each
+key is an argparse `dest`, and resolution is per key: a flag on the command line overrides only
+its own key. `RUN_ARGS` needs `checkpoint`, or an `output_dir` that names a finished run.
 
 The expensive part happens once. A single shared collection pass decodes four latent branches
 over every anchor at $K$ Monte Carlo draws and writes two durable tables — `per_sample.csv`
@@ -32,34 +44,35 @@ python -m teb_vae.lag_attn_rws.eval.run --output-dir <a finished run> --only cou
 re-runs an analysis offline with no checkpoint, no model and no GPU. `--max-batches` is a
 smoke-run batch cap (a prefix by nature); `eval_config.max_samples` is the seeded *stratified*
 cap, and the two are not interchangeable — a prefix over the unshuffled eight-shard split draws
-one subgroup and one class.
+one subgroup and one class. `--num-samples` overrides `eval_config.num_mc_samples`, and
+`--device` selects the torch device (default `cuda:0` when available, else `cpu`).
 
-**One thing an offline re-run cannot do: report a criterion the tables predate.** The verdict
-block travels with the collection record, so a re-run reports the verdicts the *collecting* pass
-decided — which is correct until the registry moves. When it has, the reuse path refuses with
-`StaleCachedVerdicts`, naming the criteria that appeared or disappeared. It is a refusal rather
-than a repair because only some criteria are decidable from what a collection record keeps: the
-predictive pair is, the calibration census is not, and a repair that worked for the cheap
-criteria and failed for the rest would be a worse failure than a clear stop. The fix is to
-re-collect — a new `--output-dir`, or the collection deleted from this one, with `--checkpoint`
-so the pass has a model. Every *analysis* number, `source_margin` included, is recomputed from
-the per-sample tables and needs no re-collection.
+**An offline re-run cannot report a criterion that the tables predate.** The verdict block
+travels with the collection record, so a re-run reports the verdicts that the *collecting* pass
+decided. When the verdict registry has changed since then, the reuse path refuses with
+`StaleCachedVerdicts` (`metrics.py`) and names the criteria that appeared or disappeared. It
+refuses rather than repairs, because only some criteria are decidable from a collection record:
+the predictive pair is, and the calibration census is not. To fix it, re-collect: use a new
+`--output-dir`, or delete the collection from this one, and pass `--checkpoint`. Every
+*analysis* number, `source_margin` included, is recomputed from the per-sample tables and needs
+no re-collection.
 
-A finished run is checked mechanically, and the calibration study's tables are generated, by
-the same offline module:
+The offline module `verify` checks a finished run and builds the arm comparison tables:
 
 ```bash
 python -m teb_vae.lag_attn_rws.eval.verify <run>/eval_results/summary.json
 python -m teb_vae.lag_attn_rws.eval.verify --runs <dir-of-runs> --out RESULTS_arms.md
 ```
 
-`verify` reads files a run left behind and nothing else — no model, no shard, no `torch` (the
-layering test walks its imports with `torch` on the forbidden list, so the property is proved
-rather than promised). The gate names which `pred_gap` column it reads: `pred_gap_mc_nats`,
-the Monte Carlo marginalised score. The arm tables key every row by the swept value read from
-each run's own dumped `resolved_config.yaml`, never by directory name, and read each run's
-training `metrics_history.csv` for the epoch count, the final `val/kld_active_frac` and the
-collapse verdict (`collapse.py::is_collapsed`, over the tail of the per-epoch series).
+`verify` reads only files that a run left behind: no model, no shard, no `torch`. The layering
+test puts `torch` on its forbidden-import list. The gate exits 1 when the summary fails and 2 on
+a usage error (no summary and no `--runs`, or both); `--json-out` also writes the gate's
+machine-readable report. The gate reads the `pred_gap_mc_nats` column, the Monte Carlo
+marginalised score. The arm tables key every row by the swept value read from each run's own
+dumped `resolved_config.yaml`, never by directory name. They read each run's training
+`metrics_history.csv` for the epoch count, the final `val/kld_active_frac` and the collapse
+verdict (`collapse.py::is_collapsed`, over the tail of the per-epoch series). `verify` also has a
+`RUN_ARGS` dict for an IDE launch; set exactly one of `summary` or `runs`.
 
 ## Output layout
 
@@ -93,7 +106,7 @@ cross-table recombination, the lag identities, the population checks); it delibe
 *not* move the exit code. The **verdicts** are the model's own acceptance criteria, in registry
 order, never a bare boolean. The **run context** block beside them records the parameter count,
 the checkpoint's training epoch, the anchor-coverage distribution and the observed objective
-magnitude — the facts the arm tables and the first-run checklist consume.
+magnitude (`observed_loss_scale`), which the arm tables read.
 
 ## The four layers
 
@@ -112,39 +125,30 @@ model-free modules, named in an allow-list; `model/*` is forbidden everywhere. A
 analyses share moves one layer down — that rule is why `frames`, `lag_axis`, `cohort` and
 `events` exist.
 
-The `EXEMPTIONS` table is asserted **minimal**: a module listing a name it no longer imports is
-a permission that outlived its use, and the next reach for that name would go unreported. The
-exemptions themselves are deliberate rather than reluctant — `metrics` assembles the model's
-inputs through the task's own builders precisely so an evaluation cannot feed the model a
-differently assembled stream than training did, and re-implementing those builders to win a
-layering rule would reintroduce the exact drift they exist to prevent.
+The test asserts that the `EXEMPTIONS` table is **minimal**: a module that lists a name it no
+longer imports fails it. `metrics` assembles the model's inputs through the task's own builders,
+so an evaluation feeds the model the same stream assembly that training uses.
 
 ### The model binding
 
-`binding` is the newest layer-0 module and it is the reason `run.main` takes a parameter this
-document did not previously mention. **The pipeline no longer names one model; it takes one.**
-A `ModelBinding` is a frozen record of the handful of facts the pipeline cannot derive — the
-classes to rebuild from a checkpoint, the constructor keys reconciled against it, the encoder's
-own half of the causality disclosure, the package's committed override delta, and any analyses
-and headline scalars that model alone can have. The module itself imports nothing but
-`dataclasses`, `pathlib` and `typing`, which is what keeps it in layer 0; the concrete instances
-name model classes and therefore live beside the code that constructs one.
+The pipeline takes the model it evaluates as a parameter. `run.main` takes a `binding` keyword
+argument of type `ModelBinding` (`binding.py`). A `ModelBinding` is a frozen record of the facts
+the pipeline cannot derive: the classes to rebuild from a checkpoint, the constructor keys
+reconciled against it, the encoder's own half of the causality disclosure, the package's
+committed override delta, and any analyses and headline scalars that only that model has. The
+module imports only `dataclasses`, `pathlib` and `typing`, which keeps it in layer 0. The
+concrete instances name model classes, so they live beside the code that constructs one.
 
-**Nothing about an `lag_attn_rws` run changed.** `RWS_BINDING` lives in `run.py`, `main` takes it
-as a keyword default, `GEOMETRY_KEYS` is still the constant in `preflight.py` and is what the
-binding is set to, and its `extra_analyses` and `headline_scalars` are empty and pinned empty by
-test — so the registry every run selects from, and the headline block every run emits, are the
-ones they were before the seam existed. That the refactor moved no number is proved rather than
-asserted: a `slow`-marked gate re-runs the pipeline against the tiny fixture and compares every
-emitted artifact against a manifest of digests captured before any binding code was written.
+For this package, `RWS_BINDING` lives in `run.py` and is the keyword default of `main`. Its
+geometry keys are `preflight.GEOMETRY_KEYS`. Its `extra_analyses` and `headline_scalars` are
+empty, and `tests/test_eval_binding.py` pins them empty. An extra analysis or headline scalar may
+not take a shared name, and an encoder disclosure may not return a key in
+`preflight.SHARED_CAUSALITY_KEYS`.
 
-The second consumer is `teb_vae/lag_attn_transformer_rws/eval`, which evaluates
-`SeqVaeLagAttnTrfRws` — the same model with both history encoders replaced — through this
-pipeline's runner, this pipeline's collection pass and all seventeen of these analyses, adding one
-of its own that profiles the encoders it replaced them with. Its own `EVAL.md` is the contract for
-that package; what matters here is why the seam is worth a parameter. The two architectures exist to be compared, and a second copy of this pipeline is how
-two things that must stay comparable stop being comparable: the first fix to an analysis lands on
-one side, and the two summaries quietly stop meaning the same thing.
+A second consumer is `teb_vae/lag_attn_transformer_rws/eval`. It evaluates `SeqVaeLagAttnTrfRws`
+(the same model with both history encoders replaced) through this pipeline's runner, collection
+pass and seventeen analyses, and adds one analysis of its own. Its own `EVAL.md` documents that
+package. Because both architectures share one pipeline, a fix to an analysis reaches both.
 
 ## Configuration reference
 
@@ -153,23 +157,22 @@ that block is dumped into the run directory and is the durable record. Every key
 against a closed set — an unknown key raises and names the valid keys, a `bool` where an `int`
 is expected raises (`True` would silently cap at 1), and a cap of `0` raises.
 
-| Key | Meaning |
-|---|---|
-| `seed` | Seeds `random`/`numpy`/`torch` and derives the loader-shuffle, derangement and Monte Carlo generators by fixed offsets. Two runs of one checkpoint at one seed compare byte-identical on `results`. |
-| `num_mc_samples` | Monte Carlo draws $K$ per anchor for the marginalised score, under common random numbers across branches. $K = 1$ is one draw of the same estimator, not the training-path score: under `base_decode: mean` the training path decodes the base branch at the prior mean, which the estimator never does. |
-| `max_samples` | Seeded **stratified** global sample cap; `null` evaluates the whole split. |
-| `caps` | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `oracle`). Retention is opt-in: a quantity absent from `caps` is retained for no samples — except `oracle`, where absence means every segment, because a probe fitted on nothing is not a cheaper measurement but no measurement. |
-| `prior_shuffle_min_nats` | The provisional margin the prior-shuffle degradation must clear; the verdict always reports the measured number beside it. |
-| `min_active_dims` | Active latent dimensions below which the latent counts as collapsed. |
-| `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. |
-| `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose windows overlap 29/30. |
-| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record; a run that changes it writes filenames those files do not list. |
-| `max_hours_before_delivery` | How far before delivery a segment may be recorded and still be evaluated, in hours; `4.0` keeps the last four hours, `null` — the shipped setting — evaluates everything. **The bound is on the population, not on an axis**: it is applied to the delivery clock before anything is binned, so every clock answers for the same segments and the second-stage clock re-bins that population on its own signed axis rather than being cut at a second, differently-defined four hours. It moves cohort sizes, window counts and every trajectory, so a bounded run is not comparable with an unbounded one — which is why it is a key, recorded in the run's dumped config. Minimum one 0.5 h bin. |
+| Key | Default | Meaning |
+|---|---|---|
+| `seed` | `42` | Seeds `random`/`numpy`/`torch` and derives the loader-shuffle, derangement and Monte Carlo generators by fixed offsets. Must lie in $[0, 2^{32})$. |
+| `num_mc_samples` | `8` (committed delta: `5`) | Monte Carlo draws $K$ per anchor for the marginalised score, under common random numbers across branches. $K = 1$ is one draw of the same estimator, not the training-path score: under `base_decode: mean` the training path decodes the base branch at the prior mean, which the estimator never does. |
+| `max_samples` | `null` | Seeded **stratified** global sample cap; `null` evaluates the whole split. |
+| `caps` | `{}` (committed delta: `waveforms: 128`, `attention: 64`, `pages: 24`) | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `oracle`). Retention is opt-in: a quantity absent from `caps` is retained for no samples, except `oracle`, where absence means every segment. |
+| `prior_shuffle_min_nats` | `1.0` | The margin the prior-shuffle degradation must clear; the verdict reports the computed value beside it. |
+| `min_active_dims` | `2` | Active latent dimensions below which the latent counts as collapsed. |
+| `event_lag_window_s` | `120.0` | Seconds after a detected contraction within which an anchor counts as event-conditioned. |
+| `bootstrap_resamples` | `2000` | Resamples behind every bootstrap interval, drawn over recordings, never over anchors (consecutive anchor windows overlap in 29 of 30 steps). Minimum 100. |
+| `figure_format` | `null` | Image format of every figure of the run, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …), validated at config load against the installed matplotlib's list. `null` keeps the `pdf` default, which `figure_manifest.json` and `FIGURE_GUIDE.md` record; another format writes filenames those files do not list. |
+| `max_hours_before_delivery` | `null` | How far before delivery a segment may be recorded and still be evaluated, in hours; `4.0` keeps the last four hours, `null` evaluates everything. **The bound is on the population, not on an axis**: it is applied to the delivery clock before anything is binned, so every clock answers for the same segments, and the second-stage clock re-bins that population on its own signed axis. It changes cohort sizes, window counts and every trajectory, so a bounded run is not comparable with an unbounded one. Minimum one 0.5 h bin. |
 
 Deliberately **not** keys: the significance level and the trajectory bin width (an operator who
 could widen them could make a difference appear or disappear), and any lag-band selection (the
-band ablation is a non-goal, so a band key would be inert by construction). Their absence is
-asserted by test, not merely intended.
+pipeline has no band ablation, so a band key would be inert). A test asserts their absence.
 
 ### Objective keys this pass reads rather than sets
 
@@ -180,15 +183,12 @@ scoring it under assumed defaults would report a different objective's numbers. 
 where there is no checkpoint, the same keys are read from the dumped `model_config.VAE_model` block,
 which preflight has already reconciled against the checkpoint on every checkpointed run.
 
-`beta_prior` is the newest of them and the one an operator is most likely to assume defaults for. It
-weights the prior's scale rate $R_p$, the fourth term of the training objective; a checkpoint
-trained at a non-zero weight must be scored under that same weight, so it is read back rather than
-defaulted, and it appears in `run_context.observed_loss_scale` beside the term it weights. Two
-readouts follow from it and exist whatever the weight was — including on runs that predate the
-anchor, which is exactly where they diagnose: the per-recording `prior_rate` column, and the
-`prior_rate_nats` headline scalar the arm tables read. Neither is conditional on `beta_prior` being
-non-zero; a column that appeared only for anchored runs would be missing from the runs it exists to
-explain.
+`beta_prior` weights the prior's scale rate $R_p$, the fourth term of the training objective. A
+checkpoint trained at a non-zero weight must be scored under that same weight, so the pass reads
+it back rather than defaulting it, and it appears in `run_context.observed_loss_scale` beside the
+term it weights. Two readouts of $R_p$ exist whatever the weight is, including at
+`beta_prior: 0`: the per-recording `prior_rate` column and the `prior_rate_nats` headline scalar
+that the arm tables read.
 
 Weights are recorded and, unlike geometry, deliberately **not** compared against the config by the
 preflight guard: $\beta$ and its ramp weight the training total and enter no evaluated readout.
@@ -223,7 +223,9 @@ significance records and the summary's own population counts are all written in 
 be read against the figure beside it row for row.
 
 **The colour is the severity**: green for healthy, amber for acidosis, red for HIE, with each
-subgroup a shade of its own class, light to dark in the order above. The mapping is a *table*
+subgroup a shade of its own class. The shades run light to dark in the order of
+`labels.CANONICAL_SUBGROUPS` (for example `hie_no_cs` lighter, `hie_cs` darker), which is the
+reverse of the display order above. The mapping is a *table*
 rather than an assignment pass, so a cohort keeps its colour whichever others a figure contains.
 
 The palette is **this package's**, `figures_seam.CLINICAL_CLASS_COLORS`, and deliberately not
@@ -336,13 +338,12 @@ value a floor rather than an estimate.
 Does the model use *this* recording's source, or react to any source at all? The verdict is three
 losses and nothing else: $D_{\mathrm{full}} < D_{\mathrm{base}} < D_{\mathrm{shuffled}}$.
 
-The KL is deliberately not a parameter, and that is the content of the criterion rather than a
-simplification of it. A stranger's source is out of distribution for a posterior trained only on
-matched pairs, so it routinely moves the posterior **more** — a healthy model has
-$K_{\mathrm{shuffled}} > K_{\mathrm{true}}$, and a criterion that read the KL would fail exactly
-the models it should pass. `shuffled_exceeds_true` is therefore recorded as a description and
-consumed by nothing, and `influential_not_specific` is a real finding about a checkpoint rather
-than a pipeline failure.
+The KL is deliberately not a parameter of the criterion. A stranger's source is out of
+distribution for a posterior trained only on matched pairs, so it can move the posterior
+**more** than the matched source does: $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is compatible
+with a recording-specific source pathway, and a KL-based criterion would fail such a model.
+`shuffled_exceeds_true` is therefore recorded as a description and consumed by nothing, and the
+`influential_not_specific` state describes the checkpoint rather than a pipeline failure.
 
 The derangement is **GUID-aware**: Sattolo's algorithm guarantees only $\pi(i) \ne i$, and the
 test split is eight per-subgroup shards read in order, so an unshuffled batch would pair a
@@ -369,15 +370,15 @@ doing — and a model whose latent geometry charges more for the source than the
 fails every base-referenced comparison while still reading *this* recording's source rather than
 any source. `source_margin` changes only the source: prior, decoder and latent geometry are
 identical between its two branches. So a **positive margin beside a negative predictive gain is a
-real state, not a contradiction** — no forecast improvement, and the source pathway is still
-recording-specific — and it is the state the readout was added to make sayable.
+consistent state, not a contradiction**: the source gives no forecast improvement, and the source
+pathway is still recording-specific.
 
 All three carry the same describe, bootstrap, positive-fraction and Wilcoxon columns, in
 `summary.json` under `perm_control.penalties`. They are **not** in `perm_control_summary.csv`,
-which carries the branch table only. `source_margin`'s mean is additionally emitted as the keyed
-scalar `perm_control.source_margin_nats` and promoted to the headline as `source_margin_nats`:
-the headline is assembled by walking key paths and `penalties` is a list, which is why the two
-penalties beside it have never appeared there.
+which carries the branch table only. `source_margin`'s mean is also emitted as the keyed scalar
+`perm_control.source_margin_nats` and promoted to the headline as `source_margin_nats`. The
+headline is assembled by walking key paths and `penalties` is a list, so the other two penalties
+do not appear in the headline.
 
 ### latent
 
@@ -398,10 +399,10 @@ would read zero forever.
 $R_p = \sum_d \tfrac12(e^{\ell^p} - 1 - \ell^p)$, per recording and in nats per anchor, reduced on
 the KL support like the divergence beside it and reported as the `prior_rate_nats` headline scalar.
 Zero means $\sigma_p = 1$ exactly, so it is the only one of these readouts bounded below by its own
-optimum, and it is continuous where the floor fraction is a step — it rises from the first epoch,
-while `logvar_prior_floor_frac` stays at $0$ until mass actually reaches the margin. Read the two
-together: a large `prior_rate` at a zero floor fraction is a prior drifting off unit scale with room
-left, and a large one at a floor fraction near $1$ is the collapse the verdict already failed on.
+optimum, and it is continuous where the floor fraction is a step: `prior_rate` grows as soon as
+the prior leaves unit scale, while `logvar_prior_floor_frac` stays at $0$ until mass reaches the
+margin. Read the two together: a large `prior_rate` at a zero floor fraction is a prior off unit
+scale with room left, and a large one at a floor fraction near $1$ is a prior on its clamp.
 The expression is recomputed here rather than imported, because the training-side function reduces a
 whole batch to one scalar and this table needs it per sample; a test pins the two equal on the same
 inputs.
@@ -491,7 +492,7 @@ taken first.
 
 RMS metrics accumulate unrooted and root once. Averaging finished per-sample RMS values is biased
 low by Jensen, in the direction that flatters the model; the analysis reports the average-of-roots
-beside the rooted-once value, so the bias is a measured number rather than an assumed one. One
+beside the rooted-once value, so every run reports the size of the bias. One
 caveat weakens in the model's favour and is stated: both branches share one log-variance head
 applied to different $z$, rather than reading two separate variance heads.
 
@@ -502,8 +503,7 @@ the time domain, and that hides a distinction with clinical content: a forecast 
 baseline while flattening beat-to-beat variability and one that tracks variability while drifting on
 baseline score identically on mean squared error.
 
-**The construction is what makes it possible, and it is the reason this was deferred until now.**
-A single forecast block is $H \cdot R = 480$ samples; a Welch window that fits inside it puts the
+**The construction is what makes it possible.** A single forecast block is $H \cdot R = 480$ samples; a Welch window that fits inside it puts the
 whole $[0, 0.04)$ Hz deceleration span in the DC bin the detrend has already removed. Fixing a
 horizon step $\tau$ and concatenating over consecutive anchors instead yields a **contiguous,
 gap-free, non-overlapping** 4 Hz series: incrementing $t$ by one advances the block start by exactly
@@ -511,8 +511,8 @@ $R$, and each anchor contributes exactly $R$ consecutive samples, so slice $\tau
 over $[R(w+1+\tau),\,R(T_{\mathrm{valid}}+1+\tau))$ — $3840$ samples, $960$ s, every sample once.
 That identity is asserted against the model's own target builder rather than re-derived.
 
-Three things follow. The window is `nperseg = 512` (128 s), so $\Delta f = 7.8125$ mHz and four bins
-sit below $0.03$ Hz where the deferred design had one. **Lead time becomes an axis rather than a
+Three things follow. The window is `nperseg = 512` raw samples (`spectra.NPERSEG_STEPS = 32`
+decimated steps, 128 s), so $\Delta f = 7.8125$ mHz and four bins sit below $0.03$ Hz. **Lead time becomes an axis rather than a
 trade**: slice $\tau$ holds lead times $[4\tau + 0.25,\ 4\tau + 4]$ s and the thirty of them tile
 $0$–$120$ s, each at full frequency resolution — there is no STFT-inside-a-block compromise
 anywhere. And because `nperseg` and the hop are integer multiples of $R$, a window spans a whole
@@ -521,9 +521,9 @@ number of anchors, so its validity is an exact `all()` over the forecast mask.
 **A window touching a gap is dropped whole; nothing is interpolated.** `events` fills gaps before
 smoothing because a peak finder needs a continuous trace; a spectral estimate cannot take that
 trade, because the interpolant is a deterministic ramp whose own spectrum — concentrated low, absent
-high — would be attributed to the model in exactly the bands this is read for. The drop is proved
-rather than promised: poisoning every invalid anchor with $\pm 10^9$ leaves every accumulator
-bit-identical. The cost is reported three ways, and one consequence is that **this analysis's
+high — would be attributed to the model in exactly the bands this is read for. A test poisons
+every invalid anchor with $\pm 10^9$ and asserts that every accumulator stays bit-identical. The
+cost is reported three ways, and one consequence is that **this analysis's
 population may be smaller than `forecast`'s**, because whole-window validity is stricter than
 per-step validity. That is a real population difference, not a fault.
 
@@ -560,8 +560,8 @@ this analysis is the only place a ratio is formed — so within a recording the 
 **summed**, a named departure from `frames.per_recording_means`, which every other analysis uses.
 Averaging per-segment coherences would be wrong rather than merely different: coherence is exactly
 $1.0$ on a single window for any two signals whatever, and is biased upward by $(1-\gamma^2)/n_d$ at
-$n_d$ windows, of which one segment holds at most $14$. Both estimators ship side by side
-(`..._segment_mean`), so the size of that bias is measured on every run. Across recordings the chain
+$n_d$ windows, of which one segment holds at most $14$. Both estimators are emitted side by side
+(`..._segment_mean`), so every run reports the size of that bias. Across recordings the chain
 resumes as usual: one value per recording, unweighted, bootstrapped over recordings.
 
 **The phase is never averaged.** It is an angle; the mean of $-3.1$ and $+3.1$ radians is $0$, half
@@ -606,13 +606,13 @@ difference. A visible separation here is a reason to look.
 value per segment; the median / inter-quartile / range **strip** above it is one value per
 recording. Their difference *is* the pseudo-replication — a strip far narrower than the density
 beneath it says most of the visible spread is within-recording variation, and the density is
-showing roughly thirty views of the same delivery. The two levels take two different forms on
-purpose: a forty-bin density over a cohort's six recordings is a row of spikes that estimates
-nothing and takes the panel's y-limit with it.
+showing many views of the same delivery. The two levels take two different forms on purpose: a
+forty-bin density over a handful of recordings is a row of spikes that estimates nothing and
+takes the panel's y-limit with it.
 
-Four presentation choices are load-bearing. **Density rather than counts**, because the healthy
-cohort contributes an order of magnitude more segments than HIE and a count axis would report the
-cohort sizes rather than the metric; each curve's $n$ travels in the legend at both levels instead.
+Four presentation choices are load-bearing. **Density rather than counts**, because the cohorts
+differ greatly in segment count, and a count axis would report the cohort sizes rather than the
+metric; each curve's $n$ travels in the legend at both levels instead.
 **One bin grid per panel**, computed from the pooled values across the cohorts drawn in it — two
 histograms on two grids are not a comparison, and the difference between them can be the binning.
 And the **subgroup figure is nested rather than flat**: one column per clinical class, that class's
@@ -673,7 +673,12 @@ nothing.
 significance level is not one — and it is defined one layer down so the lag structure is cut on
 the same grid.
 
-The analysis emits **four** figures — two pages per readout, because `pred_gap` and the unfloored KL share a unit and not a scale, so a page carrying both draws the smaller as a flat line at the bottom of the larger's range. `time_to_delivery_trajectory_<readout>.pdf` is the median line per class with its inter-quartile ribbon; `time_to_delivery_windows_<readout>.pdf` is what that line is made of — a violin per (window, class) cell over one value per recording, the Holm-adjusted $p$ of each window directly beneath it on the same axis, and Cliff's delta for every class pair that survived. The tests were always run; until that page existed nothing drew them.
+The analysis emits **four** figures, two pages per readout, because `pred_gap` and the unfloored
+KL share a unit and not a scale. `time_to_delivery_trajectory_<readout>.pdf` is the median line
+per class with its inter-quartile ribbon. `time_to_delivery_windows_<readout>.pdf` shows what that
+line is made of: a violin per (window, class) cell over one value per recording, the
+Holm-adjusted $p$ of each window beneath it on the same axis, and Cliff's delta for every class
+pair that survived.
 
 ### second_stage
 
@@ -722,8 +727,9 @@ than approximate: fixing the horizon step. For a given $\tau$ exactly one anchor
 absolute raw sample there, so a per-$\tau$ rate counts each physiological event once by
 construction — a de-duplication pass applied afterwards would need a clustering tolerance, and
 that tolerance would be the answer. The usable interior is 240 of the 480 samples, because the
-ported detector drops any event within 30 s of either block end, and the measured
-pseudo-replication factor is 14 rather than the horizon's own 30.
+ported detector drops any event within 30 s of either block end. The record reports
+`pseudo_replication_factor` as the number of usable horizon steps, which is smaller than the
+horizon's own 30.
 
 **Contraction-triggered response**, against a count-matched per-recording random-trigger null
 passed through the **identical** min-over-window operator. The statistic is a minimum over a
@@ -746,16 +752,16 @@ event whose span touches one is then **dropped**, because its shape partly came 
 interpolation.
 
 The contraction onset is a **level crossing** of the peak's own prominence rather than a gradient
-walk-back, which is a deliberate correction to the ported detector and is named as such in the
-module: a gradient test stops at the apex, where the smoothed gradient is approximately zero, and
-a two-stage gradient walk stops mid-flank.
+walk-back, which departs from the ported detector and is named as such in the module: a gradient
+test stops at the apex, where the smoothed gradient is approximately zero, and a two-stage
+gradient walk stops mid-flank.
 
 ### sufficiency
 
 What the latent bottleneck costs the forecast:
 $\Delta_{\mathrm{suff}} = D_{\mathrm{base}} - D_{\mathrm{oracle}}$, where $D_{\mathrm{oracle}}$
 comes from an evaluation-only decoder of the same capacity reading `target_state` instead of $z$,
-fitted on half the evaluation recordings and scored on the other half. Until this exists,
+fitted on half the evaluation recordings and scored on the other half. Without this reference,
 `pred_gap` is a gap between two models rather than an information rate.
 
 **It is an estimate, not a bound**, and both bias directions travel in the emitted JSON rather
@@ -828,34 +834,33 @@ against a finished directory with no checkpoint — and it self-skips below two 
 
 These are the readings the numbers invite and do not support.
 
-**The coupling readout is not causal under the shipped configuration.** Under
-`causal_reach_budget_s: null` the input features at step $t$ read far into their own future; the
-reach guard is a 95%-energy quantile rather than a hard support, measured at roughly 20×
-suppression at 120 s rather than removal; and no finite budget is currently trainable. Every run
-carries the refusal sentence verbatim in `preflight.json` and `summary.json`.
+**The coupling readout is not causal.** The input features come from two-sided filters. Under
+`causal_reach_budget_s: null` no channel is pruned and no delay is applied, so the features at
+step $t$ read into their own future. A finite budget prunes channels and delays the survivors,
+but the reach it bounds is a 95%-energy quantile rather than a hard support, so it narrows the
+leak and does not close it. Every run carries `preflight.NOT_CAUSAL_STATEMENT` verbatim in
+`preflight.json` and `summary.json`, beside `max_channel_reach_s`, the configured
+`causal_reach_budget_s` and the per-block `channels_reading_past_the_horizon`.
 
 **Specificity is read in prediction space, not in KL space.** See `perm_control`:
-$K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is what a healthy model does, so a KL-space criterion
-would fail exactly the models it should pass.
+$K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is compatible with a recording-specific source
+pathway, so a KL-space criterion would fail such a model.
 
 **Only the unfloored KL may be read as a rate.** `source_conditioned_kl_train` has free bits
 applied per dimension per step before summing, so it exceeds the raw value by construction and
-hides a collapsed source pathway. The shipped `free_bits: 0.0` makes the two coincide today,
-which is exactly why the distinction lives in code: no headline path may resolve to it, asserted
-by test.
+hides a collapsed source pathway. At `free_bits: 0.0` the two coincide. A test asserts that no
+headline path resolves to the floored value.
 
 **Only an unpinned prior variance makes that rate meaningful.** A prior variance on its clamp
 inflates every coupling number while every decoder-side diagnostic stays healthy. Read
 `prior_variance_not_pinned` before quoting the KL.
 
 **The lag is the compensated lag** $\tau = 4(\ell + \delta)$, with $\delta$ read from
-`model.source_delay_steps` and nowhere else. There is no "original-sensor" twin of this figure: the
-stored UP/FHR timeline is canonical, the dataset builder's UP shift is part of the signal, and no
-reported lag adds it back or subtracts it. The historical misreadings came from a different place — two consumers once probed
-model internals under different names and disagreed by up to 30 steps, two minutes, with nothing
-raising. `tests/test_lag_consistency.py` now pins all four consumers by identity as well as by
-value. `source_delay_is_max_over_channels` travels beside every reported lag, because per-channel
-delays have no single representative and the maximum makes every figure an upper bound.
+`model.source_delay_steps` and nowhere else. `lag_axis.compensated_seconds_axis` builds the axis
+through the shared converter `lag_attn.nets.lag_report.lag_compensated_seconds`, and
+`tests/test_lag_consistency.py` pins every consumer to it by identity as well as by value.
+`source_delay_is_max_over_channels` travels beside every reported lag, because per-channel delays
+have no single representative and the maximum makes every figure an upper bound.
 
 **A per-segment histogram is a description, not a cohort difference.** `distributions` is the one
 analysis that draws the segment-level population directly, and it exists because the shape is
@@ -865,7 +870,7 @@ answers the question on per-recording values. Its own figures draw the per-recor
 over the per-segment one so the gap between the two is on the page rather than in this paragraph.
 
 **Anchors are not independent, and every statistic is per recording.** Consecutive anchors'
-forecast windows overlap in 29 of their 30 horizon steps and one GUID contributes up to ~37
+forecast windows overlap in 29 of their 30 horizon steps and one GUID contributes many
 segments, so per-segment $p$-values are anticonservative by that factor. The chain is: per anchor
 → support-weighted mean within a segment → unweighted mean over a GUID's segments → across GUIDs.
 A segment scoring zero anchors is excluded and **counted**, never averaged in as `0.0` — the
@@ -981,9 +986,7 @@ are reported rather than filtered: an implied onset falling *at delivery*, which
 writes when it substitutes zero for a missing time, and an implied onset that *moves* across a
 recording's own segments by more than the 1 s float32 tolerance, which can only come from a broken
 write. Excluding those recordings would change the population every number on that clock is computed
-over while the numbers themselves went on looking ordinary; a count does not. If a later reading
-shows they distort the trajectory, the eligibility rule is one predicate away — and the count is what
-would say so.
+over while the numbers themselves went on looking ordinary; a count does not.
 
 ## Operations
 
@@ -1041,11 +1044,11 @@ index.
 
 | Refusal begins | Cause | Recovery |
 |---|---|---|
-| `dataset_config still carries the` | A shard or statistics path is still a `REPOINT_ME` placeholder. Checked **first**, so the message names the real cause rather than a missing file someone would then go looking for. | Point `vae_test_datasets` at the shared k-fold holdout split and `stat_path` at statistics regenerated from the same dataset at `trim_minutes: 1.0`. |
-| `dataset_config.vae_test_datasets is empty` | No evaluation shard is configured. | Set the eight holdout subgroup shards in the override delta. |
-| `dataset_config.vae_test_datasets names shard(s) that do not exist` | A configured shard is absent. When the containing directory is absent too, the message adds the two dataset build modes. | Build the dataset in `holdout` mode: the default `augmented` mode writes per-fold test splits and no shared `test/` directory, and a per-fold split is not a substitute — one pool, no fold loop, no double counting. |
+| `dataset_config still carries the` | A shard or statistics path still contains the `REPOINT_ME` placeholder (`preflight.REPOINT_MARKER`). Checked **first**, so the message names the real cause rather than a missing file. | Point `vae_test_datasets` at one HDF5 per canonical subgroup and `stat_path` at statistics regenerated from the same dataset at `trim_minutes: 1.0`. |
+| `dataset_config.vae_test_datasets is empty` | No evaluation shard is configured. | Set one shard per canonical subgroup in the override delta. |
+| `dataset_config.vae_test_datasets names shard(s) that do not exist` | A configured shard is absent. When the containing directory is absent too, the message names the two dataset build modes: `augmented` (the default) writes a per-fold test split inside each fold's directory, and `holdout` writes a shared `test/` directory. | Build the missing shards, or point `vae_test_datasets` at shards that exist. |
 | `dataset_config.dataloader_config.dataset_kwargs.trim_minutes must be` | Not `1.0`. The whole raw-index geometry — the forecast of anchor $t$ starting at raw sample $16(t+1)$ — assumes the trimmed grid; untrimmed it starts at $16(t+16)$, one full minute later, and nothing fails loudly. | Set `trim_minutes: 1.0`, and confirm the statistics file was computed on the same grid (a mismatch there only warns). |
-| `dataset_config.dataloader_config.dataset_kwargs.load_fields is missing` | One of the five clinical fields is absent. The loader **skips** a field a shard does not carry, silently, so this presents downstream as "no classes found" or "no trajectory data" rather than as a data problem. | Merge the committed override delta, which adds `target`, `epoch`, `cs_label`, `bg_label` and `time_from_labor_onset`. |
+| `dataset_config.dataloader_config.dataset_kwargs.load_fields is missing` | One of the six clinical fields (`preflight.REQUIRED_EVAL_LOAD_FIELDS`) is absent. The loader **skips** a field a shard does not carry, silently, so this presents downstream as "no classes found" or "no trajectory data" rather than as a data problem. | Merge the committed override delta, which adds `target`, `epoch`, `cs_label`, `bg_label`, `time_from_labor_onset` and `second_stage_onset`. |
 | `the config disagrees with the checkpoint it is evaluating` | A geometry or objective key in the config contradicts the checkpoint's own `model_kwargs` / `hyper_parameters`. The checkpoint always wins, so the config's values would be reported beside numbers they did not produce. | Evaluate the checkpoint against its own `resolved_config.yaml`, which the training run writes beside it. ($\beta$ and its ramp are recorded and deliberately not compared: they weight the training total and enter no evaluated readout.) |
 | `every witness tensor in this model is still exactly at the value the constructor gave it` | No checkpoint weights reached the model. `load_checkpoint_strict` returns `None` rather than raising, so an unchecked load would report randomly initialised weights as a measurement. | Check the checkpoint path and that its state dict aligns. This is a weight-space check, not a behavioural one: a genuinely trained model whose *source pathway* collapsed still has nonzero weights here and passes, because that finding must be reported rather than refused. |
 | reused guard: `stat_path` | The normalisation statistics file is missing or unreadable. | The trainer's own message names the command that regenerates it. |
@@ -1055,15 +1058,16 @@ index.
 
 ### Dependencies
 
-No new ones. `torch`, `numpy`, `pandas`, `matplotlib`, `h5py`, `pyyaml` and `loguru` are already
-in use; `scipy` is imported lazily at each call site; `pyarrow` is pinned in `requirements.txt`
-and carries the per-anchor table, so there is one format and no fallback branch. `verify.py`
-needs none of them except `pyyaml`, and that only for the arm tables — the acceptance gate itself
-is a stdlib parse.
+The pipeline uses `torch`, `numpy`, `pandas`, `matplotlib`, `h5py`, `pyyaml` and `loguru`.
+`scipy` is imported lazily at each call site. `pyarrow` is pinned in `requirements.txt` and
+carries the per-anchor table, so there is one format and no fallback branch. `verify.py` needs
+none of them except `pyyaml`, and that only for the arm tables; the acceptance gate itself is a
+stdlib parse.
 
-### The gate
+### Tests
 
-From the repository root:
+The package tests run from the repository root. The `slow` marker is registered in
+`tests/conftest.py`:
 
 ```bash
 .venv/Scripts/python.exe -m pytest teb_vae/lag_attn_rws/tests -q -m "not slow"

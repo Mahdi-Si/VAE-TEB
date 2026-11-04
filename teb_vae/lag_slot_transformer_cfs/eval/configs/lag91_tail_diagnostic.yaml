@@ -37,7 +37,6 @@
 #   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <ckpt> \
 #       --overrides teb_vae/lag_slot_transformer_cfs/eval/configs/lag91_tail_diagnostic.yaml
 #   ... --num-samples 8      (and)     ... --num-samples 128
-# The runbook is section 7.3 of eval/EVAL.md.
 
 general_config:
   batch_size:
@@ -45,8 +44,8 @@ general_config:
 
 dataset_config:
   # REPOINT THESE, as in eval_overrides.yaml: the causal integer-operator k-fold holdout shards
-  # and the statistics file accumulated from them. For the epoch-1002 diagnostic use exactly the
-  # shard list that run's summary.json records under config_overrides, so the panel is the same.
+  # and the statistics file accumulated from them. For a diagnostic of an existing run, use exactly
+  # the shard list that run's summary.json records under config_overrides, so the panel is the same.
   vae_test_datasets:
     - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
     - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5

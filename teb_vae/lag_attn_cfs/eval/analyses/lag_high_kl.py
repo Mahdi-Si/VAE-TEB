@@ -3,8 +3,8 @@ r"""The lag structure of the anchors that carry the coupling, selected by their 
 Every lag readout in this pipeline averages a segment's anchors together before it reads a lag
 position -- ``lag_kl`` pools them over a recording, ``lag_clocks`` and ``lag_kld_scaled`` per
 segment before placing it on a clock. On this family that average is dominated by anchors whose
-KL is the availability clock and little else: the diagnosed runs put $67$--$92\%$ of the coupling
-readout in a term that survives zeroing the source, spread over every anchor of every segment. The
+KL is the availability clock and little else: a large share of the coupling readout can sit in
+a term that survives zeroing the source, spread over every anchor of every segment. The
 anchors at which the source actually informed the future are the minority with a large $K_t$, and
 their lag profile is what the pooled one dilutes.
 

@@ -7,10 +7,9 @@ wavelet transforms. The value of a scattering or phase-harmonic channel at decim
 weighted average over raw samples on *both* sides of $t$, so a model told it is conditioning on
 "the past up to $t$" is in fact reading part of the interval it is being asked to forecast.
 :mod:`teb_vae.lag_attn.channel_reach` measures that violation per channel as the forward reach
-$L_{95}$ -- the slowest ``fhr_st`` channel reads $965$ s into its own future -- and
-``teb_vae/lag_attn_rws/DESIGN.md`` S7 records both the current mitigation (drop channels past a
-budget, read the survivors stale) and its limit: *"The guard bounds the leak; it does not remove
-it... Only genuinely causal transforms remove the leak."*
+$L_{95}$ -- the slowest ``fhr_st`` channel reads $965$ s into its own future. The two-sided models
+mitigate the violation: they drop the channels past a reach budget and read the survivors stale.
+That guard bounds the leak, but it does not remove it. Only causal transforms remove the leak.
 
 This module builds those genuinely causal transforms, plus an explicit two-sided implementation of
 the same chain so the causal effect can be separated from any reimplementation difference:
@@ -67,9 +66,8 @@ Filter design decisions that are correctness, not taste
 * **Normalisation is kymatio's** ``normalize='l1'``: unit $L^1$ norm in time
   (``kymatio/scattering1d/filter_bank.py::get_normalizing_factor``). For an analytic filter with a
   non-negative envelope this makes the peak gain exactly $1$, so a dB overlay of the two banks
-  compares stopbands directly. It also lets ``SCATTERING_PHASE_HARMONIC_MATH_Complete.md`` S19.3's
-  argument -- a fixed per-channel affine factor is absorbed by the pipeline's ``asinh``/``log``
-  statistics -- carry over to the causal bank unchanged.
+  compares stopbands directly. It also lets one argument carry over to the causal bank unchanged:
+  the pipeline's ``asinh``/``log`` statistics absorb a fixed per-channel affine factor.
 * **Decimation is plain subsampling.** kymatio periodises the spectrum; mean-periodisation
   followed by an $M/d$-point inverse DFT is *exactly* time subsampling, and $1456/16 = 91$ lands
   the decimated grid on raw index $0$. Subsampling is used here because taking every $16$-th
@@ -77,14 +75,14 @@ Filter design decisions that are correctness, not taste
 
 The one deliberate deviation, and how it is pinned
 ---------------------------------------------------
-``SCATTERING_PHASE_HARMONIC_MATH_Complete.md`` S15.3 documents that production's
-``_apply_phi_filter`` **truncates** the spectrum to the first $M/d$ bins instead of periodising it,
-so the stored phase block is $d$ times the *analytic projection* of the smoothed product rather
-than $\Re\{(\cdot)\star\phi\}$. :func:`phase_block` therefore takes a ``phi_mode``:
+Production's ``_apply_phi_filter`` **truncates** the spectrum to the first $M/d$ bins instead of
+periodising it, so the stored phase block is $d$ times the *analytic projection* of the smoothed
+product rather than $\Re\{(\cdot)\star\phi\}$. :func:`phase_block` therefore takes a ``phi_mode``:
 ``'kymatio_truncate'`` reproduces that operator step for step, so arm B can validate against arm A
 on the phase blocks too, and ``'exact'`` applies the documented definition. The ratio between the
-two modes of the *same* code is the measured S15.3 deviation -- an exact per-channel number rather
-than an inference. On the diagonal ($i = j$, product real) it must land in $[d/2, d] = [8, 16]$.
+two modes of the *same* code is the measured phase-smoothing deviation -- an exact per-channel
+number rather than an inference. The ratio has no fixed bound, so the exact check is the identity
+between the truncating operator and $d$ times the analytic projection.
 
 What this module is for now
 ---------------------------
@@ -148,17 +146,13 @@ GAMMATONE_ORDER = 4
 #: as a channel's staleness; the alignment shift and the forecast clock scale differences by this
 #: factor.
 #:
-#: **It is a convention, not a universal content delay** (2026-09-05 review, CFS-05). Which
+#: **It is a convention, not a universal content delay.** Which
 #: summary a filtered signal realises depends on the signal: a steady ramp through the actual
 #: low-pass is delayed by the tap-weighted MEAN ($13.30$ s, not the centroid's $11.64$ s), and a
 #: $1/8000$ Hz amplitude modulation through the slow wavelet and low-pass is delayed by
 #: $401.4$ s -- the full composed group delay $402.16$ s, $49.5$ s later than $\kappa\tau_g$
-#: predicts. Both are pinned in ``tests/test_phase_operator.py``. The earlier justification
-#: (the passband can only pull the realised lag down; a median realised/reported ratio of
-#: $0.903$ over 30 aligned-shard segments) describes an empirical average over particular
-#: real-data content and does not establish the factor for every channel or every input.
-#: Consumers must state it as an approximate content-delay summary and never as an exact
-#: physiological timestamp; calibrating it against measured probes is CFS-05's open item.
+#: predicts. Both are pinned in ``tests/test_phase_operator.py``. Consumers must state it as an
+#: approximate content-delay summary and never as an exact physiological timestamp.
 ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
 
 #: Forecast horizon, in decimated steps, at which LEGACY shards' ``causal_novelty_frac`` attribute
@@ -166,7 +160,7 @@ ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
 #: attribute: a shard now stores the horizon-free ``causal_novelty_curve`` (:func:`novelty_curve`)
 #: and the model side looks its own horizon and clock up in it, because a forecast horizon is a
 #: model-side choice and a dataset must not bake one in. Kept so a consumer of an old shard can
-#: name the gather its scalar was computed for (CFS-08).
+#: name the gather its scalar was computed for.
 LEGACY_NOVELTY_HORIZON_STEPS = 30
 
 #: Causal kernel length in taps. Measured requirement, not a guess: at the corrected rate
@@ -189,8 +183,8 @@ PHASE_REL_TOL = 0.05
 #: branch: two inputs $re^{i(\pi-\epsilon)}$ and $re^{i(-\pi+\epsilon)}$ converge to one complex
 #: number as $\epsilon \to 0$ while their images stay $2r|\sin(\pi p)| \approx 1.03r$ apart at
 #: $p = 2^{3/2}$. Forming the power in polar coordinates avoids exponentiating the modulus; it
-#: does nothing for the angle, so the 2026-09-05 review's finding stands and the legacy operator
-#: is retained ONLY so existing shards, statistics and checkpoints keep their original meaning.
+#: does nothing for the angle, so the discontinuity remains, and the legacy operator is retained
+#: ONLY so existing shards, statistics and checkpoints keep their original meaning.
 #:
 #: ``'integer_harmonic_v1'`` is the corrected operator: the harmonic index $k \in \{2, 4\}$ is an
 #: explicit **integer** stored per pair (``sel_harmonic``), the exponent is that integer, and the
@@ -1455,9 +1449,9 @@ def smooth_products_kymatio(
 
     Reflect-pad the length-$N$ complex product back to $M$, multiply by $\hat\phi$, **truncate** to
     the first $M/d$ bins, invert at that length, and slice ``[pad_left//d : +N//d]``. The truncation
-    -- rather than the periodisation kymatio's own scattering path uses -- is the deviation
-    ``SCATTERING_PHASE_HARMONIC_MATH_Complete.md`` S15.3 documents: the result is $d$ times the
-    analytic (positive-frequency) projection of the smoothed product, not
+    -- rather than the periodisation kymatio's own scattering path uses -- is the phase-smoothing
+    deviation: the result is $d$ times the analytic (positive-frequency) projection of the smoothed
+    product, not
     $\Re\{(\cdot) \star \phi\}$.
 
     Reproducing it here rather than describing it is what lets arm B validate against arm A on the
@@ -1897,7 +1891,7 @@ def novelty_curve(
     $t + 1 + h + s_c$ from anchor $t$ draws $N_c(1 + h + s_c)$ of its envelope mass from samples
     after the anchor; :func:`novelty_fraction` is that lookup at the last horizon element.
 
-    **What it is not** (2026-09-05 review, CFS-08). Not an exact decomposition of a nonlinear
+    **What it is not.** Not an exact decomposition of a nonlinear
     coefficient into "known" and "new" value fractions -- the modulus and the phase product are
     nonlinear in the raw samples, so envelope mass bounds sensitivity only up to the amplitude and
     cancellation of the actual signal -- and not a measured prediction error. For a phase channel
@@ -2159,8 +2153,8 @@ def transform_sample(
     Dispatches on the bank type so a caller can run arm B and arm C through one call site and be
     sure the only difference is the filters.
 
-    ``fhr_up_ph`` is deliberately not produced: ``teb_vae/lag_attn_rws/DESIGN.md`` S2 records that
-    it is never loaded, because a cross-channel coefficient mixes both signals in one number and
+    ``fhr_up_ph`` is deliberately not produced: no model loads it, because a cross-channel
+    coefficient mixes both signals in one number and
     would destroy the separation between the target-only prior and the source-conditioned
     posterior.
 

@@ -1,7 +1,7 @@
 r"""Measure the UA source and FHR target quality masks on a built dataset, as training reads them.
 
 The transformer cfs model (``teb_vae/lag_attn_transformer_cfs``) reads three masks from a
-signal-quality build (``research_notes/UA_QUALITY_MASK_DESIGN.md`` sections 4.10 and 4.11):
+signal-quality build:
 
 * **The source key mask.** The loader's ``ua_step_mask`` gives a validity $v_{s,c}$ per UA
   coefficient. The model ANDs it over the kept source channels $\mathcal K$,

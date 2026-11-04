@@ -5,9 +5,8 @@ axis". ``physical_lag_seconds`` answers a different question -- how far apart ar
 epochs the source and target coefficients summarise -- and it needs an input the other does not
 take: one composed group-delay reference per stream, in seconds.
 
-**The stored timeline is canonical.** No test here carries a sensor-timeline or dataset-shift
-term, and the identity has none: a version that reintroduced a constant offset fails the
-equal-reference case below, which pins the answer to the bare grid term.
+The identity carries no constant offset: a version that added one fails the equal-reference
+case below, which pins the answer to the bare grid term.
 
 The two regimes the identity has to reproduce, both asserted below:
 
@@ -25,7 +24,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from teb_vae.lag_attn.nets import lag_report
 from teb_vae.lag_attn.nets.lag_report import (
     SECONDS_PER_STEP,
     lag_compensated_seconds,
@@ -36,16 +34,6 @@ from teb_vae.lag_attn.nets.lag_report import (
 #: slowest kept target channel and therefore the clock both streams are shifted onto. Written out
 #: rather than resolved from a shard, because this file tests arithmetic and not a dataset.
 SHIPPED_REFERENCE_S = 402.1604
-
-
-def test_the_module_carries_no_dataset_shift_term():
-    """The builder's UP shift is part of the stored signal, and nothing downstream undoes it.
-
-    Pinned by name so a helper that undoes it cannot come back under the old names: a reader who
-    finds this test knows the absence is a decision rather than an omission.
-    """
-    for forbidden in ("MECHANICAL_SHIFT_SECONDS", "lag_original_sensor_seconds"):
-        assert not hasattr(lag_report, forbidden), forbidden
 
 
 def test_equal_references_leave_the_grid_term_alone():

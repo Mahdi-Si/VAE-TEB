@@ -93,7 +93,14 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
     # Plus the one density key only this cell's final revision (2026-09-23) configures, the
     # posterior event gate (2026-10-13) and the UA quality mask (2026-10-25), which this cell's
     # config alone declares.
-    final_revision_keys = {"forecast_ar_residual", "posterior_event_gate", "source_quality_mask"}
+    # Plus the two 2026-11-04 next-step keys, the AR(1) bound and the multi-lag persistence skip.
+    final_revision_keys = {
+        "forecast_ar_residual",
+        "posterior_event_gate",
+        "source_quality_mask",
+        "forecast_ar_max",
+        "persistence_lags",
+    }
 
     assert set(GEOMETRY_KEYS) == (
         (set(CFS_GEOMETRY_KEYS) - {"causal_norm"}) | encoder_keys | final_revision_keys

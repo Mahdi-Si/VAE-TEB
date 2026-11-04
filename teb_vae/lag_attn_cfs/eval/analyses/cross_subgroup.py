@@ -68,7 +68,7 @@ SIGNIFICANCE_FILENAME = "cross_subgroup_significance.csv"
 PAIRWISE_FILENAME = "cross_subgroup_pairwise.csv"
 RESULT_FILENAME = "cross_subgroup.json"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 HEATMAP_FIGURE = "subgroup_heatmap"
 
 #: Family-wise error rate the Holm correction controls. Deliberately not an ``eval_config`` key:

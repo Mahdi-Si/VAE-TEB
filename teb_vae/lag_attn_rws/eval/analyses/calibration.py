@@ -67,7 +67,7 @@ PIT_FILENAME = "calibration_pit.csv"
 LOGVAR_FILENAME = "calibration_logvar.csv"
 PER_RECORDING_FILENAME = "calibration_per_recording.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 PIT_FIGURE = "pit_reliability"
 LOGVAR_FIGURE = "logvar_distribution"
 

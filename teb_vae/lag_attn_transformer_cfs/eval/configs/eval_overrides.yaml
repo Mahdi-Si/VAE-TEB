@@ -368,15 +368,11 @@ eval_config:
   # per recording, bootstrapped over recordings, and `coupling_exceeds_availability_clock` FAILs
   # when the lower end of that interval does not clear this key.
   #
-  # UNSET AGAIN, because no run of the model this cell now trains has measured it. The previous
-  # 0.15 sat just below the bootstrap interval [0.157, 0.164] of Delta_clock = 0.160 nats per
-  # anchor, measured on the H = 15 diagnosed run, on the UNALIGNED arm. THIS CELL has moved since:
-  # the horizon is 30, the lag attention reads the pointwise adapter over max_lag 37, and the
-  # posterior event gate makes the KL exactly zero at every closed step, so the per-anchor scale of
-  # this difference is not the one 0.15 was set against. A threshold carried across that change
-  # would decide a FAIL or a PASS on exactly the run that has to measure it, and nobody could tell
-  # a healthy model failing from a broken one passing -- the reason it shipped null before it was
-  # first set.
+  # UNSET, because no run of the shipped geometry has measured it: the horizon is 30, the lag
+  # attention reads the pointwise adapter over max_lag 37, and the posterior event gate makes the
+  # KL exactly zero at every closed step. A threshold set before that run would decide a FAIL or a
+  # PASS on exactly the run that has to measure it, and nobody could tell a healthy model failing
+  # from a broken one passing.
   #
   # At null the verdict is INCONCLUSIVE, and Delta_clock, both interval ends and the positive
   # fraction are still emitted (`coupling_minus_clock_nats` in the headline block). Set it from the
@@ -428,8 +424,8 @@ eval_config:
   # a typo is refused at config load with the supported set named, before the model is built.
   #
   # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
-  # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
-  # `.pdf` filenames, so a run that changes this writes filenames those files do not list. Change
+  # default is load-bearing: the committed `figure_manifest.json` records `.pdf` filenames, so a
+  # run that changes this writes filenames the manifest does not list. Change
   # it for a one-off export, not as the committed setting, unless you also update the manifest.
   #
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;

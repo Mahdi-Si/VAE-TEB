@@ -51,10 +51,10 @@ constructor and
 it, both shared with the conv-LSTM cell of this row.
 
 The unit consequence, restated where a reader will look for it: the reconstruction is summed over
-$H \cdot R = 15 \times 16 = 240$ raw samples, against the conv-Transformer raw-signal parent's
-$30 \times 16 = 480$ and against the causal-feature cell's $15 \times 98 = 1470$ coefficients, so the
-nats are comparable to neither. They *are* comparable against ``lag_attn_crws``, which ships the
-identical geometry and differs only in which encoder reads the inputs.
+$H \cdot R = 30 \times 16 = 480$ raw samples, the same block as the conv-Transformer raw-signal
+parent's, so a per-anchor block score is comparable across that edge. A per-step loss is comparable
+only against ``lag_attn_crws``, which ships the identical geometry and tiling and differs only in
+which encoder reads the inputs.
 """
 from __future__ import annotations
 
@@ -68,8 +68,8 @@ from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 class SeqVaeLagAttnTrfCrws(CausalRawInputs, SeqVaeLagAttnTrfRws):
     r"""Single-latent lag-attentive conv-Transformer VAE forecasting raw samples from one-sided inputs.
 
-    Constructed exactly as :class:`SeqVaeLagAttnTrfRws` is -- same keywords, same defaults, same
-    refusals -- except that ``target_delays`` and ``source_delays`` are gone and six keywords of
+    Constructed exactly as :class:`SeqVaeLagAttnTrfRws` is -- same keywords, same defaults apart
+    from the causal geometry and ``horizon_film``, same refusals -- except that ``target_delays`` and ``source_delays`` are gone and six keywords of
     this input domain take their place -- the two warm-up vectors, the two alignment shifts, the
     anchor stride and the lag floor. Removing the two is the point: a warm-up is a leading *mask*
     and ``ChannelDelay`` is a *shift*, so a warm-up routed under a delay name would train a different
@@ -101,7 +101,7 @@ class SeqVaeLagAttnTrfCrws(CausalRawInputs, SeqVaeLagAttnTrfRws):
         decoder_hidden: int = 128,
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
-        horizon_film: bool = False,
+        horizon_film: bool = True,
         horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
@@ -144,11 +144,16 @@ class SeqVaeLagAttnTrfCrws(CausalRawInputs, SeqVaeLagAttnTrfRws):
         Every keyword the architecture parent takes is forwarded unchanged or renamed; only the
         six below are
         this input domain's, and only ``target_delays`` / ``source_delays`` are gone. The defaults
-        that differ from the parent's -- ``horizon`` $15$, ``warmup_period`` $134$, ``c_y`` $102$,
-        ``c_u`` $51$ -- are the causal dataset's geometry rather than a preference, and a run that
-        left them at the parent's values would be describing a dataset that does not exist.
+        that differ from the parent's -- ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ --
+        are the causal dataset's geometry rather than a preference, and a run that left them at the
+        parent's values would be describing a dataset that does not exist. ``horizon`` is $30$, the
+        same as the parent's.
 
-        Note which of those four the *target* forces: none of them. A raw sample is honest at every
+        ``horizon_film`` defaults to ``True``, as the shipped configuration sets it. The horizon
+        core is always built with per-block FiLM, and per-block FiLM requires FiLM, so a
+        ``False`` default would make the all-defaults constructor raise.
+
+        Note which of those three the *target* forces: none of them. A raw sample is honest at every
         step, so no validity constraint ties the floor to the resolved budget here; the values are
         held at the conv-LSTM cell's so that the two cells of this row differ in exactly one
         variable -- which encoder reads the inputs.

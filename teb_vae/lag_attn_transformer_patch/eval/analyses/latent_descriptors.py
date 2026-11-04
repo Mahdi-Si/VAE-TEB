@@ -1,4 +1,4 @@
-r"""``latent_descriptors`` -- which clinical descriptors of the recent raw trace the latent carries linearly (E1-L).
+r"""``latent_descriptors`` -- which clinical descriptors of the recent raw trace the latent carries linearly.
 
 **Question.** Grouped-CV ridge R² from ``mu_prior``, ``mu_post`` and ``delta_mu = mu_post - mu_prior`` to
 raw-signal descriptors of the window that ends at the latent's own step.

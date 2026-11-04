@@ -54,7 +54,7 @@ PER_RECORDING_FILENAME = "sufficiency_per_recording.csv"
 SUMMARY_FILENAME = "sufficiency_summary.csv"
 CURVE_FILENAME = "oracle_training_curve.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure stem.
 SUFFICIENCY_FIGURE = "sufficiency"
 
 #: The three block scores compared, as ``(column, label)``. All three are Monte Carlo marginalised
@@ -68,7 +68,7 @@ SCORE_COLUMNS: Tuple[Tuple[str, str], ...] = (
 )
 
 #: The short names the score violins are ticked with. The labels above travel in the records; the
-#: page carries the one word each, and ``FIGURE_GUIDE.md`` says what they stand for.
+#: page carries the one word each.
 SCORE_TICKS: Dict[str, str] = {
     "nll_oracle_block": "oracle",
     "mc_nll_base_block": "base",

@@ -664,7 +664,7 @@ def recovery_record(
         )
 
     # The clock-excess profile, which is the readout this fixture now also has to qualify. The
-    # matched attribution was 67.5% availability clock on the diagnosed run, and the clock is a
+    # matched attribution can be mostly availability clock, and the clock is a
     # deterministic function of $t$ readable from the source state at ANY lag -- so the matched
     # profile is not expected to find the plant, and whether the clock-EXCESS one does is the
     # open question this block exists to answer.
@@ -712,8 +712,8 @@ def recovery_record(
         "band_share_support_corrected": band_share(corrected, band),
         # Per readout, so a reader sees WHICH instrument found the plant rather than only whether
         # the one the exit code is wired to did. Deliberately not part of ``recovered`` and
-        # deliberately not asserted by the suite: the pass line is unchanged so that every gate
-        # already recorded in RESULTS.md stays comparable across this change.
+        # deliberately not asserted by the suite: the pass line stays the pooled support-corrected
+        # argmax, so gates read before and after these readouts were added stay comparable.
         "recovered_by": {
             "kl_support_corrected": bool(recovered),
             "clock_excess": _in_band(

@@ -554,17 +554,12 @@ def main(
         runner, runner.to_device(health_batch), floor=float(eval_config["health_probe_floor"])
     )
     # Every lag figure converts its axis with this convention, recorded here so a run states it
-    # rather than leaving it to be reconstructed. The stored UP/FHR timeline is canonical: the
-    # dataset builder's UP shift is part of the stored signal and no downstream quantity undoes it,
-    # so there is no offset term at all. A run written before this was settled carries an
-    # ``up_shift_secs`` entry here; its seconds axes are on a timeline this pipeline no longer uses.
+    # rather than leaving it to be reconstructed. The axes are on the stored UP/FHR timeline,
+    # with no offset term.
     preflight_record["lag_seconds_convention"] = {
         "step_seconds": float(metrics.STEP_SECONDS),
         "formula": "seconds = step_seconds * lag",
-        "timeline": (
-            "stored (canonical): the dataset builder's UP shift is part of the signal and is "
-            "never undone downstream"
-        ),
+        "timeline": "stored",
     }
     preflight.write_preflight(preflight_record, results_dir)
     report.set("preflight", preflight_record)

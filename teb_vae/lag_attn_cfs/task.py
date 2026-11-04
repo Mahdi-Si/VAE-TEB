@@ -668,14 +668,46 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             batch_idx: Index of the current batch.
             stage: ``'train'``, ``'val'`` or ``'test'``.
 
+        On the evaluation stages it also derives ``coupling_minus_clock``,
+        $\texttt{source\_conditioned\_kl\_raw} - \texttt{kld\_source\_null}$: the part of the KL that
+        depends on the source values, in nats per anchor, so a run can select a checkpoint on it.
+
         Returns:
             ``(loss, metrics)``, the inherited pair.
         """
         self._stage = stage
         try:
-            return super().compute_loss_and_metrics(batch, batch_idx, stage)
+            loss, metrics = super().compute_loss_and_metrics(batch, batch_idx, stage)
         finally:
             self._stage = DENSE_STAGES[0]
+        if "kld_source_null" in metrics and "source_conditioned_kl_raw" in metrics:
+            metrics["coupling_minus_clock"] = (
+                metrics["source_conditioned_kl_raw"].detach() - metrics["kld_source_null"]
+            )
+        return loss, metrics
+
+    def _source_null_penalty(
+        self,
+        inputs: Tuple[Any, ...],
+        forward_outputs: Dict[str, torch.Tensor],
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""The source-null KL with gradient, for the objective's ``lambda_source_null`` term.
+
+        ``inputs[2]`` is the source stream at its declared width, as :meth:`_build_forward_inputs`
+        assembles it, so this task can name the tensor the base task refuses to guess.
+
+        Args:
+            inputs: The forward's positional arguments.
+            forward_outputs: That forward's dict.
+            weight: Decimated validity signal $(B, T)$.
+
+        Returns:
+            $\mathrm{KL}(q^{\varnothing} \Vert p)$ in nats per anchor, carrying gradient.
+        """
+        return controls.source_null_kld_with_grad(
+            self.orig_model, forward_outputs, inputs[2], weight
+        )
 
     #: The stage the next :meth:`_build_forward_inputs` resolves its anchor geometry from. A class
     #: attribute so it exists before the first step and on a task nothing has stepped, and one of

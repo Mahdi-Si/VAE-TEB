@@ -186,11 +186,7 @@ eval_config:
     lag_31_60: [31, 60]
     lag_61_90: [61, 90]
 
-  # There is deliberately NO `up_shift_secs` key. The stored UP/FHR timeline is canonical: the
-  # dataset builder shifts the UP channel when it writes the shards, that shift is part of how the
-  # stored signals are, and no lag axis, column or record downstream adds it back or subtracts it.
-  # Every lag figure reads seconds = 4 * lag. A config that names the removed key is refused as an
-  # unknown key rather than silently honoured.
+  # Every lag figure reads seconds = 4 * lag on the stored UP/FHR timeline.
 
   # Floor on the load health probe's `residual_ratio` -- the masked RMS of delta_mu_src relative
   # to the full forecast. Below it the probe WARNS and records; it never raises. A genuinely

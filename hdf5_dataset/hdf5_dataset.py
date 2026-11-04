@@ -1359,8 +1359,7 @@ class CombinedHDF5Dataset(Dataset):
     with their own per-channel statistics. ``up_ph`` is no longer virtually
     sliced from ``fhr_up_ph`` — each field flows through the same
     normalisation code path. The two self-phase fields also carry ``sel_*``
-    attrs describing which wavelet pair each channel came from; see
-    ``PHASE_HARMONIC_CHANNEL_SELECTION.md``.
+    attrs describing which wavelet pair each channel came from.
 
     **The causal valid region.** A one-sided filter reads only the past, so
     before its warm-up has passed a channel's output is a function of the

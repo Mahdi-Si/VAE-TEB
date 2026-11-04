@@ -191,7 +191,7 @@ def test_a_finished_fitting_stage_is_not_overwritten_in_place(scratch, stage):
 
 
 def test_a_finished_run_can_still_be_re_reported(scratch):
-    """§12's own instruction: regenerate presentation from saved artifacts without refitting."""
+    """Regenerate presentation from saved artifacts without refitting."""
     opened = _open(scratch, stages=("extract", "report"))
     for stage in ("extract", "report"):
         pilot_config.mark_completed(opened["state"], stage, opened["run_dir"])

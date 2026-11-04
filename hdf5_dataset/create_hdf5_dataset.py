@@ -19,7 +19,7 @@ Two ways its output differs from the new pipeline's, both load-bearing:
 
 Datasets produced here are therefore **not** interchangeable with new-pipeline
 output. Do not extend this file; new channel-selection work belongs in
-``create_new_pipeline.py``. See ``hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md``.
+``create_new_pipeline.py``.
 """
 
 from sklearn.model_selection import train_test_split, StratifiedKFold, KFold

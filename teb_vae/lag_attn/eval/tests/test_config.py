@@ -160,13 +160,6 @@ def test_bad_health_probe_floor_raises(floor):
         validate_eval_config(_config_with({"health_probe_floor": floor}))
 
 
-def test_the_removed_up_shift_key_is_refused_as_unknown():
-    """The stored timeline is canonical, so a config still naming the removed ``up_shift_secs``
-    key must fail loudly rather than be honoured or ignored."""
-    with pytest.raises(ValueError, match="unknown eval_config key"):
-        validate_eval_config(_config_with({"up_shift_secs": -20.0}))
-
-
 def test_missing_block_falls_back_to_defaults():
     """A partial block is legitimate; only a *misspelled* key is not."""
     resolved = validate_eval_config({"model_config": {"VAE_model": {"max_lag": 90}}})

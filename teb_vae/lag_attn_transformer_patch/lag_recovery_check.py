@@ -1,4 +1,4 @@
-r"""Planted-delay check (plan P5-01): fit ``planted.yaml``, read the KL lag map back.
+r"""Planted-delay check: fit ``planted.yaml``, read the KL lag map back.
 
 The planted shard couples raw UP to raw FHR at $\delta$ steps (root attribute
 ``planted_delay_steps``). Anchor $t$ forecasts $t+1 \ldots t+H$, so the informative lags are

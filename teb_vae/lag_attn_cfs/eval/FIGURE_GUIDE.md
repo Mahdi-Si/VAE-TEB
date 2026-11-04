@@ -1,1127 +1,1456 @@
 # Figure guide
 
-This guide explains what each evaluation figure shows, how to read its axes, and what conclusions it supports. Entries use the filenames written inside each analysis directory. PDF is the default format; another configured format changes the extension. [EVAL.md](EVAL.md) explains the workflow, outputs, settings, and checks. `figure_manifest.json` beside this guide lists the fixed figure names per analysis directory and the dynamically named families (sample pages, traces, attribution example pages, grouped variants) by pattern. It is maintained by hand: no test or code reads it, so a figure added to the code without an entry there is not caught automatically.
+This guide explains what each evaluation figure shows, how the code computes it, and how to read its axes and encodings. [EVAL.md](EVAL.md) explains the workflow, outputs, settings and checks. [ATTRIBUTION.md](ATTRIBUTION.md) explains the attribution pass.
 
-**Geometry is symbolic here on purpose.** $T$ (steps per segment), $H$ (horizon), $F$ (anchor floor), $C_{\mathrm{keep}}$ (retained target channels), $L$ (lag bins, $L-1=$ `max_lag`), $d_z$ (latent dimensions), $M$ (attention heads) and every count or duration derived from them belong to the checkpoint being evaluated. Read them from that run's `preflight.json` (under `causality`: `anchor_geometry`, `lag_support`, `group_delay_seconds`), `summary.json` and the checkpoint's `model_kwargs`, never from an example.
+Each entry uses the filename that the analysis writes inside its own directory. PDF is the default format, and `eval_config.figure_format` changes the extension. `figure_manifest.json` beside this guide lists the fixed figure names per analysis directory. It also lists the figure families with dynamic names (sample pages, traces, attribution example pages and grouped variants) by pattern. The manifest is maintained by hand. No test or code reads it, so a new figure without a manifest entry is not detected automatically.
 
-Start with `forecast/baseline_comparison.pdf`, then `coupling/pred_gap_distribution.pdf` and the calibration figures. Read the source controls before interpreting KL or lag structure. Use the terminology section below whenever a metric name is unfamiliar.
+**Geometry is symbolic.** $T$ (steps per segment), $H$ (horizon), $F$ (anchor floor), $C_{\mathrm{keep}}$ (retained target channels), $L$ (lag bins, $L-1=$ `max_lag`), $d_z$ (latent dimensions) and $M$ (attention heads) belong to the checkpoint under evaluation. Read them from that run's `preflight.json` (under `causality`: `anchor_geometry`, `lag_support`, `group_delay_seconds`), from `summary.json` and from the checkpoint's `model_kwargs`.
+
+A suggested reading order is `forecast/baseline_comparison.pdf`, then `coupling/pred_gap_distribution.pdf`, then the calibration figures. Read the source controls before you interpret KL or lag structure.
+
+## Contents
+
+- [Conventions used throughout](#conventions-used-throughout)
+- [Terminology](#terminology)
+- [Grouped variants](#grouped-variants)
+- [Forecast figures](#forecast-figures)
+- [Coupling figures](#coupling-figures)
+- [Latent and lag-KL figures](#latent-and-lag-kl-figures)
+- [Attention figures](#attention-figures)
+- [Calibration figures](#calibration-figures)
+- [Distribution figures](#distribution-figures)
+- [Trajectory figures](#trajectory-figures)
+- [Time-to-delivery figures](#time-to-delivery-figures)
+- [Second-stage figures](#second-stage-figures)
+- [Lag-clock figures](#lag-clock-figures)
+- [Cross-subgroup figure](#cross-subgroup-figure)
+- [Event figures](#event-figures)
+- [Sufficiency figure](#sufficiency-figure)
+- [Warm-up figures](#warm-up-figures)
+- [Source-null figures](#source-null-figures)
+- [Time-shift figure](#time-shift-figure)
+- [Occlusion figures](#occlusion-figures)
+- [Band-resolved lag-KL figures](#band-resolved-lag-kl-figures)
+- [High-KL anchor figures](#high-kl-anchor-figures)
+- [Spectral-skill figure](#spectral-skill-figure)
+- [Recording-trace figures](#recording-trace-figures)
+- [Attribution figures](#attribution-figures)
+- [Sample pages](#sample-pages)
+
+---
 
 ## Conventions used throughout
 
 These conventions apply to all figures unless an entry states otherwise.
 
-**Missing results are labelled.** A panel with no finite observations displays `no finite values`. Treat this as an unavailable measurement and check the analysis status and counts.
+**Missing results are labelled.** A panel with no finite observations displays `no finite values`. Treat this as an unavailable measurement, and check the analysis status and counts.
 
-**Error values use normalised coefficient units.** The targets are retained wavelet-modulus and phase-harmonic coefficients, standardised by the loader. They have no direct clinical scale. Reversing standardisation would place channels on very different scales and invalidate pooled comparisons. Read error axes as normalised coefficient errors, and compare scores only when target definitions and scoring geometry agree.
+**Error values use normalised coefficient units.** The targets are retained wavelet-modulus and phase-harmonic coefficients, which the loader standardises. They have no direct clinical scale. If you reverse the standardisation, the channels go onto very different scales and pooled comparisons become invalid. Compare scores only when the target definitions and the scoring geometry agree.
 
-**Lag axes show stored-coefficient time.** The displayed compensated lag is $\tau=4(\ell+\delta)$ seconds, where $\ell$ is the lag bin and $\delta$ is the model's input delay. This corrects the input delay only. It does not establish physiological delay: the one-sided feature bank introduces composed per-channel group delays of hundreds of seconds, of the order of, or longer than, the whole $4L$-second search window. The run's own per-block range is `causality.group_delay_seconds` in `preflight.json`. Each lag figure prints the shared qualification.
+**Lag axes show stored-coefficient time.** The compensated lag is
 
-**Channel alignment, when a run uses it, reduces timing differences but does not make these lag axes physiological.** Aligning input channels to a common reference replaces channel-pair differences with a reference offset and a remaining within-band delay dispersion. The target is still a coefficient block with a nonzero target reference delay, and advancing the first target horizon element can require an unavailable stored index. These figures therefore compare coefficient epochs. An aligned run records `source_reference_delay_s` separately from the axis; the shipped default is unaligned.
+$$\tau_\ell = 4(\ell + \delta)\ \text{s},$$
 
-**Cohort order is worst first.** Clinical classes appear as `hie`, `acidosis`, then `healthy`. Subgroups appear as `hie_cs`, `hie_no_cs`, `acidosis_cs`, `acidosis_no_cs`, `healthy_bg_cs`, `healthy_bg_no_cs`, `healthy_no_bg_cs`, and `healthy_no_bg_no_cs`. Healthy is green, acidosis amber, and HIE red; subgroups use shades of their class colour. `cohort.ordered_groups`, bound to the shared label helper, also orders the corresponding CSV rows. Unrecognised cohorts appear after the known groups.
+where $\ell$ is the lag bin and $\delta$ is the causal input delay of the source stream (the model's `source_delay_steps`). `compensated_seconds_axis` in `lag_axis.py` builds this axis, and `COEFFICIENT_LAG_AXIS_LABEL` labels it. In an unaligned configuration, such as `configs/default.yaml`, the source gate shifts no channel and $\delta = 0$. The stored timeline is canonical, and no other term enters the axis.
 
-Colours in training-callback plots may differ; match cohorts by labels and legends. Clinical ordering is a display convention, not evidence of a group difference. Use `cross_subgroup` for statistical comparisons.
+The axis does not show a physiological delay. The one-sided filter bank gives each channel a group delay, and the axis does not correct it. `causality.group_delay_seconds` in `preflight.json` gives the per-block range for the run. Each lag figure prints `GROUP_DELAY_NOTE`, and the records carry the long form `GROUP_DELAY_CAVEAT` as `axis_caveat`.
 
-**A GUID is never named without its subgroup.** Every figure, title, filename or manifest that identifies a recording by GUID also names the subgroup it came from (and, where there is room, the clinical class), so a page lifted out of its directory still says which cohort it belongs to. The per-recording traces, the attribution pages and the sample pages carry it in the filename as well as the title; the forecast overlay, the contraction detection figure and the lag heatmap carry it in the panel title.
+**Channel alignment does not make the lag axes physiological.** `causal_align_reference` is `null` in `configs/default.yaml`, so the default run is unaligned. An aligned run shifts its input channels onto a common reference. This replaces the channel-pair delay differences with one reference offset plus a remaining within-band dispersion. The target is still a coefficient block with its own reference delay. An aligned run records `source_reference_delay_s` beside the axis, not inside it.
 
-**Figures share one publication style.** The style is defined in `teb_vae/lag_attn/eval/figures.py` and accessed through `figures_seam`: double-column default width, a 5.5–7 pt serif type scale with STIX mathematics, hairline frames and data lines, histogram bars with a thin dark outline, open frames except for boxed heatmaps, and unframed legends above full-width curves. Non-cohort series, including the lines of a multi-line panel, use the Okabe-Ito colour-blind-safe palette in a fixed order. Every evaluation figure is written by `render_figure` at `EVAL_SAVE_DPI` $=200$; the training callbacks keep their own resolution. Heatmaps and dense traces are rasterised inside the vector file, so a PDF stays small while its text and frames stay vector. Panel letters (**a**, **b**, and so on) are stamped at render time by `label_panels`, into the left-aligned title, running left to right, then top to bottom; colour bars, hidden or switched-off axes, insets and twin axes take no letter, and a single-panel figure gets none. Footnotes use reserved space below the axes.
+**Cohort order is worst first.** Clinical classes appear as `hie`, `acidosis`, then `healthy`. Subgroups appear as `hie_cs`, `hie_no_cs`, `acidosis_cs`, `acidosis_no_cs`, `healthy_bg_cs`, `healthy_bg_no_cs`, `healthy_no_bg_cs` and `healthy_no_bg_no_cs`. Healthy is green, acidosis is amber and HIE is red. Subgroups use shades of their class colour. `cohort.ordered_groups` also orders the matching CSV rows. Unrecognised cohorts come after the known groups.
 
-**Forecast densities follow the checkpoint's likelihood structure.** Since the 2026-09-23 revision a checkpoint can carry a per-channel scored horizon $H_c \le H$ (the cell mask $m_{\tau,c}=\mathbb 1[\tau<H_c]$) and an AR(1) residual (`forecast_ar_residual`) with coefficient $\phi_c$ per retained channel. Every score, calibration readout and predictive band in these figures uses those same terms: cells past $H_c$ are not scored, and under the AR term the density scores the innovation $e_\tau=r_\tau-\phi_c r_{\tau-1}$, so the marginal spread of a forecast step is wider than the decoder's own $\sigma_\tau$. `likelihood_structure` in `summary.json` and in the collection record (`forecast_ar_residual`, `scored_horizon_per_channel`, `ar_coef_per_channel`, `scored_cells` of `block_cells`) states which terms a run used.
+Training-callback plots can use other colours, so match cohorts by labels and legends. The clinical order is a display convention. Use `cross_subgroup` for statistical comparisons.
+
+**A GUID always appears with its subgroup.** Each figure, title, filename or manifest that identifies a recording by GUID also names its subgroup and, where there is space, its clinical class. The per-recording traces, the attribution pages and the sample pages carry the subgroup in the filename and in the title. The forecast overlay, the contraction-detection figure and the lag heatmap carry it in the panel title.
+
+**All figures share one publication style.** `teb_vae/lag_attn/eval/figures.py` defines the style, and `figures_seam` exposes it. The style has these properties:
+
+- A double-column default width and a 6.5–8.5 pt serif type scale with STIX mathematics.
+- Panels that share no axis sit two or three to a row. Only a time axis that needs the width gets a full-width panel.
+- Open frames in a slate tone lighter than the text, except on boxed heatmaps. The grid is on the value axis only.
+- Data lines are about twice the frame weight. Histogram bars are separated by white gaps, not outlined.
+- Six saturated hues in a fixed order for non-cohort series. The order was checked for colour-vision separation.
+- The two forecast branches have fixed styles on every figure, as on the sample pages: target-only is dashed slate and source-conditioned is solid vermillion.
+- Legends have no border but a white backing, and sit in headroom above the data. A significance bar or a latent dimension that passes its threshold is drawn in blue, and one that does not is drawn in light grey.
+
+`render_figure` writes every evaluation figure at `EVAL_SAVE_DPI` $=200$. The training callbacks keep their own resolution. Heatmaps and dense traces are rasterised inside the vector file, while text and frames stay vector. `label_panels` stamps panel letters (**a**, **b**, and so on) into the left-aligned titles, left to right, then top to bottom. Colour bars, hidden axes, insets and twin axes get no letter, and a single-panel figure gets none. Footnotes use reserved space below the axes.
+
+**Forecast densities follow the checkpoint's likelihood structure.** A checkpoint can carry a per-channel scored horizon $H_c \le H$, with the cell mask $m_{\tau,c}=\mathbb 1[\tau<H_c]$. It can also carry an AR(1) residual (`forecast_ar_residual`) with coefficient $\phi_c$ per retained channel. Every score, calibration readout and predictive band uses the same terms. Cells past $H_c$ are not scored. Under the AR term, the density scores the innovation
+
+$$e_\tau = r_\tau - \phi_c\, r_{\tau-1},$$
+
+so the marginal spread of a forecast step is wider than the decoder's $\sigma_\tau$. `likelihood_structure` in `summary.json` and in the collection record states which terms a run used (`forecast_ar_residual`, `scored_horizon_per_channel`, `ar_coef_per_channel`, `scored_cells` of `block_cells`).
 
 ---
 
-# Terminology
+## Terminology
 
-This section explains the model, common filename and column conventions, and the main quantities. A recording contains segments; each segment contains forecast anchors. An anchor is the time from which the model predicts the next $H$ stored steps. Most statistical summaries give each recording one value.
+This section explains the model, the filename and column conventions, and the main quantities. A recording contains segments, and each segment contains forecast anchors. An anchor is the time from which the model predicts the next $H$ stored steps. Most statistical summaries give each recording one value.
 
-## What the model predicts
+### What the model predicts
 
-The original recordings contain fetal heart-rate and uterine-pressure signals sampled at $4$ Hz. The model receives features computed from them using a strictly one-sided scattering and phase-harmonic transform. These coefficients are stored every $4$ seconds. The declared inputs are a target stream from heart rate (a scattering block and a phase-harmonic block) and a source stream from pressure; the warm-up budget then retains $C_{\mathrm{keep}}$ of the declared target channels for prediction. The declared and retained counts are properties of the dataset and checkpoint: `causality.anchor_geometry.target_kept_width` in `preflight.json` is $C_{\mathrm{keep}}$, and the run's retained-channel record names which channels survived.
+The recordings contain fetal heart rate (FHR) and uterine pressure (UP) sampled at $4$ Hz. A strictly one-sided scattering and phase-harmonic transform turns them into coefficients, stored every $4$ s. The target stream comes from FHR (a scattering block `fhr_st` and a phase-harmonic block `fhr_ph`). The source stream comes from UP (`up_st` and `up_ph`). The warm-up budget keeps $C_{\mathrm{keep}}$ of the declared target channels for prediction. `causality.anchor_geometry.target_kept_width` in `preflight.json` is $C_{\mathrm{keep}}$.
 
-At anchor $t$ the model predicts all $C_{\mathrm{keep}}$ retained target channels over the next $H$ steps, or $4H$ seconds; under a scored-horizon mask, channel $c$ is scored over its first $H_c$ of those steps only. It makes a **base** forecast using target history and a **full** forecast that also uses source history. Their predictive gap measures whether adding source history improved the score. The checkpoint supplies `horizon`; `preflight.json` echoes it.
+At anchor $t$ the model predicts all $C_{\mathrm{keep}}$ retained target channels over the next $H$ steps, or $4H$ s. Under a scored-horizon mask, channel $c$ is scored over its first $H_c$ steps only. The model makes a **base** forecast from target history and a **full** forecast that also uses source history. Their predictive gap measures the score change from adding source history. The checkpoint supplies `horizon`, and `preflight.json` echoes it.
 
-Two timing constraints determine which anchors can be evaluated:
+Two timing constraints decide which anchors are evaluated:
 
-- **Warm-up sets the first usable anchor.** Target channels must be valid at the earliest scored step, and aligned input channels must have enough history after their shifts. The anchor floor is $F=\max\bigl(B-1,\ \max_c(W'_c+d_c)\bigr)$, recorded as `causality.anchor_geometry.anchor_floor` in `preflight.json`.
-- **The searched lags must fit before the anchor.** When $F \ge$ `max_lag` $+$ `lag_floor`, the full lag window exists at each scored anchor. The pipeline measures this property on each run (`causality.lag_support.lag_support_margin_steps` and `every_lag_valid_at_every_anchor` in `preflight.json`) rather than assuming it. Anchor count also depends on the horizon and forecast clock; it is not fixed by the floor alone.
+- **Warm-up sets the first usable anchor.** The anchor floor is $F=\max\bigl(B-1,\ \max_c(W'_c+d_c)\bigr)$, where $B$ is the warm-up budget, $W'_c$ is the leading delay of channel $c$, and $d_c$ is its alignment shift. `preflight.json` records it as `causality.anchor_geometry.anchor_floor`.
+- **The searched lags must fit before the anchor.** When $F \ge$ `max_lag` $+$ `lag_floor`, the full lag window exists at each scored anchor. The pipeline measures this on each run (`causality.lag_support.lag_support_margin_steps` and `every_lag_valid_at_every_anchor`).
 
-## Statistical terms used in the figures
+### Statistical terms used in the figures
 
 | Term | How to read it |
 | --- | --- |
-| Median | The middle value after observations are sorted. |
+| Median | The middle value after the observations are sorted. |
 | Quartiles and IQR | $Q_1$ and $Q_3$ bound the middle half of the values. The interquartile range is $Q_3-Q_1$. |
-| Density | Relative concentration of observations along an axis. A density's width or height is not a recording count. |
-| Paired comparison | A difference calculated within each recording before combining recordings. |
-| Centroid | The weighted average location of a lag profile. |
-| Entropy | A measure of how spread out normalised weights are. Lower entropy indicates more concentrated weights. |
-| Argmax | The position with the largest value. On a flat profile, it can reflect a tie-breaking rule rather than a meaningful peak. |
-| Degenerate profile | A profile that fails the stated shape criterion, so its peak position should not be interpreted alone. |
-| Holm correction | A procedure that adjusts several tests together to limit false-positive findings within their declared family. |
+| Density | The relative concentration of observations along an axis. Its width or height is not a recording count. |
+| Paired comparison | A difference calculated within each recording before recordings are combined. |
+| Centroid | The weighted mean location of a lag profile. |
+| Entropy | A measure of how spread out normalised weights are. Lower entropy means more concentrated weights. |
+| Argmax | The position of the largest value. On a flat profile, it can reflect a tie-breaking rule. |
+| Degenerate profile | A profile that fails the stated shape criterion, so its peak position is not read alone. |
+| Holm correction | A procedure that adjusts several tests together to limit false positives within a declared family. |
 | Kruskal–Wallis | A rank-based test for differences among groups. A significant result does not identify which pair differs. |
 | Mann–Whitney | A rank-based comparison between two independent groups. |
 | Wilcoxon signed-rank | A rank-based test of paired differences, such as two scores from the same recordings. |
-| Cliff's delta | An effect size describing how often values in one group exceed values in another. Its sign follows the stated group order. |
-| Nominal and adjusted intervals | A nominal interval applies to one specified comparison. A family-adjusted interval accounts for a declared set of comparisons. |
-| Attribution | A way of assigning a fitted model's output change to inputs or intermediate quantities under a specified method. It does not by itself establish a physiological cause. |
+| Cliff's delta | An effect size that says how often values in one group exceed values in another. Its sign follows the stated group order. |
+| Nominal and adjusted intervals | A nominal interval applies to one comparison. A family-adjusted interval accounts for a declared set of comparisons. |
+| Attribution | A method that assigns a fitted model's output change to inputs or intermediate quantities. It does not establish a physiological cause. |
 
-## How to read a name
+### How to read a name
 
 | Piece | Means |
 |---|---|
-| `base` | the target-only branch (prior belief) |
-| `full` | the source-conditioned branch (posterior belief) |
-| `shuffled` | the negative control: the *same* model fed **another recording's** source |
-| `null` | the second control: the same model fed a **zeroed** source stream |
-| `mc_` prefix | Monte Carlo scoring: average likelihood over $K$ latent draws, then take its negative logarithm. |
-| `_block` suffix | summed over the whole $H \times C_{\mathrm{keep}}$-coefficient forecast block (`block_width` in `preflight.json`), then averaged over anchors |
-| `_raw` suffix (on a KL) | **unfloored** — no free-bits floor applied. The only form readable as a rate. |
-| `_sq` suffix | left **unrooted** (a mean square). Its `_rms` partner is the rooted version. |
+| `base` | The target-only branch (prior belief). |
+| `full` | The source-conditioned branch (posterior belief). |
+| `shuffled` | The negative control: the same model fed another recording's source. |
+| `null` | The second control: the same model fed a zeroed source stream. |
+| `mc_` prefix | Monte Carlo scoring: average the likelihood over $K$ latent draws, then take its negative logarithm. |
+| `_block` suffix | Summed over the $H \times C_{\mathrm{keep}}$ forecast block (`block_width` in `preflight.json`), then averaged over anchors. |
+| `_raw` suffix (on a KL) | Unfloored: no free-bits floor applied. |
+| `_sq` suffix | Not rooted (a mean square). Its `_rms` partner is the rooted version. |
 
-## The quantities
+### Scores
 
-### Scores: predictive performance
+A score is a negative log-likelihood. Lower is better, and a score is not bounded below by zero.
 
-A **score** here is always a negative log-likelihood: **lower is better**, and it is not bounded below by zero.
-
-| Name | Plain meaning | Units |
+| Name | Meaning | Units |
 |---|---|---|
-| `nll_base_block` | how badly the target-only forecast fit the truth | nats per anchor |
-| `nll_full_block` | the same for the source-conditioned forecast | nats per anchor |
-| `mc_nll_base_block`, `mc_nll_full_block` | Negative log of the likelihood averaged over $K$ latent draws; the headline pair. | nats per anchor |
-| `mc_nll_shuffled_block` | the score when fed another recording's source; the negative control | nats per anchor |
-| `nll_persistence_block` | baseline: hold the last **observed** coefficient vector for the whole window | nats per anchor |
-| `nll_climatology_block` | baseline: predict the population mean, which after z-scoring is exactly $0$ | nats per anchor |
-| `nll_segment_mean_block` | baseline: predict this segment's own per-channel mean | nats per anchor |
-| `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the latent bottleneck | nats per anchor |
+| `nll_base_block` | The score of the target-only forecast. | nats per anchor |
+| `nll_full_block` | The score of the source-conditioned forecast. | nats per anchor |
+| `mc_nll_base_block`, `mc_nll_full_block` | The negative log of the likelihood averaged over $K$ latent draws. | nats per anchor |
+| `mc_nll_shuffled_block` | The score with another recording's source (the negative control). | nats per anchor |
+| `nll_persistence_block` | Baseline: hold the last observed coefficient vector for the whole window. | nats per anchor |
+| `nll_climatology_block` | Baseline: predict the population mean, which is $0$ after z-scoring. | nats per anchor |
+| `nll_segment_mean_block` | Baseline: predict the segment's own per-channel mean. | nats per anchor |
+| `nll_oracle_block` | An evaluation-only decoder that reads the encoder state directly and bypasses the latent bottleneck. | nats per anchor |
 
-**Nats per anchor** means that a score is summed over the valid coefficients of each forecast block, then averaged across scored anchors. Its magnitude depends on block size, predicted variance, and the observations. A negative log-density can be negative, so compare score differences on the same target and support rather than interpreting zero as a universal reference. Dividing by $H\cdot C_{\mathrm{keep}}$ gives a fixed-width rescaling. With masked forecast steps, that divisor is larger than the number of coefficients actually scored.
+**Nats per anchor** means that the score is summed over the valid coefficients of each forecast block, then averaged over scored anchors. Its magnitude depends on the block size, the predicted variance and the observations. A negative log-density can be negative. Compare score differences on the same target and support, and do not treat zero as a universal reference. Division by $H\cdot C_{\mathrm{keep}}$ gives a fixed-width rescaling. With masked forecast steps, that divisor is larger than the number of scored coefficients.
 
-### Gaps: the predictive contribution of the source
+### Gaps
 
-| Name | Plain meaning | Units |
+| Name | Meaning | Units |
 |---|---|---|
-| `pred_gap` | $D_{\mathrm{base}}-D_{\mathrm{full}}$ using the training scoring path. Positive means source benefit under that convention. | nats per anchor |
+| `pred_gap` | $D_{\mathrm{base}}-D_{\mathrm{full}}$ on the training scoring path. Positive means a source benefit under that convention. | nats per anchor |
 | `mean_pred_gap` | The same difference with both branches decoded at their latent means, without sampling. | nats per anchor |
-| `mc_pred_gap` | the same difference on the marginalised scores. **This is the headline coupling number.** | nats per anchor |
-| `pred_gap_warm_lo` / `_mid` / `_hi` | the same gap restricted to each warm-up tertile of the $C_{\mathrm{keep}}$ kept channels. The three **sum to** `pred_gap`. | nats per anchor |
-| `pred_gap_<band>` | the same gap restricted to one frequency band of the target coefficient. These sum to `pred_gap` too. | nats per anchor |
-| `delta_suff_nats` | $D_{\mathrm{base}}-D_{\mathrm{oracle}}$: an estimate of the cost of the latent bottleneck, subject to probe and population biases. | nats per anchor |
-| `mse_skill` | $1 - \mathrm{MSE}_{\mathrm{model}}/\mathrm{MSE}_{\mathrm{baseline}}$. $1$ = perfect, $0$ = no better than the baseline, negative = worse. | dimensionless |
-| `advantage_nats_per_anchor` | the NLL-space analogue of skill, and a **difference**, not $1 -$ a ratio — a log score has no natural zero | nats per anchor |
-| `pred_gap_rmse_pct`, `pred_gap_mse_pct` | the percentage of the target-only branch's point-forecast error the source removed, rooted and unrooted. **Scale-free.** | percent |
-| `pred_gap_mc_likelihood_pct` | $100(e^{\texttt{mc\_pred\_gap}/(H \cdot C_{\mathrm{keep}})} - 1)$: the extra probability density the source-informed forecast puts on each observed coefficient. **Budget-local.** | percent |
+| `mc_pred_gap` | The same difference on the marginalised scores. The acceptance gate reads this estimator (`pred_gap_mc_nats`). | nats per anchor |
+| `pred_gap_warm_lo` / `_mid` / `_hi` | The gap restricted to each warm-up tertile of the $C_{\mathrm{keep}}$ kept channels. The three sum to `pred_gap`. | nats per anchor |
+| `pred_gap_<band>` | The gap restricted to one frequency band of the target coefficients. These also sum to `pred_gap`. | nats per anchor |
+| `delta_suff_nats` | $D_{\mathrm{base}}-D_{\mathrm{oracle}}$: an estimate of the cost of the latent bottleneck, with probe and population biases. | nats per anchor |
+| `mse_skill` | $1 - \mathrm{MSE}_{\mathrm{model}}/\mathrm{MSE}_{\mathrm{baseline}}$. $1$ is perfect, $0$ matches the baseline, and a negative value is worse. | dimensionless |
+| `advantage_nats_per_anchor` | The NLL-space analogue of skill. It is a difference, not $1 -$ a ratio, because a log score has no natural zero. | nats per anchor |
+| `pred_gap_rmse_pct`, `pred_gap_mse_pct` | The percentage of the target-only point-forecast error that the source removed, rooted and not rooted. Scale-free. | percent |
+| `pred_gap_mc_likelihood_pct` | $100\bigl(e^{\texttt{mc\_pred\_gap}/(H \cdot C_{\mathrm{keep}})} - 1\bigr)$: the extra density that the full forecast puts on each observed coefficient. Budget-local. | percent |
 
-Keep the scoring conventions separate. `mc_pred_gap` integrates over latent draws and is the acceptance headline. `mean_pred_gap` decodes both latent means without sampling. `pred_gap` follows the training scoring path; under `base_decode: mean`, its base and full branches use different decoding conventions. Their values and even their signs can differ. A figure's labels identify which comparison it displays.
+Keep the scoring conventions separate. `mc_pred_gap` integrates over latent draws. `mean_pred_gap` decodes both latent means without sampling. `pred_gap` follows the training scoring path; under `base_decode: mean` (the value in `configs/default.yaml`), its base and full branches use different decoding conventions. Their values and their signs can differ. Each figure's labels identify which estimator it shows.
 
-Do not divide a predictive gap by a block NLL to obtain a percentage. NLL has no natural zero and may be negative, making that ratio misleading. The error percentages use a positive error denominator. The likelihood percentage is defined only for `gaussian_nll` and uses the fixed block width $H\cdot C_{\mathrm{keep}}$. It is budget-local: changing the horizon or retained channels changes the denominator.
+Do not divide a predictive gap by a block NLL to get a percentage. NLL has no natural zero and can be negative. The error percentages use a positive error denominator. The likelihood percentage is defined only for `gaussian_nll` and uses the fixed block width $H\cdot C_{\mathrm{keep}}$. It is budget-local: a change of horizon or of retained channels changes the denominator.
 
-### KL: changes in the latent distribution
+### KL
 
-$K_t = \mathrm{KL}(q_t \Vert p_t)$ measures how far reading the source moved the belief at anchor $t$. Zero means the source changed nothing.
+$K_t = \mathrm{KL}(q_t \Vert p_t)$ measures how far source history moved the belief at anchor $t$. Zero means that the source changed nothing.
 
-| Name | Plain meaning | Units |
+| Name | Meaning | Units |
 |---|---|---|
-| `source_conditioned_kl_raw` | $K_t$ averaged over the scored anchors. **The** KL readout. | nats per anchor |
-| `source_conditioned_kl_shuffled_raw` | the same under another recording's source — the specificity control | nats per anchor |
-| `kld_source_null` | the same under a **zeroed** source — the availability-clock control | nats per anchor |
-| `coupling_minus_clock_nats` | their difference: the part of the coupling attributable to source *variation* | nats per anchor |
-| `kld_per_t` | $K_t$ *before* averaging: one value per anchor | nats per anchor |
-| `kld_per_dim`, `kld_per_head` | $K_t$ split across latent dimensions or attention heads; each sums back to the total | nats per anchor |
-| `source_kl_lag_map` | $K_t$ split across the $L$ lags; sums back to the total | nats per anchor |
-| `active_dims`, `top_dimension_share` | how many latent dimensions carry more than a threshold, and the largest one's share | count, fraction |
+| `source_conditioned_kl_raw` | $K_t$ averaged over the scored anchors. The KL readout. | nats per anchor |
+| `source_conditioned_kl_shuffled_raw` | The same with another recording's source (the specificity control). | nats per anchor |
+| `kld_source_null` | The same with a zeroed source (the availability-clock control). | nats per anchor |
+| `coupling_minus_clock_nats` | Their difference: the part of the coupling that comes from source variation. | nats per anchor |
+| `kld_per_t` | $K_t$ before averaging: one value per anchor. | nats per anchor |
+| `kld_per_dim`, `kld_per_head` | $K_t$ split across latent dimensions or attention heads. Each sums back to the total. | nats per anchor |
+| `source_kl_lag_map` | $K_t$ split across the $L$ lags. It sums back to the total. | nats per anchor |
+| `active_dims`, `top_dimension_share` | The number of latent dimensions above a threshold, and the share of the largest one. | count, fraction |
 
-Check these four points before interpreting KL:
+Do these four checks before you interpret KL:
 
-1. **Use unfloored KL.** A free-bits floor imposes a minimum contribution and can hide a weak or collapsed source pathway. The `_raw` columns retain the measured value.
-2. **Check prior variance.** KL contains $(\mu^q-\mu^p)^2/\sigma_p^2$, so a prior variance near its lower clamp can inflate it. Read `prior_variance_not_pinned` and the predictive gap alongside KL.
-3. **Judge source specificity by predictive scores.** Another recording's source may increase KL while worsening prediction. A larger shuffled KL alone is not a failure or success.
-4. **Check the availability clock.** Source availability varies with time in the same way across batch rows. Row permutation cannot remove that shared pattern. Compare matched KL with `kld_source_null` and report their difference with its limitations.
+1. Use the unfloored KL. A free-bits floor sets a minimum contribution and can hide a weak source pathway. The `_raw` columns keep the measured value.
+2. Check the prior variance. KL contains $(\mu^q-\mu^p)^2/\sigma_p^2$, so a prior variance near its lower clamp can inflate it. Read `prior_variance_not_pinned` and the predictive gap beside KL.
+3. Judge source specificity by predictive scores. Another recording's source can increase KL and also make prediction worse.
+4. Check the availability clock. Source availability changes with time in the same way across batch rows, and row permutation cannot remove that pattern. Compare the matched KL with `kld_source_null`.
 
 ### Warm-up, bands and geometry
 
-| Name | Plain meaning |
+| Name | Meaning |
 |---|---|
-| `causal_warmup_steps` | per channel: the leading delay, in 4-second steps, before that channel's coefficients have completed warm-up |
-| `causal_delay_s` | per channel: the composed one-sided group delay, in seconds. What makes the lag axis coefficient time. |
-| `target_warm_frac` | the fraction of scored anchors at which every kept target channel is warm. Must be exactly $1.0$. |
-| `anchors_per_sample` | anchors decoded per segment. Must be exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense set: $T_{\mathrm{valid}} - F$ on the stored forecast clock, less the clock's largest label advance under a `physical` one (`causality.anchor_geometry.anchors_per_sample` in `preflight.json` is the expected value). |
-| `source_lag_warmth_frac_st` / `_ph` | the fraction of attention mass landing on lags at which that stored source block is warm. **A small value is the expected finding.** |
-| band | one of `slow_baseline`, `deceleration`, `variability`, `beat_to_beat`, `unknown` — the band of the **analysing filter** that produced the coefficient, not a bin of the forecast's own spectrum |
-| `unknown` | a channel whose centre frequency is not recoverable, because no selected phase-harmonic pair named its filter. Never bucketed into a neighbour. |
+| `causal_warmup_steps` | Per channel: the leading delay, in 4 s steps, before the channel's coefficients complete warm-up. |
+| `causal_delay_s` | Per channel: the composed one-sided group delay, in seconds. This delay makes the lag axis coefficient time. |
+| `target_warm_frac` | The fraction of scored anchors at which every kept target channel is warm. The check requires exactly $1.0$. |
+| `anchors_per_sample` | Anchors decoded per segment: `anchor_ceiling - anchor_floor` at the dense set. `causality.anchor_geometry.anchors_per_sample` in `preflight.json` is the expected value. |
+| `source_lag_warmth_frac_st` / `_ph` | The fraction of attention mass on lags at which that stored source block is warm. |
+| band | One of `slow_baseline`, `deceleration`, `variability`, `beat_to_beat`, `unknown`. It is the band of the analysing filter that produced the coefficient, not a bin of the forecast's own spectrum. |
+| `unknown` | A channel whose centre frequency is not recoverable, because no selected phase-harmonic pair names its filter. It is never put into a neighbouring band. |
 
-## Geometry reference
+### Geometry reference
 
-Every symbol below is a property of the checkpoint and dataset of the run being plotted, not a universal dimension. The value column says where that run records it; `preflight.json` paths are under its `causality` record.
+Each symbol below is a property of the checkpoint and dataset of the plotted run. The value column says where the run records it. The `preflight.json` paths are under `causality`.
 
 | Symbol | Value | What it is |
 |---|---|---|
-| $T$ | see the checkpoint's `model_kwargs`; `anchor_geometry.t_valid` is its valid span $T_{\mathrm{valid}}$ | steps per loaded segment |
-| $H$ | see `anchor_geometry.horizon` | forecast horizon in stored steps, $4H$ seconds |
-| $H_c$ | see `summary.json` `likelihood_structure.scored_horizon_per_channel` | steps of the horizon scored for kept channel $c$; $H$ for every channel without a scored-horizon mask |
-| $F$ | see `anchor_geometry.anchor_floor` | anchor floor: nothing below it is decoded at all; $\max(B - 1, \max_c(W'_c + d_c))$ |
-| anchors | see `anchor_geometry.anchors_per_sample` | `anchor_ceiling - anchor_floor`, decoded per segment at the dense set |
-| $C_{\mathrm{keep}}$ | see `anchor_geometry.target_kept_width` | target channels the warm-up budget kept, of those declared |
-| $H \cdot C_{\mathrm{keep}}$ | see `anchor_geometry.block_width` | coefficients in one forecast block |
-| $d_z$ | see the checkpoint's `model_kwargs` | latent dimensions |
-| $L$ | see `lag_support.n_lags` | lag bins, `max_lag` $+1$; $4L$ seconds of source history |
-| $M$ | see the checkpoint's `model_kwargs` | attention heads |
-| lag support margin | see `lag_support.lag_support_margin_steps` | $F - (L-1) - \texttt{lag\_floor}$; $\ge 0$ means no anchor has truncated lag support |
+| $T$ | the checkpoint's `model_kwargs`; `anchor_geometry.t_valid` is the valid span $T_{\mathrm{valid}}$ | steps per loaded segment |
+| $H$ | `anchor_geometry.horizon` | forecast horizon in stored steps, $4H$ s |
+| $H_c$ | `summary.json` `likelihood_structure.scored_horizon_per_channel` | scored horizon steps for kept channel $c$; $H$ without a scored-horizon mask |
+| $F$ | `anchor_geometry.anchor_floor` | anchor floor, $\max(B - 1, \max_c(W'_c + d_c))$; nothing below it is decoded |
+| anchors | `anchor_geometry.anchors_per_sample` | `anchor_ceiling - anchor_floor`, decoded per segment at the dense set |
+| $C_{\mathrm{keep}}$ | `anchor_geometry.target_kept_width` | target channels that the warm-up budget kept |
+| $H \cdot C_{\mathrm{keep}}$ | `anchor_geometry.block_width` | coefficients in one forecast block |
+| $d_z$ | the checkpoint's `model_kwargs` | latent dimensions |
+| $L$ | `lag_support.n_lags` | lag bins, `max_lag` $+1$; $4L$ s of source history |
+| $M$ | the checkpoint's `model_kwargs` | attention heads |
+| lag support margin | `lag_support.lag_support_margin_steps` | $F - (L-1) - \texttt{lag\_floor}$; $\ge 0$ means no anchor has truncated lag support |
 
 ---
 
-## The grouped variants: `<stem>_by_clinical_class.pdf` and `<stem>_by_subgroup.pdf`
+## Grouped variants
 
-**Purpose.** Compare the distribution of a metric across clinical classes or subgroups, using one value per recording.
+### `<stem>_by_clinical_class.pdf` and `<stem>_by_subgroup.pdf`
 
-**Read the violin width as estimated density.** Wider regions contain more of the group's values. The thick internal bar spans the middle half, from the first quartile $Q_1$ to the third quartile $Q_3$. Thin whiskers extend to observations within $1.5$ interquartile ranges of that bar, and the white dot marks the median. Values beyond the whiskers remain represented in the violin body, which extends to the group's observed extremes.
+**Purpose.** Compare the distribution of a metric across clinical classes or subgroups, with one value per recording.
 
-Grouped variants are created automatically from each analysis's declared per-recording tables. Their filenames identify the source table and grouping axis, so they are described here as a family rather than listed individually.
+**What it shows.** The analyses create these variants automatically from their declared per-recording tables. The filename names the source table and the grouping axis. Each violin's width is the estimated density. The thick internal bar spans $Q_1$ to $Q_3$. The thin whiskers extend to observations within $1.5$ interquartile ranges of the bar, and the white dot marks the median. The violin body extends to the group's observed extremes.
 
-**Axes.** One row per metric; the metric's own units on the vertical axis, cohorts across in descending severity. The CSV beside each figure carries its rows in that same order.
+**Axes.** One panel per metric, titled with the metric, two panels to a row (one per row when there are more than four cohorts). Cohorts run across in descending severity. The CSV beside each figure has its rows in the same order.
 
-**Interpretation.** Each violin contains one value per recording. Eight recordings remain eight observations regardless of how many segments they contribute. Violin width is density, not sample size. Fewer than two groups produces a recorded skip. Use `cross_subgroup` to test group differences rather than relying on visual separation.
+**How to read it.** Each violin contains one value per recording, so eight recordings are eight observations, independent of their segment counts. Fewer than two groups produce a recorded skip. Use `cross_subgroup` to test group differences.
 
 ---
 
-## `forecast/baseline_comparison.pdf`
+## Forecast figures
 
-**Purpose.** Compare both model branches with three simple predictors: the last observed coefficient vector, the population mean, and the segment mean. The lower panel reports squared-error skill: $1$ is perfect prediction, $0$ matches the baseline, and a negative value is worse.
+The `forecast` analysis (`analyses/forecast.py`) writes these figures into `forecast/`.
 
-**What it shows.** Top: the per-recording block score of every predictor — the two model branches and the three trivial baselines — as violins, in nats per anchor, lower better. Bottom: the squared-error skill of each branch against each baseline, with a percentile bootstrap interval over **recordings**.
+### `forecast/baseline_comparison.pdf`
 
-**Axes.** Top: nats per anchor, one violin per predictor. Bottom: skill, dimensionless, zero marked; whiskers are asymmetric because a percentile interval is not symmetric about its point estimate.
+**Purpose.** Compare both model branches with three simple predictors: the last observed coefficient vector, the population mean and the segment mean.
 
-**Terms on this figure.** `base`, `full`, then `persistence`, `climatology`, `segment_mean`; each violin is `nll_<name>_block` across recordings. The bars are `mse_skill` with `mse_skill_lo` / `_hi` as whiskers.
+**What it shows.** The left panel shows the per-recording block score of each predictor as violins: `base`, `full`, `persistence`, `climatology` and `segment_mean`. Each violin is `nll_<name>_block` across recordings. The right panel shows `mse_skill` as one horizontal bar per (branch, baseline) pair, blue where the skill is positive and vermillion where it is negative. The whiskers are `mse_skill_lo` and `mse_skill_hi`, a percentile bootstrap interval over recordings.
 
-- **persistence** carries forward the last *observed* step, not the last one: `weight` is the only trustworthy validity signal here, since the coefficients carry no sentinel of their own, and carrying an invalid step forward would measure the gap.
-- **climatology** is exactly $0$ per channel, which is the z-scored population mean — and it is a meaningful baseline only because the normalisation statistics were accumulated *excluding* the warm-up region.
-- The baselines are scored at a fixed `BASELINE_LOGVAR = 0.0`, recorded rather than fitted: a point predictor has no variance of its own, and the whole score would otherwise be decided by whatever $\sigma$ it was handed.
+- **persistence** carries forward the last observed step. `weight` is the validity signal, because the coefficients carry no sentinel value.
+- **climatology** is $0$ per channel, the z-scored population mean. The normalisation statistics exclude the warm-up region.
+- The baselines are scored at a fixed `BASELINE_LOGVAR` $= 0.0$ (`metrics.py`), because a point predictor has no variance of its own.
 
-**Interpretation.** The block score is a *sum over the scored cells of the $H \cdot C_{\mathrm{keep}}$ block*, so it is large under every predictor and its scale says nothing about the model. The baselines are scored under the same density terms as the branches (the scored-horizon mask and, when on, the AR(1) residual), so the comparison is on one support. Only the comparison is readable. The skill drawn here is the MSE-space one; the NLL-space column beside it in the CSV is a **difference** in nats, not $1 -$ a ratio.
+**Axes.** Top: nats per anchor, one violin per predictor. Bottom: skill across, dimensionless, with zero marked; one bar per pair down. The whiskers are asymmetric, because a percentile interval is not symmetric about its point estimate.
 
-## `forecast/anchor_profile.pdf`
+**How to read it.** The block score is a sum over the scored cells of the $H \cdot C_{\mathrm{keep}}$ block, so its absolute scale depends on the block size. Read the comparison between predictors. The baselines use the same density terms as the branches (the scored-horizon mask and, when on, the AR(1) residual). The figure draws the MSE-space skill. The NLL-space column in the CSV is a difference in nats.
 
-**Purpose.** Show whether predictive scores change from early to late anchors within a segment. At each stored position, the curve averages over segments scored there.
+### `forecast/anchor_profile.pdf`
 
-**What it shows.** The two block scores and `pred_gap` against position in the segment, averaged over every segment that scored that anchor.
+**Purpose.** Show how predictive scores change from early to late anchors within a segment.
+
+**What it shows.** Panel a shows both block scores against the anchor position. Panel b shows `pred_gap` against the same axis. Each position averages over every segment that scored an anchor there.
 
 **Axes.** Anchor index in decimated (4 s) steps from the start of the trimmed segment; nats per anchor.
 
-**Interpretation.** **The profile starts at the anchor floor $F$, and that is the geometry rather than a finding** — and it is the opposite shape from the raw-target cells, where the curve begins at the model's own short warm-up and droops through a truncated-lag region. Here nothing below the anchor floor is decoded at all, so there is no droop to discount and, when the recorded lag support margin is non-negative, no truncated region inside the profile. The last $H$ anchors are still never scored, because their forecast window would run past the end of the segment. A reader expecting the raw cells' shape and finding a curve that begins well into the segment is looking at the anchor floor.
+**How to read it.** The profile starts at the anchor floor $F$, because nothing below $F$ is decoded. When the lag support margin is non-negative, no position inside the profile has truncated lag support. The last $H$ anchors are not scored, because their forecast window runs past the end of the segment.
 
-## `forecast/horizon_skill.pdf`
+### `forecast/horizon_skill.pdf`
 
-**Purpose.** Show how predictive scores and errors change with forecast lead time. The gap panel identifies the future steps where adding source history helps.
+**Purpose.** Show how predictive scores and errors change with forecast lead time.
 
-**What it shows.** $D_{\mathrm{base}}(\tau)$ and $D_{\mathrm{full}}(\tau)$, their gap, and each branch's error, against lead time over the checkpoint's $H$ horizon steps.
+**What it shows.** Four panels against lead time, in a $2 \times 2$ grid:
 
-**Axes.** Lead time in **seconds**; nats **per horizon step**, so the $H$ values sum back to the block.
+1. Panel a shows $D_{\mathrm{base}}(\tau)$ and $D_{\mathrm{full}}(\tau)$. When the record carries the per-step cell counts, the curve is in nats per scored coefficient; otherwise it is in nats per horizon step.
+2. Panel b shows the gap in nats per horizon step.
+3. Panel c shows each branch's RMSE in normalised units.
+4. Panel d shows the scored channels per anchor at each step.
 
-**Interpretation.** The score curve (panel a) is computed on the **single-draw** path, which the page does not state: the Monte Carlo marginalisation does not commute with the sum over $\tau$, so a marginalised curve would not sum back to the marginalised headline. Horizon step $0$ is $4$ s ahead, not $0$ — the anchor's own step is the past, not the forecast. Under a scored-horizon mask, step $\tau$ sums only the channels with $H_c > \tau$, so the late steps hold fewer scored cells and a falling per-step score there partly reflects fewer cells rather than better forecasts; under the AR(1) residual each step scores the innovation given the previous step, not the raw residual.
+**Axes.** Lead time in seconds, from $0$ to $4H$; the units above on the vertical axes.
 
-## `forecast/forecast_overlay.pdf`
+**How to read it.** The curves use the single-draw path (`score_path` in the record). The Monte Carlo marginalisation does not commute with the sum over $\tau$, so a marginalised curve would not sum back to the marginalised headline. Horizon step $0$ is $4$ s ahead. Under a scored-horizon mask, step $\tau$ contains only the channels with $H_c > \tau$; panel d shows that count, and the per-coefficient normalisation of panel a removes it from the score. Under the AR(1) residual, each step scores the innovation given the previous step.
 
-**Purpose.** Compare individual forecasts with their observed targets over the checkpoint's horizon, against the physiology they came from. This reveals details that averages can hide.
+### `forecast/forecast_overlay.pdf`
 
-**What it shows.** **One column per retained sample** (at most `OVERLAY_SAMPLES`, drawn class by class in cohort order from a seeded draw over the retained set), each at one anchor, its median **scored** anchor. The **top two rows** are the raw FHR (bpm) and raw UP (mmHg) on the fixed CTG scales, with the contractions the event detector finds on UP shaded green. Under them, **one row per drawn channel**, at most `OVERLAY_CHANNELS` of them: the middle scattering channel of every clinical band in ascending frequency plus one phase-harmonic channel (the one scored over the fewest horizon steps when $H_c$ is known), or evenly spaced kept positions without the kept-axis channel map. Each channel row draws the target's history as a dashed black line at $x<0$ (one horizon's worth), the truth over the forecast window as a solid black line, the base (blue) and full (vermillion) means, and each branch's predictive $\pm1\sigma$ band. Under the AR(1) residual the band is widened to the marginal variance $v_\tau=\sigma^2_\tau+\phi_c^2 v_{\tau-1}$; without it, it is the decoder's per-cell $\sigma$. Cells past a channel's scored horizon $H_c$ are shaded grey, and the row title states "scored $H_c$ of $H$ steps". $H_c$ and $\phi_c$ are read from the collection record's `likelihood_structure`, the terms every score in the run used. Each column's title carries the GUID, **the subgroup**, the class, the anchor step and its hours before delivery; `forecast_overlay_samples.csv` carries the same identity and the drawn channels.
+**Purpose.** Compare individual forecasts with their observed targets, beside the raw signals they came from.
 
-**Axes.** Seconds from the anchor's causal endpoint, shared by every row: $x<0$ is what the model had read, $x>0$ the $4H$-second forecast window, zero ruled. Raw rows in bpm and mmHg; channel rows in the loader's $z$ units. Every row shares its $y$ range across the columns, so samples are compared, not only read. A column's title is its GUID and subgroup; its anchor step and hours before delivery are in `forecast_overlay_samples.csv`. The footnote keys the band: the predictive $\pm 1\sigma$ of each branch whose log-variance was retained, widened to the AR(1) residual's marginal variance when that is on and otherwise the per-cell innovation $\sigma$.
+**What it shows.** The figure has one column per retained sample, at most `OVERLAY_SAMPLES` $= 3$. The samples come from a seeded draw over the retained set, class by class in cohort order. Each column uses the sample's median scored anchor.
 
-**Interpretation.** Each column is **one anchor of one retained recording**, not a representative case. Retention is opt-in (`eval_config.caps.waveforms`), so a run that did not ask for it emits no such figure at all; the absence is silence, not failure. The drawn channels are a handful of $C_{\mathrm{keep}}$ — a channel that tracks well says nothing about the ones not drawn. A mean that departs from the truth inside the grey region costs nothing in any score: those cells are emitted but not scored. No band is drawn under an `mse` checkpoint, whose log-variance head was never trained.
+- The top two rows show raw FHR (bpm) and raw UP (mmHg) on the fixed CTG scales. Green shading marks the contractions that the event detector finds on UP.
+- Below them is one row per drawn channel, at most `OVERLAY_CHANNELS` $= 5$. With the kept-axis channel map (`band_channel_map_kept.csv`), `overlay_channels` picks the middle scattering channel of each clinical band in ascending frequency, plus one phase-harmonic channel. That channel is the one with the fewest scored horizon steps when $H_c$ is known. Without the map, it picks evenly spaced kept positions.
+- Each channel row draws the target history as a dotted black line at $x<0$ (one horizon of history), the truth over the forecast window as a solid black line, the base (dashed slate) and full (solid vermillion) means, and each branch's predictive $\pm1\sigma$ band.
+- Under the AR(1) residual, the band uses the marginal variance $v_\tau=\sigma^2_\tau+\phi_c^2 v_{\tau-1}$. Without it, the band uses the decoder's per-cell $\sigma$.
+- Grey shading marks cells past the channel's scored horizon $H_c$, and the row title states "scored $H_c$ of $H$ steps". $H_c$ and $\phi_c$ come from the collection record's `likelihood_structure`.
 
-## `coupling/pred_gap_distribution.pdf`
+Each column title carries the GUID, the subgroup and the class. `forecast_overlay_samples.csv` carries the same identity, the anchor step, the hours before delivery and the drawn channels.
 
-**Purpose.** Show whether adding uterine-pressure history improves prediction and how consistently it helps across recordings. This is the main predictive-gain figure. Zero means no improvement under the displayed scoring convention.
+**Axes.** Seconds from the anchor's causal endpoint, shared by every row. $x<0$ is the history that the model read, and $x>0$ is the $4H$ s forecast window; zero is ruled. Raw rows are in bpm and mmHg, and channel rows are in the loader's $z$ units. Each row shares its $y$ range across the columns. A footnote keys the band.
 
-**What it shows.** Three blocks. **Top, one histogram per estimator** — `mc_pred_gap` (Monte Carlo marginalised, the gate's headline), `mean_pred_gap` (both branches decoded at their latent **mean** under the decoder's own variance, no draw) and `pred_gap` (the training path, the parity column) — each over **recordings**, each with zero marked and the bootstrap interval on its *own* mean shaded; the share of recordings above zero is in the summary rows (`positive_fraction`), not in the title. **Middle:** the three estimators side by side as violins, one colour per estimator kept across the page.
+**How to read it.** Each column is one anchor of one retained recording. The figure needs `eval_config.caps.waveforms`; without that cap, the analysis writes no overlay. The drawn channels are a few of the $C_{\mathrm{keep}}$ channels. A mean that departs from the truth inside the grey region does not change any score, because those cells are not scored. An `mse` checkpoint gets no band, because its log-variance head is not trained.
 
-**Bottom:** the mean-decoded estimator against the marginalised one and against the training-path one, one point per recording, with the identity line and the two zero lines, and Spearman's $\rho$ in the title; the share of recordings on which the two agree in sign is in the record (`same_sign_share`).
+---
 
-**Axes.** Nats per anchor throughout; a histogram's height is a count of recordings, not of segments.
+## Coupling figures
 
-**Interpretation.** Four ways. The shaded band is the interval on the **mean**, not the range of the data. The three histograms are three *estimators of the same quantity*, and a sign that differs between them is a fact about the estimator rather than a contradiction: the marginalised score is a log of an average likelihood over $K$ draws, so a broad prior can out-score a sharper posterior there while its mean forecast is worse, and on a `base_decode: mean` checkpoint that is the ordinary case — which is why the mean-decoded estimator is the one the other figures foreground and why the scatters exist, since two histograms cannot say whether the recordings that flipped are the same recordings.
+The `coupling` analysis (`analyses/coupling.py`) writes these figures into `coupling/`.
 
-The unit is one recording, so a recording that scored no anchors is absent rather than at zero — the count actually available is `n_recordings_scored` in the summary rows, not on the page. And the gate still reads `pred_gap_mc_nats`; the mean-decoded column is beside it in the headline under its own name, not in its place.
+### `coupling/pred_gap_distribution.pdf`
 
-A fourth is this cell's own: **a positive gap here is not yet a source finding.** Read `source_null/source_null_difference.pdf` beside it, because part of a coupling readout can be an availability clock that no control on this figure can see.
+**Purpose.** Show whether source history improves prediction and how consistently it does so across recordings. Zero means no improvement under the displayed estimator.
 
-## `coupling/pred_gap_percent.pdf`
+**What it shows.** Three blocks:
 
-**Purpose.** Express the predictive comparison as percentage changes in error and likelihood density. Zero means no change. The panels separate these quantities because they use different denominators.
+1. **Top row: one histogram per estimator, side by side.** The estimators are `mc_pred_gap` (Monte Carlo marginalised, which the gate reads), `mean_pred_gap` (both branches decoded at their latent means) and `pred_gap` (the training path). Each histogram is over recordings, with zero marked and the bootstrap interval on its own mean shaded.
+2. **Bottom left: the three estimators as violins**, one colour per estimator (`ESTIMATOR_COLORS`), kept across the page.
+3. **Bottom middle and right: two scatters, one point per recording.** They show the mean-decoded estimator against the marginalised one and against the training-path one. Each scatter has the identity line and the two zero lines. The title gives Spearman's $\rho$.
 
-**What it shows.** Top: the distribution of `pred_gap_rmse_pct` over recordings, zero marked, the interval on the mean shaded. Middle: `pred_gap_rmse_pct` and `pred_gap_mse_pct` side by side — the same ratio under a root, so the mean-square figure is the larger wherever both are positive. Bottom: `pred_gap_mc_likelihood_pct` and `pred_gap_mean_likelihood_pct` side by side — the same per-coefficient density ratio on the marginalised and on the mean-decoded gap, in the estimator colours of the figure beside this one — **empty under an `mse` checkpoint**, where they are undefined rather than zero.
+The summary rows carry the share of recordings above zero (`positive_fraction`), the sign agreement of each pair (`same_sign_share`) and `n_recordings_scored`.
 
-**Axes.** Percent on every panel; the histogram's height is a count of recordings.
+**Axes.** Nats per anchor throughout. A histogram's height is a count of recordings.
 
-**Interpretation.** The bottom panel is **budget-local**: it divides by $H \cdot C_{\mathrm{keep}}$, and $C_{\mathrm{keep}}$ is whatever the warm-up budget decided, so it cannot be compared across two arms at two budgets — nor, for that matter, against any other cell of the grid. The two error-space panels are scale-free and do not carry that caveat.
+**How to read it.** The shaded band is the interval on the mean, not the range of the data. The three histograms are three estimators of one quantity. Their signs can differ, because the marginalised score is the log of an average likelihood over $K$ draws: a broad prior can score better there while its mean forecast is worse. The scatters show whether the same recordings change sign. A recording that scored no anchors is absent, not at zero. A positive gap on this figure does not separate source content from the availability clock; read `source_null/source_null_difference.pdf` beside it.
 
-## `latent/kl_spectrum.pdf`
+### `coupling/pred_gap_percent.pdf`
 
-**Purpose.** Show how much each latent dimension changes when source history is added. A concentrated spectrum means a small number of dimensions account for most of the KL; it does not establish forecast usefulness by itself.
+**Purpose.** Express the predictive comparison as percentage changes in error and in likelihood density.
 
-**What it shows.** The per-dimension KL, sorted. The active-dimension count, the top dimension's share and the total are in the analysis record beside it rather than annotated on the panel.
+**What it shows.** Three panels side by side. The left panel shows the distribution of `pred_gap_rmse_pct` over recordings, with zero marked and the interval on the mean shaded. The middle panel ("Error space") shows `pred_gap_rmse_pct` and `pred_gap_mse_pct` side by side. They are the same ratio with and without a root, so the mean-square value is larger where both are positive. The right panel ("Likelihood space") shows `pred_gap_mc_likelihood_pct` and `pred_gap_mean_likelihood_pct` in the estimator colours of `pred_gap_distribution.pdf`. Under an `mse` checkpoint the right panel is empty, because these values are undefined.
 
-**Axes.** Latent dimension rank; nats per anchor.
+**Axes.** Percent on every panel. The histogram's height is a count of recordings.
 
-**Interpretation.** A tall first bar is not automatically a fault — one dimension carrying most of a small total is a different finding from one carrying most of a large one, and the total is in the record for that reason. What *is* a fault is a spectrum read without checking `prior_variance_not_pinned` first: a prior variance on its clamp multiplies every bar by an arbitrary factor while every decoder-side diagnostic stays healthy.
+**How to read it.** The right panel divides by $H \cdot C_{\mathrm{keep}}$, and the warm-up budget sets $C_{\mathrm{keep}}$. Two runs at two budgets therefore have different denominators. The two error-space panels are scale-free.
 
-## `lag_kl/lag_kl_profile.pdf`
+---
 
-**Purpose.** Show how the model's attention weights distribute KL across stored source lags. Read this as a coefficient-time attribution, with the lag and variance limitations below.
+## Latent and lag-KL figures
 
-**What it shows.** The per-lag KL attribution in its raw, support-corrected and untruncated forms, with the peak and its width marked. The legend names the three forms: *raw* sums to the KL, *support-corrected* divides each lag by its contributing-anchor count, *untruncated* uses only the anchors where every lag exists; the lower panel is that contributing-anchor count, the correction's denominator.
+### `latent/kl_spectrum.pdf`
 
-**Axes.** Lag in 4-second steps, with the compensated seconds axis beside it; nats per anchor.
+**Purpose.** Show how much each latent dimension changes when source history is added.
 
-**Interpretation.** Two ways, and the one-line note under the figure states the second (the full caveat is `axis_caveat` in the records). **When the three profiles coincide, that is a measurement rather than a redundancy**: with a non-negative lag support margin (`causality.lag_support` in `preflight.json`) every lag exists at every scored anchor, so the support correction and the untruncated recomputation are inert — and an arm that lowered the floor or widened `max_lag` would separate them again, which is why all three are still drawn. And **a peak is a position in stored-coefficient time**, not a physiological delay: the composed group delay is uncorrected and reaches the same order as the search window itself.
+**What it shows.** The per-dimension KL, sorted. Dimensions above the activity threshold are blue and the rest are light grey. The analysis record (`analyses/latent.py`) carries the active-dimension count, the top dimension's share and the total.
 
-## `attention/attention_profile.pdf`
+**Axes.** Latent dimension (sorted) across; nats per anchor up.
 
-**Purpose.** Show where each attention head places weight over source history. Separate head curves reveal patterns that a head-averaged profile can hide.
+**How to read it.** A concentrated spectrum means that a few dimensions carry most of the KL. It does not show forecast usefulness. Read the total in the record beside the spectrum. Check `prior_variance_not_pinned` first: a prior variance at its clamp multiplies every bar by an arbitrary factor.
 
-**What it shows.** Two panels: the head-averaged attention profile over lags, and the per-head profiles beside it, one curve per head. Each head's entropy against the ceiling it can actually reach is **not on the page**; it is in `attention_per_recording.csv` and the analysis record.
+### `lag_kl/lag_kl_profile.pdf`
 
-**Axes.** Lag in seconds (stored-coefficient time); attention weight.
+**Purpose.** Show how the attention weights distribute KL across stored source lags.
 
-**Interpretation.** The entropy is quoted against the **attainable** ceiling $\operatorname{mean}_t \log \min(t+1, L)$, which equals $\log L$ exactly whenever the recorded lag support margin is non-negative — measured, not substituted. Reading a head's entropy against a hand-computed $\log L$ on an arm with a lower floor would report a model attending uniformly over what exists as increasingly concentrated. And the entropy is taken per anchor and then averaged, never as the entropy of the averaged profile: a mixture's entropy is at least the mean of the entropies mixed, so the second reports a model whose lag focus *shifts* as one that has none.
+**What it shows.** The left panel draws the per-lag KL attribution in three forms (`analyses/lag_kl.py`):
 
-## `attention/lag_heatmap.pdf`
+- *raw* sums to the KL;
+- *support-corrected* divides each lag by its contributing-anchor count;
+- *untruncated* uses only the anchors where every lag exists.
+
+Dashed vertical lines mark the raw argmax and the support-corrected argmax. The right panel shows the contributing-anchor count per lag, which is the denominator of the correction. A footnote carries `GROUP_DELAY_NOTE`, and the records carry the full `axis_caveat`.
+
+**Axes.** Compensated lag in seconds (stored-coefficient time) across. Nats per anchor up on the left panel; anchors per segment up on the right panel.
+
+**How to read it.** With a non-negative lag support margin (`causality.lag_support` in `preflight.json`), every lag exists at every scored anchor, so the support correction and the untruncated form do not change the profile and the three curves coincide. A run with a lower floor or a wider `max_lag` separates them. A peak is a position in stored-coefficient time, not a physiological delay.
+
+---
+
+## Attention figures
+
+The `attention` analysis (`analyses/attention.py`) writes these figures into `attention/`.
+
+### `attention/attention_profile.pdf`
+
+**Purpose.** Show where the attention places weight over source history, averaged over heads and per head.
+
+**What it shows.** Panel a shows the head-averaged attention profile over lags in its raw, support-corrected and untruncated forms. Panel b shows one curve per head. Both panels shade any truncated-support region. Each head's entropy and its ceiling are in `attention_per_recording.csv` and the analysis record, not on the page.
+
+**Axes.** Lag in seconds (stored-coefficient time) across; attention weight up.
+
+**How to read it.** The analysis quotes entropy against the attainable ceiling $\operatorname{mean}_t \log \min(t+1, L)$. This ceiling equals $\log L$ whenever the lag support margin is non-negative. The analysis takes the entropy per anchor and then averages it. It never takes the entropy of the averaged profile, because the entropy of a mixture is at least the mean entropy of its parts; a model whose lag focus moves between anchors would then read as unfocused.
+
+### `attention/lag_heatmap.pdf`
 
 **Purpose.** Show how attention over source lags changes across the anchors of one retained segment.
 
-**What it shows.** Head-averaged attention as a heat map over (time in segment, lag) for one retained sample, with the anchor floor marked. The figure title names the recording: its GUID with **its subgroup** and class; the segment's place before delivery is in `per_sample.csv`.
+**What it shows.** Head-averaged attention as a heatmap over time in segment and lag, for one retained sample, with the anchor floor marked. The title names the GUID, the subgroup and the class. `per_sample.csv` carries the segment's place before delivery.
 
-**Axes.** Time in segment (s) across; lag in seconds (stored-coefficient time) down, each lag row spanning its own 4 s bin; colour is attention weight.
+**Axes.** Time in segment (s) across; lag in seconds (stored-coefficient time) down, each row spanning its own 4 s bin. Colour is attention weight.
 
-**Interpretation.** It is **one retained segment**, drawn only where `eval_config.caps.attention` asked for retention — an absent figure is silence, not failure. It is head-averaged, so a single head's structure can be hidden under three flat ones; the per-head profiles are on `attention_profile.pdf`. The vertical axis is the same coefficient-time lag as everywhere else.
+**How to read it.** The heatmap shows one retained segment. It needs `eval_config.caps.attention`; without that cap, the analysis writes no heatmap. The map is head-averaged, so the structure of one head can be hidden; `attention_profile.pdf` shows the per-head profiles.
 
-## `calibration/pit_reliability.pdf`
+---
 
-**Purpose.** Check whether forecast uncertainty matches observed errors. For example, an interval with about $68\%$ nominal coverage should contain about $68\%$ of observations over repeated forecasts.
+## Calibration figures
 
-**What it shows.** The probability integral transform of the standardised residuals against uniform, and the empirical central coverage at the exact erf nominals. The observed and nominal coverage values are in the coverage table and the record, not in the panel title.
+The `calibration` analysis (`analyses/calibration.py`) writes these figures into `calibration/`.
 
-**Axes.** Nominal probability against realised; the diagonal is perfect calibration.
+### `calibration/pit_reliability.pdf`
 
-**Interpretation.** The nominals are $\operatorname{erf}(k/\sqrt{2}) = 0.6827,\ 0.9545,\ 0.9973$ — the two-sigma figure is **not** 0.95, which is $\pm 1.96\sigma$, and the half-point difference reads as a real miscalibration if the wrong nominal is assumed. The unit here is one **scored coefficient**, not one element of a 4 Hz trace, which is why the count beside it is `n_coefficients`: cells past a channel's scored horizon $H_c$ are left out, and under the AR(1) residual the standardised residual is the innovation $e_\tau=r_\tau-\phi_c r_{\tau-1}$ over the decoder's $\sigma_\tau$, the quantity the density actually scores. An `mse` checkpoint emits no such figure at all: its log-variance head was never fitted.
+**Purpose.** Check whether forecast uncertainty matches the observed errors. For example, an interval with about $68\%$ nominal coverage should contain about $68\%$ of observations.
 
-## `calibration/logvar_distribution.pdf`
+**What it shows.** Panel a shows the histogram of the probability integral transform (PIT) of the standardised residuals, against the uniform density. Panel b shows the empirical central coverage at the exact erf nominals, against the diagonal. The coverage table and the record carry the observed and nominal values.
 
-**Purpose.** Show whether predicted log-variances concentrate near their allowed lower or upper limits. A mean log-variance alone can hide concentration at both ends.
+**Axes.** Panel a: PIT value across, density up. Panel b: nominal probability across, observed coverage up; the diagonal is perfect calibration.
 
-**What it shows.** The distribution of the decoder's log-variance with both clamp bounds marked. The floor and ceiling fractions are in the analysis record and `summary.json`, not annotated on the panel.
+**How to read it.** The nominals are $\operatorname{erf}(k/\sqrt{2}) = 0.6827,\ 0.9545,\ 0.9973$ for $k = 1, 2, 3$. The two-sigma value is not $0.95$, which belongs to $\pm 1.96\sigma$. The unit is one scored coefficient, so the count is `n_coefficients`. Cells past a channel's $H_c$ are left out. Under the AR(1) residual, the standardised residual is the innovation $e_\tau$ over the decoder's $\sigma_\tau$, which is the quantity the density scores. An `mse` checkpoint gets no figure, because its log-variance head is not fitted.
 
-**Axes.** Log-variance; fraction of coefficients.
+### `calibration/logvar_distribution.pdf`
 
-**Interpretation.** This is the one figure whose reading changes a config value — the analysis states a recommended `logvar_clamp` revision **per coefficient**, which is the axis the objective's block score reduces over, and says *no change* when neither end binds. A recommendation emitted unconditionally would be applied unconditionally.
+**Purpose.** Show whether predicted log-variances concentrate near their lower or upper clamp.
 
-## `distributions/class_histograms.pdf`
+**What it shows.** The distribution of the decoder's log-variance, with both `logvar_clamp` bounds marked. The analysis record and `summary.json` carry the floor and ceiling fractions.
 
-**Purpose.** Compare distribution shapes across clinical classes. Similar means can hide different tails or a small set of large errors. Segment densities and recording summaries show different levels of aggregation.
+**Axes.** Log-variance across; fraction of coefficients up.
 
-**What it shows.** Nine metrics, one panel each, drawn at **two levels on the same axes**: a filled density of one value per **segment**, and a median / inter-quartile / range **strip** above it of one value per **recording**. The coupling pair is `mc_pred_gap` and `mean_pred_gap`, adjacent, because the two estimators of the same gap disagree wherever a branch's latent spread matters and a reader should see both distributions before trusting either sign.
+**How to read it.** A mean log-variance alone can hide concentration at both ends. The analysis states a recommended `logvar_clamp` revision per coefficient, which is the axis over which the block score reduces. It states *no change* when neither end binds.
 
-**Axes.** The x label is the metric's own unit, in $z$ space, and the panel title names the metric. The legend (cohort names, drawn once in the first row) carries no counts: the segment and recording counts are in the summary table. Density rather than counts, so a cohort contributing ten times the segments does not simply draw a taller curve.
+---
 
-**Interpretation.** **The difference between the two levels is the content, not a redundancy**: a strip far narrower than the density beneath it says most of the visible spread is within-recording variation, and the density is showing many views of the same delivery. This analysis computes **no test on purpose** — consecutive anchors overlap in $H-1$ of their $H$ horizon steps at the dense evaluation geometry, so a per-segment $p$-value is anticonservative by roughly that factor. A separation visible here is a reason to look at `cross_subgroup`, not a result.
+## Distribution figures
 
-## `distributions/subgroup_histograms.pdf`
+The `distributions` analysis (`analyses/distributions.py`) writes these figures into `distributions/`.
 
-The same nine metrics resolved by subgroup, **nested rather than flat**: one column per clinical class with that class's subgroups overlaid inside it, so a cell holds at most four curves and they are four tints of one hue. Each cohort is a faint fill under a hairline outline at full opacity, drawn in two passes so every outline sits above every fill — one pass per cohort would leave the first cohort's outline veiled by every later fill, and the first legend entry would be the hardest curve to trace.
+### `distributions/class_histograms.pdf`
 
-## `trajectory/trajectory_profile_pred_gap.pdf`
+**Purpose.** Compare distribution shapes across clinical classes at two levels of aggregation.
 
-**Purpose.** Follow predictive gain within a segment and across a recording assembled from its segments.
+**What it shows.** Nine metrics, one panel each, at two levels on the same axes. A filled density shows one value per segment. A strip above it shows the median, interquartile range and range of one value per recording. The coupling pair `mc_pred_gap` and `mean_pred_gap` sits in adjacent panels, so you can compare the two estimators.
 
-**What it shows.** `mc_pred_gap` against time in segment, and against absolute time $t_{\mathrm{abs}} = \mathrm{epoch} + T_{\mathrm{trim}} + 4t$ across a delivery, with overlapping steps averaged and `n_contributing` travelling beside them. $\mathrm{epoch}$ is the stored segment's start (seconds, negative before delivery), $T_{\mathrm{trim}}$ is `LOADER_TRIM_S`, the fixed trim the loader cuts from the front of every stored segment before loaded step $0$ (preflight refuses any other `trim_minutes`), and $t$ is the loaded anchor step. The same `traces.absolute_seconds` places every anchor on the clinical clock in the traces, the forecast overlay and the attribution pages; leaving the trim out would put every anchor one trim early.
+**Axes.** The $x$ label is the metric's unit in $z$ space, and the panel title names the metric. The legend (drawn once, in the first row) names the cohorts without counts. The summary table carries the segment and recording counts. The vertical axis is density, so a cohort with ten times more segments does not draw a taller curve.
 
-**Axes.** Time in segment (s) on the within-segment panel; hours before delivery on the whole-delivery panel; nats per anchor. The whole-delivery panel's title names the recording it draws (GUID, subgroup, class); the readout is named by the panel above it.
+**How to read it.** A strip that is much narrower than the density below it means that most of the spread is within-recording variation. The analysis computes no test. At the dense evaluation geometry, consecutive anchors share $H-1$ of their $H$ horizon steps, so a per-segment $p$-value would be anticonservative. Use `cross_subgroup` for tests.
 
-**Interpretation.** The within-segment panel **starts at the anchor floor**, for the same reason `forecast/anchor_profile.pdf` does. Across a delivery the line is **lifted wherever nothing was decoded** — and on this cell that includes the undecoded warm-up prefix of every segment, so the whole-delivery line is a run of short pieces one segment apart by construction, not a recording full of gaps. A **break** in `trajectory_delivery_summary.csv` is only a gap longer than one segment stride, i.e. a missing segment. The averaging of overlapping steps is visible in `n_contributing` rather than inferred.
+### `distributions/subgroup_histograms.pdf`
 
-**Why it is one readout.** The lower panel is a single axis in nats per anchor, and the KL sitting on it beside `pred_gap` is routinely orders of magnitude larger — so a shared page draws the gap as a flat line at the bottom of the KL's range and reports a real movement of a tenth of a nat as nothing. The KL has its own page beside this one.
+**What it shows.** The same nine metrics by subgroup, nested in one column per clinical class. Each cell holds at most four curves, in tints of one hue. Each cohort is a faint fill under a full-opacity hairline outline. The code draws all fills first and all outlines second, so each outline stays visible above every fill.
 
-## `trajectory/trajectory_profile_pred_gap_mean.pdf`
+---
 
-The same two views of `mean_pred_gap` — the gap on the mean-decoded forecasts, no latent draw — on its own page beside the marginalised one. Same axes, same unit, a different estimator; on a `base_decode: mean` checkpoint the two pages routinely disagree in sign, and a reader comparing them is comparing estimators rather than recordings. The caveats of the page above apply unchanged.
+## Trajectory figures
 
-## `trajectory/trajectory_profile_kl.pdf`
+The `trajectory` analysis (`analyses/trajectory.py`) writes these figures into `trajectory/`.
 
-The same two views of `kld_per_t`, on its own axis. Everything about the reading is the page above's; what differs is the quantity, and its one caveat: the KL is **inflated by an arbitrary factor whenever the prior variance sits on its clamp**, so its level is not comparable across checkpoints and a rise here is a rise only if the clamp state did not change. `pred_gap` carries no such factor, which is why the pair is reported and why neither is read alone.
+### `trajectory/trajectory_profile_pred_gap.pdf`
 
-## `time_to_delivery/time_to_delivery_trajectory_pred_gap.pdf`
+**Purpose.** Follow the predictive gain within a segment and across a recording assembled from its segments.
 
-**Purpose.** Compare predictive-gain trajectories across clinical classes as delivery approaches, using half-hour windows.
+**What it shows.** `mc_pred_gap` against time in segment, and against absolute time across a delivery:
 
-**What it shows.** `mc_pred_gap` against hours before delivery, $-\mathrm{epoch}/3600$, class-stratified, using one value per recording within each window. The legend names the classes only; the recordings per class are `n_recordings_total` in the trajectory table.
+$$t_{\mathrm{abs}} = \mathrm{epoch} + T_{\mathrm{trim}} + 4t.$$
 
-**Axes.** Hours before delivery (negative, increasing to the right); nats per anchor.
+Here $\mathrm{epoch}$ is the stored segment start (seconds, negative before delivery), $T_{\mathrm{trim}}$ is `LOADER_TRIM_S` (the fixed trim that the loader cuts from the front of each stored segment; preflight refuses any other `trim_minutes`), and $t$ is the loaded anchor step. Overlapping steps are averaged, and `n_contributing` travels beside them. `traces.absolute_seconds` applies the same formula in the traces, the forecast overlay and the attribution pages.
 
-**Interpretation.** Significance is tested **per window**, with Holm across windows as one family; the `pooled` row is flagged `confounded_by_time` and consumed by nothing, because a pooled difference between classes with different recording lengths is a difference in when they were recorded. The bin width is a module constant rather than a config key, for the same reason the significance level is not one.
+**Axes.** Time in segment (s) on the within-segment panel; hours before delivery on the whole-delivery panel; nats per anchor. The whole-delivery panel's title names the recording (GUID, subgroup, class).
 
-**Why it is one readout.** The KL is on the same nominal unit and not on the same scale — it is multiplied by an arbitrary factor whenever the prior variance sits on its clamp — so a page carrying both puts `pred_gap` on a range the KL set. It has its own page beside this one, and the two are compared in `time_to_delivery_trajectory.csv` rather than by eye.
+**How to read it.** The within-segment panel starts at the anchor floor, as `forecast/anchor_profile.pdf` does. Across a delivery, the line is lifted wherever nothing was decoded. This includes the undecoded warm-up prefix of every segment, so the whole-delivery line is a series of short pieces one segment apart. In `trajectory_delivery_summary.csv`, a **break** is a gap longer than one segment stride, which means a missing segment.
 
-**Beside it.** `time_to_delivery_windows_pred_gap.pdf` draws the per-recording distribution behind every point of this figure, the Holm-adjusted significance of each window, and the effect size of every class pair that survived — on this same axis. Read that one before quoting a gap between two lines here.
+The KL has its own page, because KL and `pred_gap` can differ in scale by a large factor. On a shared axis, the gap would draw as a flat line.
 
-## `time_to_delivery/time_to_delivery_trajectory_kl.pdf`
+### `trajectory/trajectory_profile_pred_gap_mean.pdf`
 
-The same figure for `source_conditioned_kl_raw`, on its own axis, with `time_to_delivery_windows_kl.pdf` beside it. Read exactly as the page above, with one addition: the unfloored KL is **inflated by an arbitrary factor whenever the prior variance sits on its clamp**, so a trajectory visible here and absent from the `pred_gap` page is a statement about which of the two is being read rather than about the coupling.
+**What it shows.** The same two views of `mean_pred_gap`, the gap on the mean-decoded forecasts without a latent draw. The axes, the unit and the reading notes are those of the page above. The two pages show two estimators of one quantity, and their signs can differ.
 
-## `time_to_delivery/time_to_delivery_windows_pred_gap.pdf`
+### `trajectory/trajectory_profile_kl.pdf`
 
-**Purpose.** Show the recording-level values behind each class trajectory and the statistical comparisons within each time window.
+**What it shows.** The same two views of `kld_per_t`, on its own axis. The reading is that of the `pred_gap` page. A prior variance at its clamp inflates the KL by an arbitrary factor, so its level is not comparable across checkpoints. `pred_gap` carries no such factor.
 
-**What it shows.** Three panels of `mc_pred_gap`. A violin per (window, clinical class) cell over one value per **recording**; directly beneath it, $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line; then a heatmap of Cliff's delta for every class pair that survived Holm, in any window. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
+---
 
-**Axes.** Hours before delivery on the same $0.5$ h grid as the trajectory, inverted so delivery is at the right — on every panel including the heatmap, whose columns run in the same direction as the panels above it; nats per anchor on the violins; $-\log_{10} p$ on the strips.
+## Time-to-delivery figures
 
-**Interpretation.** **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, while a cross means fewer than two classes had enough recordings there and nothing was tested. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes, and it receives them worst first.
+The `time_to_delivery` analysis (`analyses/time_to_delivery.py`) writes these figures into `time_to_delivery/`. Windows are $0.5$ h wide (`BIN_WIDTH_HOURS`). The bin width and the significance level are module constants, not config keys.
 
-A positive Cliff's delta therefore means the *more severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `time_to_delivery_pairwise.csv`. The correction is across the windows of this clock as one family, which is what makes "eight windows survived" a claim rather than an artefact of having asked twenty-two times; the two readouts are **not** jointly corrected, because they are two readings of the same recordings rather than two hypotheses.
+### `time_to_delivery/time_to_delivery_trajectory_pred_gap.pdf`
 
-## `time_to_delivery/time_to_delivery_windows_kl.pdf`
+**Purpose.** Compare predictive-gain trajectories across clinical classes as delivery approaches.
 
-The same three panels for `source_conditioned_kl_raw`. Read exactly as the page above — including the row order and the sign of Cliff's delta — remembering that the KL's *level* is inflated wherever the prior variance is clamped. The Holm family is still this clock's windows: the two readouts are not corrected jointly, so a window significant on one page and not the other is one comparison each rather than one comparison twice.
+**What it shows.** `mc_pred_gap` against hours before delivery, $-\mathrm{epoch}/3600$, by class, with one value per recording in each window. The legend names the classes. `n_recordings_total` in the trajectory table gives the recordings per class.
 
-## `second_stage/second_stage_trajectory_pred_gap.pdf`
+**Axes.** Hours before delivery, with delivery at the right; nats per anchor.
 
-**Purpose.** Follow predictive gain around the onset of the second stage of labour. Only recordings with a recorded onset can be placed on this axis.
+**How to read it.** The analysis tests significance per window, with Holm across windows as one family. The `pooled` row carries the flag `confounded_by_time`, and nothing consumes it: a pooled difference between classes with different recording lengths mixes in when they were recorded. The KL has its own page, because the clamp factor puts it on a different scale. `time_to_delivery_trajectory.csv` holds both readouts. `time_to_delivery_windows_pred_gap.pdf` shows the per-recording distribution and the tests behind each point.
 
-**What it shows.** `mc_pred_gap` against `second_stage_onset / 3600`, class-stratified, as a median with an inter-quartile ribbon over **recordings** — one value per recording per window, averaged over that recording's own segments in it. Each point is annotated with the number of recordings behind it, and a dotted vertical marks the onset itself. The legend names the classes only; the recordings per class are `n_recordings_total` in the trajectory table.
+### `time_to_delivery/time_to_delivery_trajectory_kl.pdf`
 
-**Axes.** Signed hours from second-stage onset, **negative before onset and positive after**, on the same $0.5$ h grid the delivery clock uses; **not** inverted, because this coordinate reads naturally left to right. Nats per anchor.
+**What it shows.** The same figure for `source_conditioned_kl_raw`, on its own axis, with `time_to_delivery_windows_kl.pdf` beside it. The unfloored KL is inflated by an arbitrary factor wherever the prior variance sits at its clamp.
 
-**Interpretation.** **The sign is the opposite convention from the delivery clock's**: negative is *before* the onset. The axis label does not spell this out; the dotted line at zero marks the onset. **The positive side is short by construction** — the second stage begins a couple of hours before delivery, so the windows after onset hold far fewer recordings than those before it, and the annotated $n$ is what says which is which. The population is a **subset**: recordings with no recorded onset are dropped and counted in `second_stage_eligibility.csv`, so this figure describes fewer recordings than any other in the run.
+### `time_to_delivery/time_to_delivery_windows_pred_gap.pdf`
 
-## `second_stage/second_stage_trajectory_kl.pdf`
+**Purpose.** Show the recording-level values behind each class trajectory, and the statistical comparisons within each window.
 
-The same figure for `source_conditioned_kl_raw` on this clock, on its own axis. Read as the page above, with the KL's clamp caveat: its level is inflated by an arbitrary factor wherever the prior variance sits on its clamp, so the shape is readable and the height is not.
+**What it shows.** Three panels of `mc_pred_gap`:
 
-## `second_stage/second_stage_windows_pred_gap.pdf`
+1. A violin per (window, class) cell over one value per recording.
+2. Below it, $-\log_{10}$ of the window's Holm-adjusted $p$, against the $\alpha$ line.
+3. A heatmap of Cliff's delta for every class pair that survives Holm in any window.
+
+Each cell carries its recording count. A cell below `MIN_GROUP_SIZE` $= 3$ recordings, or a cell whose values are all equal, is drawn as points instead of a density. The test excludes the same cells.
+
+**Axes.** Hours before delivery on the $0.5$ h grid, with delivery at the right on every panel, including the heatmap. Nats per anchor on the violins; $-\log_{10} p$ on the strips.
+
+**How to read it.** A missing bar means that the window was tested and its $p$ is at or near $1$. A grey cross at zero means that fewer than two classes had enough recordings, so nothing was tested. Each heatmap row reads more severe against less severe: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, in that order. A positive Cliff's delta therefore means that the more severe class runs higher. `time_to_delivery_pairwise.csv` carries the same signs. The Holm family is the windows of this clock. The two readouts are not corrected jointly, because they are two readings of the same recordings.
+
+### `time_to_delivery/time_to_delivery_windows_kl.pdf`
+
+**What it shows.** The same three panels for `source_conditioned_kl_raw`, with the same row order and sign convention. The KL level is inflated wherever the prior variance is clamped. The Holm family is again this clock's windows.
+
+---
+
+## Second-stage figures
+
+The `second_stage` analysis (`analyses/second_stage.py`) writes these figures into `second_stage/`. The axis is signed hours from second-stage onset (`second_stage_onset / 3600`): negative before onset and positive after. It uses the same $0.5$ h grid as the delivery clock and is not inverted. Recordings without a recorded onset are dropped and counted in `second_stage_eligibility.csv`.
+
+### `second_stage/second_stage_trajectory_pred_gap.pdf`
+
+**Purpose.** Follow predictive gain around the onset of the second stage of labour.
+
+**What it shows.** `mc_pred_gap` against the signed onset clock, by class, as a median with an interquartile ribbon over recordings. Each recording gives one value per window, the mean over its segments in that window. Each point carries its recording count, and a dotted vertical line marks the onset. `n_recordings_total` in the trajectory table gives the recordings per class.
+
+**Axes.** Signed hours from second-stage onset; nats per anchor.
+
+**How to read it.** The sign convention is the opposite of the delivery clock: negative is before the onset. The second stage begins a short time before delivery, so the windows after onset hold fewer recordings; the annotated $n$ shows how many. The population is the subset of recordings with a recorded onset.
+
+### `second_stage/second_stage_trajectory_kl.pdf`
+
+**What it shows.** The same figure for `source_conditioned_kl_raw` on its own axis. The clamp factor inflates the KL level, so read the shape and not the height.
+
+### `second_stage/second_stage_windows_pred_gap.pdf`
 
 **Purpose.** Show recording-level predictive gaps and class comparisons within windows before and after second-stage onset.
 
-**What it shows.** Three panels of `mc_pred_gap`. A violin per (window, clinical class) cell over one value per **recording**; directly beneath it, $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line; then a heatmap of Cliff's delta for every class pair that survived Holm, in any window. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
+**What it shows.** The same three panels as `time_to_delivery_windows_pred_gap.pdf`, on the signed onset clock: violins per (window, class) cell, the Holm-adjusted $p$ strip, and the Cliff's delta heatmap. The `MIN_GROUP_SIZE` rule is the same.
 
-**Axes.** Signed hours from second-stage onset, negative before and positive after, on the same $0.5$ h grid; not inverted, with the onset marked at zero on every panel that carries the clock. Nats per anchor on the violins; $-\log_{10} p$ on the strips.
+**Axes.** Signed hours from second-stage onset, not inverted, with the onset marked at zero on each panel that carries the clock. Nats per anchor on the violins; $-\log_{10} p$ on the strips.
 
-**Interpretation.** **This clock's Holm family is its own** and is not corrected jointly with `time_to_delivery`'s: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment, and a reader quoting both is making two comparisons. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes, and it receives them worst first.
+**How to read it.** This clock has its own Holm family. It is not corrected jointly with `time_to_delivery`, because the two clocks are different alignments of an overlapping population. The heatmap rows and the sign of Cliff's delta follow the delivery-clock page; `second_stage_pairwise.csv` carries the same signs. A grey cross at zero means that fewer than two classes had enough recordings in the window.
 
-A positive Cliff's delta therefore means the *more severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `second_stage_pairwise.csv`. **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, a cross means fewer than two classes had enough recordings there — which on the positive side of this axis is the common case rather than the exception.
+### `second_stage/second_stage_windows_kl.pdf`
 
-## `second_stage/second_stage_windows_kl.pdf`
+**What it shows.** The same three panels for `source_conditioned_kl_raw` on this clock, with the same row order and sign convention, and with the clamp caveat on the violin heights.
 
-The same three panels for `source_conditioned_kl_raw` on this clock. Read exactly as the page above, including the row order and the sign of Cliff's delta, and with the KL's clamp caveat on the violins' heights.
+---
 
-## `lag_clocks/lag_time_to_delivery.pdf`
+## Lag-clock figures
 
-**Purpose.** Follow the location of the lag attribution as delivery approaches and compare it across classes. Read this alongside the coupling trajectories, which show the magnitude of predictive gain and KL.
+The `lag_clocks` analysis (`analyses/lag_clocks.py`) writes these figures into `lag_clocks/`. It computes per-segment statistics of two lag profiles: the KL attribution (`kl`) and the attention (`attn`). The two tested readouts are the centroids of the two profiles. All other statistics are tabled and drawn without tests.
 
-**What it shows.** One heatmap per clinical class: lag down, time before delivery across, colour the **share** of the KL attribution sitting in that lag bin, over one profile per **recording** in each window. Then two panels reducing the same thing to a number — the median centre of mass across recordings with its inter-quartile ribbon, once for the attribution and once for the attention profile, with each window's recording count annotated and the median spread as a dashed line beside it. Each heatmap is titled with its class and its recording count; the trajectory legend is drawn once, on the first trajectory panel.
+### `lag_clocks/lag_time_to_delivery.pdf`
 
-**Axes.** Hours before delivery on the same $0.5$ h grid as the coupling clocks, inverted so delivery is at the right; lag in seconds of **stored-coefficient time**, lag $0$ at the bottom; colour is a share in $[0, 1]$.
+**Purpose.** Follow the location of the lag attribution as delivery approaches, and compare it across classes.
 
-**Interpretation.** **The class panels share one colour scale, and that is what makes them comparable** — three panels each scaled to its own extremes would paint the same colour for three different shares while every colourbar stayed correct. **It is a share, not a magnitude**: every window is normalised to sum to one, so a band moving down means the attribution moved toward the anchor, not that there is more of it — how much there is is what `time_to_delivery_trajectory_pred_gap.pdf` draws.
+**What it shows.** One heatmap per clinical class: lag down, time before delivery across, and colour as the share of the KL attribution in each lag bin, over one profile per recording in each window. Two trajectory panels follow. They show the median centroid across recordings with its interquartile ribbon, once for the attribution and once for the attention. Each window carries its recording count, and the median spread is a dashed line. Each heatmap's title gives its class and recording count. The trajectory legend appears once, on the first trajectory panel.
 
-**A centroid is not a peak**, and this page draws no peak: the argmax and the eleven other per-segment statistics are on `lag_time_to_delivery_features.pdf` beside the guard that says whether a peak may be read at all. And the lag axis is stored-coefficient time, so a centroid that moves by some seconds is a shift over the axis the coefficients are stored on rather than a physiological latency.
+**Axes.** Hours before delivery on the $0.5$ h grid, with delivery at the right. Lag in seconds of stored-coefficient time, with lag $0$ at the bottom. Colour is a share in $[0, 1]$.
 
-## `lag_clocks/lag_time_to_delivery_windows.pdf`
+**How to read it.** All class heatmaps share one colour scale, so one colour means one share in every panel. Each window is normalised to sum to one, so the heatmap shows where the attribution sits, not how much there is; `time_to_delivery_trajectory_pred_gap.pdf` shows the amount. The page draws centroids and no peak; `lag_time_to_delivery_features.pdf` draws the argmax beside the degeneracy share.
 
-**Purpose.** Test class differences in lag centroids within each delivery-time window. A centroid is the profile's weighted average lag.
+### `lag_clocks/lag_time_to_delivery_windows.pdf`
 
-**What it shows.** Five panels. For each tested readout — the centroid of the attribution and the centroid of the attention — a violin per (window, class) cell over one value per **recording**, and directly beneath it $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line. Then one heatmap: Cliff's delta for every class pair that survived Holm, in any window, for either readout.
+**Purpose.** Test class differences in lag centroids within each delivery-time window.
 
-**Axes.** Hours before delivery, inverted; lag in seconds of stored-coefficient time on the violins; $-\log_{10} p$ on the strips.
+**What it shows.** Five panels. For each tested readout (the attribution centroid and the attention centroid), a violin per (window, class) cell over one value per recording, with the window's Holm-adjusted $-\log_{10} p$ below it against the $\alpha$ line. A final heatmap shows Cliff's delta for every class pair that survives Holm in any window, for either readout.
 
-**Interpretation.** **This clock's two families are its own** and are not corrected jointly with the second-stage clock's, nor with each other: four families across this analysis, and a reader quoting two of them is making two comparisons. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, so a positive Cliff's delta means the *more severe* class's centroid sits further back in the past. A cell below `MIN_GROUP_SIZE` = 3 recordings is drawn as its own points rather than as a density the smoother invented, and those are the same cells the test excludes.
+**Axes.** Hours before delivery, with delivery at the right; lag in seconds of stored-coefficient time on the violins; $-\log_{10} p$ on the strips.
 
-## `lag_clocks/lag_time_to_delivery_features.pdf`
+**How to read it.** Each (clock, readout) pair is its own Holm family, which gives four families across the analysis. They are not corrected jointly. The heatmap rows read more severe against less severe, so a positive Cliff's delta means that the more severe class's centroid sits further back in the past. A cell below `MIN_GROUP_SIZE` $= 3$ recordings is drawn as points, and the test excludes it.
 
-**Purpose.** Describe lag-profile shape beyond its centroid, including spread, asymmetry, concentration, and peak behaviour. These additional curves are exploratory.
+### `lag_clocks/lag_time_to_delivery_features.pdf`
 
-**What it shows.** Nine panels against the same clock, one per statistic, each the **median across recordings** with the attribution's inter-quartile ribbon: skewness, the median lag, the inter-quartile range, the entropy, the effective support, the near and far mass shares, the peak lag, and the share of segments whose peak is degenerate. On every panel the **solid line is the KL attribution and the dashed line is the attention profile**, in the same class colours as every other cohort figure. On the peak panel each point additionally carries that window's degenerate share as a percentage.
+**Purpose.** Describe lag-profile shape beyond the centroid.
 
-**Axes.** Hours before delivery on the same $0.5$ h grid, inverted so delivery is at the right. The $y$ axis differs per panel and is labelled per panel: seconds of stored-coefficient time for the median, the inter-quartile range, the effective support and the peak; nats for the entropy; a dimensionless ratio for the skewness; a share in $[0, 1]$ for the three mass and segment shares.
+**What it shows.** Eight panels against the clock, one per drawn statistic (`DRAWN_STATISTICS`): skewness, median lag, interquartile range, entropy, near-mass share, far-mass share, peak lag, and the share of segments whose peak is degenerate. Each panel shows the median across recordings, with the attribution's interquartile ribbon. The solid line is the KL attribution and the dashed line is the attention, in the class colours. On the peak panel, each point also carries the window's degenerate share as a percentage (`PANEL_ANNOTATIONS`).
 
-**Interpretation.** **Nothing on this page is tested.** These statistics are tabled and drawn only, which is what keeps each clock's Holm family at two; a trajectory here that looks separated is a hypothesis, and `lag_clocks_significance.csv` carries the only claims this analysis makes. **The peak panel must be read with the panel beneath it**: `entmax15` assigns lags exactly zero, so a flat or nearly empty profile still has a perfectly confident argmax, and a window whose degenerate share is high has a peak line that means nothing — the annotated percentage on each point is that number for the attribution, and the panel below carries it for both profiles.
+**Axes.** Hours before delivery on the $0.5$ h grid, with delivery at the right. Each panel labels its own $y$ axis: seconds of stored-coefficient time for the median, the interquartile range and the peak; nats for the entropy; a dimensionless value for the skewness; a share in $[0, 1]$ for the mass and segment shares.
 
-**Solid and dashed are two readings of the same recordings, not two cohorts**: the attribution is $K_t$ times the attention and inherits the prior-variance inflation the attention is immune to, so where the two diverge the divergence is the finding. **The near and far shares are measured from the shortest lag the axis carries**, not from zero, so they mean the same thing at any causal input delay — and they do not sum to one, because the middle of the axis belongs to neither.
+**How to read it.** Nothing on this page is tested, which keeps each clock's Holm family at two. `lag_clocks_significance.csv` carries the only tests of the analysis. Read the peak panel together with the degenerate-share panel: `entmax15` gives some lags exactly zero weight, so a flat or nearly empty profile still has an argmax. The attribution is $K_t$ times the attention, so it inherits the prior-variance inflation and the attention does not. The near and far shares are measured from the shortest lag on the axis, so their meaning does not depend on $\delta$. They do not sum to one, because the middle of the axis belongs to neither.
 
-## `lag_clocks/lag_second_stage.pdf`
+### `lag_clocks/lag_second_stage.pdf`
 
-**Purpose.** Follow lag-profile location around second-stage onset using the same panels as the delivery-time version.
+**What it shows.** The panels of `lag_time_to_delivery.pdf` on the second-stage clock: a share-of-attribution heatmap per class, then the centroid trajectories with their ribbons and the median spread.
 
-**What it shows.** The same panels: a share-of-attribution heatmap per class, then the centroid trajectories with their ribbons and the median spread.
+**Axes.** Signed hours from second-stage onset, negative before onset, not inverted, with the onset marked at zero. Lag in seconds of stored-coefficient time, with lag $0$ at the bottom.
 
-**Axes.** Signed hours from second-stage onset, **negative before onset and positive after**, on the same $0.5$ h grid; **not** inverted, with the onset marked at zero. Lag in seconds of stored-coefficient time, lag $0$ at the bottom.
+**How to read it.** The sign convention is the opposite of the delivery clock. The windows after onset hold fewer recordings, and the annotated $n$ shows how many. The population is the subset with a recorded onset, counted in `second_stage/second_stage_eligibility.csv` and in this analysis's record.
 
-**Interpretation.** **The sign is the opposite convention from the delivery clock's** — negative is *before* the onset, and the dotted line at zero marks it. **The positive side is short by construction**, so the windows after onset hold far fewer recordings than those before it and the annotated $n$ is what says which is which. The population is a **subset**: recordings with no recorded onset are dropped, counted in `second_stage/second_stage_eligibility.csv`, and reported in this analysis's own record.
+### `lag_clocks/lag_second_stage_windows.pdf`
 
-## `lag_clocks/lag_second_stage_windows.pdf`
+**What it shows.** The five panels of `lag_time_to_delivery_windows.pdf` on the signed second-stage clock, with the onset at zero.
 
-**Purpose.** Test class differences in lag centroids in windows aligned to second-stage onset.
+**How to read it.** This clock's Holm families are its own, per readout. The heatmap rows read more severe against less severe. A grey cross at zero on a strip means that fewer than two classes had enough recordings in the window.
 
-**What it shows.** Five panels, exactly as the delivery clock's tested page: a violin per (window, class) cell for each tested readout, the Holm-adjusted $p$ beneath it, and Cliff's delta for every surviving class pair.
+### `lag_clocks/lag_second_stage_features.pdf`
 
-**Axes.** Signed hours from second-stage onset, not inverted, onset at zero; lag in seconds of stored-coefficient time; $-\log_{10} p$ on the strips.
+**What it shows.** The eight panels of `lag_time_to_delivery_features.pdf` on the signed second-stage clock, not inverted, with the onset at zero.
 
-**Interpretation.** **This clock's Holm family is its own**, per readout, and is not corrected jointly with the delivery clock's: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment. **Every heatmap row reads more severe against less severe**, so a positive delta means the more severe class's centroid sits further back. A grey cross at zero on a strip means fewer than two classes had enough recordings in that window — which on the positive side of this axis is the common case rather than the exception.
+**How to read it.** The reading notes of the delivery-clock features page apply. The population is the subset with a recorded onset, and the windows after onset hold fewer recordings.
 
-## `lag_clocks/lag_second_stage_features.pdf`
+---
 
-**Purpose.** Describe the additional lag-shape statistics on the second-stage time axis.
+## Cross-subgroup figure
 
-**What it shows.** The same nine panels as the delivery clock's features page — skewness, median lag, inter-quartile range, entropy, effective support, near and far mass share, peak lag, degenerate share — solid for the KL attribution and dashed for the attention, median across recordings with the attribution's inter-quartile ribbon.
+### `cross_subgroup/subgroup_heatmap.pdf`
 
-**Axes.** Signed hours from second-stage onset, **negative before onset and positive after**, **not** inverted, with the onset marked at zero. The $y$ axis is per panel, as on the delivery clock's page.
+**Purpose.** Show effect sizes for cohort comparisons, and mark which comparisons pass the multiple-testing correction.
 
-**Interpretation.** **The sign is the opposite convention from the delivery clock's**, and the population is a **subset**: recordings with no recorded onset are not on this axis at all, and the positive side is short by construction, so a statistic that looks unstable after onset is usually a statistic computed over very few recordings. **Nothing on this page is tested**, and the peak panel must be read with the degenerate share beneath it — both for the reasons the delivery clock's features page states.
+**What it shows.** Two panels (`analyses/cross_subgroup.py`):
 
-## `cross_subgroup/subgroup_heatmap.pdf`
+- **Top:** the omnibus test per metric, a Kruskal–Wallis across cohorts over one value per recording. Each bar is $-\log_{10}$ of the Holm-adjusted $p$ (Holm across the metrics as one family), against the dashed $\alpha$ line. Each metric label carries its recording count. A metric that cannot be tested keeps its row, labelled `not testable`.
+- **Bottom:** Cliff's delta for every cohort pair of the metrics that survive the correction. The pairs come from Mann–Whitney tests whose $p$-values are Holm-corrected again within each metric (`p_holm` beside `p_value` in `cross_subgroup_pairwise.csv`). When no metric survives, the panel is empty and says so.
 
-**Purpose.** Show effect sizes for cohort comparisons and identify which pass the stated multiple-testing correction. Visual separation alone is insufficient when many groups and metrics are compared.
+**Axes.** Top: $-\log_{10}$ Holm-adjusted $p$ across, metrics down in omnibus order. Bottom: surviving metrics down in the same order, cohort pairs across; colour is the signed effect size on a symmetric scale.
 
-**What it shows.** Two panels, because *is there anything there* and *does it matter* are different questions. **Top:** the omnibus test per metric, a Kruskal–Wallis across cohorts over one value per recording, drawn as a bar of $-\log_{10}$ of its Holm-adjusted $p$ (Holm across the metrics as one family) against the dashed $\alpha$ line; each metric's label carries its recording count, and a metric that could not be tested keeps its row, labelled `not testable`. **Bottom:** Cliff's delta for every cohort pair of the metrics that **survived** that correction only, from pairwise Mann–Whitney tests whose $p$-values are Holm-corrected again within each metric as their own family (`p_holm` beside the raw `p_value` in `cross_subgroup_pairwise.csv`). When no metric survives, the lower panel is empty and says so.
+**How to read it.** A bar past the line is not an effect size. With many cohorts and recordings, a metric can pass the omnibus test while every pairwise delta is small, so read the bottom panel before you quote a difference. Each column names the more severe cohort first, so a positive Cliff's delta means that the more severe cohort runs higher. Every test uses one value per recording.
 
-**Axes.** Top: $-\log_{10}$ Holm-adjusted $p$ across, metrics down in the omnibus order. Bottom: surviving metrics down in the same order, cohort **pairs** across; colour is the effect size, signed, on a symmetric scale.
+---
 
-**Interpretation.** **A bar past the line is not an effect size**: at many cohorts and many recordings a metric can clear the omnibus test with every pairwise delta negligible, which is why the lower panel is read before quoting a difference. **The column order and the sign convention are both clinical.** Each column is one cohort pair named more severe first — the shared pairwise helper names a pair in the order it receives the cohorts, and this analysis hands them over worst first — so a positive Cliff's delta means the more severe cohort's values run higher, in every column. Reorienting a column by eye still flips its sign against the number in the CSV. Every test here consumes one value per **recording**; a source naming a per-segment file would test segments while reading as though it tested recordings.
+## Event figures
 
-## `events/conditioned_coupling.pdf`
+The `events` analysis (`analyses/events.py`) writes these figures into `events/`.
+
+### `events/conditioned_coupling.pdf`
 
 **Purpose.** Compare predictive gain and KL shortly after detected contractions with count-matched control anchors from the same recordings.
 
-**What it shows.** One panel per readout — `pred_gap_mc_nats` (the Monte Carlo gap, per anchor) and `source_conditioned_kl_raw` (the per-anchor KL $K_t$). Each panel is one violin per clinical class, in cohort order and colours, of the per-recording **difference**: the recording's mean over its event anchors (anchors within `event_lag_window_s` after a detected contraction onset) minus its mean over count-matched control anchors drawn from the same recording. Each violin's label carries its recording count, the panel title is the readout name, the event window (`event_lag_window_s`) is in the record, and zero is marked as "no effect". The event and control means themselves are in `conditioned_coupling.csv` and `conditioned_coupling_per_recording.csv`, not drawn.
+**What it shows.** One panel per readout: `pred_gap_mc_nats` (the Monte Carlo gap per anchor) and `source_conditioned_kl_raw` (the per-anchor $K_t$). Each panel has one violin per clinical class, in cohort order, of the per-recording difference:
 
-**Axes.** Clinical class across; difference in nats per anchor up, zero marked.
+$$\Delta = \overline{x}_{\mathrm{event}} - \overline{x}_{\mathrm{control}}.$$
 
-**Interpretation.** **Controls are matched within each recording**, count for count, so a difference is not a comparison between recordings wearing two labels; an anchor with no preceding contraction at all counts as a control, the same as one long after its contraction. The contraction timing comes from the **raw pressure trace** carried through the collection pass, not from the source coefficients the model reads — a contraction exists nowhere in the tables unless that one pass puts it there — so this runs over every anchor of the split rather than only over retained samples. Gaps are masked by `weight` and never by value; an event whose span touches an interpolated region is **dropped**, because its shape partly came from that interpolation. Below 200 event anchors over 4 recordings the analysis records a skip and draws nothing.
+Event anchors are anchors within `event_lag_window_s` after a detected contraction onset. Control anchors are count-matched anchors from the same recording. Each violin label carries its recording count, and zero is marked as "no effect". `conditioned_coupling.csv` and `conditioned_coupling_per_recording.csv` carry the event and control means.
 
-Two readouts the raw-target pipeline draws here are **absent**, and the emitted record names both with their reasons: deceleration forecast skill and the contraction-triggered response both score a clinical heart-rate trace in beats per minute, and defining a deceleration on a channel axis with no order and no clinical unit is a new construction rather than a port.
+**Axes.** Clinical class across; event minus control in nats up, with zero marked.
 
-## `events/contraction_detection.pdf`
+**How to read it.** The controls are matched within each recording, count for count. An anchor with no preceding contraction counts as a control. The contraction timing comes from the raw UP trace that the collection pass carries, so the analysis runs over every anchor of the split. `weight` masks the gaps. An event whose span touches an interpolated region is dropped. Below `MIN_EVENT_ANCHORS` $= 200$ event anchors or `MIN_EVENT_RECORDINGS` $= 4$ recordings, the analysis records a skip and draws nothing.
 
-**Purpose.** Show the contractions every conditioned number rests on, on the traces they were found in, so a reader can check by eye that the conditioning is on contractions at all.
+The record names two readouts that this cell does not compute, with the reasons: deceleration forecast skill and the contraction-triggered response. Both score a clinical FHR trace in bpm, and the target here is a coefficient block.
 
-**What it shows.** One panel per drawn segment: up to `DETECTION_SAMPLES_PER_CLASS` retained segments from every clinical class, classes in cohort order (worst first). Each panel is the raw UP trace in mmHg on the fixed CTG scale (the loader's $z$ units when its statistics are unknown), with the detector's **onset** (up-triangle), **peak** (circle) and **end** (down-triangle) marked in vermillion; the `event_lag_window_s` seconds after each onset, in which an anchor counts as an event anchor, shaded green; and the stretch before the first decoded anchor shaded grey, since no anchor there can be conditioned on anything. The panel title carries the **GUID and its subgroup**; the segment start and the contractions found are in `contraction_detections.csv`. One footnote line keys the markers, the green window and the grey stretch. `contraction_detections.csv` lists every detection on every retained segment with its identity (GUID, class, subgroup, epoch), its onset, peak and end in seconds, and the peak pressure with its unit.
+### `events/contraction_detection.pdf`
+
+**Purpose.** Show the detected contractions on the traces they were found in, so you can check the detector by eye.
+
+**What it shows.** One panel per drawn segment: up to `DETECTION_SAMPLES_PER_CLASS` $= 2$ retained segments per clinical class, in cohort order. Each panel shows the raw UP trace in mmHg on the fixed CTG scale (the loader's $z$ units when its statistics are unknown). The detector's onset (up-triangle), peak (circle) and end (down-triangle) are vermillion. Green shading marks the `event_lag_window_s` seconds after each onset. Grey shading marks the stretch before the first decoded anchor. The panel title carries the GUID and its subgroup. One footnote keys the markers and the shading. `contraction_detections.csv` lists every detection on every retained segment with its identity (GUID, class, subgroup, epoch), its onset, peak and end in seconds, and the peak pressure with its unit.
 
 **Axes.** Seconds into the loaded (trimmed) segment across; UP pressure up.
 
-**Interpretation.** Three ways.
+**How to read it.**
 
-- **It is the same detector on the same trace and validity** that wrote `seconds_since_contraction` onto the per-anchor table, re-run on the retained segments. The conditioned comparison itself runs over every anchor of the split; this figure only draws the few segments retention kept, so it checks the detector, not the population.
-- **A contraction touching a gap is dropped, not missed.** Invalid samples are interpolated across before smoothing and any event whose span touches one is removed, so a visible rise with no markers over a stretch of lost signal is the detector declining an event whose shape the interpolation made. The onset is the corrected rising-edge walk-back (`onset_convention` in the record); it is not the peak.
-- **Retention is opt-in.** Without retained raw UP (`eval_config.caps.waveforms`) the figure is absent and the analysis record says why; the absence is silence, not failure.
+- The figure re-runs the detector that wrote `seconds_since_contraction` on the per-anchor table, on the same trace and validity. It checks the detector on a few retained segments, not the population.
+- The detector interpolates invalid samples before smoothing and removes any event whose span touches one. A visible rise without markers over lost signal is such a removed event. The onset follows the rising-edge walk-back (`onset_convention` in the record).
+- The figure needs retained raw UP (`eval_config.caps.waveforms`). Without it, the analysis record states why the figure is absent.
 
-## `sufficiency/sufficiency.pdf`
+---
 
-**Purpose.** Estimate the predictive cost of the latent bottleneck by comparing the base branch with an evaluation-only decoder that reads the encoder state directly. The estimate has probe and population biases, described below.
+## Sufficiency figure
 
-**What it shows.** $D_{\mathrm{base}}$ against $D_{\mathrm{oracle}}$ per recording, the gap's distribution, and the probe's held-out learning curve. The two gaps with their intervals are in `sufficiency_summary.csv`, not on the page.
+### `sufficiency/sufficiency.pdf`
 
-**Axes.** Nats per anchor; passes over the fit half for the curve.
+**Purpose.** Estimate the predictive cost of the latent bottleneck. The analysis compares the base branch with an evaluation-only decoder that reads the encoder state directly.
 
-**Interpretation.** **It is an estimate, not a bound**, and both bias directions travel in the emitted JSON: conditioning on the encoder state rather than on the target's own history omits the encoder's information loss and biases the gap **down**, while fitting the probe on the evaluation population biases it **up**. They oppose, neither is measured, and nothing downstream may treat the number as a bound. The convergence flag is a precondition rather than a decoration: an unfinished probe understates the gap, and a curve that never improved is **not** converged.
+**What it shows.** Two panels (`analyses/sufficiency.py`):
 
-## `warmup/warmup_tertiles.pdf`
+- **Left ("Block score"):** per-recording violins of `nll_oracle_block`, `mc_nll_base_block`, `mean_nll_base_block` and `mc_nll_full_block`. $\Delta_{\mathrm{suff}}$ is read between the oracle and base violins, and `pred_gap` between the base and full violins.
+- **Right ("Oracle probe fit"):** the probe's held-out and fit curves against the optimizer step, one pair per probe width multiplier. The hue names the width, the held-out curve is solid and the fit curve is dashed.
 
-**Purpose.** Compare predictive gaps for three groups of retained channels with short, medium, and long warm-up periods. The lower panel shows attention on source coefficients that had completed warm-up.
+`sufficiency_summary.csv` carries the two gaps with their intervals.
 
-**What it shows.** Top: `pred_gap_warm_lo`, `_mid` and `_hi` per recording, as violins, with zero marked. Bottom: `source_lag_warmth_frac_st` and `_ph` per recording.
+**Axes.** Top: nats per anchor. Bottom: optimizer step across; nats per anchor up.
 
-**Axes.** Top: nats per anchor. Bottom: fraction of attention mass — a **separate axis on purpose**, because a fraction and a nats figure on one axis would flatten whichever is smaller into a line at zero.
+**How to read it.** The gap is an estimate, not a bound, and the JSON record carries both bias directions. The probe conditions on the encoder state instead of the target's own history, which omits the encoder's information loss and biases the gap down. The probe is fitted on the evaluation population, which biases the gap up. The two biases oppose, and neither is measured. The convergence flag is a precondition: an unfinished probe understates the gap, and a held-out curve that never improves is not converged.
 
-**Interpretation.** **The three tertiles are a decomposition, not three readouts**: they sum to `pred_gap` over the same denominator, and the run asserts that they do rather than describing it — so their *relative* sizes are the finding and their absolute sizes carry the block's scale. And **a small warmth fraction in the bottom panel is the expected finding, not a fault**: the stored source blocks warm up late, so much of the searched lag window is a region where the source coefficient is still affected by warm-up.
+---
 
-The page does not say so, and a reader who treats a low value as a defect is reading the dataset's geometry as the model's behaviour.
+## Warm-up figures
 
-## `warmup/causal_warmup_budget.pdf`
+The `warmup` analysis (`analyses/warmup.py`) writes these figures into `warmup/`. It draws the two budget figures through `teb_vae/lag_attn_cfs/warmup_budget.py`.
 
-**Purpose.** Show which channels were retained or dropped, their warm-up requirements, and the resulting anchor floor.
+### `warmup/warmup_tertiles.pdf`
 
-**What it shows.** Two panels, one per stream (target above, source below). One horizontal bar per **declared** channel — the dropped ones included, which is the point of drawing it — laid out against a seconds axis whose origin is the anchor's own causal endpoint. A kept channel's bar spans $[-\Delta W'_c, 0]$: it *ends* at the anchor, and how far left it starts is its warm-up. A dropped channel is drawn at $\delta_c = 0$ instead, so its bar runs **forward** through the shaded forecast window it was still warming up for. The budget threshold is a dashed line; each panel is titled with its stream, its legend counts the kept and dropped channels, and the per-block counts and the warm-up range are in the record's `summary`.
+**Purpose.** Compare predictive gaps for three groups of retained channels with short, medium and long warm-up, and show how much attention falls on warm source coefficients.
 
-**Axes.** Seconds relative to the anchor, negative to the left; one row per channel. The shaded span on the right is the forecast window.
+**What it shows.** Left ("Gap by warm-up tertile"): `pred_gap_warm_lo`, `_mid` and `_hi` per recording as violins, with zero marked. Right ("Warm-lag attention"): `source_lag_warmth_frac_st` and `_ph` per recording. The right panel appears only when the table carries the warmth fractions.
 
-**Interpretation.** **A bar starting before zero is how long that channel spent becoming honest — it is the mirror image of the two-sided cells' reading.** In a two-sided build a channel's boundary is a symmetric smear on both sides of a step; here it is a strictly leading delay, and a long bar means a slow filter rather than a broken one. Two more. **The line is drawn on the source panel too, where it is not a guard**: the source is never gated, so its bars crossing the budget is the design compromise being visible rather than a violation.
+**Axes.** Top: nats per anchor. Bottom: fraction of attention mass. The two quantities have separate axes, because one shared axis would flatten the smaller one.
 
-And bars that run past the right edge are **clipped at the frame**, so a bar that meets the right edge is truncated rather than a channel that ends there. The figure is a constant of the **shard**, not of the run: two runs over the same dataset draw the identical staircase.
+**How to read it.** The three tertiles are a decomposition: they sum to `pred_gap` over the same denominator, and the analysis checks that identity (`recomposition`). Their relative sizes carry the information, and their absolute sizes carry the block's scale. The stored source blocks have long warm-up delays, so part of the searched lag window can fall on source coefficients that are still in warm-up. A low warmth fraction therefore reflects that geometry.
 
-## `warmup/causal_warmup_tradeoff.pdf`
+### `warmup/causal_warmup_budget.pdf`
 
-**Purpose.** Show the tradeoff between retaining more channels and having fewer usable anchors as the warm-up budget changes.
+**Purpose.** Show which channels the warm-up budget kept or dropped, their warm-up requirements, and the resulting anchor floor.
 
-**What it shows.** Three step curves against the candidate budget $B$: target channels kept, anchors admitted, and tiles a training step decodes at phase $0$. The shipped threshold is marked with its three values annotated, and the region where no tile fits at all is shaded behind the curves.
+**What it shows.** Two panels, target stream above and source stream below. Each declared channel, including the dropped ones, gets one horizontal bar against a seconds axis whose origin is the anchor's causal endpoint. A kept channel's bar spans $[-\Delta W'_c, 0]$ with $\Delta = 4$ s: it ends at the anchor, and its left end is its warm-up. A dropped channel is drawn at $\delta_c = 0$, so its bar runs forward through the shaded forecast window. A dashed line marks the budget $-\Delta B$. Each panel's title names its stream, and its legend counts the kept and dropped channels. The record's `summary` carries the per-block counts and the warm-up range.
 
-**Axes.** Budget threshold $B$ in decimated steps; a count axis shared by all three curves.
+**Axes.** Seconds relative to the anchor, negative to the left; one row per channel. The shaded span at the right is the forecast window of $H$ steps.
 
-**Interpretation.** Three ways. The curves are **steps, not a smooth trade**: the anchor count is computed from the **survivors' own maximum** warm-up rather than from the threshold, so any two thresholds that fall between the same pair of consecutive channel warm-ups keep exactly the same channels and admit exactly the same anchors — reading it as continuous suggests tuning room that is not there. The shaded region is **not a bad choice, it is not a choice**: no tile fits there at all. And the curve says nothing about **quality** — two budgets produce mutually unloadable checkpoints whose nats are not comparable, so this figure is about feasibility rather than about which budget forecasts better.
+**How to read it.** A one-sided filter gives each channel a strictly leading delay, so a long bar means a slow filter. The source panel also shows the budget line, but the source is not gated, so source bars that cross the line do not violate anything. Bars that run past the right edge are clipped at the frame. The figure depends only on the shard and the budget, so two runs over the same dataset and budget draw the same figure.
 
-## `source_null/source_null_difference.pdf`
+### `warmup/causal_warmup_tradeoff.pdf`
 
-**Purpose.** Compare matched-source KL with zero-source KL. Source availability changes predictably with time, so it can affect the latent even without varying source values. This comparison measures the excess over the zero-source response; read its limitations below.
+**Purpose.** Show the trade between more retained channels and fewer usable anchors as the warm-up budget changes.
 
-**What it shows.** Top: the distribution of `coupling_minus_clock_nats` over **recordings**, with zero marked. Bottom: `source_conditioned_kl_raw` (`matched`) and `kld_source_null` (`source-null`) side by side, on one support.
+**What it shows.** Three step curves against the candidate budget $B$: target channels kept, anchors admitted, and tiles per sample at phase $0$. A dashed vertical line marks the configured budget, with its three values annotated. Grey shading marks the budgets at which no tile fits.
 
-**Axes.** Nats per anchor; the histogram's height is a count of recordings.
+**Axes.** Warm-up budget $B$ in steps across, with $\Delta B$ in seconds on a top axis; one count axis for all three curves.
 
-**Interpretation.** Four ways, and the first two are the point of the bottom panel.
+**How to read it.** The curves are steps. The anchor count comes from the maximum warm-up of the kept channels, so all thresholds between the same two consecutive channel warm-ups keep the same channels and admit the same anchors. The grey region is infeasible. The figure shows feasibility, not forecast quality: checkpoints at two budgets cannot load each other's geometry, and their nats are not comparable.
 
-- **A large difference between two large numbers is not the same as a large coupling.** The violins are drawn so that case is visible rather than inferred from one subtraction.
-- **The reference line (legend: `no excess`) means "the clock accounts for all of it"**, not "no coupling". Mass at or below zero says the coupling readout is measuring an availability pattern.
-- **The verdict is INCONCLUSIVE while `eval_config.clock_margin_min_nats` is `null`, which is how it ships.** The earlier $0.15$ was measured on a configuration neither cell trains any more, so it is unset until a run of the current configuration has measured the spread. The *number* on this figure is the reading either way; the status beside it becomes a gate once the margin is set from that run.
-- **Zeroing floors no source variation.** The encoder's response to a flat trajectory is not literally the availability pattern's own response, so this difference is a slightly **weaker** statement than "the clock alone" — it errs in the model's favour, and the emitted record says so.
-- **A large `kld_source_null` is not a defect.** Giving the prior the same clock cannot drive it to zero: the posterior is a bounded residual on the prior, so the mean half of the divergence at a silent source is a function of the delta head alone and no prior-side clock appears in it. The bottom panel's two violins overlapping heavily is the expected picture; the top panel is where the finding is.
+---
 
-## `source_null/source_null_lag_profile.pdf`
+## Source-null figures
 
-**Purpose.** Show where matched-source KL attribution exceeds or falls below the zero-source attribution. Their signed difference sums to the scalar source-null comparison.
+The `source_null` analysis (`analyses/source_null.py`) writes these figures into `source_null/`.
 
-**What it shows.** Top: the matched attribution and the null arm, both in nats per anchor, on the compensated lag axis. Bottom: their signed difference with zero drawn, the four `occlusion_bands` shaded and labelled, and the delta mask marked where one was emitted. `matched` is $\mathrm{KL}(q(z|Y,U)\,\|\,p(z|Y))$ and `source-null` is the same posed against a zeroed source, the availability clock. The two notes the lower panel can carry are `degenerate, no mask` (no mask was emitted) and `edge-censored peak` (the peak is on the longest searched lag, so the true peak may lie beyond the window).
+### `source_null/source_null_difference.pdf`
 
-**Axes.** Compensated lag seconds across, on the shared stored-coefficient axis; nats per anchor up on both panels. Two panels because a small excess drawn against a total several times its size is a flat line.
+**Purpose.** Compare the matched-source KL with the zero-source KL. Source availability changes predictably with time, so it can move the latent without any source variation.
 
-**Interpretation.** Four ways.
+**What it shows.** Left ("Coupling minus clock", with $n$ in the title): the distribution of `coupling_minus_clock_nats` over recordings, with zero marked. Right ("Matched and source-null arms"): `source_conditioned_kl_raw` (`matched`) and `kld_source_null` (`source-null`) side by side on one support.
 
-- **The difference is signed, and only the signed sum is the gated scalar.** It sums over lags to `coupling_minus_clock` exactly — that identity is what makes this a decomposition of the quantity `clock_margin_min_nats` gates rather than a second lag reading. Every *share* on this page is taken of the **positive part**, because a share of a signed vector is not a share, so the rectified total is an **upper bound** on the gated scalar and not a partition of it. The gap is `rectified_frac`.
-- **A negative bin is a real state.** The null arm re-poses the posterior against a zeroed source, so its attention is its own and can exceed the matched arm's at a lag. That means no clock-exceeding coupling there; it does not mean negative information.
-- **The delta mask is withheld when the profile is degenerate, and that is the expected outcome.** `entmax15` assigns lags exactly zero, so a flat or nearly empty profile still has a perfectly confident argmax. A withheld mask is a measurement — the geometry-fixed bands remain the selection that needs no estimate.
-- **This is still stored-coefficient time.** A peak's position here is not a physiological latency, for the reason every lag page in this run carries.
+**Axes.** Nats per anchor. The histogram's height is a count of recordings.
 
-## `time_shift/time_shift_control.pdf`
+**How to read it.**
 
-**Purpose.** Separate a model that reads *what the uterus is doing now* from one that reads *what kind of uterine activity this patient has*. The permutation control swaps recording and moment together and the source-null arm removes the values altogether; neither can tell those two apart. Here every segment's posterior is posed again on the source of the **nearest segment of the same recording that shares no stored sample with it**, with everything target-side (encoder state, prior, anchors) kept the segment's own. Both arms are mean-decoded.
+- A large difference between two large numbers is not the same as a large coupling. The right panel shows both terms.
+- The reference line (legend `no excess`) marks the point where the zero-source response accounts for the whole matched KL.
+- The verdict `coupling_exceeds_availability_clock` is INCONCLUSIVE while `eval_config.clock_margin_min_nats` is `null`, which is the value in `configs/eval_overrides.yaml`. With a margin set, the verdict is stated on the lower end of the bootstrap interval.
+- A zeroed source is a flat trajectory, and the encoder's response to it is not exactly the availability pattern's own response. The difference is therefore a slightly weaker statement than "the clock alone", and the record says so.
+- The posterior is a bounded residual on the prior. At a silent source, the mean term of the KL depends on the delta head alone, so `kld_source_null` can be large.
 
-**What it shows.** Three panels. **a:** one line per recording, in its class colour, joining its mean source-conditioned KL under three sources: the zeroed source (`kld_source_null`, the availability clock alone, from the collection pass), the own source time-shifted to the partner segment, and the own source aligned. **b:** $\Delta K = K^{\mathrm{aligned}} - K^{\mathrm{shifted}}$, one grey point per recording, with the mean over recordings and its $95\%$ bootstrap interval over recordings in blue, zero ruled. **c:** the same for $\Delta g = g^{\mathrm{aligned}} - g^{\mathrm{shifted}}$, the mean-decoded forecast gap under the two sources — the forecast cost of the misalignment, since the base branch is the same in both arms and cancels.
+### `source_null/source_null_lag_profile.pdf`
 
-**Axes.** a: the three source arms across; KL up (the panel's label says nats per step). b: $\Delta K$ up, in the same unit. c: $\Delta g$ in nats per anchor up. The difference panels have no horizontal scale; the points are jittered only to be seen.
+**Purpose.** Show at which lags the matched-source KL attribution exceeds or falls below the zero-source attribution.
 
-**The verdict.** `coupling_is_time_specific` is written to the analysis record and the headline, not onto the page: **PASS** when the lower end of the bootstrap interval of $\Delta K$ in panel **b** is above zero, **FAIL** when it is not, **INCONCLUSIVE** when too few recordings had a non-overlapping partner for an interval. $\Delta g$ travels beside it as evidence and does not decide it. It is reported beside the pre-registered acceptance verdicts, not among them: the gate is a pre-registered list and this control was added after it.
+**What it shows.** Top ("Lag profile"): the matched attribution and the null arm, both in nats per anchor. `matched` is $\mathrm{KL}(q(z|Y,U)\,\|\,p(z|Y))$, and `source-null` is the same divergence with a zeroed source. Bottom: their signed difference with zero drawn, the four `occlusion_bands` shaded and labelled, and the delta mask where one is emitted. The bottom panel can carry two notes: `degenerate, no mask` (no mask emitted) and `edge-censored peak` (the peak is on the longest searched lag, so the true peak can lie beyond the window).
 
-**Interpretation.** Four ways.
+**Axes.** Compensated lag in seconds (stored-coefficient time) across; nats per anchor up on both panels.
 
-- **A FAIL is a finding about what the coupling reads, not a defect.** It says the same patient's source from another stretch of labour moves the posterior as much as the aligned one, i.e. the coupling is carried by a recording-level source state rather than by the moment. Read panel **a** for where the two arms sit relative to the clock: both far above `kld_source_null` and close to each other is that case.
-- **Wrong in time by at least one stored segment**, never by less: a partner sharing samples would carry part of the aligned source and understate the difference, so a segment whose recording has no non-overlapping partner is counted in the pairing census and excluded. The recordings on this page are therefore a subset, and the arm is capped (`eval_config.caps.time_shift`, seeded draw).
-- **$\Delta K$ and $\Delta g$ can disagree.** A source that moves the belief more when aligned but does not forecast better is the pattern `lag_high_kl_usefulness.pdf` asks about at the anchor level; read it there before calling a positive $\Delta K$ useful.
-- **The class colours in panel a are a label, not a test.** Nothing here compares classes; `time_shift_per_recording.csv` feeds the grouped variants for that.
+**How to read it.**
 
-## `occlusion/occlusion_horizon_delta.pdf`
+- The signed difference sums over lags to `coupling_minus_clock`, the quantity that `clock_margin_min_nats` gates. Every share on the page is a share of the positive part, so the rectified total is an upper bound on the gated scalar. `rectified_frac` gives the ratio.
+- A negative bin is a valid state. The null arm has its own attention, which can exceed the matched arm's at a lag. A negative bin means no clock-exceeding coupling at that lag.
+- The analysis withholds the delta mask when the profile is degenerate, because `entmax15` gives a flat or nearly empty profile a confident argmax. The geometry-fixed bands need no such estimate.
+- The axis is stored-coefficient time.
 
-**Purpose.** Measure the predictive cost of zeroing source values within each lag band and re-encoding the stream. The horizon curves show which future steps are affected. Read these intervention results alongside attention-based lag profiles.
+---
 
-**What it shows.** One curve per configured band: the change in block NLL against an un-occluded reference, resolved by **horizon step**. Positive is worse without the band, which means the band mattered. The legend gives each band's name and its live fraction; the band's lag range is its configured `occlusion_bands` entry.
+## Time-shift figure
 
-**Axes.** Horizon step $0 \ldots H-1$ across; nats per anchor up, with zero marked.
+### `time_shift/time_shift_control.pdf`
 
-**Interpretation.** Five ways.
+**Purpose.** Separate a coupling that reads the current uterine activity from a coupling that reads a recording-level source state. The analysis (`analyses/time_shift.py`) poses each segment's posterior again on the source of the nearest segment of the same recording that shares no stored sample with it. Everything on the target side (encoder state, prior, anchors) stays the segment's own. Both arms are mean-decoded.
 
-- **A near-zero band is not always an uninformative band.** A band reaching into the warm-up has less source in it to remove; the summary's **live fraction** column is what separates "the source did not matter there" from "there was no source there". Read the two together, never the curve alone.
-- **The bands are lag ranges relative to each segment's own scored anchor**, not absolute step ranges. One anchor is drawn per segment and held fixed across every band and the reference, because the source pathway has memory and a second anchor scored in the same forward would attribute one anchor's loss to another's band.
-- **A negative curve is a real state, not a defect.** Removing source the model was mildly misusing improves the forecast. Whether a small negative value means anything is a question about the spread across segments, which the per-recording table carries and this figure does not.
-- **The availability announcement does not move.** The intervention edits values and leaves the arrival clock exactly where it was, and that invariance is *measured* on every occluded encode rather than assumed — which is what stops this being a second reading of the clock the `source_null` figure already reports.
-- **There is no threshold and no verdict here on purpose.** What a healthy per-band delta is has never been measured; a bar guessed before the first production runs would decide a pass or a fail on exactly the run that was going to set it.
+**What it shows.** Three panels:
 
-## `occlusion/occlusion_clock_delta.pdf`
+- **a ("KL by source"):** one line per recording, in its class colour, joining its mean source-conditioned KL under three sources: the zeroed source (`kld_source_null`, from the collection pass), the own source time-shifted to the partner segment, and the own source aligned.
+- **b:** $\Delta K = K^{\mathrm{aligned}} - K^{\mathrm{shifted}}$, one grey point per recording, with the mean over recordings and its $95\%$ bootstrap interval in blue, and zero ruled.
+- **c:** the same for $\Delta g = g^{\mathrm{aligned}} - g^{\mathrm{shifted}}$, the mean-decoded forecast gap under the two sources. The base branch is the same in both arms and cancels.
 
-**Purpose.** Follow each band's occlusion cost through clinical time. A changing cost suggests that the fitted model's use of that source interval changes over the evaluated window.
+**Axes.** a: the three source arms across; KL in nats per step up. b: $\Delta K$ up, in the same unit. c: $\Delta g$ in nats per anchor up. Panels b and c have no horizontal scale; the points are jittered for visibility.
 
-**What it shows.** One panel per band, titled with the band and its lag range in compensated seconds, one line per clinical class: the mean per-recording delta in that band, window by window, with zero marked.
+**The verdict.** The analysis writes `coupling_is_time_specific` to its record and the headline, not to the page. The rule is:
 
-**Axes.** Hours before delivery across, drawn with delivery at the right; nats per anchor up.
+1. PASS when the lower end of the bootstrap interval of $\Delta K$ is above zero.
+2. FAIL when it is not.
+3. INCONCLUSIVE when too few recordings have a non-overlapping partner for an interval.
 
-**Interpretation.** Three ways.
+$\Delta g$ travels beside the verdict and does not decide it. The verdict is reported beside the pre-registered acceptance verdicts, not among them.
 
-- **Nothing on this page is tested.** No Kruskal-Wallis, no Holm correction, no new family. This analysis scores one anchor per segment and is capped in segments, so a half-hour window holds tens at best and most (class, window) cells fall below the minimum group size a test needs. A $p$-value here would be a correction over cells that mostly could not be tested.
-- **The line is thin where the cap is binding.** Read `n_recordings` in `occlusion_clocks.csv` before reading a movement; the cap is chosen from the cost block and the per-band standard errors, and `EVAL.md`'s occlusion section carries the arithmetic.
-- **This is the interventional half of a two-part question.** The observational half is `lag_kld_scaled`'s band trajectories, on the same partition and the same grid. Where the two disagree, that disagreement is the finding — on the fixture whose informative lags are known, they did.
+**How to read it.**
 
-## `lag_kld_scaled/lag_kld_scaled_time_to_delivery.pdf`
+- A FAIL means that the same patient's source from another stretch of labour moves the posterior as much as the aligned source. In panel a, the two arms then sit close to each other.
+- The partner is wrong in time by at least one stored segment. A segment whose recording has no non-overlapping partner is counted in the pairing census and excluded, so the recordings here are a subset. `eval_config.caps.time_shift` caps the arm with a seeded draw.
+- $\Delta K$ and $\Delta g$ can disagree. `lag_high_kl_usefulness.pdf` asks the same question at the anchor level.
+- The class colours in panel a are labels. `time_shift_per_recording.csv` feeds the grouped variants for class comparisons.
 
-**Purpose.** Show the amount of KL attribution in each fixed lag band as delivery approaches. This preserves magnitude, whereas a normalised lag profile shows only relative shares.
+---
 
-**What it shows.** One panel per `occlusion_bands` band, one line per clinical class: the mean per-recording `total_nats` of the KL attribution restricted to that band, window by window.
+## Occlusion figures
 
-**Axes.** Hours before delivery across, drawn with delivery at the right; nats per anchor up. Each panel's title carries the band and the seconds it spans.
+The `occlusion` analysis (`analyses/occlusion.py`) zeroes the source values within each lag band in `eval_config.occlusion_bands`, re-encodes the stream, and scores one anchor per segment. It writes these figures into `occlusion/`. `eval_config.caps.occlusion` caps the segments.
 
-**Interpretation.** Four ways.
+### `occlusion/occlusion_horizon_delta.pdf`
 
-- **Nothing on this page is tested.** Every feature in this analysis ships untested, so it adds no Holm family to the four `lag_clocks` carries and writes no significance table at all. A trajectory quoted from here is a description, not a claim.
-- **The bands are geometry-fixed, and that is what makes them readable.** They are not chosen from the KL, so a statistic on one is free of the circularity that makes a top-$K$-by-KL selection test its own selector. They are the same bands the interventional page removes source from.
-- **A line moving *between* panels is the informative past moving; a line moving *within* one is that band's coupling changing magnitude.** Neither is visible on a scale-free statistic over the whole window, which is what `lag_clocks` draws — the two pages answer different halves.
-- **`near_mass` and `far_mass` are absent from banded sources on purpose.** Both are measured from the axis's own start, so on a band they would re-base onto the band's start and `far_mass` would be identically zero on three of the four. Their absence is a measurement.
+**Purpose.** Measure the predictive cost of removing each lag band, resolved by horizon step.
 
-## `lag_kld_scaled/lag_kld_scaled_second_stage.pdf`
+**What it shows.** One curve per configured band ("Forecast cost of band removal"): the change in NLL against an un-occluded reference, per horizon step. Positive means a worse forecast without the band. The legend gives each band's name and its live fraction. The band's lag range is its `occlusion_bands` entry.
 
-**Purpose.** Show the same band-resolved KL magnitudes against signed hours from second-stage onset: negative before onset and positive after.
+**Axes.** Horizon step $0 \ldots H-1$ across; nats per anchor per step up, with zero marked.
 
-**What it shows and its axes.** As the delivery-clock page above, on the second-stage axis drawn left to right with the onset where it falls.
+**How to read it.**
 
-**Interpretation.** As above, plus one. **The population is a strict subset**: a recording with no recorded onset cannot be placed on this axis at all, so this page and the delivery-clock page answer for different recordings by design. The analysis declares itself capped for that reason, and the eligibility rule is the shared one — the same the `second_stage` analysis applies.
+- Read each curve with the band's live fraction. A band that reaches into the warm-up has less source to remove, so a near-zero curve there can mean that little source was present.
+- The bands are lag ranges relative to each segment's scored anchor. The analysis draws one anchor per segment and holds it fixed across every band and the reference, because the source pathway has memory.
+- A negative curve means that removing the band improved the forecast. The per-recording table carries the spread across segments.
+- The intervention edits values and leaves the availability clock unchanged. The analysis measures that invariance on every occluded encode.
+- The analysis applies no threshold and writes no verdict.
 
-## `lag_high_kl/lag_high_kl_selection.pdf`
+### `occlusion/occlusion_clock_delta.pdf`
 
-**Purpose.** Show how anchors are selected by KL or predictive gain, and compare their pooled lag profiles. The thresholds define which observations contribute to later figures.
+**Purpose.** Follow each band's occlusion cost through clinical time.
 
-**What it shows.** Four panels. **Top:** the pooled per-anchor KL, one step histogram per clinical class on a $\log_{10}$ axis, with the band thresholds drawn as dashed lines and labelled with the band and its value in nats (the quantile is in `lag_high_kl_thresholds.csv`) — the histogram the bands were cut on. **Second:** the pooled KL attribution per lag for the `high`, `rest` and `top` anchor bands, with the **hot lags** — the lags whose pooled attribution sits in the upper $30\%$ across the lag axis — shaded behind them.
+**What it shows.** One panel per band, titled with the band and its lag range in compensated seconds, with one line per clinical class. Each line is the mean per-recording delta in that band, window by window, with zero marked.
 
-**Third:** a heatmap of where each anchor's attribution peaks, by KL decile (lowest at the bottom) and lag: the share of that decile's anchors whose `argmax_lag` falls at each lag. **Bottom:** one violin per class of the per-recording contraction enrichment — the high-anchor share within `event_lag_window_s` of a contraction minus the share outside it — over recordings with at least five anchors in each arm, zero marked.
+**Axes.** Hours before delivery across, with delivery at the right; nats per anchor up.
+
+**How to read it.** Nothing on this page is tested. The analysis scores one anchor per segment and is capped in segments, so many (class, window) cells are below the minimum group size. Read `n_recordings` in `occlusion_clocks.csv` before you read a movement. [EVAL.md](EVAL.md) gives the arithmetic behind the cap. The observational counterpart is `lag_kld_scaled`, on the same bands and the same grid.
+
+---
+
+## Band-resolved lag-KL figures
+
+The `lag_kld_scaled` analysis (`analyses/lag_kld_scaled.py`) writes these figures into `lag_kld_scaled/`.
+
+### `lag_kld_scaled/lag_kld_scaled_time_to_delivery.pdf`
+
+**Purpose.** Show the amount of KL attribution in each fixed lag band as delivery approaches. A normalised lag profile shows only relative shares; this figure keeps the magnitude.
+
+**What it shows.** One panel per `occlusion_bands` band, with one line per clinical class. Each line is the mean per-recording `total_nats` of the KL attribution restricted to the band, window by window.
+
+**Axes.** Hours before delivery across, with delivery at the right; nats per anchor up. Each panel title gives the band and the seconds it spans.
+
+**How to read it.**
+
+- Nothing on this page is tested. The analysis adds no Holm family and writes no significance table.
+- The bands are fixed by geometry and not chosen from the KL, so a statistic on a band does not test its own selection. They are the bands that the occlusion analysis removes.
+- A line that moves between panels shows the informative past moving. A line that moves within one panel shows that band's coupling changing magnitude.
+- `near_mass` and `far_mass` are absent on bands, because both are measured from the axis start; on a band they would re-base onto the band start.
+
+### `lag_kld_scaled/lag_kld_scaled_second_stage.pdf`
+
+**What it shows.** The panels of the delivery-clock page against signed hours from second-stage onset, drawn left to right with the onset marked.
+
+**How to read it.** The notes above apply. The population is the subset of recordings with a recorded onset, under the eligibility rule of the `second_stage` analysis.
+
+---
+
+## High-KL anchor figures
+
+The `lag_high_kl` analysis (`analyses/lag_high_kl.py`) selects anchors by KL or by forecast gain and writes these figures into `lag_high_kl/`. The anchor bands are `high`, `rest`, `top` and `gain` (`ANCHOR_BANDS`). The pooled thresholds are in `lag_high_kl_thresholds.csv`.
+
+### `lag_high_kl/lag_high_kl_selection.pdf`
+
+**Purpose.** Show how the analysis selects anchors, and compare the pooled lag profiles of the selected bands.
+
+**What it shows.** Four panels:
+
+1. The pooled per-anchor KL, one step histogram per clinical class on a $\log_{10}$ axis. Dashed lines mark the band thresholds, labelled with the band and its value in nats.
+2. The pooled KL attribution per lag for the `high`, `rest` and `top` bands. Shading marks the hot lags: the lags whose pooled attribution is in the upper $30\%$ across the lag axis (`HOT_LAG_QUANTILE` $= 0.7$).
+3. A heatmap of where each anchor's attribution peaks, by KL decile (`N_KL_QUANTILE_BINS` $= 10$, lowest at the bottom) and lag. Each cell is the share of that decile's anchors whose `argmax_lag` falls at that lag.
+4. One violin per class of the per-recording contraction enrichment: the high-anchor share within `event_lag_window_s` of a contraction minus the share outside it. Only recordings with at least `MIN_ENRICHMENT_ANCHORS` $= 5$ anchors in each arm enter, and zero is marked.
 
 **Axes.** Panel 1: $\log_{10}$ nats across, density of anchors up. Panels 2 and 3: stored-coefficient lag in seconds across; nats per anchor up in panel 2, KL decile up in panel 3. Panel 4: class across, share difference up.
 
-**Interpretation.** Five ways.
+**How to read it.**
 
-- **The thresholds are one number per run, pooled over every class.** A class whose histogram sits to the right has more high anchors *under the same cut*; nothing here re-cuts per class, and that is what makes the class shares comparable.
-- **The hot-lag set is selected from the attribution it shades.** A pooled profile that is high on the hot lags is a tautology, not a finding; what the set is for is the per-segment share placed on the clocks, and even there it describes the run's own selection. The geometry-fixed bands on the `lag_kld_scaled` page and the `occlusion` page need no such estimate.
-- **A decile heatmap that is flat across rows is the geometry talking.** If the top decile peaks at the same lags as the bottom one, the argmax is a property of the window's censoring edges and the K/V receptive field rather than of the coupling; read the `attention` and `source_null` pages before reading a peak position off this one.
-- **The enrichment violin is descriptive.** No test is run on it, and a recording enters it only with enough anchors in both arms, so its population is a subset that the record counts.
-- **The lag axis is stored-coefficient time**, as the foot of the page says: a lag here is not a physiological delay.
+- The thresholds are one number per run, pooled over all classes. A class whose histogram sits to the right has more high anchors under the same cut.
+- The hot-lag set comes from the attribution that it shades, so a pooled profile that is high on the hot lags is true by construction. The set is used for the per-segment share on the clock pages.
+- If all deciles peak at the same lags, the argmax follows the window's edges and the K/V receptive field. Read the `attention` and `source_null` pages before you read a peak position here.
+- The enrichment violin is descriptive. No test runs on it, and its population is a subset that the record counts.
+- The lag axis is stored-coefficient time.
 
-## `lag_high_kl/lag_high_kl_time_to_delivery.pdf`
+### `lag_high_kl/lag_high_kl_time_to_delivery.pdf`
 
-**Purpose.** Follow the lag profiles and prevalence of high-KL anchors as delivery approaches. This focuses on anchors where adding source history moved the latent most strongly.
+**Purpose.** Follow the lag profiles and the prevalence of high-KL anchors as delivery approaches.
 
-**What it shows.** One heatmap per class — lag down, window across, colour the **share** of the high band's KL attribution in that lag bin, every window normalised to one and the three classes on one colour scale — then four trajectory panels, each the median per class with its inter-quartile ribbon and the recording count on every point: the **high-anchor share** of a segment's anchors, with the `top` band's share dashed; the **high band's KL centroid** in seconds, with the `rest` band's centroid dashed beside it; the **hot-lag share** of the attribution, with the attention's dashed; and the **high band's forecast gain** in nats per anchor, with the `rest` band's dashed.
+**What it shows.** One heatmap per class: lag down, window across, and colour as the share of the `high` band's KL attribution in each lag bin. Each window is normalised to one, and the classes share one colour scale. Four trajectory panels follow, each the median per class with its interquartile ribbon and the recording count on each point:
 
-The first two are the tested readouts; the last two are untested per window (the gain's one paired run-level test is on the usefulness page).
+1. The high-anchor share of a segment's anchors, with the `top` band's share dashed.
+2. The `high` band's KL centroid in seconds, with the `rest` band's centroid dashed.
+3. The hot-lag share of the attribution, with the attention's share dashed.
+4. The `high` band's forecast gain in nats per anchor, with the `rest` band's gain dashed.
 
-The classes are in the legend of the first trajectory panel only; every trajectory panel names what its solid and dashed lines are.
+Panels 1 and 2 are the tested readouts. Panels 3 and 4 are not tested per window; the one paired run-level test of the gain is on the usefulness page. The class legend appears on the first trajectory panel only.
 
-**Axes.** Hours before delivery across, drawn with delivery at the right; stored-coefficient lag in seconds up on the heatmaps and the centroid panel; a share of anchors, or of the attribution, up on the other two.
+**Axes.** Hours before delivery across, with delivery at the right. Stored-coefficient lag in seconds up on the heatmaps and the centroid panel; a share or nats per anchor up on the other panels.
 
-**Interpretation.** Four ways.
+**How to read it.**
 
-- **The heatmap is a share, not a magnitude.** It answers *where* the high anchors' attribution sat, never how much of it there was; the high band's `total_nats` is on the trajectory table and the amount of coupling is what `time_to_delivery` draws.
-- **A centroid that separates the classes is a hypothesis until the windows page says otherwise.** The ribbon is a quartile range over recordings, not an interval on the median, and the test lives on `lag_high_kl_time_to_delivery_windows.pdf`.
-- **The high-anchor share is measured against a pooled threshold.** A class whose share rises toward delivery has more anchors clearing the *run's* cut, not a cut of its own; and the pooled share over the whole population is $30\%$ by construction, so only its distribution over classes and windows carries information.
-- **The `rest` centroid beside the `high` one is the contrast that matters.** If the two move together the lag structure is not specific to the coupling; if only the `high` one moves, the anchors carrying the coupling looked somewhere the others did not.
+- The heatmap shows where the high anchors' attribution sits, not how much there is. The `high` band's `total_nats` is in the trajectory table.
+- The ribbon is an interquartile range over recordings, not an interval on the median. The test is on `lag_high_kl_time_to_delivery_windows.pdf`.
+- The high-anchor share uses the pooled threshold. Over the whole population it is $30\%$ by construction, so only its distribution over classes and windows carries information.
+- The `rest` centroid is the contrast for the `high` centroid. If both move together, the lag structure is not specific to the high-KL anchors.
 
-## `lag_high_kl/lag_high_kl_time_to_delivery_windows.pdf`
+### `lag_high_kl/lag_high_kl_time_to_delivery_windows.pdf`
 
-**Purpose.** Test class differences in the two selected high-KL readouts within each delivery-time window.
+**Purpose.** Test class differences in the two tested high-KL readouts within each delivery-time window.
 
-**What it shows.** For each of `high_lag_centroid_kl_s` and `high_anchor_frac`: one violin per (window, class) cell over one value per recording, the Holm-adjusted $p$ of each window directly beneath it on the same axis, and — at the foot — Cliff's delta for every class pair that survived, oriented more severe against less severe so a positive value means the more severe class runs higher.
+**What it shows.** For `high_lag_centroid_kl_s` and `high_anchor_frac`: one violin per (window, class) cell over one value per recording, the window's Holm-adjusted $p$ below it, and at the foot Cliff's delta for every class pair that survives. The pairs read more severe against less severe, so a positive value means that the more severe class runs higher.
 
-**Axes.** Hours before delivery across, delivery at the right. The violin rows share one $y$ label because the page carries two readouts in two units: seconds for the centroid, a share of anchors for the fraction; each row's title names which it is.
+**Axes.** Hours before delivery across, with delivery at the right. The violin rows share one $y$ label because the page carries two units (seconds for the centroid, a share for the fraction); each row's title names its readout.
 
-**Interpretation.** Two ways. **Each (clock, readout) is its own Holm family** — two here, two on the second-stage page, none joint — so a reader quoting a window from two of them has made two comparisons. And **a cell too small to test is still drawn**: classes with fewer than three recordings in a window are excluded from the test and recorded, but their violins stay on the page so a cohort thinning toward the edge of the axis does not simply vanish.
+**How to read it.** Each (clock, readout) pair is its own Holm family: two here and two on the second-stage page, none joint. Classes with fewer than three recordings in a window are excluded from the test and recorded, but their violins stay on the page.
 
-## `lag_high_kl/lag_high_kl_second_stage.pdf`
+### `lag_high_kl/lag_high_kl_second_stage.pdf`
 
-**Purpose.** Show the high-KL profiles and trajectories against signed hours from second-stage onset.
+**What it shows.** The panels of `lag_high_kl_time_to_delivery.pdf` on the signed second-stage clock, drawn left to right with the onset marked.
 
-**What it shows and its axes.** As the delivery-clock page, on the second-stage axis drawn left to right with the onset marked where it falls.
+**How to read it.** The population is the subset of recordings with a recorded onset, under the eligibility rule of the `second_stage` analysis.
 
-**Interpretation.** As above, plus one. **The population is a strict subset**: a recording with no recorded onset cannot be placed on this axis at all, so this page and the delivery-clock page answer for different recordings by design, under the shared eligibility rule the `second_stage` analysis applies.
+### `lag_high_kl/lag_high_kl_second_stage_windows.pdf`
 
-## `lag_high_kl/lag_high_kl_second_stage_windows.pdf`
+**What it shows.** The panels of `lag_high_kl_time_to_delivery_windows.pdf` on the signed second-stage clock, with the onset at zero. This clock has its own Holm families, and the population is the onset subset.
 
-**Purpose.** Test the same two high-KL readouts on the second-stage clock, with separate multiple-testing families for this clock.
+### `lag_high_kl/lag_high_kl_time_to_delivery_histogram.pdf`
 
-**What it shows and its axes.** As `lag_high_kl_time_to_delivery_windows.pdf`, on the signed second-stage axis with the onset marked at zero.
+**Purpose.** Compare full lag distributions of the selected high-KL anchors across classes and delivery-time windows.
 
-**Interpretation.** As that page, and with the same population caveat as the second-stage profile page above.
+**What it shows.** Both profile sources appear side by side in each row: `kl` on the left and `attn` on the right (`HISTOGRAM_BANDS` $=$ `high`, `top`).
 
-## `lag_high_kl/lag_high_kl_time_to_delivery_histogram.pdf`
+- **Rows 1–6, three per band, pooled over every window of the clock.**
+  - The classes overlaid as step outlines, with the recording-weighted pool of all classes dashed in grey. The legend appears on the first panel.
+  - Each class minus the pooled distribution, in percentage points of share per lag, with zero marked.
+  - The cumulative distributions, with each class's median lag dropped to the axis as a dotted line.
+- **Row 7, the density violins.** The `high` band's cells on the clock, one body per (window, class), dodged by class within each window. The body is the cell's own lag distribution: its half-width at a lag is that lag's share, drawn as a step outline. It is not a kernel density. Inside each body, a heavy bar spans the quartile lags, a white dot marks the median lag and a short black tick marks the centroid. The recording count stands above each body. A cell below three recordings is faint and dashed.
+- **Row 8, the ridges.** The same cells with lag across, one ridge per window and one column per class. Labour runs down the page on both clocks, with the window farthest from delivery at the top. Inside each ridge, the class's own distribution pooled over the clock is a grey dashed outline. The window centre is labelled at the left of the first column, the recording count at the right of each ridge, and the median lag is ticked on the baseline. All bodies on a panel share one scale.
+- **Bottom two rows: distances against the clock.** The left column shows each window against its own class pooled over the clock, one line per class. The right column shows the distance between classes within each window, one line per class pair, on the `high` band's `attn` profile. The pair lines use a blue, purple and black palette that is different from the class colours. The upper row is the $1$-Wasserstein distance in seconds. The lower row is the Jensen–Shannon distance (base $2$, bounded by $1$).
 
-**Purpose.** Compare full lag distributions for selected high-KL anchors across classes and delivery-time windows. Distribution shape can reveal differences that a centroid alone hides.
+**Axes.** Stored-coefficient lag in seconds across on the pooled panels and the ridges. Share up on the overlay, percentage points on the difference panel, cumulative share on the third panel, and window centre up on the ridges. Hours before delivery across on the violins and the distance panels, with delivery at the right. Lag in seconds up on the violins; seconds up on the Wasserstein row; Jensen–Shannon distance up on the row below.
 
-**What it shows.** Four blocks, both profile sources side by side in every row — `kl` on the left, `attn` on the right. **Rows 1–6, three per band** (`high` then `top`), pooled over every window of the clock: **the classes overlaid** as outlines only, one step curve each, with the recording-weighted pool of every class dashed in grey behind them, the legend drawn once, on the first panel; **each class minus that pooled distribution**, in percentage points of share per lag with zero marked — the panel a class contrast is actually read on, because three monotone decays that coincide to within a few percent of their peak are indistinguishable overlaid and their differences from a common reference are not; and **the cumulative distributions**, on which a shift between skewed distributions is a horizontal offset readable in seconds, with each class's median lag dropped to the axis as a dotted line.
+**How to read it.**
 
-**Row 7, the density violins:** the `high` band's cells on the clock, one body per (window, class) dodged by class inside each window. The body is **the cell's own lag distribution** — its half-width at a lag is that lag's share — drawn as a step outline because a share is per lag bin; it is not a kernel density of anything. Inside each body the heavy bar spans the distribution's quartile lags, the white dot is its median lag and the short black tick its centroid, which on these skewed profiles sits well away from the median.
+- The code normalises each recording's distribution before the cell mean, so each recording counts once. The heatmap on `lag_high_kl_time_to_delivery.pdf` normalises after averaging and therefore shows where the coupling mass sits.
+- Nothing on this page carries a $p$-value. A distance between two estimated distributions is positive almost surely, even when the populations coincide, so read it beside the recording counts. The tests on the shape features are on `lag_high_kl_time_to_delivery_histogram_features.pdf`, and the within-recording drift is on `lag_high_kl_time_to_delivery_histogram_drift.pdf`.
+- A violin's inner bar shows the quartile lags of the cell's distribution, not the spread across recordings.
+- Wasserstein measures displacement along the lag axis and does not detect a distribution that broadens in place. Jensen–Shannon measures overlap and saturates at $1$ once two supports separate. Read the two rows together.
+- `attn` counts each selected timestep once, and `kl` weights each by $K_t$. A shift in one column only tells you which readout carries it.
+- A missing body or ridge is a window with no scored recording for that class.
+- The lag axis is stored-coefficient time.
 
-The recording count stands above every body; a cell below three recordings is faint and dashed rather than absent. **Row 8, the ridges:** the same cells with the lag across, one ridge per window, **one column per class** rather than the classes overlaid — three filled decays of nearly the same shape on one baseline blend into a colour no legend explains — with **labour running down the page** on both clocks (farthest from delivery at the top).
+### `lag_high_kl/lag_high_kl_second_stage_histogram.pdf`
 
-Inside every ridge the class's own distribution pooled over the whole clock is outlined in grey and dashed, so a ridge that leaves its outline has moved and a column whose ridges all sit on it is a stationary class; the same window sits at the same height in every column, so a horizontal read compares the classes. The window centre is labelled on the left of the first column, the recording count on the right of each ridge, and the cell's median lag is ticked on the baseline. Every body on a panel is drawn at one scale, so widths and heights compare across windows and classes.
+**What it shows.** The panels of `lag_high_kl_time_to_delivery_histogram.pdf`, with the density violins and the four distance panels on the signed second-stage clock and the onset at zero. The ridgeline still puts the earliest window before onset at the top. The population is the onset subset.
 
-**Bottom two rows:** the distances against the clock, **metric down and comparison across**. The left column is each window against its own class pooled over the whole clock, one line per class in the severity colours — a cohort whose lag structure is stationary sits flat and near zero. The right column is the distance between the classes within each window, one line per class **pair** (the distances are the `high` band's `attn` profile, and each column is titled on its upper row only); a pair belongs to two cohorts and to neither alone, so those lines use a separate blue/purple/black palette that is none of the class green, amber or red, and the pair is read off the legend rather than off the hue.
-
-The upper of the two rows is the $1$-Wasserstein distance **in seconds**, which says how far the distribution moved; the lower is the Jensen–Shannon distance, which says how much overlap is left.
-
-**Axes.** Stored-coefficient lag in seconds across on the pooled panels and the ridges; share of the distribution up on the overlay, percentage points of share on the difference panel, cumulative share on the third, and window centre up on the ridges. Hours before delivery across on the density violins and on all four distance panels, drawn with delivery at the right; lag in seconds up on the violins; seconds up on the Wasserstein row, and Jensen–Shannon (base $2$, bounded by $1$) up on the row below it.
-
-**Interpretation.** Six ways.
-
-- **It is a distribution per recording, then averaged — not a pooled histogram.** Each recording is normalised before the cell mean, so a recording carrying ten times the coupling of its neighbours counts once, not ten times. This is why the shape here can differ from the heatmap on `lag_high_kl_time_to_delivery.pdf`, which normalises after averaging and therefore reports where a cohort's coupling *mass* sits. Neither is wrong; they answer different questions.
-- **Nothing on this page carries a $p$-value.** The violins and ridges are the cells themselves and both distances are descriptive; a distance between two estimated distributions is positive almost surely even when the two populations coincide, so a non-zero value is not evidence of a difference — read it beside the recording counts on the row. The tests on these cells' shape features are on `lag_high_kl_time_to_delivery_histogram_features.pdf`, and the within-recording drift on `lag_high_kl_time_to_delivery_histogram_drift.pdf`.
-- **A density violin's width is a share, and its inner marks are the distribution's own.** The bar is the quartile *lags* of the cell's distribution, not the spread of the recordings behind it; the spread over recordings is what the features page's violins show. Two cells with the same body can stand on three recordings or thirty, which is why the count is printed above each.
-- **Neither distance row answers the other's question, so a column is read down, not alone.** Wasserstein measures displacement along the lag axis and is blind to a distribution that broadened or split *in place*; Jensen–Shannon measures overlap and is blind to displacement once two supports have separated, at which point it sits at its ceiling of $1$ however far apart they are. A cohort whose distribution widened toward delivery without shifting reads as near zero on the upper row and plainly non-zero on the lower one, and a single row would lose that finding.
-- **The two columns are not a consistency check, they are the finding.** `attn` counts every selected timestep once; `kl` weights each by how far the source moved the belief there. A shift visible in one column and absent from the other says which readout is carrying it.
-- **A missing body or ridge is a window with no scored recording for that class**, not a window where the distribution collapsed; the dodge keeps every class's slot, so a gap stays a gap.
-- **The lag axis is stored-coefficient time.** A distance quoted in seconds is a displacement on that axis and not a change in physiological latency; the caveat at the foot of the page applies to every number on it.
-
-## `lag_high_kl/lag_high_kl_second_stage_histogram.pdf`
-
-**Purpose.** Compare selected-anchor lag distributions across classes and windows aligned to second-stage onset.
-
-**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram.pdf`, with the density violins and the four bottom distance panels on the signed second-stage axis and the onset marked at zero; the ridgeline still runs earliest-before-onset at the top.
-
-**Interpretation.** As that page, and with the same population caveat as the second-stage profile page above: the recordings scored here are those carrying an onset, a strict subset of the cohort, so a class's distribution on this page and on the delivery page are over different populations.
-
-## `lag_high_kl/lag_high_kl_subgroup_histogram.pdf`
+### `lag_high_kl/lag_high_kl_subgroup_histogram.pdf`
 
 **Purpose.** Compare high-KL lag distributions across classes and their subgroups, pooled over the evaluated population without time windows.
 
-**What it shows.** The `high` band pooled over the **whole** evaluated population: each recording's selected-anchor profile averaged over every one of its segments, normalised once, then averaged over the recordings of the cohort. One column per clinical class; inside each, that class's subgroups as tints of the class colour with the class's own pooled distribution as a black dashed reference, so a subgroup is read against its class rather than against the population. Two rows per profile source (`kl` then `attn`): the distributions, and their cumulative forms with the medians dropped to the axis. Each cohort's delivery count is in the table.
+**What it shows.** The `high` band pooled over the whole evaluated population. Each recording's selected-anchor profile is averaged over all its segments and normalised once, then averaged over the recordings of the cohort. There is one column per clinical class. Inside each column, the subgroups are tints of the class colour, and the class's pooled distribution is a black dashed reference. Each profile source (`kl` then `attn`) has two rows: the distributions, and their cumulative forms with the medians dropped to the axis. `lag_high_kl_subgroup_histogram.csv` carries the curves and the delivery counts on both cohort axes.
 
-The table beside it, `lag_high_kl_subgroup_histogram.csv`, carries the same curves on both cohort axes.
+**Axes.** Stored-coefficient lag in seconds across; share up on the first row of each pair, cumulative share on the second.
 
-**Axes.** Stored-coefficient lag in seconds across; share of the distribution up on the first row of each pair, cumulative share on the second.
+**How to read it.** Nothing here is tested, and a small subgroup draws as confidently as a large one, so read the count. This pool covers every segment in the run; the pooled rows of the clock page cover one clock's binned recordings.
 
-**Interpretation.** Three ways. **Nothing here is tested**: the curves are descriptive, and a subgroup of six recordings draws as confidently as one of sixty — read the count. **It is population-pooled, so it is not the delivery-clock page's pooled row**: that row pools one clock's binned recordings, this one every segment within the run's horizon, and a recording enters both once. And **the lag axis is stored-coefficient time**, as the foot of the page says.
+### `lag_high_kl/lag_high_kl_time_to_delivery_histogram_features.pdf`
 
-## `lag_high_kl/lag_high_kl_time_to_delivery_histogram_features.pdf`
+**Purpose.** Test class differences in three properties of each recording's lag histogram within delivery-time windows.
 
-**Purpose.** Test class differences in three properties of each recording's lag histogram: median lag, interquartile range, and entropy. The tests run within delivery-time windows.
+**What it shows.** For `hist_median_s`, `hist_iqr_s` and `hist_entropy_nats`: one violin per (window, class) cell over one value per recording, the Holm-adjusted Kruskal–Wallis $p$ of the window below it, and at the foot Cliff's delta for every class pair that survives (more severe against less severe). The layout is that of `lag_high_kl_time_to_delivery_windows.pdf`.
 
-**What it shows.** For each of `hist_median_s`, `hist_iqr_s` and `hist_entropy_nats`: one violin per (window, class) cell over one value per recording, the Holm-adjusted $p$ of that window's Kruskal–Wallis directly beneath it on the same axis, and — at the foot — Cliff's delta for every class pair that survived, oriented more severe against less severe so a positive value means the more severe class runs higher. Exactly the page `lag_high_kl_time_to_delivery_windows.pdf` is, for three more readouts.
+**Axes.** Hours before delivery across, with delivery at the right. The violin rows share one $y$ label; each row's title names its readout and unit (seconds for the median and the range, nats for the entropy).
 
-**Axes.** Hours before delivery across, delivery at the right. The violin rows share one $y$ label because the page carries three units: seconds for the median and the range, nats for the entropy; each row's title names which it is.
+**How to read it.** These are three more Holm families per clock, and they are not corrected jointly with the other families. The centroid is not here, because `high_lag_centroid_kl_s` already tests the position of the same selection. The tested features use the `kl` source only. `lag_high_kl_histogram_features.csv` carries the attention-source features, which are drawn on the histogram page without tests.
 
-**Interpretation.** Three ways. **These are three more Holm families per clock**, six across the two clocks, and they are not corrected jointly with the four the analysis already defends; a reader quoting a window from two families has made two comparisons. **The centroid is deliberately not here**: `high_lag_centroid_kl_s` already tests the position of the same selection on the same band and source, and a second family on it would ask one question twice. And **the features are of the `kl` source alone** — the attention source's features are in `lag_high_kl_histogram_features.csv` and drawn on the histogram page, untested.
+### `lag_high_kl/lag_high_kl_second_stage_histogram_features.pdf`
 
-## `lag_high_kl/lag_high_kl_second_stage_histogram_features.pdf`
+**What it shows.** The panels of `lag_high_kl_time_to_delivery_histogram_features.pdf` on the signed second-stage clock, with the onset at zero. This clock has its own families, and the population is the onset subset.
 
-**Purpose.** Test the same three histogram features on the second-stage clock, using this clock's own correction families.
+### `lag_high_kl/lag_high_kl_time_to_delivery_histogram_drift.pdf`
 
-**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram_features.pdf`, on the signed second-stage axis with the onset marked at zero.
+**Purpose.** Measure how lag-histogram features change within each recording as delivery approaches.
 
-**Interpretation.** As that page, and with the same population caveat as the second-stage profile page above.
+**What it shows.** One row per tested feature (`hist_median_s`, `hist_iqr_s`, `hist_entropy_nats`).
 
-## `lag_high_kl/lag_high_kl_time_to_delivery_histogram_drift.pdf`
+- **Left:** each recording's own trajectory of the feature along the clock, thin in its class colour, with the class median per window drawn heavy.
+- **Right:** the least-squares slope of the feature against forward labour time, one value per recording scored in at least `MIN_DRIFT_WINDOWS` $= 3$ windows, as one violin per class with zero marked.
 
-**Purpose.** Measure how lag-histogram features change within each recording as delivery approaches. This helps distinguish within-recording change from a changing mix of recordings across windows.
+The title carries the Holm-adjusted Kruskal–Wallis $p$ across classes. `lag_high_kl_histogram_drift_summary.csv`, `lag_high_kl_histogram_pairwise.csv` and the record carry each class's Holm-adjusted Wilcoxon signed-rank $p$ against zero and Cliff's delta for any surviving pair.
 
-**What it shows.** One row per tested feature (`hist_median_s`, `hist_iqr_s`, `hist_entropy_nats`). **Left:** every recording's own trajectory of the feature along the clock, thin in its class colour, with the class median per window heavy over it — so a moving median can be read as many recordings moving together or as a few entering and leaving. **Right:** the least-squares slope of the feature against **forward labour time**, one value per recording scored in at least three windows, as one violin per class with zero marked.
+**Axes.** Left: hours before delivery across, with delivery at the right; the feature's unit up. Right: class across; the feature's unit per hour of labour up, with zero marked.
 
-The title carries the Holm-adjusted Kruskal–Wallis $p$ across classes; each class's Holm-adjusted Wilcoxon signed-rank $p$ against zero and Cliff's delta for any class pair that survived are in `lag_high_kl_histogram_drift_summary.csv`, `lag_high_kl_histogram_pairwise.csv` and the record.
+**How to read it.**
 
-**Axes.** Left: hours before delivery across, delivery at the right; the feature's unit up. Right: class across; the feature's unit **per hour of labour** up, zero marked.
+- A positive slope means that the feature rises as delivery approaches, on both clocks. The code negates the delivery clock's centres before the fit. `lag_high_kl_histogram_drift.csv` carries the raw window centres.
+- Each clock has two families, each with Holm across the three features: the class-against-zero tests and the across-class tests. Pairwise tests run on survivors only.
+- A recording scored in fewer than three windows is absent. The tick label of each class counts the fitted recordings.
+- A slope is a straight line through a trajectory that need not be straight. The left panel shows the shape.
 
-**Interpretation.** Four ways.
+### `lag_high_kl/lag_high_kl_second_stage_histogram_drift.pdf`
 
-- **Positive means the feature rises as delivery approaches, on both clocks.** The delivery clock counts backwards, so its centres are negated before the fit; a slope here and a slope on the second-stage page carry the same sign for the same drift. The raw window centres are on `lag_high_kl_histogram_drift.csv` for a reader who wants the fit's inputs.
-- **Two families per clock, each Holm across the three features.** The class-against-zero tests are one family; the across-class tests are another; pairwise runs on survivors only. Neither is joint with the per-window families.
-- **A recording scored in fewer than three windows is absent**, not at zero — the count in each class's tick label is the fitted recordings, which is a subset of the class.
-- **A slope is a straight line through a trajectory that need not be straight.** A distribution that moves out and back reads as no drift; the left panel is where that would be seen.
+**What it shows.** The panels of `lag_high_kl_time_to_delivery_histogram_drift.pdf`. The left panels use the signed second-stage clock, not inverted, with the onset at zero. The slopes are already in forward time, so the right panels read the same way. The population is the onset subset.
 
-## `lag_high_kl/lag_high_kl_second_stage_histogram_drift.pdf`
+### `lag_high_kl/lag_high_kl_usefulness.pdf`
 
-**Purpose.** Measure within-recording changes on the second-stage clock for recordings with a recorded onset.
+**Purpose.** Check whether anchors with large KL also show improved prediction.
 
-**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram_drift.pdf`; the left panels are on the signed second-stage axis, not inverted, with the onset marked at zero, and the slopes are already in forward time so the right panels read identically.
+**What it shows.** Four panels:
 
-**Interpretation.** As that page, and with the same population caveat as the second-stage profile page above. A recording with few windows on either side of the onset spans a short clock here even when it spanned a long one on the delivery clock, so its slope is the noisier of the two.
+1. The forecast gain $D_{\mathrm{base}} - D_{\mathrm{full}}$ of an anchor against its KL decile: the median per recording with its interquartile ribbon, pooled in black and one line per class, with zero marked. The record's `usefulness` block carries the run-level paired test: the `high` band's mean gain minus the `rest` band's within each recording, its Wilcoxon $p$, and the share of recordings in which it is positive.
+2. The mean gain by the lag at which the anchor's KL attribution peaks, for all anchors and for the `high`, `rest` and `gain` bands.
+3. The pooled lag profiles as shares: the all-anchor KL attribution, the attention weighted by positive forecast gain, and the `gain` and `high` bands' attributions. The `usefulness` block carries the high–gain overlap against the $30\%$ that independence gives.
+4. Per recording and per `occlusion_bands` band, the share of KL attribution inside the band against the forecast cost of occluding it, one colour per band, with zero marked. Without the occlusion pass in the directory, the panel carries a note instead.
 
-## `lag_high_kl/lag_high_kl_usefulness.pdf`
+**Axes.** Panel 1: KL decile across (0 is lowest), nats per anchor up. Panel 2: stored-coefficient lag in seconds across, nats per anchor up. Panel 3: lag across, share up. Panel 4: share of the recording's attribution across, occlusion delta in nats up.
 
-**Purpose.** Check whether anchors with large KL also show improved prediction. Large KL means the latent changed; this figure tests whether that change was useful for forecasting.
+**How to read it.**
 
-**What it shows.** Four panels. **Top:** the forecast gain $D_{\mathrm{base}} - D_{\mathrm{full}}$ of an anchor against the KL decile of the same anchor — the median per recording with its inter-quartile ribbon, pooled in black and one line per class, zero marked. The run-level paired test (the high band's mean gain minus the rest band's within recording, its Wilcoxon $p$ and the share of recordings in which it is positive) is in the record's `usefulness` block, not on the figure. **Second:** the mean gain by the lag the anchor's KL attribution peaks at, for every anchor and for the `high`, `rest` and `gain` bands.
+- If the gain rises with the KL decile, high-KL anchors also forecast better. If it stays flat, the KL readout measures something that the forecast does not use. Read `source_null` beside it.
+- The paired test is one test in its own family. Panels 2 to 4 are descriptive.
+- Panel 2 conditions on the argmax, which the near edge of the window can pin. Read it beside `n_anchors` in `lag_high_kl_gain_by_argmax.csv`.
+- The gain-weighted profile reweights the same attention, so it can only redistribute mass that the model already placed.
+- Panel 4 compares the observational and the interventional readings for this checkpoint only.
 
-**Third:** the pooled lag profiles as shares — the all-anchor KL attribution, the attention weighted by positive forecast gain (where the source looks *when it helps*), and the `gain` and `high` bands' attributions — with the high–gain overlap against the $30\%$ independence would give in the record's `usefulness` block. **Bottom:** per recording and per `occlusion_bands` band, the share of KL attribution inside the band against the forecast cost of occluding it, one colour per band, zero marked; or the note that the interventional pass did not run in this directory.
+---
 
-**Axes.** Panel 1: KL decile across (0 = lowest), nats per anchor up. Panel 2: stored-coefficient lag in seconds across, nats per anchor up. Panel 3: lag across, share of the profile up. Panel 4: share of the recording's attribution across, occlusion delta in nats up.
+## Spectral-skill figure
 
-**Interpretation.** Five ways.
+### `spectral_skill/spectral_skill_bands.pdf`
 
-- **A rising top panel is the finding, a flat one is the other finding.** If the gain does not rise with the KL decile — or the high-minus-rest difference is not positive — the coupling readout is measuring something the forecast does not use, however sharp the lag profile looks. The availability clock is the standing candidate for what it is measuring instead; read `source_null`.
-- **The paired test is one test, its own family.** It is not corrected with the four clock families, and it says nothing about *which* lags helped; panels 2 to 4 are where that is read, and they are descriptive.
-- **Panel 2 conditions on the argmax, which the near edge can pin.** A lag with many anchors and a small gain is a censoring artefact as readily as a finding; read it beside `n_anchors` in `lag_high_kl_gain_by_argmax.csv` and beside the degeneracy share on the clock pages.
-- **The gain-weighted profile is not a second lag detector.** It weights the same attention by the same run's forecast gain, so it can only redistribute mass the model already put somewhere; a profile identical to the KL-weighted one means the useful anchors look where all anchors look.
-- **The bottom panel's agreement is a property of the run, not of the method.** On the planted-delay fixture the two readings disagreed; a positive $\rho$ here says the observational and the interventional answers coincide for this checkpoint, and nothing more.
+**Purpose.** Compare forecast performance across bands defined by the analysing filters of the target coefficients.
 
-## `spectral_skill/spectral_skill_bands.pdf`
+**What it shows.** Top ("Forecast gap by band"): the forecast gap per recording, one violin per band. Each label gives the band's frequency range with the period in parentheses, and its channel count. Bottom ("Error-space skill by band"): the skill of the full branch against the base branch, per band.
 
-**Purpose.** Compare forecast performance across bands defined by the target coefficients' analysing filters. The bands describe the input transform, not a new spectrum computed from the forecast.
+**Axes.** Top: nats per anchor, with zero marked. Bottom: $1 - \mathrm{MSE}_{\mathrm{full}}/\mathrm{MSE}_{\mathrm{base}}$, with zero marked. The two quantities have different units, so they have separate axes.
 
-**What it shows.** Top: the forecast gap per recording, one violin per band, each labelled by the band's **frequency range with the period in parentheses** (not its clinical name) and with its **channel count in its label**. Bottom: the error-space skill of the source-conditioned branch against the target-only one, per band.
+**How to read it.**
 
-**Axes.** Top: nats per anchor, zero marked. Bottom: $1 - \mathrm{MSE}_{\mathrm{full}}/\mathrm{MSE}_{\mathrm{base}}$, zero marked. Two axes because the two are in different units and one shared axis would flatten whichever is smaller into a line at zero.
+- This is band-resolved skill, not coherence. A stored scattering coefficient is a modulus, so the figure cannot separate a mistimed forecast from a mis-scaled one.
+- The band is the band of the analysing filter, not a bin of the forecast's own spectrum.
+- The channel counts in the labels show how many channels carry each band.
+- `unknown` holds the channels without a recoverable centre frequency. They keep their own label.
 
-**Interpretation.** Four ways.
+---
 
-- **This is band-resolved skill, not coherence.** A stored coefficient is a *modulus*: the analysing filter's phase was discarded before the value was written, so nothing here can say whether a forecast is mistimed rather than mis-scaled. A forecast that is right in every band but arrives a step late reads here as a forecast that is right.
-- **The band is the band of the analysing filter**, not a bin of the forecast's own spectrum. Those are two different objects.
-- **The channel counts in the labels are load-bearing.** A band carried by three channels and one carried by forty are not comparable as evidence, and the label is where that shows.
-- **`unknown` is a band with no frequency, not a leftover.** A channel lands here when it has no recoverable centre frequency because no selected phase-harmonic pair named its filter; the band's label carries how many of the scored channels that is, and they are reported under their own label rather than bucketed into a neighbour — which would misattribute their skill to a frequency they do not have.
+## Recording-trace figures
 
-## `recording_traces/recording_traces_summary.pdf`
+The `recording_traces` analysis (`analyses/recording_traces.py`) follows up to `eval_config.caps.traces_per_class` recordings per class through all their segments. It writes these figures into `recording_traces/`.
 
-**Purpose.** Follow selected recordings through their segments up to delivery, and read each class's typical course against them. These examples support visual exploration rather than population-level testing.
+### `recording_traces/recording_traces_summary.pdf`
 
-**What it shows.** A coverage row, then one panel per per-segment summary column — the divergence $K_t$, the mean-decoded forecast gap, the source shift of the latent mean $\lVert \mu^q - \mu^p \rVert_2$, the active coordinate count, the lag centroid of the KL attribution and its entropy — all on one shared axis of hours before delivery with delivery on the right. Every recording is a thin line in its **class** colour with one marker per segment, lifted at a break (a gap longer than one segment stride), so a missing hour is a hole rather than a slope. Over the lines, the **class median** per half-hour window is drawn bold, with the inter-quartile band over recordings wherever at least three recordings fall in the window; each recording contributes one value per window (the mean of its segments there), so a recording with many segments weighs the same as one with a single segment. The coverage row counts the recordings each window holds per class, which is what a median rests on. When `max_hours_before_delivery` is set the axis is bounded to it and the segments beyond it stay in `segment_summary.csv`.
+**Purpose.** Follow selected recordings through their segments up to delivery, beside each class's median course.
 
-**Interpretation.** These are up to `eval_config.caps.traces_per_class` recordings per class, drawn for looking at rather than for testing: a class whose median sits higher is a hypothesis, and `cross_subgroup` and the clock analyses are where such a difference is asked properly, on every recording, with a correction. A median over three recordings is a median of three; read the coverage row before the band. Every value is a mean over the segment's **scored** anchors; a segment that scored none is absent from its line rather than drawn at zero. The lag centroid is in stored-coefficient time.
+**What it shows.** A coverage row comes first. Then there is one panel per per-segment summary column: the divergence $K_t$, the mean-decoded forecast gap, the source shift of the latent mean $\lVert \mu^q - \mu^p \rVert_2$, the active coordinate count, the lag centroid of the KL attribution and its entropy. All panels share one axis of hours before delivery, with delivery on the right.
 
-## The per-recording traces: `recording_traces/<class>/<guid>_<subgroup>_trace.pdf`
+- Each recording is a thin line in its class colour, with one marker per segment. The line is lifted at a break (a gap longer than one segment stride).
+- The class median per half-hour window is bold, with the interquartile band over recordings wherever at least three recordings fall in the window. Each recording gives one value per window (the mean of its segments there).
+- The coverage row counts the recordings per class in each window.
 
-**Purpose.** Inspect every available segment of one recording at anchor resolution, on a shared axis of hours before delivery. The filename identifies both the recording and its subgroup.
+When `max_hours_before_delivery` is set, the axis stops there, and `segment_summary.csv` keeps the segments beyond it.
 
-**The interactive page.** Beside the PDF, `<guid>_<subgroup>_trace.html` is the same trace as a plotly page (plotly.js from its CDN): the raw FHR and UP the loader served on top, then every row below, on one shared zoomable time axis relative to delivery. Every series is painted onto a uniform grid in `epoch` order, so where a dataset stores overlapping segments the **later segment overwrites the earlier one** and each instant carries the latest reading; a break is an empty stretch. The lag map and, on the lag-slot cell, the bounded mean update are on logarithmic colour (a signed log for the update), ticked in the panel's own units.
+**How to read it.** The figure is for inspection, not for testing; `cross_subgroup` and the clock analyses test class differences. Read the coverage row before the band. Each value is a mean over the segment's scored anchors, and a segment that scored none is absent. The lag centroid is in stored-coefficient time.
 
-**What it shows.** The page **leads with the raw signals**: the raw FHR (bpm) and raw UP (mmHg) the segments carry, one row each on the fixed CTG scales, painted over the whole recording in `epoch` order at the raw rate, so every model row below is read against the physiology it came from. A signal the loader did not serve is left out rather than drawn empty. Then ten model rows on the same shared axis of hours before delivery, delivery on the right, every model row at the anchor step so a column is the same anchor on every row: the divergence $K_t$; both `pred_gap` estimators, **joined from the collection pass** at those anchors and therefore absent wherever the pass did not collect the segment; the posterior mean $\mu^q$ over the latent coordinates and the source shift $\mu^q - \mu^p$ on a symmetric colour scale, as heatmaps; the per-coordinate divergence; the KL attribution over lags on a **logarithmic** colour scale with the peak lag drawn over it; the latent norms; the mean log-variances of prior and posterior; the lag centre of the attribution (centroid and median, in seconds); and the lag entropies of the attribution and of the attention. The colour axis of every heatmap row sits in its own column, so every row's data axes span the same hours.
+### The per-recording traces: `recording_traces/<class>/<guid>_<subgroup>_trace.pdf`
 
-On the $K_t$ and forecast-gap rows a black step marks each segment's mean over its scored anchors — the value the summary figure carries for that segment — so the two figures can be read against each other. Segments alternate a faint background on the line rows; a stretch of the recording the dataset holds no segment for (a **break**, a gap longer than one segment stride) is shaded darker on every row; and a line row is lifted at every unscored anchor so nothing is drawn across a gap. Where the recording carries a clinical clock, its onset is ruled across the page: labour onset dashed, second-stage onset dotted, each labelled on the first row. The title carries the GUID, the subgroup and the class; the segment count and the span are in `recording_traces.csv`, and a break is the darker shading.
+**Purpose.** Inspect every available segment of one recording at anchor resolution, on a shared axis of hours before delivery.
 
-**Interpretation.** Four ways. *A step at a join is geometry*: segments are separate forward passes with a reset encoder state, so a discontinuity at a marked join is a property of the harness rather than of the fetus. *A smooth path is not evidence of smooth physiology*: there is no latent transition density, and consecutive anchors are smooth because the encoders are. *The lag axis is stored-coefficient time*, and the note under the figure applies to every lag row (its long form is `GROUP_DELAY_CAVEAT`). *The scales are shared across recordings*: `traces.shared_panel_scales` takes one colour-scale top per heatmap row and one $y$ range per line row over **every** recording the run traces, and the raw rows sit on the fixed CTG scales, so two recordings' pages are compared by colour and height directly. The flip side is that a quiet recording really does draw pale: a page scaled to its own maximum would make it look as loud as the loudest one.
+**What it shows.** The page starts with the raw signals: raw FHR (bpm) and raw UP (mmHg), one row each on the fixed CTG scales, painted over the whole recording in `epoch` order at the raw rate. A signal that the loader did not serve is left out. Ten model rows follow, each at the anchor step, so a column is the same anchor on every row:
 
-The full arrays behind every panel are in the `_full.npz` beside the figure.
+1. The divergence $K_t$.
+2. Both `pred_gap` estimators, joined from the collection pass at those anchors and absent where the pass did not collect the segment.
+3. The posterior mean $\mu^q$ over the latent coordinates, as a heatmap.
+4. The source shift $\mu^q - \mu^p$ on a symmetric colour scale, as a heatmap.
+5. The per-coordinate divergence.
+6. The KL attribution over lags on a logarithmic colour scale, with the peak lag drawn over it.
+7. The latent norms.
+8. The mean log-variances of prior and posterior.
+9. The lag centre of the attribution (centroid and median, in seconds).
+10. The lag entropies of the attribution and of the attention.
 
-## `attribution/attribution_maps.pdf`
+Each heatmap's colour axis sits in its own column, so all rows span the same hours. On the $K_t$ and forecast-gap rows, a black step marks each segment's mean over its scored anchors, which is the value that the summary figure carries. Segments alternate a faint background on the line rows. A break is shaded darker on every row. A line row is lifted at every unscored anchor. Where the recording has a clinical clock, the page rules the onsets across it: labour onset dashed, second-stage onset dotted, each labelled on the first row. The title carries the GUID, the subgroup and the class. `recording_traces.csv` carries the segment count and the span. The `_full.npz` beside the figure holds the arrays behind every panel.
 
-**Purpose.** Show the coefficients the encoders read at one example anchor per clinical class, and which of them the divergence was attributed to. The example is the highest-KL clean anchor of each class (`ATTRIBUTION.md`, section 7); without a per-anchor table it is the middle chosen anchor of the first selected recording of each class.
+**How to read it.**
 
-**What it shows.** **One column per class example**, seven rows, every row but the last on that segment's stored-time axis $[0, 4T]$ seconds, identical in every column. First the **raw FHR** (bpm) and **raw UP** (mmHg) of the segment on the fixed CTG scales, the physiology every map below is read against. Then the **inputs**: the declared target stream (the scattering block above the phase-harmonic block, divided by a rule) and the declared source stream, standardised coefficients over stored second and declared channel on a sequential scale with robust (1st–99th percentile) limits taken over the read cells of **all** examples, one scale per stream. **The cells the model never read are blanked** in light grey rather than drawn: every channel's cold steps, which the input gate multiplies by zero, so the warm-up region neither sets the colour scale nor reads as data. Then the attribution of $K_t$: to the target stream under the **all-zero** baseline — the only baseline along which the target inputs move, so the only one under which a target map exists — and to the source stream under the **source-null** baseline, the primary comparison, each on a **symmetric-log** colour scale (linear within `LOG_DECADES` decades of the largest magnitude, logarithmic beyond) shared by every column, with the cold cells and every step after the anchor blanked, since both are exactly zero by construction. Last, the source attribution re-indexed by offset from the anchor, as a share per lag on a symmetric-log axis, against the model's own lag readout at the same anchor normalised the same way, with their correlation and Jensen–Shannon distance left to the `lag_corr` and `lag_js` columns of `attribution_rows.csv`. Panels are titled in the first column only, and the lag legend is kept in its first panel. Every map carries the anchor as a vertical rule and the forecast block it scores as a shaded window; the column heading carries the GUID, **the subgroup** and the class; the anchor and its epoch are in `attribution_examples.csv`. One colour bar per row sits at the right of the last column.
+- A step at a segment join comes from the harness: each segment is a separate forward pass with a reset encoder state.
+- A smooth path comes from the smooth encoders. There is no latent transition density.
+- The lag rows are in stored-coefficient time, and the note under the figure applies to each of them (long form `GROUP_DELAY_CAVEAT`).
+- `traces.shared_panel_scales` sets one colour-scale top per heatmap row and one $y$ range per line row over all traced recordings, and the raw rows use the fixed CTG scales. Two recordings' pages therefore compare by colour and height. A quiet recording draws pale.
 
-**Axes.** Stored time in seconds across (the samples pages' axis); raw rows in bpm and mmHg; declared channel down on the map rows; standardised coefficient (inputs) or readout units on a symmetric-log scale (attribution) in colour. The lag panel is in stored-coefficient seconds.
+### The interactive page: `recording_traces/<class>/<guid>_<subgroup>_trace.html`
 
-**Interpretation.** Four ways. *Every cell after the anchor is exactly zero* on a causal model and is blanked, not cropped — `attribution_checks.pdf` is where a non-zero there would show, as a defect rather than a finding. *The map is one anchor of one segment of one recording*, drawn for looking at; the population reductions are the other figures, and the per-class example pages below give the same anchor under every readout. *The colour scales are shared* (`attributions.example_norms`, stated here and not under the figure): one linear scale per input stream and one symmetric-log scale per readout, baseline and stream, over every class example, so a colour means the same value in every column and on every per-class example page. A row still cannot be compared by colour with a *different* row, which carries its own scale; use the totals in `attribution_rows.csv` for that. *A cold channel's cells are zero because the gate multiplied them by zero*, not because the model found nothing there. The note under the figure is the one-line form of `ATTRIBUTION_CAVEAT` (a sensitivity, not a causal effect or a latency); the model's own lag readout is the cell's (`lag_qualification` in `summary.json`).
+**What it shows.** The same trace as a plotly page (plotly.js from its CDN), written by `traces_html.py`. It shows the raw FHR and UP on top, then every model row, on one shared zoomable time axis relative to delivery. Each series is painted onto a uniform grid in `epoch` order. Where a dataset stores overlapping segments, the later segment overwrites the earlier one, and a break is an empty stretch. The lag map and, on the lag-slot cell, the bounded mean update use a logarithmic colour scale (a signed log for the update), ticked in the panel's own units.
 
-## The per-class example pages: `attribution/maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf`
+---
 
-**Purpose.** Put the input coefficients and every readout's attribution of them on one page, for the same anchor: what the model read, and what in it moved the latent, the forecast and the lag readout.
+## Attribution figures
 
-**What it shows.** One page per example, up to three per class: the highest-KL clean anchors of the class, each from a different recording, ranked by $K_t$. The pages are laid out as the samples pages are: a stack of full-width rows on **one shared stored-time axis**, with a colour-axis column on the right, so a column of the page is the same stored second on every row and maps are compared by reading down. The first two rows are the **raw FHR and raw UP** of the segment on the fixed CTG scales; the next two are the input streams the encoders read, cold cells blanked. Every readout variant then takes two rows — its target attribution under the all-zero baseline above its source attribution under the source-null baseline, each on a symmetric-log colour scale and titled by readout and stream; the readout's value at the input and at the exact null is `value_input` and `value_baseline` in `attribution_rows.csv`. The variants, in order: the divergence $K_t$, the forecast gap (base minus full), the full-branch block score, the full-branch **squared error** (the fidelity of the mean forecast, which the learned variance cannot trade against), the squared-error gap, the full-branch score at the **first and the last horizon step**, then the lag readout on each configured `occlusion_bands` band. Three rows off the time axis close the page: the **latent at the anchor** — prior mean, source shift $\mu^q - \mu^p$ and per-coordinate divergence $K_{t,d}$, with the top coordinate marked; the **activation split** — the layer integrated gradients of every variant on the cell's own layer (per head on the attentive cells, per lag on the lag-residual cell), source-null baseline; and every variant's lag-aligned source attribution overlaid on one lag axis against the model's lag readout. The page title carries the GUID, the subgroup and the class, the anchor and its epoch are in `attribution_examples.csv`, and the filename carries the class, the GUID **and the subgroup**. Every page shares one set of colour scales with every other example page and with `attribution_maps.pdf` (computed once over all examples), so the same colour is the same value across classes.
+The attribution pass (`attribution_pass.py`, `attributions.py`, `class_contrast.py`, `attribution_strata.py`, `gradcam.py`) writes these figures into `attribution/`. [ATTRIBUTION.md](ATTRIBUTION.md) explains the methods, baselines and checks. Unless an entry states otherwise:
 
-**Axes.** Stored time in seconds across on every map row, raw rows in bpm and mmHg, declared channel down on the map rows; latent coordinate, head or lag, and stored-coefficient seconds on the three closing rows.
+- The main pass attributes up to `eval_config.caps.attribution_segments` segments, `attribution_segments_per_recording` per recording, and up to `ANCHORS_PER_SEGMENT` $= 4$ anchors per segment from the top $30\%$ of that segment's $K_t$ (`HIGH_KL_QUANTILE` $= 0.7$).
+- The class-comparison pass (`attribution_classes.pdf`, `attribution_class_maps.pdf`, `gradcam_classes.pdf`) uses `eval_config.caps.attribution_cohort_segments` segments, one per recording.
+- The strata pass (`late_behaviour.pdf` and the `strata_*` figures) uses `eval_config.caps.attribution_strata_segments` late segments, one per recording, from segments that start at most `LATE_WINDOW_HOURS` $= 2$ h before delivery.
+- The model was trained on the healthy-only pretraining split, so a class contrast describes the fitted model's response to inputs outside its training distribution. It is not a physiological effect.
 
-**Interpretation.** Read down a column to see whether the same coefficients drive different readouts, and across a row to see where in stored time and in which channels one readout was sensitive. The sign matters and differs by readout: a positive cell raises the readout along the path, which is a larger latent change for $K_t$, a larger advantage of full over base for the gap, and a *worse* forecast for the block score. The all-zero and source-null columns are attributions along different paths from different baselines and do not sum to anything together; the lag-band readout's own attribution is expected to concentrate on its band, and how far it does is what the last rows show. The two horizon-step rows say whether the near and the far end of the block read the inputs differently; the squared-error rows say which inputs moved the forecast itself rather than its score. `attribution_maps.npz` carries every map on the pages, keyed by example, readout, baseline and band (`h<step>` for a horizon step), beside the inputs, the latent (`example_latent_*`) and the activation split (`map_layer`).
+### `attribution/attribution_maps.pdf`
 
-## `attribution/attribution_blocks.pdf`
+**Purpose.** Show the coefficients that the encoders read at one example anchor per clinical class, and which coefficients the divergence is attributed to. The example is the highest-KL clean anchor of each class. Without a per-anchor table, it is the middle chosen anchor of the first selected recording of each class.
 
-**Purpose.** Answer, per readout, which of the four input blocks the model responded to — the question behind the NLL and the forecast-fidelity analysis: does the score, the error, the latent change and the gain come from the target's scattering coefficients, its phase harmonics, the source's scattering coefficients or its phase harmonics.
+**What it shows.** One column per class example and seven rows. All rows except the last share the segment's stored-time axis $[0, 4T]$ s, the same in every column:
 
-**What it shows.** Left: per readout variant — the divergence, the forecast gap, the full-branch block score, the full-branch squared error and the score at the first and the last horizon step — the mean over recordings of the **unsigned** attribution's share in each block under the all-zero baseline, the one path along which every stream moves, as a stacked bar summing to one. Right: the same rows' **signed** block sums on a symmetric-log axis, so a block that raised a readout and one that lowered it are told apart. `attribution_blocks.csv` carries both under both baselines.
+1. Raw FHR (bpm) on the fixed CTG scale.
+2. Raw UP (mmHg) on the fixed CTG scale.
+3. The declared target stream as input: the scattering block above the phase-harmonic block, divided by a rule.
+4. The declared source stream as input.
+5. The attribution of $K_t$ to the target stream under the **all-zero** baseline. Only along this baseline do the target inputs move, so only this baseline gives a target map.
+6. The attribution of $K_t$ to the source stream under the **source-null** baseline, the primary comparison.
+7. The source attribution re-indexed by offset from the anchor, as a share per lag on a symmetric-log axis, against the model's own lag readout at the same anchor normalised the same way.
 
-**Axes.** Share of the unsigned attribution across (left); signed attribution in readout units, symmetric log (right); readout variants down.
+The input rows show standardised coefficients on a sequential scale with robust (1st–99th percentile) limits, taken over the read cells of all examples, one scale per stream. Cells that the model never read are blanked in light grey: each channel's cold steps, which the input gate multiplies by zero. The attribution rows use a symmetric-log colour scale (linear within `LOG_DECADES` decades of the largest magnitude, logarithmic beyond), shared by all columns. The cold cells and every step after the anchor are blanked, because both are exactly zero by construction. `attribution_rows.csv` carries the correlation and the Jensen–Shannon distance of row 7 (`lag_corr`, `lag_js`).
 
-**Interpretation.** A share is a split of sensitivity along one path from one baseline, not a variance decomposition. The block-score and squared-error rows read against each other: a block that carries the score but not the error is one that moved the forecast's variance rather than its mean. Under the all-zero baseline the source's share includes what the source contributes when introduced together with the target, which is not the source-null comparison the lag figures use.
+Panels are titled in the first column only, and the lag legend is in its first panel. Each map carries the anchor as a vertical rule and the scored forecast block as a shaded window. The column heading carries the GUID, the subgroup and the class. `attribution_examples.csv` carries the anchor and its epoch. One colour bar per row sits at the right of the last column.
 
-## `attribution/attribution_horizon.pdf`
+**Axes.** Stored time in seconds across; raw rows in bpm and mmHg; declared channel down on the map rows; standardised coefficient (inputs) or readout units on a symmetric-log scale (attribution) in colour. The lag panel is in stored-coefficient seconds.
 
-**Purpose.** Show how the near and the far end of the forecast block read the inputs.
+**How to read it.**
 
-**What it shows.** Over the per-step score rows (`nll_horizon`, tagged `h<step>` in the `band` column). Left: per named horizon step, the mean over recordings of the unsigned attribution total of the target stream (all-zero baseline) and of the source stream (source-null baseline), with the step's score at the input as a line. Middle: the source attribution by lag per step, source-null baseline, magnitude. Right: the target attribution by offset from the anchor per step, all-zero baseline. All vertical axes symmetric-log.
+- On a causal model every cell after the anchor is exactly zero. `attribution_checks.pdf` shows any non-zero value there as a defect.
+- The map shows one anchor of one segment of one recording. The per-class example pages give the same anchor under every readout.
+- The colour scales are shared (`attributions.example_norms`): one linear scale per input stream, and one symmetric-log scale per readout, baseline and stream, over all class examples. A colour means the same value in every column and on every per-class example page. Rows have their own scales, so use the totals in `attribution_rows.csv` to compare rows.
+- A cold channel's cells are zero because the gate multiplied them by zero.
+- The note under the figure is the short form of `ATTRIBUTION_CAVEAT`: an attribution is a sensitivity, not a causal effect or a latency. `lag_qualification` in `summary.json` qualifies the model's own lag readout.
+
+### The per-class example pages: `attribution/maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf`
+
+**Purpose.** Put the input coefficients and every readout's attribution of them on one page, for one anchor.
+
+**What it shows.** One page per example, up to `EXAMPLES_PER_CLASS` $= 3$ per class: the highest-KL clean anchors of the class, each from a different recording, ranked by $K_t$. The page is a stack of full-width rows on one shared stored-time axis, with a colour-axis column on the right.
+
+- The first two rows are raw FHR and raw UP on the fixed CTG scales. The next two are the input streams, with cold cells blanked.
+- Each readout variant takes two rows: its target attribution under the all-zero baseline above its source attribution under the source-null baseline, each on a symmetric-log scale. `value_input` and `value_baseline` in `attribution_rows.csv` give the readout at the input and at the exact null.
+- The variants, in order: the divergence $K_t$, the forecast gap (base minus full), the full-branch block score, the full-branch squared error, the squared-error gap, the full-branch score at the first and the last horizon step, and the lag readout on each configured `occlusion_bands` band.
+- Three closing rows are off the time axis. The first shows the latent at the anchor: prior mean, source shift $\mu^q - \mu^p$ and per-coordinate divergence $K_{t,d}$, with the top coordinate marked. The second shows the activation split: the layer integrated gradients of every variant on the cell's own layer, under the source-null baseline. The third overlays every variant's lag-aligned source attribution on one lag axis against the model's lag readout.
+
+The page title carries the GUID, the subgroup and the class. `attribution_examples.csv` carries the anchor and its epoch. The filename carries the class, the GUID and the subgroup. Every page shares one set of colour scales with the other example pages and with `attribution_maps.pdf`.
+
+**Axes.** Stored time in seconds across on every map row; raw rows in bpm and mmHg; declared channel down on the map rows. Latent coordinate, head or lag, and stored-coefficient seconds on the three closing rows.
+
+**How to read it.** Read down a column to see whether the same coefficients drive different readouts. Read across a row to see where in stored time and in which channels one readout is sensitive. The sign depends on the readout: a positive cell raises the readout along the path, which is a larger latent change for $K_t$, a larger advantage of full over base for the gap, and a worse forecast for the block score. The all-zero and source-null rows use different baselines and paths and do not add together. The two horizon-step rows compare the near and far ends of the block. The squared-error rows show which inputs moved the mean forecast. `attribution_maps.npz` carries every map, keyed by example, readout, baseline and band (`h<step>` for a horizon step), with the inputs, the latent (`example_latent_*`) and the activation split (`map_layer`).
+
+### `attribution/attribution_blocks.pdf`
+
+**Purpose.** Show, per readout, how the attribution splits over the four input blocks: target scattering, target phase harmonics, source scattering and source phase harmonics.
+
+**What it shows.** Left: for each readout variant (divergence, forecast gap, full-branch block score, full-branch squared error, and the score at the first and last horizon step), the mean over recordings of the unsigned attribution share of each block under the all-zero baseline, as a stacked bar that sums to one. Right: the signed block sums of the same rows on a symmetric-log axis. `attribution_blocks.csv` carries both under both baselines.
+
+**Axes.** Left: share of the unsigned attribution across. Right: signed attribution in readout units, symmetric log. Readout variants down.
+
+**How to read it.** A share is a split of sensitivity along one path from one baseline, not a variance decomposition. A block that carries the score but not the squared error moved the forecast variance and not its mean. Under the all-zero baseline, the source share includes the source contribution when it enters together with the target. That is not the source-null comparison of the lag figures.
+
+### `attribution/attribution_horizon.pdf`
+
+**Purpose.** Show how the near and the far ends of the forecast block read the inputs.
+
+**What it shows.** The per-step score rows (`nll_horizon`, tagged `h<step>` in the `band` column).
+
+- Left: per named horizon step, the mean over recordings of the unsigned attribution total of the target stream (all-zero baseline) and of the source stream (source-null baseline), with the step's score at the input as a line.
+- Middle: the source attribution magnitude by lag per step, source-null baseline.
+- Right: the target attribution by offset from the anchor per step, all-zero baseline.
+
+All vertical axes are symmetric-log.
 
 **Axes.** Horizon step across (left); offset from the anchor in stored-coefficient seconds across (middle, right); nats up.
 
-**Interpretation.** A far step that reads the source more than the near one is a source whose information pays later in the block; a lag profile that shifts between the steps is a model reading further back for further-out forecasts. The steps are the first and the last of the block, so this is the two ends and not the shape between them. The axis is stored-coefficient time.
+**How to read it.** The steps are the first and last of the block, so the figure shows the two ends and not the shape between them. A lag profile that differs between the steps means that the two ends read different source history. The axis is stored-coefficient time.
 
-## `attribution/attribution_lag_profile.pdf`
+### `attribution/attribution_lag_profile.pdf`
 
-**Purpose.** Compare source-input attribution over lag offsets with the model's own lag readouts at the attributed anchors.
+**Purpose.** Compare the source-input attribution over lag offsets with the model's own lag readout at the attributed anchors.
 
-**What it shows.** One row per main readout — the divergence, the forecast gap, the full-branch block score and the full-branch squared error — source-null baseline. Left: the mean over recordings of the normalised $|q_\ell|$ beside the mean normalised model profile, pooled, with the recording-mean Pearson correlation and Jensen–Shannon distance left to the `lag_corr` and `lag_js` columns of `attribution_rows.csv`. Right: the same by class, solid for the attribution and dashed for the model readout, in the severity colours, the recordings per class are listed in `attribution_recordings.csv`. A last row puts every readout on one lag axis: left, the normalised source attribution of the divergence, of the forecast gap and of the lag readout on each configured band, pooled over recordings, with the model's lag readout dashed in black; right, the lag-band readouts alone, each against its own band shaded in its colour.
+**What it shows.** One row per main readout (divergence, forecast gap, full-branch block score, full-branch squared error), under the source-null baseline.
+
+- Left: the mean over recordings of the normalised $|q_\ell|$ beside the mean normalised model profile, pooled. `attribution_rows.csv` carries the recording-mean Pearson correlation and Jensen–Shannon distance (`lag_corr`, `lag_js`).
+- Right: the same by class, solid for the attribution and dashed for the model readout, in the severity colours. `attribution_recordings.csv` lists the recordings per class.
+- A last row puts every readout on one lag axis. Left: the normalised source attribution of the divergence, of the forecast gap and of the lag readout on each configured band, pooled over recordings, with the model's lag readout dashed in black. Right: the lag-band readouts alone, each with its own band shaded in its colour.
 
 **Axes.** Lag in seconds, stored-coefficient time; share per lag, symmetric log.
 
-**Interpretation.** The two profiles are different objects that happen to share an axis: the model readout is $K_t$ times the attention, an allocation; the attribution is a sensitivity of $K_t$ to the source coefficient at that offset, which can be negative and is drawn by magnitude. Agreement is a finding about the model's self-description, disagreement is not a fault in either. On the comparison row, the readouts are sensitivities of different quantities to the same inputs, so where their profiles coincide the same stored source time moves the latent, the forecast and the lag readout together, and where they part it does not; a band readout whose attribution sits outside its own band is a readout the model computes from beyond the band it names. The axis is stored-coefficient time, uncorrected for the composed group delay. Up to `eval_config.caps.attribution_segments` recordings, one segment each.
+**How to read it.** The two profiles are different objects on one axis. The model readout is $K_t$ times the attention, an allocation. The attribution is the sensitivity of $K_t$ to the source coefficient at that offset; it can be negative and is drawn by magnitude. On the comparison row, coinciding profiles mean that the same stored source time moves the latent, the forecast and the lag readout. A band readout whose attribution sits outside its own band is computed from source history beyond that band. The axis is not corrected for the composed group delay.
 
-## `attribution/attribution_bands.pdf`
+### `attribution/attribution_bands.pdf`
 
-**Purpose.** Summarise input attribution by frequency band and source lag band, and compare it with related predictive and intervention analyses.
+**Purpose.** Summarise the input attribution by frequency band and by source lag band, beside the related predictive and intervention analyses.
 
-**What it shows.** Top, one column per readout: the mean over recordings of the attribution summed over each frequency band of the declared channel map, one bar group per stream — the target read along the all-zero path and the source along the source-null path, the only path on which each stream moves — with `spectral_skill`'s per-band gap drawn on a twin axis for the target bands where that pass ran. The ticks name each band by its frequency range with the period in parentheses; the `band` column of the table keeps the key.
+**What it shows.** Top, one column per readout: the mean over recordings of the attribution summed over each frequency band of the declared channel map, one bar group per stream. The target uses the all-zero path and the source uses the source-null path. Where the `spectral_skill` pass ran, its per-band gap appears on a twin axis for the target bands. The ticks name each band by its frequency range with the period in parentheses, and the `band` column keeps the key.
 
-Bottom: per `occlusion_bands` band of the source relative to the anchor, the integrated-gradient sum over the band, this analysis's own feature-ablation delta of the readout, and the `occlusion` pass's delta where it ran — sign-flipped on the gap readout, because that pass reports the forecast cost of removing a band and the gap moves the other way.
+Bottom: per `occlusion_bands` band of the source, three bars: the integrated-gradient sum over the band, this pass's own feature-ablation delta of the readout, and the `occlusion` pass's delta where it ran. The occlusion delta is sign-flipped on the gap readout, because that pass reports the forecast cost of removing a band.
 
-**Axes.** Bands across; readout units up, symmetric log (nats per anchor for the divergence, the forecast gap and the full-branch score; squared standardised units for the full-branch squared error; the occlusion series in nats per anchor).
+**Axes.** Bands across; readout units up, symmetric log (nats per anchor for the divergence, the forecast gap and the full-branch score; squared standardised units for the full-branch squared error; nats per anchor for the occlusion series).
 
-**Interpretation.** A frequency-band sum over an input stream is over the **declared** channels of that stream, including the ones the budget dropped (their attribution is exactly zero) — the channel counts are in `attribution_bands.csv`. The ablation delta and the occlusion delta are the same intervention at different anchors and on different readouts, so they agree in sign rather than in value. Nothing here is tested.
+**How to read it.** A frequency-band sum covers the declared channels of the stream, including the dropped ones, whose attribution is exactly zero. `attribution_bands.csv` carries the channel counts. The ablation delta and the occlusion delta are the same intervention at different anchors and on different readouts. Nothing here is tested.
 
-## `attribution/attribution_layer.pdf`
+### `attribution/attribution_layer.pdf`
 
-**Purpose.** Show the attention-head contributions to the attributed output and the inputs associated with the latent coordinate carrying the largest divergence.
+**Purpose.** Show the attention-head contributions to the attributed output, and the inputs linked to the latent coordinate with the largest divergence.
 
-**What it shows.** Left: the layer integrated gradients on the head-structured posterior's per-head fusion modules, summed over each head's feature at the anchor — one bar per head per readout, mean over recordings, source-null baseline. Right: for the anchor's largest per-coordinate divergence $K_{t,d}$, the magnitude of its attribution by offset from the anchor, per stream.
+**What it shows.** Left: the layer integrated gradients on the per-head fusion modules of the head-structured posterior, summed over each head's feature at the anchor. There is one bar per head per readout, as a mean over recordings, under the source-null baseline. Right: for the anchor's largest per-coordinate divergence $K_{t,d}$, the magnitude of its attribution by offset from the anchor, per stream.
 
 **Axes.** Head across (left); lag in stored-coefficient seconds across (right); readout units up.
 
-**Interpretation.** The per-head split sums to the readout difference along the source-null path only; under the all-zero baseline the prior's direct route into the posterior bypasses the fusion, which is why the split is not taken there. A flat (non-head-structured) posterior has no split and the panel is empty. The top coordinate is chosen per anchor, so the right panel pools anchors whose coordinate differs.
+**How to read it.** The per-head split sums to the readout difference along the source-null path only. Under the all-zero baseline, the prior's direct route into the posterior bypasses the fusion, so the split is not taken there. A posterior without head structure has no split, and the panel is empty. The top coordinate is chosen per anchor, so the right panel pools anchors whose top coordinate differs.
 
-## `attribution/attribution_null.pdf`
+### `attribution/attribution_null.pdf`
 
-**Purpose.** Separate the exact zero-source response, integrated source-content attribution, and the entry jump caused by moving away from the zero baseline.
+**Purpose.** Separate the exact zero-source response, the integrated source-content attribution, and the entry jump at the zero baseline.
 
-**What it shows.** Left, per class: the mean over recordings of $K_t$ at the input, at the exact null (the availability-clock part), the integrated source-content attribution and the entry jump, for the divergence under the source-null baseline. Right: under the all-zero baseline, the split of the attribution between the target and the source streams, and the entry jump.
+**What it shows.** Left, per class: the mean over recordings of $K_t$ at the input, $K_t$ at the exact null (the availability-clock part), the integrated source-content attribution and the entry jump, under the source-null baseline. Right: under the all-zero baseline, the split of the attribution between the target and source streams, and the entry jump.
 
 **Axes.** Class across, with the recording count; nats per anchor up.
 
-**Interpretation.** The four bars on the left are not a partition: input equals null plus entry jump plus attributed content only up to the completeness residual, which `attribution_summary.csv` reports. The entry jump is a property of the encoders' normalisation at the exactly-zero point, not of any input step. Every class contrast is out of distribution.
+**How to read it.** The four left bars are not a partition. The input equals the null plus the entry jump plus the attributed content only up to the completeness residual, which `attribution_summary.csv` reports. The entry jump is a property of the encoders' normalisation at the exactly-zero point, not of any input step.
 
-## `attribution/attribution_channels.pdf`
+### `attribution/attribution_channels.pdf`
 
-**Purpose.** Show which declared input channels each readout responded to, summed over stored time — the channel marginal of the maps.
+**Purpose.** Show which declared input channels each readout responds to, summed over stored time.
 
-**What it shows.** One row per main readout; the target stream (all-zero baseline) left, the source stream (source-null baseline) right. Bars are the mean over recordings of the **signed** channel profile, the sum of a channel's attribution over stored steps; the line is the mean of the **unsigned** one, the sum of absolute values, which says how much a channel mattered when its contributions cancelled over time. Bars are coloured by the channel's frequency band where the run wrote `band_channel_map.csv` (the legend names the bands by their frequency range), grey otherwise. On the target stream the scattering block sits left of the dashed rule and the phase-harmonic block right of it.
+**What it shows.** One row per main readout. The target stream (all-zero baseline) is on the left, and the source stream (source-null baseline) is on the right. The bars are the mean over recordings of the signed channel profile, the sum of a channel's attribution over stored steps. The line is the mean of the unsigned profile, the sum of absolute values. Where the run wrote `band_channel_map.csv`, the bars are coloured by frequency band, and the legend names each band by its frequency range; otherwise the bars are grey. On the target stream, the scattering block sits left of a dashed rule and the phase-harmonic block sits right of it.
 
 **Axes.** Declared channel across; attribution in readout units up, symmetric log.
 
-**Interpretation.** A channel with a tall line and a short bar pulled the readout both ways at different steps; a channel whose bar and line coincide pulled one way. Channels the warm-up budget dropped are exactly zero, because the gate multiplied them by zero. The two streams are on different baselines and different vertical scales, so they are compared by shape, not by height. The frequency-band figure sums these same profiles over bands.
+**How to read it.** A tall line over a short bar means that the channel pulled the readout both ways at different steps. A bar and line that coincide mean that the channel pulled one way. Dropped channels are exactly zero. The two streams use different baselines and scales, so compare them by shape. `attribution_bands.pdf` sums these profiles over bands.
 
-## `attribution/attribution_lag_channel.pdf`
+### `attribution/attribution_lag_channel.pdf`
 
-**Purpose.** Show which channel at which offset from the anchor each readout responded to — the full map that the lag profile and the channel profile are the marginals of.
+**Purpose.** Show which channel at which offset from the anchor each readout responds to. The lag profile and the channel profile are the marginals of this map.
 
-**What it shows.** One row per main readout: the target stream re-indexed by offset from the anchor under the all-zero baseline (left) and the source stream by lag under the source-null baseline (right), each the mean over attributed anchors of the **unsigned** attribution at that offset and channel. The scattering/phase-harmonic boundary is ruled on the target map. `attribution_lag_channel.npz` carries the signed means beside the unsigned ones.
+**What it shows.** One row per main readout. Left: the target stream by offset from the anchor under the all-zero baseline. Right: the source stream by lag under the source-null baseline. Each cell is the mean over attributed anchors of the unsigned attribution at that offset and channel. A rule marks the scattering/phase-harmonic boundary on the target map. `attribution_lag_channel.npz` carries the signed means beside the unsigned ones.
 
 **Axes.** Offset from the anchor in stored-coefficient seconds across; declared channel down; mean unsigned attribution in colour on a logarithmic scale, one scale per panel.
 
-**Interpretation.** A peak here says both what the marginals say separately: which coefficient, how far back. A row that is bright across every offset is a channel the model reads throughout its window; a column that is bright across many channels is an offset the model reads on every channel. The mean is over attributed anchors (a few per segment, one segment per recording), not a per-recording mean, so a recording with more scored anchors weighs slightly more. The axis is stored-coefficient time.
+**How to read it.** A bright row is a channel that the model reads across its whole window. A bright column is an offset that the model reads on many channels. The mean is over attributed anchors, not per recording, so a recording with more scored anchors weighs slightly more. The axis is stored-coefficient time.
 
-## `attribution/attribution_time_profile.pdf`
+### `attribution/attribution_time_profile.pdf`
 
-**Purpose.** Show the sign of the attribution by offset from the anchor, which the magnitude profiles discard.
+**Purpose.** Show the sign of the attribution by offset from the anchor.
 
-**What it shows.** One row per main readout; the source stream (source-null baseline) left and the target stream (all-zero baseline) right, by offset from the anchor. The shaded area above the axis is the mean over recordings of the **positive** part of the per-offset attribution, the area below it the mean of the **negative** part, the black line the net mean and the dashed line the unsigned mean.
+**What it shows.** One row per main readout. The source stream (source-null baseline) is on the left and the target stream (all-zero baseline) is on the right, by offset from the anchor. The shaded area above the axis is the mean over recordings of the positive part of the per-offset attribution. The area below is the mean of the negative part. The black line is the net mean, and the dashed line is the unsigned mean.
 
 **Axes.** Offset in stored-coefficient seconds across; attribution in readout units up, symmetric log.
 
-**Interpretation.** A positive value raises the readout along the path: a larger latent change for $K_t$, a larger advantage of full over base for the gap. An offset whose two parts are both large and whose net is near zero is one where channels pull the readout both ways; the unsigned line measures that. A net that changes sign along the axis is a model that reads the recent past and the further past in opposite directions. The axis is stored-coefficient time.
+**How to read it.** A positive value raises the readout along the path. An offset with two large parts and a net near zero is an offset where channels pull the readout both ways; the unsigned line measures that. A net that changes sign along the axis means that recent and older history push the readout in opposite directions.
 
-## `attribution/attribution_checks.pdf`
+### `attribution/attribution_checks.pdf`
 
-**Purpose.** Put the numerical checks behind every attribution row on one page, so a map is read after its residual and not before.
+**Purpose.** Show the numerical checks behind every attribution row on one page.
 
-**What it shows.** Left: the relative completeness residual of every row, one histogram per readout and baseline on a logarithmic axis, with the tolerance the pass counts against as a dotted rule; the count over it is `n_rows_over_tolerance` in `summary.json`. Every strip names its baseline on its tick label, and the black tick is the median. Middle: the entry jump $f(x_0) - f(b)$ against the readout at the input, one point per row, per baseline. Right: the largest attribution to a stored step after the anchor and to a gated-off source step, per readout, on a symmetric-log axis.
+**What it shows.** Left: the relative completeness residual of every row, one histogram per readout and baseline on a logarithmic axis, with the tolerance as a dotted rule. `n_rows_over_tolerance` in `summary.json` gives the count above it. Each strip names its baseline on its tick label, and a black tick marks the median. Middle: the entry jump $f(x_0) - f(b)$ against the readout at the input, one point per row, per baseline. Right: the largest attribution to a stored step after the anchor and to a gated-off source step, per readout, on a symmetric-log axis.
 
-**Axes.** Relative residual (log) and rows; readout units on both middle axes; readout units (symmetric log) on the right.
+**Axes.** Relative residual (log) and rows (left); readout units on both middle axes; readout units, symmetric log (right).
 
-**Interpretation.** A row over tolerance is one whose integrated gradients do not account for the readout change they claim; its map is a picture, not a decomposition. Raise `IG_STEPS` before reading such rows. A large entry jump is a readout that moved sharply between the exact baseline and the entry point, which belongs to the baseline and the normalisation, not to any input step. The right panel is exactly zero on a causal, gated model; anything else is a defect, not a finding.
+**How to read it.** A row above the tolerance has integrated gradients that do not account for its readout change, so its map is not a decomposition. Raise `IG_STEPS` (default $64$) before you read such rows. A large entry jump belongs to the baseline and the normalisation. The right panel is exactly zero on a causal, gated model; any other value is a defect.
 
-## `attribution/attribution_time_to_delivery.pdf`
+### `attribution/attribution_time_to_delivery.pdf`
 
 **Purpose.** Place the attributed anchors on the clinical clock.
 
-**What it shows.** One row per main readout under the source-null baseline: the source attribution total (left) and the $|q|$-weighted lag centroid of the source attribution (right) of every attributed anchor against its hours before delivery, one point per anchor in its class colour, with the class median per one-hour window drawn where at least three recordings fall in it. Delivery is on the right.
+**What it shows.** One row per main readout under the source-null baseline. Left: the source attribution total of every attributed anchor against its hours before delivery. Right: the $|q|$-weighted lag centroid of the source attribution. Each point is one anchor in its class colour. The class median per one-hour window is drawn where at least three recordings fall in it. Delivery is on the right.
 
-**Axes.** Hours before delivery across; readout units and stored-coefficient seconds up.
+**Axes.** Hours before delivery across; readout units (left) and stored-coefficient seconds (right) up.
 
-**Interpretation.** A sparse view: a few anchors of one segment per recording. It says whether the attributed recordings sit at comparable stages of labour and whether the source attribution or its lag centre drifts with that stage, and no more; the traces read the clock densely for one recording per class, and the clock analyses read it on every recording with a correction. The axis of the right panels is stored-coefficient time.
+**How to read it.** This is a sparse view: a few anchors per attributed segment. It shows whether the attributed recordings sit at comparable stages of labour and whether the attribution or its lag centre moves with that stage. The traces read the clock densely for a few recordings per class, and the clock analyses read it on every recording with a correction.
 
-## `attribution/attribution_classes.pdf`
+### `attribution/attribution_classes.pdf`
 
-**Purpose.** Compare the clinical classes on their source attribution over many recordings, not one example anchor.
+**Purpose.** Compare the clinical classes on their source attribution over many recordings.
 
-**What it shows.** One row per cohort readout (`kld`, `pred_gap`), all under the source-null baseline and read from the cohort pass. (1) The class-mean signed source attribution by lag, with a 95% bootstrap band over recordings. The legend gives each class's recording count and the median $K_t$ of its attributed anchors. (2) The class-mean unsigned lag share: each anchor's $|a_\ell|$ divided by its sum over lags. (3) The difference of those shares for every class pair, more severe minus less severe (HIE − acidosis, HIE − healthy, acidosis − healthy), with its own bootstrap band and the zero line. The pairs are drawn in black, blue and purple, which are not class colours. The rug under the curves has one row per pair and marks each lag where that pair's band excludes zero. (4) One violin per class of the per-recording lag centroid, titled with the Holm-adjusted Kruskal–Wallis $p$.
+**What it shows.** One row per cohort readout (`kld`, `pred_gap`, `COHORT_READOUTS`), all under the source-null baseline, from the cohort pass:
+
+1. The class-mean signed source attribution by lag, with a $95\%$ bootstrap band over recordings. The legend gives each class's recording count and the median $K_t$ of its attributed anchors.
+2. The class-mean unsigned lag share: each anchor's $|a_\ell|$ divided by its sum over lags.
+3. The difference of those shares for every class pair, more severe minus less severe (HIE − acidosis, HIE − healthy, acidosis − healthy), with its own bootstrap band and the zero line. The pairs are black, blue and purple, which are not class colours. A rug under the curves has one row per pair and marks each lag where that pair's band excludes zero.
+4. One violin per class of the per-recording lag centroid, titled with the Holm-adjusted Kruskal–Wallis $p$.
 
 **Axes.** Stored-coefficient lag across; readout units, share per lag, or seconds up.
 
-**Interpretation.** Read panels 3 and 4 first; panel 1 shows the magnitude they are drawn from. The comparison uses shares, not signed totals, for one reason. The cohort anchors are each segment's own top $30\%$ of $K_t$, so the classes are attributed at different coupling levels, and the IG of `kld` sums to roughly $K_t - K_{\mathrm{null}}$. A class difference in signed totals is therefore mostly a class difference in $K_t$, which the legend's medians and the `level:kld` row of `attribution_class_stats.csv` show. A share does not scale with $K_t$. In panel 3, a band that excludes zero shows a lag where two classes put a different share of their attribution. The rug is pointwise at $95\%$, not adjusted over lags, so expect isolated marks at about $5\%$ of lags by chance; read a run of adjacent marks. The unit is the recording: each recording's anchors are averaged first, so a long recording counts once. For a comparison at one matched $K_t$ level, read `strata_matched.pdf`. The model trained on healthy recordings only, so a class difference is a difference in the fitted model's response to out-of-distribution input, not a physiological effect. `attribution_class_stats.csv` and `attribution_class_pairwise.csv` carry the tests.
+**How to read it.** Read panels 3 and 4 first. The cohort anchors are each segment's top $30\%$ of $K_t$, so the classes are attributed at different coupling levels. The IG of `kld` sums to approximately $K_t - K_{\mathrm{null}}$, so a class difference in signed totals is mostly a class difference in $K_t$. The legend medians and the `level:kld` row of `attribution_class_stats.csv` show that level. A share does not scale with $K_t$. The rug is pointwise at $95\%$ and not adjusted over lags, so about $5\%$ of lags carry a mark by chance; read runs of adjacent marks. Each recording's anchors are averaged first, so a long recording counts once. `strata_matched.pdf` compares the classes at one matched $K_t$ level. `attribution_class_stats.csv` and `attribution_class_pairwise.csv` carry the tests.
 
-## `attribution/attribution_class_maps.pdf`
+### `attribution/attribution_class_maps.pdf`
 
-**Purpose.** Show which source channel at which lag each class's attribution sits on, and where the classes part.
+**Purpose.** Show on which source channel and lag each class's attribution sits, and where the classes differ.
 
-**What it shows.** One row per cohort readout. The class columns are the mean unsigned source attribution by lag and declared source channel, one shared log scale per row. The pair columns are the difference of those class means, left minus right, on one linear symmetric scale per row clipped at the 99th percentile of the differences.
+**What it shows.** One row per cohort readout. The class columns show the mean unsigned source attribution by lag and declared source channel, on one shared log scale per row. The pair columns show the difference of those class means, left minus right, on one linear symmetric scale per row, clipped at the 99th percentile of the differences.
 
-**Interpretation.** A red cell in `hie − healthy` is a channel and lag where HIE recordings carry more attribution magnitude than healthy ones. These maps are means without a per-cell test, so read an isolated cell as noise and a coherent band of channels or lags as a pattern worth checking in the tables. The source channel axis is the declared input axis; dropped channels stay at zero.
+**How to read it.** A red cell in `hie − healthy` is a channel and lag where HIE recordings carry more attribution magnitude than healthy ones. These maps are means without a per-cell test, so treat an isolated cell as noise and a coherent band of channels or lags as a pattern to check in the tables. The channel axis is the declared input axis, and dropped channels stay at zero.
 
-## `attribution/gradcam_classes.pdf`
+### `attribution/gradcam_classes.pdf`
 
-**Purpose.** Compare where in time each class's readouts looked, through Grad-CAM, at the cost of one forward and one backward per readout.
+**Purpose.** Compare where in time each class's readouts look, through Grad-CAM, at the cost of one forward and one backward pass per readout.
 
-**What it shows.** One row per main readout (`kld`, `pred_gap`, `nll_full`, `mse_full`). Each of the three views has a class-mean panel and a class-difference panel, with 95% bootstrap bands over recordings. The views are: the target stream at the input of the target encoder's last attention block, on a minutes axis over the history after the warm-up floor $F$ (the steps before $F$ are left out, so an anchor at $t_a$ reaches back $t_a - F$ steps and the far end of the axis averages only the later anchors); the source K/V stream on the lag axis; and the lag-attention weights at the anchor scored as gradient-weighted attention, on the same lag axis. The target view is summed into bins of `TARGET_BIN_STEPS` $= 8$ steps ($32$ s), because its per-step share is noise at the cohort's size; a partial last bin is dropped. The difference panels carry the same per-pair rug as `attribution_classes.pdf`.
+**What it shows.** One row per main readout (`kld`, `pred_gap`, `nll_full`, `mse_full`; `GRADCAM_READOUTS`). Each of three views has a class-mean panel and a class-difference panel, with $95\%$ bootstrap bands over recordings:
+
+1. The target stream at the input of the target encoder's last attention block, on a minutes axis over the history after the anchor floor $F$. An anchor at $t_a$ reaches back $t_a - F$ steps, so the far end of the axis averages only the later anchors. The view is summed into bins of `TARGET_BIN_STEPS` $= 8$ steps ($32$ s), and a partial last bin is dropped.
+2. The source K/V stream on the lag axis.
+3. The lag-attention weights at the anchor, scored as gradient-weighted attention, on the same lag axis.
+
+The difference panels carry the same per-pair rug as `attribution_classes.pdf`.
 
 **Axes.** Offset before the anchor (minutes, bin centres) or stored-coefficient lag across; Grad-CAM share per $32$ s bin or per lag up. Each anchor's map sums to one.
 
-**Interpretation.** Grad-CAM keeps only the evidence that raises the readout, so the meaning follows the readout: more divergence for `kld`, more advantage of the full branch for `pred_gap`, and a worse score for `nll_full` and `mse_full`. Because each map is a share, the panels compare where the model looked, not how strongly; the per-recording totals and centroids are tested in `attribution_class_stats.csv`. The target view uses the last attention block's input because the per-step prior and posterior heads read the encoder's output only at the anchor. Grad-CAM has no baseline and no completeness property, so read it beside the integrated gradients rather than instead of them.
+**How to read it.** Grad-CAM keeps only the evidence that raises the readout: more divergence for `kld`, more advantage of the full branch for `pred_gap`, and a worse score for `nll_full` and `mse_full`. Each map is a share, so the panels compare where the model looked, not how strongly. `attribution_class_stats.csv` tests the per-recording totals and centroids. The target view uses the input of the last attention block, because the per-step prior and posterior heads read the encoder output only at the anchor. Grad-CAM has no baseline and no completeness property, so read it beside the integrated gradients.
 
-## `attribution/late_behaviour.pdf`
+### `attribution/late_behaviour.pdf`
 
-**Purpose.** Show what the network does over every scored anchor of the last $2$ h before delivery, by class, with no gradient. It is the cheap context for the strata figures below.
+**Purpose.** Show what the network does over every scored anchor of the last `LATE_WINDOW_HOURS` $= 2$ h before delivery, by class, without gradients.
 
-**What it shows.** Six panels, each a class mean over recordings with a $95\%$ bootstrap band. (a) $K_t$ against minutes before delivery, in $10$ min bins, with delivery on the right. (b) The forecast gain $D_{\mathrm{base}} - D_{\mathrm{full}}$ on the same axis (`mean_pred_gap`, else `mc_pred_gap`, else `pred_gap`). (c) $K_t$ against seconds since the last detected contraction onset, in $15$ s bins up to $300$ s; the grey span is the contraction window $w$ (`event_lag_window_s`). (d) The forecast gain on the same axis. (e) The head-averaged attention by lag at high-$K_t$ anchors minus low-$K_t$ anchors, as a paired difference per recording. (f) The same for the $K_t$ lag map, with each anchor's map divided by its sum first. In (e) and (f) the rug marks lags where a class band excludes zero.
+**What it shows.** Six panels, each a class mean over recordings with a $95\%$ bootstrap band:
 
-**Interpretation.** Panels (c) and (d) answer whether the source moves the belief, and whether that helps, during a contraction rather than between contractions. A class whose $K_t$ rises inside the window while its gain does not is a class whose source coupling does not pay. Panels (e) and (f) show where on the lag axis the attention and the divergence move when $K_t$ is high. The tiers are per segment ($q \ge 0.7$ against $q \le 0.3$ of that segment's $K_t$). Anchors with no onset behind them in the segment are absent from (c) and (d). Minutes before delivery is the segment start plus the anchor step, so it inherits the segment's trim offset.
+- **(a)** $K_t$ against minutes before delivery, in `DELIVERY_BIN_MINUTES` $= 10$ min bins, with delivery on the right.
+- **(b)** The forecast gain $D_{\mathrm{base}} - D_{\mathrm{full}}$ on the same axis (`mean_pred_gap`, else `mc_pred_gap`, else `pred_gap`).
+- **(c)** $K_t$ against seconds since the last detected contraction onset, in `ONSET_BIN_SECONDS` $= 15$ s bins up to `ONSET_MAX_SECONDS` $= 300$ s. The grey span is the contraction window $w$ (`event_lag_window_s`).
+- **(d)** The forecast gain on the same axis.
+- **(e)** The head-averaged attention by lag at high-$K_t$ anchors minus low-$K_t$ anchors, as a paired difference per recording.
+- **(f)** The same for the $K_t$ lag map, with each anchor's map first divided by its sum.
 
-## `attribution/strata_kl_ig.pdf` and `attribution/strata_ua_ig.pdf`
+In (e) and (f), the rug marks lags where a class band excludes zero.
+
+**How to read it.** Panels (c) and (d) show whether the source moves the belief, and whether that helps the forecast, during a contraction compared with between contractions. Panels (e) and (f) show where on the lag axis the attention and the divergence move when $K_t$ is high. The tiers are per segment: $q \ge 0.7$ against $q \le 0.3$ of that segment's $K_t$. Anchors without an onset before them in the segment are absent from (c) and (d). Minutes before delivery is the segment start plus the anchor step, so it inherits the segment's trim offset.
+
+### `attribution/strata_kl_ig.pdf` and `attribution/strata_ua_ig.pdf`
 
 **Purpose.** Show how the integrated-gradient attribution changes between two kinds of anchor in the same late segments, per class.
 
-**What it shows.** The `kl` file contrasts high-$K_t$ anchors (A, black) with low-$K_t$ anchors (B, blue). The `ua` file contrasts anchors at most $w$ seconds after a contraction onset (A) with anchors between contractions (B). One row per readout and stream, on the lag axis: the source attribution of `kld` under the source-null baseline, the target (FHR history) attribution of `kld` under the all-zero baseline, and the same two for `pred_gap`. The target rows use the all-zero baseline because the source-null baseline holds the target streams at the input, so its target attribution is exactly zero. One column per class shows A and B with $95\%$ bootstrap bands over recordings. Its title gives the median $K_t$ of that class's A and B anchors, because the tiers are cut per segment and one tier can sit at different nats in different classes. The last column shows, per class, the mean over recordings of the per-recording difference A $-$ B, with its band and a rug where that band excludes zero.
+**What it shows.** The `kl` file contrasts high-$K_t$ anchors (A, black) with low-$K_t$ anchors (B, blue). The `ua` file contrasts anchors at most $w$ seconds after a contraction onset (A) with anchors between contractions (B). There is one row per readout and stream, on the lag axis:
 
-**Interpretation.** Read the last column first. The difference is paired: each recording contributes its own A and its own B, so recording-level offsets cancel. A positive band at a lag means the model draws more attribution from that lag at high-$K_t$ (or in-contraction) anchors. The strata are defined by $K_t$, so a larger source attribution of `kld` at high-$K_t$ anchors is partly built in; the scale-free readings in `strata_paired.pdf` (shares, centroids) are the fairer test of a change in *where* the model reads. The source and target rows use different baselines, so compare each row across strata and classes, not the two rows with each other.
+- the source attribution of `kld` under the source-null baseline;
+- the target (FHR history) attribution of `kld` under the all-zero baseline;
+- the same two for `pred_gap`.
 
-## `attribution/strata_kl_gradcam.pdf` and `attribution/strata_ua_gradcam.pdf`
+The target rows use the all-zero baseline, because the source-null baseline holds the target streams at the input, so its target attribution is exactly zero. One column per class shows A and B with $95\%$ bootstrap bands over recordings. Its title gives the median $K_t$ of the class's A and B anchors. The last column shows, per class, the mean over recordings of the per-recording difference A $-$ B, with its band and a rug where the band excludes zero.
 
-**Purpose.** The same two contrasts through Grad-CAM, in all three views.
+**How to read it.** Read the last column first. The difference is paired, so recording-level offsets cancel. A positive band at a lag means that the model draws more attribution from that lag at A anchors. The `kl` strata are defined by $K_t$, so a larger source attribution of `kld` at high-$K_t$ anchors is partly built in; the scale-free metrics in `strata_paired.pdf` test a change in where the model reads. The source and target rows use different baselines, so compare each row across strata and classes, not the two rows with each other.
+
+### `attribution/strata_kl_gradcam.pdf` and `attribution/strata_ua_gradcam.pdf`
+
+**Purpose.** Show the same two contrasts through Grad-CAM, in all three views.
 
 **What it shows.** One row per readout (`kld`, `pred_gap`) and view (target encoder, source K/V, lag attention). The layout is that of the IG strata figures. The target view is binned as in `gradcam_classes.pdf`, on a minutes axis; the other two views are on the lag axis.
 
-**Interpretation.** Every map is a share, so a paired difference compares where the readout looked, not how strongly. A rise at long lags in the attention view at in-contraction anchors means the readout at a contraction leans on older source history. Read it beside the IG figure for the same contrast; Grad-CAM keeps only the evidence that raises the readout and has no baseline.
+**How to read it.** Each map is a share, so a paired difference compares where the readout looked, not how strongly. Read each figure beside the IG figure for the same contrast. Grad-CAM keeps only the evidence that raises the readout and has no baseline.
 
-## `attribution/strata_paired.pdf`
+### `attribution/strata_paired.pdf`
 
 **Purpose.** Test the stratum contrasts per recording on scale-free and scalar metrics, per class.
 
-**What it shows.** Two rows: high against low $K_t$, then in against between contractions. Six metrics: the anchor's $K_t$, the forecast gain, the source share of the unsigned IG of $K_t$ under the all-zero baseline ($\sum|a_{\mathrm{src}}| / (\sum|a_{\mathrm{src}}| + \sum|a_{\mathrm{tgt}}|)$, how much the readout leans on UA rather than FHR history), the IG lag centroid of $K_t$, the Grad-CAM attention centroid of $K_t$, and the IG lag centroid of the gap. Apart from the first two, every metric is scale-free, so the circularity of the KL tiers cannot produce it. Per class, each thin line joins one recording's A value (left) to its B value (right); the bold markers are the class means with $95\%$ bootstrap intervals. The tick label under each class gives the Wilcoxon signed-rank $p$, starred when it passes Holm. The panel title gives the Kruskal–Wallis $p$ of the paired differences across classes.
+**What it shows.** Two rows: high against low $K_t$, then in against between contractions. Six metrics (`PAIRED_METRICS`):
 
-**Interpretation.** A starred class says that, within that class, the metric moves between the two strata. A small Kruskal–Wallis $p$ says that the size of the move differs between classes, which is the class question. The first column is a manipulation check for the `kl` row: it must separate by construction. Holm families are one contrast, one class, and one method and readout; `strata_stats.csv` carries every test with its family.
+1. the anchor's $K_t$;
+2. the forecast gain;
+3. the source share of the unsigned IG of $K_t$ under the all-zero baseline, $\sum|a_{\mathrm{src}}| / (\sum|a_{\mathrm{src}}| + \sum|a_{\mathrm{tgt}}|)$;
+4. the IG lag centroid of $K_t$;
+5. the Grad-CAM attention centroid of $K_t$;
+6. the IG lag centroid of the gap.
 
-## `attribution/strata_matched.pdf`
+Metrics 3 to 6 are scale-free, so the KL tiers cannot produce them by construction. Per class, each thin line joins one recording's A value (left) to its B value (right). The bold markers are the class means with $95\%$ bootstrap intervals. The tick label under each class gives the Wilcoxon signed-rank $p$, starred when it passes Holm. The panel title gives the Kruskal–Wallis $p$ of the paired differences across classes.
+
+**How to read it.** A starred class means that the metric moves between the two strata within that class. A small Kruskal–Wallis $p$ means that the size of the move differs between classes. The first column is a manipulation check for the `kl` row: it separates by construction. The Holm families are one contrast, one class, and one method and readout. `strata_stats.csv` carries every test with its family.
+
+### `attribution/strata_matched.pdf`
 
 **Purpose.** Compare the classes at one coupling level, so that a class difference in attribution is not a class difference in $K_t$.
 
-**What it shows.** Only the `kl_matched` anchors: those whose $K_t$ falls inside one band of the pooled late-window $K_t$ distribution, the same nats for every class. The title gives the band. The pooled distribution is cut into $5$ equal-count bands. The chosen band is the one whose worst-covered class holds the most recordings, and a tie goes to the narrowest band. Five profile rows, each with a class-mean panel and a class-difference panel with the pointwise rug: the unsigned IG lag share of `kld` and of `pred_gap` under the source-null baseline, and the Grad-CAM share of `kld` in the three views. The last two rows are per-recording violins, each titled with the Holm-adjusted Kruskal–Wallis $p$: $K_t$ at the anchor, the IG lag centroid of $K_t$, the source share of the IG of $K_t$ under the all-zero baseline, and the Grad-CAM attention centroid.
+**What it shows.** Only the `kl_matched` anchors: the anchors whose $K_t$ falls inside one band of the pooled late-window $K_t$ distribution, the same nats for every class. The pooled distribution is cut into `MATCHED_BANDS` $= 5$ equal-count bands. The chosen band is the one whose worst-covered class holds the most recordings; a tie goes to the narrowest band. The title gives the band.
 
-**Interpretation.** Read the $K_t$ violin first. It checks the match and should **not** differ between classes. If it does, the band was too wide for this cohort, and the other panels still carry a level difference. A large $p$ there does not by itself prove that the levels are equal, so also read the class difference of `anchor:kld_per_t` and its bootstrap interval in `strata_matched_pairwise.csv`, against the band width `strata.rule.matched.width_nats`. The $K_t$ check is its own Holm family, so no other readout moves its $p$. When the match holds, a class difference in the other panels is a difference in how the network reads the UA history at equal coupling. The rug is pointwise at $95\%$, so read runs of adjacent marks, not isolated ones. A class whose recordings rarely reach the band is represented by few recordings; the legend gives each count. `strata_matched_stats.csv` and `strata_matched_pairwise.csv` carry every test, with the cohort's rule (Kruskal–Wallis, Holm within one method and readout, then Mann–Whitney $U$ and Cliff's $\delta$ per pair).
+- Five profile rows, each with a class-mean panel and a class-difference panel with the pointwise rug: the unsigned IG lag share of `kld` and of `pred_gap` under the source-null baseline, and the Grad-CAM share of `kld` in the three views.
+- Two rows of per-recording violins, each titled with the Holm-adjusted Kruskal–Wallis $p$: $K_t$ at the anchor, the IG lag centroid of $K_t$, the source share of the IG of $K_t$ under the all-zero baseline, and the Grad-CAM attention centroid.
 
-## `attribution/strata_onset_locked.pdf`
+**How to read it.** Read the $K_t$ violin first. It checks the match, and it should not differ between classes. If it does, the band is too wide for the cohort, and the other panels still carry a level difference. A large $p$ there does not prove equal levels. Also read the class difference of `anchor:kld_per_t` and its bootstrap interval in `strata_matched_pairwise.csv`, against the band width `strata.rule.matched.width_nats`. The $K_t$ check is its own Holm family. When the match holds, a class difference in the other panels is a difference in how the network reads the UP history at equal coupling. The rug is pointwise at $95\%$, so read runs of adjacent marks. The legend gives each class's recording count. `strata_matched_stats.csv` and `strata_matched_pairwise.csv` carry every test, with the cohort's rule (Kruskal–Wallis, Holm within one method and readout, then Mann–Whitney $U$ and Cliff's $\delta$ per pair).
 
-**Purpose.** Show whether the attribution locks onto the uterine contraction itself: whether the model draws on the source steps at the contraction onset, wherever that onset falls in the lag window.
+### `attribution/strata_onset_locked.pdf`
 
-**What it shows.** Every attributed late anchor whose most recent contraction onset lies inside the lag window, from any stratum and counted once. Each anchor's unsigned IG lag share of `kld` and of `pred_gap` (source-null baseline), and its Grad-CAM attention and source K/V shares of `kld`, are re-indexed on the onset. With $a$ the anchor's seconds since the onset, the source step at lag $\ell$ sits $x = a - 4\ell$ seconds after the onset. Both $a$ and $\ell$ are on the stored timeline. The two Grad-CAM views are on the lag attention's own axis, which reads the source $\delta$ steps further back (the causal input delay of the lag axis, zero in the shipped configuration), so they are aligned at $x = a - 4(\ell + \delta)$. One column per class: the class mean over recordings with a $95\%$ bootstrap band. In grey dashes, the same mean after the onset ages are shuffled among that class's anchors: the onset-shuffle null.
+**Purpose.** Show whether the attribution locks onto the contraction onset, wherever that onset falls in the lag window.
+
+**What it shows.** Every attributed late anchor whose most recent contraction onset lies inside the lag window, from any stratum and counted once. The figure re-indexes on the onset each anchor's unsigned IG lag share of `kld` and of `pred_gap` (source-null baseline), and its Grad-CAM attention and source K/V shares of `kld`. With $a$ the anchor's seconds since the onset, the source step at lag $\ell$ sits
+
+$$x = a - 4\ell$$
+
+seconds after the onset. Both $a$ and $\ell$ are on the stored timeline. The two Grad-CAM views are on the lag attention's own axis, which reads the source $\delta$ steps further back, so they are aligned at $x = a - 4(\ell + \delta)$. In an unaligned configuration, $\delta = 0$. One column per class shows the class mean over recordings with a $95\%$ bootstrap band. Grey dashes show the onset-shuffle null: the same mean after the onset ages are shuffled among the class's anchors.
 
 **Axes.** Seconds after the most recent onset across, with $x = 0$ at the onset and $x < 0$ before it; share up.
 
-**Interpretation.** A peak at or just after $x = 0$ that the grey null does not show means the attribution follows the contraction onset from anchor to anchor. A coloured curve that follows the null means the profile shape comes from the lag geometry and is not locked to the contraction. Only the most recent onset is used, so an earlier contraction inside the window adds a smaller, blurred peak at negative $x$. Compare the lock between classes by the height of the peak above the null. The axis inherits the caveat of every lag axis here: it is coefficient time, not a physiological latency.
+**How to read it.** A peak at or just after $x = 0$ that the grey null does not show means that the attribution follows the onset from anchor to anchor. A curve that follows the null means that the profile shape comes from the lag geometry. Only the most recent onset is used, so an earlier contraction inside the window adds a smaller, blurred peak at negative $x$. Compare the classes by the height of the peak above the null. The axis is coefficient time, not a physiological latency.
 
-## The per-recording attribution traces: `attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`
+### The per-recording attribution traces: `attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`
 
-**Purpose.** Follow attribution through one recording per class. Selection favours the recording whose stored segments most completely cover the evaluation window, helping readers inspect change over time.
+**Purpose.** Follow the attribution through one recording per class. The selection prefers the recording whose stored segments cover the evaluation window most completely.
 
-**What it shows.** The traces' shared figure, on one axis of hours before delivery: the raw FHR and raw UP rows first, as on the recording traces, then seven attribution rows: the magnitude of the source attribution of $K_t$ by offset from the anchor as a heatmap; the same for the forecast gap; the model's own lag readout at the same anchors; the correlation of each readout's lag-aligned attribution with the model's readout; the two readouts' source attribution totals; $K_t$ at the input and at the exact null; and the forecast gap at the input and at the exact null. Each heatmap cell spans the gap to its neighbouring anchors, so the sparse anchors read as blocks rather than hairlines. The filename carries the GUID **and the subgroup**.
+**What it shows.** The traces' shared figure, on one axis of hours before delivery. The raw FHR and raw UP rows come first, as on the recording traces. Seven attribution rows follow:
 
-**Interpretation.** As the traces are: a step at a segment join is geometry, the colour and $y$ scales are **shared across the traced recordings** (`traces.shared_panel_scales` over every recording this pass traces), so two classes' pages compare by colour, and the lag axis is stored-coefficient time. The anchors are `ANCHORS_PER_SEGMENT` per segment rather than every scored anchor, so a feature narrower than the spacing between them is invisible here. The two attribution rows answer different questions of the same inputs — where the source moved the belief, and where it helped the forecast — and an hour where the two part is an hour where the latent change was not the change that paid.
+1. The magnitude of the source attribution of $K_t$ by offset from the anchor, as a heatmap.
+2. The same for the forecast gap.
+3. The model's own lag readout at the same anchors.
+4. The correlation of each readout's lag-aligned attribution with the model's readout.
+5. The two readouts' source attribution totals.
+6. $K_t$ at the input and at the exact null.
+7. The forecast gap at the input and at the exact null.
 
-## The per-recording pages: `samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>.pdf`
+Each heatmap cell spans the gap to its neighbouring anchors. The filename carries the GUID and the subgroup.
 
-**Purpose.** Inspect one selected segment in detail, including inputs, forecasts, latent quantities, and lag readouts. Use it to investigate examples behind aggregate scores.
+**How to read it.** The reading notes of the recording traces apply: a step at a segment join comes from the harness, the scales are shared across the traced recordings (`traces.shared_panel_scales`), and the lag axis is stored-coefficient time. The pass uses `ANCHORS_PER_SEGMENT` anchors per segment, so a feature narrower than their spacing is not visible. Rows 1 and 2 show where the source moved the belief and where it helped the forecast; an hour where they differ is an hour where the latent change did not improve the forecast.
 
-**What it shows.** This cell's **fifteen-row** diagnostic page, drawn through the task's own page seams — the same layout the training callback draws, rather than a second builder that could disagree with it. The rows are: the raw context (the raw FHR in bpm and the raw UP in mmHg on one time axis, one $y$ axis each), the forecast lanes (a few kept channels as offset lanes, truth against the base and full means with their $\pm2\sigma$ bands and each channel's scored horizon $H_c$ marked on its lane), six causal extra rows (truth, both branch means, the signed skill difference, the posterior's own $\sigma$, and the per-window score), two gated-input rows, and the five latent and lag rows the layout owns (latent state over its source shift, per-dimension KL, $K_t$, lag attention with its argmax, KL by lag). The page title is one line: the dataset index, the GUID, **the subgroup**, the class and the epoch; the hours before delivery are in `sample_pages.csv`.
+---
 
-**Reading the page text.** The panel titles name only the quantity, and the page title is the identity line (`epoch E, sample i, guid G, subgroup S` on a training page, the evaluation's own line here). What the titles used to spell out: *base* is the target-only latent $z^p$ and *full* the source-conditioned $z^q$; the forecast lanes are the worst, middle and best kept channels by $2\sigma$ calibration, named by declared channel and coverage on the y ticks, stitched from consecutive windows (first anchor wins); the dotted grid is the sparser anchor set a training step tiles; the three field rows share one fixed normalised colour scale and grey cells are steps no drawn window covers; *Source skill* is $|Y^{+}-\mu^p| - |Y^{+}-\mu^q|$ on the scored cells, red where conditioning on the source helped; the per-window score is the objective's own likelihood, shaded green where the source helps. The loss readouts (`nll_base_block`, `nll_full_block`, `pred_gap`) are columns of `sample_pages.csv`, not page text.
+## Sample pages
 
-**Colour scales are run-wide; y-axes are per page.** Every line row is fitted to the segment it draws, by `fitted_limits` in `teb_vae/lag_attn_rws/sample_page.py`: the padded range of the finite values, with $5\,\%$ head room on each side. $K_t$ runs from $0$ to its padded maximum over the trained anchors. The raw FHR and UP rows, and the raw overlay on an input row, are fitted inside the CTG ranges, FHR $50$–$210$ bpm and UP $0$–$100$ mmHg (`RAW_TRACE_LIMITS`). A value outside them, such as the $0$ bpm gap sentinel, is left out of the fit. The range is never narrower than `MIN_TRACE_SPAN`, $30$ bpm and $20$ mmHg, so a flat trace is not stretched into apparent variability. The forecast lanes and the per-window score autoscale to the segment. The latent, shift, KL, lag-map, attention, error, skill and $\sigma$ heatmaps take the colour limits `shared_row_limits` computes **once per run** from the collection's own tables, before the first page is drawn — a high percentile of each quantity over the whole split, not over the pages — and records them under the analysis's `plan.row_limits`. One colour is therefore one value on every page of the run, whichever selection it sits in; one height on a line row is not. The lag attention is on a **logarithmic** colour scale on both the full and the reduced page; see the next section. Every page is written uncropped at the builder's own fixed size (`render_figure(..., crop=False)`), so two pages of a run overlay row for row.
+The `samples` analysis (`analyses/samples.py`) draws the per-segment diagnostic pages into `samples/<selection>/`. It draws each page through the task's own page seams, with the layout of the training callback (`teb_vae/lag_attn_cfs/sample_page.py`, built on `teb_vae/lag_attn_rws/sample_page.py`). Rendering needs a checkpoint; a model-free re-run records a skip.
 
-**Clocks.** Every model row is at the anchor step, so a column is the same anchor on all of them; only the raw row is in physical time. On an **aligned** run an input channel at step $t$ carries content centred $\kappa\tau_{\mathrm{ref}}$ earlier, $\tau_{\mathrm{ref}}$ being that stream's alignment reference (recorded as `source_reference_delay_s` for the source), so the input rows sit that far to the right of the raw row, as their $x$ labels state.
+### The per-recording pages: `samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>.pdf`
 
-To make the alignment checkable, an aligned run's **input rows overlay their own raw signal delayed by $\kappa\tau_{\mathrm{ref}}$**: the raw FHR on the target row, the raw UP on the source row, as a thin black trace on a twin axis, so a deceleration and the coefficient columns it produced coincide on the row itself. The constant comes from the resolved budget, which the runner attaches to the loaded task after preflight. An **unaligned** run — the shipped default — has no single constant, draws no overlay, and its input rows' $x$ label says each channel's content sits at its own delay.
+**Purpose.** Inspect one selected segment in detail: inputs, forecasts, latent quantities and lag readouts.
 
-**Directories.** `stratified/` is a seeded, shard-stratified draw over the whole split, so a cap at or above the shard count reaches every shard. `by_class/` is a **class-balanced** draw: the same number of segments from every clinical class, `eval_config.caps.pages_per_class` of them. Beside them, one directory per extreme metric and tail holds the segments at the extremes of that metric — `mean_pred_gap_low/` and `mean_pred_gap_high/` on the mean-decoded gap (the estimator that scores the mean forecast lanes the page draws), and the same pair for `nll_full_block` and `source_conditioned_kl_raw`.
+**What it shows.** A fifteen-row page:
 
-**Whose page it is.** The filename is `sample<index>_<guid>_<subgroup>_epoch<epoch>` with the run's format extension: the four-digit dataset index, the GUID, **the subgroup**, and the segment's `epoch` in whole seconds. The subgroup is sanitised by the GUID's rule (only letters, digits, `_` and `-`) and is `na` for a row that carries none; the epoch is `na` for a segment without one. A page lifted out of its directory therefore still names its cohort, and its title names it again with the class. `sample_pages.csv` beside the directories carries the same identity per file — selection, variant, both file names of the segment, `dataset_index`, `guid`, `subgroup`, `clinical_class`, `epoch`, `hours_before_delivery` and the page's headline scalars — so a directory can be filtered by cohort without opening a PDF, and a sanitised subgroup in a filename can be read back as the label it came from.
+- The raw context: raw FHR in bpm and raw UP in mmHg on one time axis, with one $y$ axis each.
+- The forecast lanes: a few kept channels as offset lanes, with the truth against the base and full means, their $\pm2\sigma$ bands, and each channel's scored horizon $H_c$ marked on its lane.
+- Six causal extra rows (`CAUSAL_EXTRA_ROWS`): the truth, both branch means, the signed skill difference, the posterior $\sigma$, and the per-window score.
+- Two gated-input rows: the target stream (`fhr_st` | `fhr_ph`) and the source stream.
+- Five latent and lag rows: the latent state over its source shift, the per-dimension KL, $K_t$, the lag attention with its argmax, and the KL by lag.
 
-**The two draws are not interchangeable, and reading one as the other is the mistake to avoid.** `stratified/` allocates its quota in proportion to shard size, so what it renders is what the split mostly *contains* — on the shipped cohort, mostly healthy. `by_class/` gives `hie` as many pages as `healthy` and is therefore, by construction, not representative of anything: it is what supports a comparison *across* classes, and it says nothing about how common either class is. Counting pages in `by_class/` as evidence of prevalence inverts the one property it was drawn for.
+The page title is one line: the dataset index, the GUID, the subgroup, the class and the epoch. `sample_pages.csv` carries the hours before delivery.
 
-**Every segment here appears twice** — the full page, and the reduced page beside it. See the next section.
+**Row meanings.** The panel titles name only the quantity:
 
-**Interpretation.** A page is **one segment of one recording: an illustration, never evidence.** The extreme pages are selected *on* the quantity they display, so the panel showing it is guaranteed to look unusual and says nothing about how often it does. The `<index>` in the filename is the position in the evaluation **dataset**, not in `per_sample.csv` — the collection pass runs under a seeded shuffle — and the two are reconciled by a `guid`/`epoch` round trip checked before anything is rendered. Rendering needs a checkpoint; a model-free re-run records a skip.
+- *base* is the target-only latent $z^p$, and *full* is the source-conditioned latent $z^q$.
+- The forecast lanes are the worst, middle and best kept channels by $2\sigma$ calibration, named by declared channel and coverage on the $y$ ticks. They are stitched from consecutive windows, and the first anchor wins.
+- The dotted grid is the sparser anchor set that a training step tiles.
+- The three field rows share one fixed normalised colour scale. Grey cells are steps that no drawn window covers.
+- *Source skill* is $|Y^{+}-\mu^p| - |Y^{+}-\mu^q|$ on the scored cells, red where source conditioning helped.
+- The per-window score is the objective's own likelihood, shaded green where the source helps.
 
-## The reduced per-recording pages: `samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>_compact.pdf`
+`sample_pages.csv` carries the loss readouts (`nll_base_block`, `nll_full_block`, `pred_gap`).
 
-**Purpose.** Inspect the same segment and forward pass in a shorter layout: the whole segment at a glance, without the per-channel detail.
+**Scales.** Colour scales are shared across the run, and $y$ axes are fitted per page.
 
-**What it shows.** Eight of the full page's fifteen rows (`COMPACT_PAGE_ROWS` in `teb_vae/lag_attn_cfs/sample_page.py`), in the full page's own order, drawn by the same code from the same forward pass: the raw FHR and UP, the forecast lanes (truth against both branch means with their bands and the scored-horizon mask), both input streams as the encoders receive them (`fhr_st` | `fhr_ph` and the source, block dividers and warm-up staircase intact), the latent state over its source-derived shift, $K_t$, the lag attention and the KL by lag. It is the full page with rows removed, not a second page — a reader who knows one knows the other — and it uses the same run-wide row limits, so a reduced page and a full page compare by colour.
+- `fitted_limits` in `teb_vae/lag_attn_rws/sample_page.py` fits each line row to its segment: the range of the finite values, with `FIT_PAD_FRACTION` $= 5\,\%$ head room on each side. $K_t$ runs from $0$ to its padded maximum over the trained anchors.
+- The raw FHR and UP rows, and the raw overlay on an input row, are fitted inside the CTG ranges `RAW_TRACE_LIMITS`: FHR $50$–$210$ bpm and UP $0$–$100$ mmHg. Values outside them, such as the $0$ bpm gap sentinel, are left out of the fit. The range is never narrower than `MIN_TRACE_SPAN`: $30$ bpm and $20$ mmHg.
+- The forecast lanes and the per-window score autoscale to the segment.
+- The latent, shift, KL, lag-map, attention, error, skill and $\sigma$ heatmaps use the colour limits that `shared_row_limits` computes once per run from the collection's tables. Each limit is a high percentile of its quantity over the whole split. The analysis records them under `plan.row_limits`. One colour is therefore one value on every page of the run.
+- The lag attention uses a logarithmic colour scale on both the full and the reduced page (see the next section).
+- `render_figure(..., crop=False)` writes every page uncropped at the builder's fixed size, so two pages of a run overlay row for row.
 
-**What it drops, and why that is the point.** The five per-channel field rows (the truth, both branch means, the signed skill difference and $\sigma^q$), the per-window score, and the per-dimension KL. Those rows answer *what did the model predict, channel by channel*, which is a different question from *what state was the model in*, and they sit between the input rows and the latent row that are read against each other.
+**Clocks.** Every model row is at the anchor step, so a column is the same anchor on all model rows. Only the raw row is in physical time. On an aligned run, an input channel at step $t$ carries content centred $\kappa\tau_{\mathrm{ref}}$ earlier, where $\tau_{\mathrm{ref}}$ is the stream's alignment reference (`source_reference_delay_s` for the source). The input rows then sit that far to the right of the raw row, as their $x$ labels state. An aligned run's input rows overlay their own raw signal delayed by $\kappa\tau_{\mathrm{ref}}$, as a thin black trace on a twin axis: the raw FHR on the target row and the raw UP on the source row. The constant comes from the resolved budget, which the runner attaches to the task after preflight. An unaligned run, such as the `configs/default.yaml` configuration, has no single constant and draws no overlay. Its input rows' $x$ label says that each channel's content sits at its own delay.
 
-**The lag attention is drawn on a logarithmic colour scale, on both pages.** Attention is an `entmax15` over the $L$ lags: most of its mass is spread thin with some lags exactly zero, so on a linear scale one dominant lag flattens the rest of the panel into the bottom colour. The scale's top is the run-wide shared limit and its bottom the run-wide low percentile of the positive weights, never more than `_LOG_ATTENTION_FLOOR` ($10^{-4}$) of the top, so a single near-zero cell cannot stretch the colormap over decades that hold nothing.
+**Directories.**
 
-**Interpretation.** Three ways.
+- `stratified/` holds a seeded, shard-stratified draw over the whole split, capped by `eval_config.caps.pages`. Its quota is proportional to shard size, so it shows what the split contains.
+- `by_class/` holds a class-balanced draw: `eval_config.caps.pages_per_class` segments per clinical class. It supports comparisons across classes and does not show prevalence.
+- One directory per extreme metric and tail holds the segments at the extremes of that metric (`EXTREME_METRICS`, `EXTREME_PAGES_PER_TAIL` $= 10$): `mean_pred_gap_low/` and `mean_pred_gap_high/`, and the same pair for `nll_full_block` and `source_conditioned_kl_raw`. The gap pages use the mean-decoded estimator, which scores the mean forecast lanes drawn on the page.
 
-- **A grey cell is a zero or forbidden lag, not a small one.** The log scale masks the non-positive cells and paints them light grey rather than leaving the axes background showing. Every lag below the source floor $F_u$ is zeroed by the lag mask, and `entmax15` sets others to exactly zero; on a linear scale those cells would be indistinguishable from genuinely low attention.
-- **The colour scale is run-wide.** It is taken from the whole split's attention, so two pages of the run — reduced or full, any selection — compare by colour. A page can still saturate at the top where its segment exceeds the run's high percentile; the argmax overlay is unaffected.
-- **Everything the full page's caveats say still applies**, including the lag-time one printed at the foot of both: a lag axis here is stored-coefficient time, not physical delay.
+**Filename.** The filename is `sample<index>_<guid>_<subgroup>_epoch<epoch>` with the run's format extension. `<index>` is the four-digit dataset index, and `<epoch>` is the segment's `epoch` in whole seconds. The subgroup is sanitised by the GUID's rule (letters, digits, `_` and `-` only) and is `na` for a row without one. The epoch is `na` for a segment without one. `sample_pages.csv` carries the same identity per file: selection, variant, both file names of the segment, `dataset_index`, `guid`, `subgroup`, `clinical_class`, `epoch`, `hours_before_delivery` and the page's headline scalars.
+
+**How to read it.** A page shows one segment of one recording, as an illustration. The extreme pages are selected on the quantity that they display, so that panel always looks unusual. `<index>` is the position in the evaluation dataset, not in `per_sample.csv`, because the collection pass runs under a seeded shuffle. A `guid`/`epoch` round trip reconciles the two before rendering. Every selected segment is drawn twice: as the full page and as the reduced page beside it.
+
+### The reduced per-recording pages: `samples/<selection>/sample<index>_<guid>_<subgroup>_epoch<epoch>_compact.pdf`
+
+**Purpose.** Inspect the same segment and forward pass in a shorter layout, without the per-channel detail.
+
+**What it shows.** Eight of the fifteen rows (`COMPACT_PAGE_ROWS` in `teb_vae/lag_attn_cfs/sample_page.py`), in the order of the full page and from the same forward pass:
+
+1. The raw FHR and UP.
+2. The forecast lanes: truth against both branch means, with their bands and the scored-horizon mask.
+3. The target input stream (`fhr_st` | `fhr_ph`), with block dividers and the warm-up staircase.
+4. The source input stream.
+5. The latent state over its source-derived shift.
+6. $K_t$.
+7. The lag attention.
+8. The KL by lag.
+
+The page drops the five per-channel field rows (the truth, both branch means, the signed skill difference and $\sigma^q$), the per-window score and the per-dimension KL. It uses the same run-wide row limits, so a reduced page and a full page compare by colour.
+
+**The logarithmic attention scale.** The attention is an `entmax15` over the $L$ lags. Most of its mass is spread thin, and some lags are exactly zero. On a linear scale, one dominant lag would flatten the rest of the panel into the bottom colour. The top of the log scale is the run-wide shared limit. The bottom is the run-wide low percentile of the positive weights, never more than `_LOG_ATTENTION_FLOOR` $= 10^{-4}$ times the top below it.
+
+**How to read it.**
+
+- A grey cell is a zero or masked lag. The log scale masks non-positive cells and paints them light grey. The lag mask zeroes every lag below the source floor $F_u$, and `entmax15` sets other lags to exactly zero.
+- The colour scale comes from the whole split's attention, so all pages of the run compare by colour. A page can saturate at the top where its segment exceeds the run's high percentile. The argmax overlay is not affected.
+- The reading notes of the full page apply, including the lag note at the foot of both pages: a lag axis here is stored-coefficient time, not a physical delay.

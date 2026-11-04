@@ -1,6 +1,5 @@
-# Context ablation (SPEC §17 item 4): no time-from-onset, stage or time-in-second-stage input, the features alone.
-# In the 2026-10-07 run a logistic fit on these three values at the last segment alone reached test AUROC 0.60, so
-# this run says what the latents contribute on their own.
+# Context ablation: no time-from-onset, stage or time-in-second-stage input, the features alone.
+# This run says what the latents contribute on their own.
 base: regularised.yaml
 
 classifier:

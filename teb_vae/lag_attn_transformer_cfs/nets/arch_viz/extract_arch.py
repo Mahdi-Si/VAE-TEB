@@ -47,8 +47,7 @@ pass rather than transcribed from the source. This module does three things:
 
 **Reusing this for another model:** everything model-specific sits in one marked section near
 the top (``MODEL_CLASS``, ``build_model_kwargs``, ``config_excerpt``, ``build_inputs``,
-``model_geometry``); the rest reads only the model object. ``README.md`` beside this file walks
-through it.
+``model_geometry``); the rest reads only the model object.
 
 Run from the IDE's Run button (``RUN_ARGS`` at the bottom names the config, the shard, the batch
 size and the output path) or from the command line::
@@ -596,7 +595,7 @@ def install_ctor_capture() -> int:
 
 
 # =======================================================================================
-# MODEL-SPECIFIC SECTION -- the only code to edit for another model (see README.md).
+# MODEL-SPECIFIC SECTION -- the only code to edit for another model.
 #
 # Five hooks: which class, how its constructor kwargs are obtained, what a realistic dummy input
 # is, which configuration excerpt to record, and which geometry numbers the overview tabulates.

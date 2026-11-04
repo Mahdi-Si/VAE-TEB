@@ -211,28 +211,18 @@ model_config:
     # It is fused into the single main forward (the source encoder is batch-independent, so
     # permuting `source_state` equals re-encoding pi(U)), which keeps it inside one backward.
     #
-    # lambda_perm > 0 would ALSO add lambda_perm * K_shuffled to the loss. It is deliberately 0.
-    # Measured on a causal, source-coupled synthetic task (fresh batches, held-out eval), with the
-    # model demonstrably using the source (feat_loss 3.87 vs base_loss 14.20):
-    #
-    #   lambda_perm=0.0  ->  K_true 6.04  K_shuffled 6.62   ratio 1.10
-    #   lambda_perm=0.0  ->  K_true 6.37  K_shuffled 6.49   ratio 1.02   (seed 1)
-    #   lambda_perm=0.5  ->  K_true 3.00  K_shuffled 2.51   ratio 0.84
-    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
-    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
-    #
-    # Two conclusions. (1) KL(q||p) measures "the source moved my belief", not "...correctly": a
+    # lambda_perm > 0 would ALSO add lambda_perm * K_shuffled to the loss. It is deliberately 0,
+    # for two reasons. (1) KL(q||p) measures "the source moved my belief", not "...correctly": a
     # deranged UP is still a UP, and the posterior -- trained only on matched pairs -- reacts to it
-    # out of distribution, so K_shuffled >= K_true even for a model that plainly uses the source.
-    # kld_raw alone is therefore NOT a source-specific TE surrogate. (2) The only way L_perm can
-    # suppress K_shuffled is to teach the posterior to ignore mismatched sources, which competes
-    # directly with using the source at all; in 2 of 4 seeds it destroyed the source pathway
-    # outright while total_loss still looked healthy.
+    # out of distribution, so K_shuffled can match or exceed K_true even for a model that uses the
+    # source. kld_raw alone is therefore NOT a source-specific TE surrogate. (2) The only way
+    # L_perm can suppress K_shuffled is to teach the posterior to ignore mismatched sources, which
+    # competes directly with using the source at all and can collapse the source pathway while
+    # total_loss still looks healthy.
     #
     # The control that DOES discriminate lives in prediction space and needs no auxiliary loss --
-    # logged every validation step as `feat_loss_shuffled`:
+    # logged every validation step as `feat_loss_shuffled`. A model that uses the source has
     #     feat_loss  <  base_loss  <  feat_loss_shuffled
-    #     (3.87)        (14.20)       (26.32)
     # i.e. a wrong source is worse than no source. Watch `shuffle_penalty`
     # (= feat_loss_shuffled - feat_loss) stay large and positive, and `pred_gap`
     # (= base_loss - feat_loss) stay positive.
@@ -280,7 +270,7 @@ model_config:
 
 
 dataset_config:
-  # REPOINT THESE. The previous directory (`12H_22min_tlo_stratified_20sec_updelay`) holds the
+  # REPOINT THESE. The previous dataset directory holds the
   # OLD channel selection -- fhr_ph=44, up_ph=58 -- and the widths below are 66/15. The path is
   # deliberately left non-existent rather than pointing at the old data, so a run fails on a
   # missing file instead of on a width mismatch that someone might "fix" by reverting c_y/c_u.
@@ -382,24 +372,18 @@ advanced_config:
   # variance and goes negative routinely. Once the EMA is negative, `max(EMA, 0.0)` is 0.0 and the
   # test degenerates to `watched > 0` -- so an ordinary batch that lands just above zero during the
   # sign crossing is declared a spike, its gradient is discarded, and the value logged as
-  # train/main_loss is replaced by the EMA. Measured: EMA -0.5 with batches at +0.3/+0.6/+0.2/+0.4
-  # skips 4 of 4 and logs -0.5 for each. The EMA only updates on accepted batches, so it stays
+  # train/main_loss is replaced by the EMA. For example, an EMA of -0.5 with batches at +0.3,
+  # +0.6, +0.2 and +0.4 skips all 4 and logs -0.5 for each. The EMA only updates on accepted batches, so it stays
   # negative and the bias persists: the run silently drops its hardest batches. No value of
   # ema_floor fixes this -- a negative floor makes the threshold negative and skips nearly
   # everything; 0.0 is as good as the relative test gets here. So ema_floor is set far above any
   # reachable loss, which switches the relative test off.
   #
-  # What that alone cost was measured on the 2026-07 baseline: a FINITE blow-up (epoch 79,
-  # main_loss ~ -0.5 -> +4..+10 within one epoch, no NaN anywhere in the run) sailed through --
-  # the non-finite guard had nothing to catch and the only test that could have fired was
-  # disabled. The run never recovered. `additive_margin` closes exactly that gap: skip when
-  # `watched > EMA + margin`, compared against the RAW EMA, not the floored one, so it works in
-  # the negative-NLL regime. The margin is in nats of main_loss: healthy epoch-to-epoch
-  # fluctuation on that run was ~ +/-0.3 around an EMA of ~ -0.5, while the blow-up batches
-  # landed 5-10 above it, so 3.0 is ~10x the noise and ~2x below the crash -- it cannot trip on
-  # the sign crossing (an ordinary +0.3 batch needs EMA + 3.0 > +2.5 to be skipped) and it
-  # catches the event this run actually had. A deliberate regime shift (the beta ramp) moves
-  # main_loss by well under 3 nats per EMA timescale, so it does not trip either.
+  # With the relative test off, a FINITE blow-up (no NaN) passes the non-finite guard.
+  # `additive_margin` closes exactly that gap: skip when `watched > EMA + margin`, compared against
+  # the RAW EMA, not the floored one, so it works in the negative-NLL regime. The margin is in nats
+  # of main_loss. It cannot trip on the sign crossing: with an EMA of -0.5, an ordinary +0.3 batch
+  # is far below EMA + 3.0 = +2.5.
   #
   # (The trainer this replaced gated on `ema_before > 0.0`, so its breaker simply went inert once
   # the EMA turned negative. It was never protecting a negative-loss run either.)

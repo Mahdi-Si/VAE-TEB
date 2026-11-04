@@ -1,8 +1,8 @@
 r"""``decelerations`` -- deceleration-centred skill, causal-contraction attention, implied delay and
-dose-response (plan §2, E1-E; EVAL_MAP_LAG N3/N5, EVAL_MAP_FORECAST P2).
+dose-response.
 
 **Detection.** Contractions on raw UP (``events.detect_contractions``) and decelerations on raw FHR in
-bpm (``events.detect_decelerations``, the D7 port; loader inverse from ``traces.raw_signal_scales``),
+bpm (``events.detect_decelerations``; loader inverse from ``traces.raw_signal_scales``),
 both ``weight``-masked as the collection pass does.
 
 **Pairing.** Each contraction claims the deepest nadir in ``(peak, peak + W]`` (``W`` =
@@ -32,7 +32,7 @@ delay near that spacing (the planted 180 s), the latest-peak rule pairs most nad
   population's measured delay without any pairing rule.
 
 Caps: ``decelerations_segments`` (256), ``decelerations_pair_window_s`` (120). Production cost: 256
-dense forwards (about a minute on one GPU); the rest is numpy.
+dense forwards; the rest is numpy.
 """
 from __future__ import annotations
 

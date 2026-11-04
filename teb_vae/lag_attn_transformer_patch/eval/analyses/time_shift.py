@@ -1,11 +1,11 @@
-r"""``time_shift`` -- port; owner E1-O (``notes/EVAL_PLAN.md`` §2).
+r"""``time_shift`` -- the same-recording source-swap timing control; port.
 
 **Question.** Is the coupling about the UP **at the right moment**, or about this patient's UP at
 any moment? The source is swapped for the nearest non-overlapping segment of the same recording.
 Everything target-side stays the segment's own. The readouts are ΔK and the mean-decoded Δgap; the
 verdict is ``coupling_is_time_specific``.
 
-**No port was needed.** The shared implementation runs unchanged on the eval view (plan D3/D4):
+**No port was needed.** The shared implementation runs unchanged on the eval view:
 * ``metrics.model_inputs`` returns ``(y_patch, empty, u_patch, summaries, weight)``;
 * the forward is the CFS five-argument form;
 * ``model._build_forecast_target`` is the loss's own ``a + 1 + τ`` gather;

@@ -2,22 +2,23 @@
 
 Every figure an eval run emits, what it shows, and what it does **not** show. For the pipeline's
 contract — what each analysis measures, the config schema, the enforced preconditions — see
-[`EVAL.md`](EVAL.md).
+[`EVAL.md`](EVAL.md). Filenames below use the default `.pdf` extension; when
+`eval_config.figure_format` names another format, the extension follows it.
 
 Read §1 first. Each of those seven traps is a case where a figure looks like it says one thing and
-says another, and six of the seven have already been drawn as a wrong conclusion at least once.
+says another.
 
 ---
 
 ## 1. Seven traps, before any figure
 
-### 1.1 $K_{\mathrm{shuffled}} \gtrsim K_{\mathrm{true}}$ is normal and is not a failure
+### 1.1 The KL-space control does not test specificity
 
 `perm_control/kl_overlay.pdf` puts the true per-step KL against the KL under a deranged source. The
-intuitive reading — "a wrong source should move the posterior less" — is **backwards**. A
-mismatched UP stream is out of distribution, and an out-of-distribution input typically moves the
-posterior *more*, not less. A run where $K_{\mathrm{shuffled}}$ sits at or above
-$K_{\mathrm{true}}$ is the ordinary healthy case.
+intuitive reading — "a wrong source should move the posterior less" — does not hold. A mismatched
+UP stream is out of distribution, and an out-of-distribution input can move the posterior as much
+as the matched one, or more. $K_{\mathrm{shuffled}}$ at or above $K_{\mathrm{true}}$ is therefore
+not a failure.
 
 Source specificity is proven in **prediction space**, by the ordering
 
@@ -28,20 +29,14 @@ The KL-space panel is labelled as diagnostic and **cannot flip that verdict**.
 
 ### 1.2 The seconds axis is the stored timeline, with no offset
 
-Every lag figure gets a secondary axis in seconds, $\mathrm{seconds}(\ell) = 4\ell$. The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it.
-The former `eval_config.up_shift_secs` key — which undid that shift on every axis, and whose sign
-was corrected once before the key itself was removed on 2026-09-05 — no longer exists; a config
-naming it is refused. Figures drawn before that date carry a secondary axis on a "raw-file"
-timeline offset by the key's value, and `preflight.json`'s `lag_seconds_convention` says which.
+Every lag figure gets a secondary axis in seconds, $\mathrm{seconds}(\ell) = 4\ell$, on the
+stored UP/FHR timeline, which is canonical. `preflight.json`'s `lag_seconds_convention` records the
+convention. Read the **model-lag** axis (the left one) first. The training-callback figures in
+`plotting.py` use the same bare $4\ell$.
 
-**What this means for a figure you already have.** A run whose `preflight.json` records
-`"sign_verified": false` drew its seconds axes under the old convention: subtract $40$ s from every
-number on them. The **model-lag** axis (the left one) was exact throughout and needs no correction —
-read it first regardless.
-
-The **training-callback** figures are a separate case and still carry no offset at all:
-`plotting.py` reads `delta_up_seconds` off an attribute the model does not have, so their seconds
-axis is the bare $4\ell$. Not wrong in sign, but not a lead either.
+For a checkpoint built with a causal reach budget, the source channels are read $\delta$ steps
+stale, so a peak at lag $\ell$ refers to source content $\ell + \delta$ steps back. No figure here
+adds $\delta$; `nets/lag_report.py::lag_compensated_seconds` computes $\Delta(\ell + \delta)$.
 
 ### 1.3 `te_lag_map` needs `head_structured_latent`
 
@@ -60,12 +55,13 @@ this is the first thing to check — `preflight.json` records `causal_norm` and 
 
 `latent/kt_curve.pdf` and the $K_t$ row of every sample page fall away at the right-hand edge. Under
 `kld_support='anchor'` those final anchors sit outside the supervised support, so they collapse
-toward the prior with nothing pulling back. It reads as a real drop in coupling at the end of every
-recording. It is not one. Read the interior.
+toward the prior with nothing pulling back. A drop there is not a drop in coupling. Read the
+interior.
 
 ### 1.6 `attended_source` is diagnostic-only in production
 
-The posterior consumes `attended_source_heads`, and $W_o$ is frozen (`frozen_attn_proj`). So
+With the shipped `head_structured_latent: true`, the posterior consumes `attended_source_heads`,
+and with `freeze_unused_attn_proj: true` $W_o$ is frozen (`frozen_attn_proj`). So
 `attended_source` — the projected combination — is not on the path that produces the latent, and a
 figure of it describes a quantity the model does not use. Nothing in this pipeline draws it as a
 headline; if you add one, label it.
@@ -83,13 +79,12 @@ too small, and it looks entirely plausible.
 ### `horizon_error.pdf`
 Masked MSE against horizon step $h$, median with an inter-quartile ribbon over samples.
 
-**Read:** the slope. Error is *supposed* to rise with $h$ — a step further into the future is
-harder. **A flat profile is the signature of a model predicting a constant**, which can post a
-perfectly respectable aggregate MSE. This is the single most diagnostic panel in the run.
+**Read:** the slope. A step further into the future is harder to forecast, so error should rise
+with $h$. **A flat profile is the signature of a model predicting a constant**, which can post a
+respectable aggregate MSE.
 
-**Median and IQR, not mean and SD:** these profiles are right-skewed, a handful of poorly forecast
-recordings sit far above the rest, and a mean band would be pulled off the bulk and could extend
-below zero on a non-negative quantity.
+**Median and IQR, not mean and SD:** a few poorly forecast recordings can pull a mean band off the
+bulk, and a mean $\pm$ SD band can extend below zero on a non-negative quantity.
 
 ### `anchor_error.pdf`
 The same, against anchor position $t$. Localises a forecast that degrades partway through a
@@ -135,9 +130,9 @@ Per-sample masked MSE and $R^2$, one violin per band, each with a thin box plot 
 bar is $Q_1$ to $Q_3$, the hairline runs to the furthest sample within $1.5$ inter-quartile ranges
 of it, the dot is the median — and a reference line at $R^2 = 0$.
 
-**Read:** which bands the model actually predicts. Violins rather than boxes because these
-distributions are routinely bimodal — a set of recordings forecast well and a tail that is not —
-and a box renders both as the same five numbers.
+**Read:** which bands the model actually predicts. Violins rather than boxes because a bimodal
+distribution — a set of recordings forecast well and a tail that is not — renders as the same five
+numbers in a box.
 
 **A band with no finite value keeps its slot** as an empty position rather than being dropped, so
 the categories stay aligned with their labels.
@@ -165,10 +160,9 @@ $p = \xi_j / \xi_i$, and plotting it at $\xi_j$ alone throws away the half of it
 distinguishes it from the scattering channel at the same frequency. The phase panel therefore
 colours by $p$, so the dual-frequency identity survives into the figure.
 
-**Channels with no centre frequency are omitted, and the count is in the legend.** At the
-production geometry that is $14$ of the $43$ scattering channels — the three fastest and eleven
-slowest order-1 filters, which no selected phase pair references. A panel silently missing them
-would look complete.
+**Channels with no centre frequency are omitted, and the count is in the legend.** With the
+production selection that is $14$ of the $43$ scattering channels — the three fastest and eleven
+slowest order-1 filters, which no selected phase pair references (`EVAL.md` §11).
 
 ---
 
@@ -195,10 +189,9 @@ per anchor, against the `health_probe_floor` reference line.
 **Read:** whether the distribution clears the floor. Below it, the residual head is contributing
 essentially nothing.
 
-**The floor is a priori.** It was set to `0.01` before any real checkpoint existed. A distribution
-sitting just below it is not evidence of collapse — it is evidence the floor has not been
-calibrated. The check that actually separates "collapsed" from "never loaded" is the weight-space
-one in `preflight.json`, not this figure.
+**The floor is set a priori** (`0.01`; `EVAL.md` §8 gives the procedure to set it from data). A
+distribution just below it is not by itself evidence of collapse. The check that separates
+"collapsed" from "never loaded" is the weight-space one in `preflight.json`, not this figure.
 
 ---
 
@@ -213,7 +206,7 @@ anchors cannot reach $\log 91$ at all. The bound the panel draws is the support-
 one, $\sum_t s_t \log\min(t{+}1, L) / \sum_t s_t$, reported as `mean_attainable_entropy_nats`;
 $\log L$ survives as the separately named `max_possible_entropy_nats`, the width of the window
 rather than a reachable value. Attention uniform over every causally available lag — zero lag
-structure — scores $4.398$ against $\log 91 = 4.511$, so read against $\log L$ that degenerate case
+structure — has an entropy below $\log 91 = 4.511$, so read against $\log L$ that degenerate case
 looks like mild concentration. `per_sample.csv` carries the per-sample `attainable_entropy` if you
 want to check the panel against the verdict.
 
@@ -257,8 +250,8 @@ The per-head decomposition $K_t = \sum_m K_t^{(m)}$ — the readout only this mo
 The heatmap is $K^{(m)}_t\,\alpha^{(m)}_{t,\ell}$ averaged over the support; its sum over heads is the
 lag attribution, and the per-head shares sum to $1$.
 
-**Read:** whether the heads specialise by lag or all look alike. All-alike is not a bug, but it
-means the head structure is buying nothing.
+**Read:** whether the heads specialise by lag or all look alike. All-alike is not a bug, but then
+the heads carry the same lag information.
 
 ---
 
@@ -267,8 +260,8 @@ means the head structure is buying nothing.
 ### `per_dim_kl.pdf`
 Mean KL per latent dimension against the active threshold, with `kld_active_frac`.
 
-**Read:** how many dimensions clear the threshold. A handful of active dimensions out of $d_z = 24$
-is the posterior-collapse signature. **Exactly zero everywhere is the trap:** the posterior delta
+**Read:** how many dimensions clear the threshold. Few active dimensions out of $d_z = 24$ is the
+posterior-collapse signature. **Exactly zero everywhere is the trap:** the posterior delta
 heads are zero-initialised, so $K_t \equiv 0$ at initialisation — an all-zero panel is as
 consistent with "the checkpoint never loaded" as with "the latent collapsed", and only
 `preflight.json`'s weight-space check tells them apart.
@@ -280,7 +273,7 @@ few recordings and dead on the rest looks identical to a uniformly weak one in t
 ### `kt_curve.pdf`
 $K_t$ against $t$. **See trap 1.5** about the right-hand edge under `kld_support='anchor'`.
 
-**The saturation readouts** in `summary.json` come in `_raw` and `_masked` pairs and routinely
+**The saturation readouts** in `summary.json` come in `_raw` and `_masked` pairs, which can
 disagree. `_raw` is the model's own in-forward reading over *every* element including warm-up and
 padding; `_masked` is recomputed over the supervised support. A model saturated in its padding but
 not in its supervised region has a padding problem, not a hyperparameter problem. The flag applies
@@ -301,8 +294,8 @@ narrow); a $\cap$ shape means over-dispersion (too wide).
 
 ### `coverage.pdf`
 Observed central-interval coverage at $1/2/3\sigma$ against nominal. Note the $2\sigma$ nominal is
-$0.9545$, **not** $0.95$ — $0.95$ is $\pm 1.96\sigma$, and the difference is large enough to read
-as a real miscalibration if you compare against the wrong one.
+$0.9545$, **not** $0.95$ — $0.95$ is $\pm 1.96\sigma$, and comparing against the wrong nominal
+shifts every coverage gap by half a percentage point.
 
 ### `sharpness.pdf`
 The predictive $\sigma$ distribution against the homoscedastic reference. **Read together with
@@ -331,8 +324,7 @@ shuffle penalty $L_{\mathrm{feat,\ shuffled}} - L_{\mathrm{base}}$, where positi
 
 ### `kl_overlay.pdf`
 $K_{\mathrm{true}}$ against $K_{\mathrm{shuffled}}$ per step. **See trap 1.1** — this panel cannot
-prove or disprove specificity, and the direction most readers expect is the wrong one; the figure's
-one footnote says so.
+prove or disprove specificity; the figure's footnote says so.
 
 **Cross-referencing the CSV: mind the normalisation.** These are the $d_z$-summed per-step KL, and
 `per_sample.csv` names them `kld_true_per_t` / `kld_shuffled_per_t` for that reason. They are
@@ -406,7 +398,7 @@ Rows, in order:
 | TE lag attribution | Column-normalised `te_lag_map` | Which lag carries the coupling. The title adds `diagnostic` when the map is not a rigorous attribution — **see trap 1.3**. |
 
 The heatmaps draw with `interpolation='none'`, so one data cell is one cell. `'nearest'` would
-resample at 600 dpi and can merge adjacent channels — on a per-channel diagnostic that is the one
+resample at the save DPI and can merge adjacent channels — on a per-channel diagnostic that is the one
 artifact these rows exist to rule out.
 
 A page missing from the directory is not a silent loss: `summary.json`'s `samples.failures` names
@@ -414,7 +406,7 @@ every sample whose render failed and why.
 
 ---
 
-## 11b. By-class and by-subgroup variants — `<analysis>/<stem>_by_class.pdf`, `<analysis>/<stem>_by_subgroup.pdf`
+## 11b. By-class and by-subgroup variants — `<analysis>/<stem>_by_clinical_class.pdf`, `<analysis>/<stem>_by_subgroup.pdf`
 
 One violin panel per headline metric, split across cohorts, beside every analysis's pooled output.
 Each panel is titled by its metric; the grouping axis is the file name's `_by_<axis>` suffix.
@@ -445,10 +437,9 @@ survived correction across the whole family.
 **Lower — does it matter?** Cliff's delta for every pair of every surviving metric. Positive means
 the *left* group of the pair runs higher; the colour scale is symmetric about zero.
 
-**A metric can clear the upper panel and be negligible on the lower, and at eight subgroups that is
-the common case rather than the exceptional one.** A $p$-value is not an effect size: with a few
-thousand recordings per cohort, a difference of no clinical consequence reaches significance
-readily. Quote $\delta$ and its magnitude label, never the $p$ alone.
+**A metric can clear the upper panel and be negligible on the lower.** A $p$-value is not an
+effect size: with large cohorts, a difference of no clinical consequence can reach significance.
+Quote $\delta$ and its magnitude label, never the $p$ alone.
 
 **Only metrics that survived Holm appear in the lower panel.** A metric absent from it was not
 tested pairwise, which is different from having been tested and found equal — `significance.csv`
@@ -492,19 +483,17 @@ Not oversights — each was considered and declined, and knowing that saves look
 
 - **Raw-FHR reconstruction.** The model forecasts *features*, not raw signal. Raw FHR and UP appear
   only as the sample pages' context strip.
-- **Latent interpolation.** A no-op in the predecessor too, for the same reason.
 - **Cross-run or cross-checkpoint comparison.** Every analysis writes CSVs to a timestamped
   directory; comparing two runs is a `pandas` merge.
 - **Cross-*run* comparison of the grouped variants.** Each run's grouped tables are CSVs in a
   timestamped directory; comparing two checkpoints' by-subgroup results is a `pandas` merge.
-- **Interactive Plotly.** `plotly` is installed, but static PDF is the repository's figure
-  convention and the figure tests assert it.
+- **Interactive Plotly.** Static figures in one `figure_format` are the repository's figure
+  convention.
 
 ---
 
 ## 13. Coverage
 
-`summary.json`'s `artifacts.figures` lists every PDF a run actually emitted. A test reads that
-manifest and asserts each filename appears in this guide, so a new figure with no entry here fails
-the suite rather than shipping undocumented. That is why the manifest exists: a hardcoded filename
-list would pass by construction.
+`summary.json`'s `artifacts.figures` lists every figure a run actually emitted. Check each filename
+in that manifest against this guide; a new figure needs an entry here. The manifest is built from
+the run directory, so the check needs no hardcoded filename list.

@@ -2,7 +2,7 @@
 #
 # The shipped floor of 134 is a CAUSAL-VALIDITY boundary and nothing else: its job is to make
 # t + 1 >= W'_c hold for every scored channel and t >= W'_c + d_c hold for every shifted input
-# channel, and 134 is where both land. 134 steps is 536 s, i.e. 8.93 minutes; nothing physiological
+# channel, and 134 clears both. 134 steps is 536 s, i.e. 8.93 minutes; nothing physiological
 # distinguishes it from step 150, both are inside the same segment, and the model's own 30-step
 # warm-up has long passed at either.
 #
@@ -14,10 +14,8 @@
 # tiles at phase 0 (28 against 32). It buys nothing on the validity axis; it buys the policy.
 #
 # The withheld 16 anchors are the invariant and the tile count is not: the same span costs
-# ceil(16 / S) tiles, so it re-prices with every tiling change (one tile at the old S = 13 or the
-# horizon-partitioning S = 30, two at S = 10, four at the shipped S = 5, which the legacy tiling
-# also used). tests/test_sweep_configs.py
-# pins the current figure so a tiling change fails there rather than quietly re-pricing the arm.
+# ceil(16 / S) tiles, so it re-prices with every tiling change. tests/test_sweep_configs.py pins the
+# current figure so a tiling change fails there rather than quietly re-pricing the arm.
 #
 # The budget and the alignment reference both stay put. The floor is a lower bound rather than an
 # equality, so a higher one is always admissible -- and lowering the budget alongside it would drop

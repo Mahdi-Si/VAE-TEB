@@ -1,4 +1,4 @@
-r"""The evaluation view of the patch model and task (plan D3): the CFS calling convention, no new weights.
+r"""The evaluation view of the patch model and task: the CFS calling convention, no new weights.
 
 Every shared call site in ``teb_vae/lag_attn_cfs/eval`` builds inputs through ``metrics.model_inputs``
 (the task's three ``_build_*`` builders) and calls ``model(y_st, y_ph, u_stream, anchor_phase=,
@@ -7,7 +7,7 @@ anchor_stride=)``. These two classes present the patch cell in exactly that form
 * ``y_st = y_patch`` ``(B, T, 2R + 1)``, ``y_ph = y_patch[..., :0]`` (empty), ``u_stream = u_patch``;
 * ``target_features = model.summary_target(fhr, weight)`` ``(B, T, 2)`` -- the standardized
   ``[level, variability]`` the forecast is scored against, gathered by the model's own
-  ``_build_forecast_target`` (plan D4), so an evaluated ``nll_*`` is the training loss's.
+  ``_build_forecast_target``, so an evaluated ``nll_*`` is the training loss's.
 
 :class:`SeqVaeLagAttnTrfPatch` keeps the training class's **name** (the checkpoint class guard compares
 names) and adds no parameter or buffer (the strict state-dict load must still align). It declares the

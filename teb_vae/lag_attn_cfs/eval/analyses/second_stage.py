@@ -67,7 +67,7 @@ SIGNIFICANCE_FILENAME = "second_stage_significance.csv"
 PAIRWISE_FILENAME = "second_stage_pairwise.csv"
 ELIGIBILITY_FILENAME = "second_stage_eligibility.csv"
 
-#: The figure stems, named as ``FIGURE_GUIDE.md`` names them. Each is a **stem**, not a filename:
+#: The figure stems. Each is a **stem**, not a filename:
 #: every readout gets both pages to itself, written as ``<stem>_<readout slug>``, exactly as
 #: the delivery clock's are and for the reason
 #: :class:`~teb_vae.lag_attn_cfs.eval.cohort.ClockReadout`
@@ -109,7 +109,7 @@ VALUE_COLUMNS: Tuple[str, ...] = cohort.CLOCK_VALUE_COLUMNS
 
 #: The x-axis label of both figures. The sign convention (negative before onset, positive after)
 #: is not spelled out on the axis: the onset is marked by a dotted line at zero, which tells the two
-#: halves apart, and the convention is written in ``FIGURE_GUIDE.md``.
+#: halves apart.
 AXIS_LABEL = "Hours from second-stage onset"
 
 #: The method sentence written into every record, so a $p$-value here is readable without this

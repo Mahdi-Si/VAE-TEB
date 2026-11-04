@@ -353,7 +353,7 @@ def main() -> None:
     """
     sequence_length = 300
     kernels, dilations = (5, 9), (1, 2)
-    target_blocks, source_blocks, source_window = 4, 3, 16
+    target_blocks, source_blocks, source_window = 6, 3, 16
     # The late lag cross-attention searches $\ell \in \{0, \ldots, 90\}$, spanning 90 steps.
     lag_search_steps = 90
 

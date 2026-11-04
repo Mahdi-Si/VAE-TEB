@@ -80,7 +80,7 @@ ANALYSIS_DIRNAME = "distributions"
 SUMMARY_FILENAME = "distribution_summary.csv"
 PER_SEGMENT_FILENAME = "per_segment_metrics.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them.
+#: The figure stems.
 #:
 #: **The ``<stem>_by_clinical_class.pdf`` / ``<stem>_by_subgroup.pdf`` shape is reserved** for the
 #: runner's grouped-variant fan-out, and a figure named into it reads to an operator as one of the
@@ -380,9 +380,9 @@ RECORDING_STRIP_FRACTION = 0.28
 #: value a reader is most likely to be looking for.
 LEGEND_HEADROOM_FRACTION = 0.24
 
-#: The y label. It names the density only: the strip's encoding (one mark per recording) is
-#: written in ``FIGURE_GUIDE.md``, because a label long enough to explain both levels is repeated on
-#: every panel of a page that has twenty-four of them.
+#: The y label. It names the density only and leaves out the strip's encoding (one mark per
+#: recording), because a label long enough to explain both levels is repeated on every panel of a
+#: page that has twenty-four of them.
 DENSITY_YLABEL = "density"
 
 #: How opaque a cohort's filled body is. Faint on purpose: up to four cohorts are drawn on top of

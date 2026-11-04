@@ -2103,8 +2103,7 @@ def cell_verdicts(
 
     * **The predictive verdict reads the paired recording-bootstrap interval** of the
       marginalised gap. A positive point estimate whose interval crosses zero is INCONCLUSIVE,
-      which is what the epoch-1002 development run is; PASS needs the whole interval above zero
-      and FAIL the whole interval below.
+      and PASS needs the whole interval above zero and FAIL the whole interval below.
     * **The calibration verdict reads the mixture census** -- the averaged component CDF over
       the $K$ shared draws -- of the full branch, at the same relative tail tolerance the family
       uses, because the predictive distribution is the mixture and not one draw's conditional.

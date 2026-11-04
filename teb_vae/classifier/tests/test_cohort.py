@@ -1,6 +1,6 @@
 """Cohort tables, tasks, labeling strategies, fold checks and the cohort stage.
 
-T-C1..T-C5 of SPEC §15 on the generated fixture, plus the P0 sample-shard acceptance (§16).
+T-C1..T-C5 on the generated fixture, plus the P0 sample-shard acceptance.
 """
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def test_tc3_strategy_weights_known_answers():
 
 
 def test_tc3_eval_windows_are_time_matched(fixture_segments, smoke_config):
-    """§6.6: the same window for positive and negative GUIDs."""
+    """The same window for positive and negative GUIDs."""
     for window in ("all", "bins", "horizon", "stage:first", "stage:second"):
         labels = smoke_config.labels.model_copy(update={"eval_window": window})
         seg, _ = cohort.guid_table(fixture_segments[0], labels, smoke_config.cohort)
@@ -175,7 +175,7 @@ def test_tc5_asof_join_is_causal_and_respects_max_age(tmp_path):
 
 # ---- confound check, context columns, fold summary ---------------------------------------------
 def test_context_hides_whether_second_stage_is_reached():
-    """§7.1: pre-onset segments of a GUID that later reaches second stage and of a GUID whose onset is unknown
+    """Pre-onset segments of a GUID that later reaches second stage and of a GUID whose onset is unknown
     have the same context (an ``unknown`` flag would be ``~has_ss`` from segment 0)."""
     seg = pd.DataFrame({"tlo_end_s": 7200.0, "epoch_s": -9000.0, "t_end_s": -7740.0, "valid_frac": 0.8,
                         "ss_rel_s": [-5000.0, np.nan, -600.0, 100.0]})
@@ -188,7 +188,7 @@ def test_context_hides_whether_second_stage_is_reached():
 
 def test_context_tlo_hides_time_until_onset():
     """``context.tlo.pre_onset: clip`` (default): pre-onset segments look alike whatever their time until onset
-    (future information, like time until second stage, §2.4); ``signed`` (ablation) keeps ψ of the negative hours."""
+    (future information, like time until second stage); ``signed`` (ablation) keeps ψ of the negative hours."""
     seg = pd.DataFrame({"tlo_end_s": [-3600.0, -30000.0, 3600.0], "epoch_s": -9000.0, "t_end_s": -7740.0,
                         "valid_frac": 0.8, "ss_rel_s": np.nan, "stage": "unknown"})
     np.testing.assert_allclose(cohort.context_features(seg)["tlo_psi"], [0.0, 0.0, np.log(2.0)])

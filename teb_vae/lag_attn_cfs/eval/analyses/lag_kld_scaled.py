@@ -4,16 +4,16 @@ r"""The lag structure read on the lags that carry the coupling, and with its mag
 **all** $L$ lags and through statistics that are functions of $p_\ell = w_\ell / \sum_k w_k$ alone,
 and on this family both of those are load-bearing limitations rather than conventions:
 
-* **Most of the profile is not source content.** The diagnosed conv-Transformer run put
-  $\texttt{kld\_source\_null} = 0.333$ of a $\texttt{kl\_total} = 0.494$ -- $67.5\%$ of the
-  coupling readout survives zeroing the source -- leaving $0.160$ nats spread over the whole lag window. The
-  availability staircase behind that share is a deterministic function of $t$ and is readable from
+* **Much of the profile need not be source content.** Whatever share of the coupling readout
+  survives zeroing the source ($\texttt{kld\_source\_null}$ against $\texttt{kl\_total}$) is not
+  source content, and the remainder is spread over the whole lag window. The availability
+  staircase behind that share is a deterministic function of $t$ and is readable from
   the source state at *any* lag, so it enters the attribution wherever the attention happens to sit
   and no renormalisation of the matched profile removes it.
 * **The scale is divided out.** Two windows whose profile has the same shape and a tenfold
   different coupling reduce identically, so "the informative past moved closer" and "there is less
   of it" are the same number.
-* **The heads are averaged.** ``kl_top_dimension_share`` was $0.954$ on that run: the pooled
+* **The heads are averaged.** When ``kl_top_dimension_share`` is close to $1$, the pooled
   profile is one latent group wearing four heads' name.
 
 This analysis is the three answers, against the same two clocks and the same $0.5$ h grid, so its
@@ -46,9 +46,9 @@ change meaning with the support they are taken on are withheld rather than misla
 
 **Nothing here is tested, and that is a decision rather than an omission.** Every feature ships
 untested, so this analysis adds **no** Holm family to the four ``lag_clocks`` already carries and
-writes no significance table at all. At $0.160$ nats of clock-exceeding coupling across the whole lag window,
-per-segment restricted centroids are very likely noise, and eight new corrected families over
-noise is how a family-wise correction stops being believed. Promoting one is a single flag; the
+writes no significance table at all. When the clock-exceeding coupling is a fraction of a nat
+spread across the whole lag window, per-segment restricted centroids are very likely noise, and
+eight new corrected families over noise is how a family-wise correction stops being believed. Promoting one is a single flag; the
 record says so outright rather than leaving a reader to infer that a $p$-value was withheld.
 
 **The emission is long-form** -- ``source`` and ``statistic`` are row keys rather than columns.
@@ -175,10 +175,9 @@ NO_INFERENCE_NOTE = (
     "this analysis runs no significance test and writes no significance or pairwise table. Every "
     "feature here is untested, so it adds NO Holm family to the four lag_clocks carries and a "
     "reader quoting a trajectory from this page is quoting a description, not a claim. That is a "
-    "decision and not an omission: at the clock-exceeding coupling this family has measured -- "
-    "a fraction of a nat spread over the whole lag window on the diagnosed run -- per-segment "
-    "restricted centroids are "
-    "very likely noise, and correcting eight new families over noise is how a family-wise "
+    "decision and not an omission: when the clock-exceeding coupling is a fraction of a nat "
+    "spread over the whole lag window, per-segment restricted centroids are very likely noise, "
+    "and correcting eight new families over noise is how a family-wise "
     "correction stops being believed. Promoting a feature is the Feature.tested flag and nothing "
     "else"
 )
@@ -764,7 +763,9 @@ def build_band_figure(
         The figure.
     """
     names = list(bands)
-    figure, axes = figures.new_figure(max(len(names), 1), 1)
+    # Two bands to a row on the one clock, for the reason the occlusion clock page gives.
+    figure, flat = figures.panel_grid(max(len(names), 1))
+    axes = [[panel] for panel in flat]
     subset = (
         trajectory[
             (trajectory["clock"] == clock.name)
@@ -799,14 +800,15 @@ def build_band_figure(
                 color=colors.get(group, figures.COLOR_GRAY),
                 linewidth=figures.LINE_REGULAR, label=group,
             )
-        panel.set_title(f"{name.capitalize()}, {max(lo, 0.0):g}-{hi:g} s", fontsize=figures.FONT_SMALL)
+        panel.set_title(f"{name.capitalize()}, {max(lo, 0.0):g}-{hi:g} s")
         panel.set_ylabel("nats per anchor")
         if clock.inverted:
             panel.invert_xaxis()
         figures.style_axes(panel)
-    axes[-1][0].set_xlabel(clock.axis_label)
+    for row in axes[-2:]:
+        row[0].set_xlabel(clock.axis_label)
     if groups:
-        axes[0][0].legend(loc="best", fontsize=figures.FONT_TINY)
+        axes[0][0].legend(loc="best")
     figures.caveat_note(figure)
     return figure
 

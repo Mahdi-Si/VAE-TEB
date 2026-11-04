@@ -202,9 +202,9 @@ eval_config:
   # a typo is refused at config load with the supported set named, before the model is built.
   #
   # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
-  # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
-  # `.pdf` filenames, so a run that changes this writes filenames those files do not list. Change
-  # it for a one-off export, not as the committed setting, unless you also update the manifest.
+  # default is load-bearing: the committed `figure_manifest.json` records `.pdf` filenames, so a
+  # run that changes this writes filenames the manifest does not list. Change it for a one-off
+  # export, not as the committed setting, unless you also update the manifest.
   #
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;
   # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the

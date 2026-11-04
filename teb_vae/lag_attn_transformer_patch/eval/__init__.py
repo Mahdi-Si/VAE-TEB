@@ -1,4 +1,4 @@
-r"""The evaluation pipeline for the patch-token lag-attention VAE: a binding, not a fork (plan D1).
+r"""The evaluation pipeline for the patch-token lag-attention VAE: a binding, not a fork.
 
 The pipeline is ``teb_vae/lag_attn_cfs/eval``. This package supplies what it cannot derive:
 
@@ -7,6 +7,4 @@ The pipeline is ``teb_vae/lag_attn_cfs/eval``. This package supplies what it can
 * :mod:`.raw` -- the raw-signal substrate every new analysis builds on;
 * :mod:`.analyses` -- the four ports and ten new raw-signal analyses;
 * :mod:`.run` / :mod:`.verify` -- the command lines; ``configs/`` -- the override deltas.
-
-See ``EVAL.md`` and ``../notes/EVAL_PLAN.md``.
 """

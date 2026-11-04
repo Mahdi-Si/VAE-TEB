@@ -1,7 +1,5 @@
 r"""``raw_attribution`` -- where in raw UP history the belief change and the forecast gain come from.
 
-Owner E1-C (``notes/EVAL_PLAN.md`` §2; proposals P1, P2, P5, P6, P7 of ``notes/EVAL_MAP_CAPTUM.md``).
-
 **Question.** At the shared high-KL clean anchors, which raw UP samples -- at which offset behind the
 anchor, at 0.25 s resolution over the lag window -- moved the divergence ``kld``, the mean-decoded
 forecast gap ``pred_gap`` and the UP-driven forecast-level shift ``delta_level``

@@ -1,4 +1,4 @@
-"""Classifier losses and their composition (SPEC §10.2-§10.3, Appendix B).
+"""Classifier losses and their composition.
 
 * :func:`loss_fn` validates ``train.loss`` against ``labels.head`` and returns the per-element loss
   ``ℓ(logits (..., K_out), y (...)) -> (...)``: ``bce | weighted_bce | focal | logit_adjusted`` (binary),
@@ -11,7 +11,7 @@
   a bad config fails before the first step.
 * :func:`class_weights` (GUID-level train counts; normalised to Σ_k w_k = K, Cui 2019) and
   :func:`prior_offset` (Saerens: subtract from raw logits before calibration).
-* :func:`compute_loss` composes the terms (§10.3). Masks are applied by multiplication; every
+* :func:`compute_loss` composes the terms. Masks are applied by multiplication; every
   division is guarded, so empty GUIDs / padded rows / Σω = 0 give 0, never NaN.
   - segment scope: ``loss_positions = Σ w·ℓ / Σ w`` (``w`` already GUID-normalised) + λ₃ · the aux
     head's same term. The positions term has weight 1 here (it is the only main term).
@@ -61,7 +61,7 @@ def class_weights(counts: Sequence[float], scheme: str = "none", beta: float = 0
 
 def prior_offset(weights: Sequence[float], priors: Optional[Sequence[float]] = None,
                  tau: float = 0.0) -> Any:
-    """Offset to subtract from raw logits before calibration (Saerens 2002; Appendix B).
+    """Offset to subtract from raw logits before calibration (Saerens 2002).
 
     ``log w`` undoes class weighting; ``- τ·log π`` undoes ``logit_adjusted`` (pass ``priors`` and
     ``train.loss.logit_adjust_tau``; weights all 1 then). Binary: the float ``log(w₁/w₀) - τ·log(π₁/π₀)``
@@ -85,7 +85,7 @@ def loss_fn(cfg: LossCfg, head: str, class_weights: Optional[Sequence[float]] = 
                          f"expected one of {HEAD_LOSSES[head]}")
     if name == "focal" and cfg.focal_alpha is None:
         raise ValueError("train.loss.name=focal needs an explicit train.loss.focal_alpha (α for the "
-                         "positive class; torchvision's 0.25 down-weights positives, SPEC §10.2)")
+                         "positive class; torchvision's 0.25 down-weights positives)")
     if name.startswith("weighted") and class_weights is None:
         raise ValueError(f"train.loss.name={name!r} needs class_weights")
     if name == "logit_adjusted" and priors is None:
@@ -139,7 +139,7 @@ def loss_fn(cfg: LossCfg, head: str, class_weights: Optional[Sequence[float]] = 
 
 
 def set_loss(name: str, alpha: Optional[float] = None, margin: float = 1.0) -> Crit:
-    """``auc_margin`` | ``pauc`` over one weighted population (§10.2), on ``h = σ(s)`` as in LibAUC; written from the
+    """``auc_margin`` | ``pauc`` over one weighted population, on ``h = σ(s)`` as in LibAUC; written from the
     papers. With ``w`` = 0 rows dropped, P = the positives and N the negatives (weighted expectations E₊, E₋):
 
     * ``auc_margin`` (AUC-M, Yuan et al. 2021, eq. 3): ``E₊(h - a)² + E₋(h - b)² + (m - a + b)₊²`` with a = E₊h and
@@ -187,7 +187,7 @@ def criterion(cfg: LossCfg, head: str, class_weights: Optional[Sequence[float]] 
 
 
 def coral_log_probs(o: Tensor) -> Tensor:
-    """Class log-probabilities (..., K) of the K-1 ordered cumulative logits ``o_k = logit P(Y > k)`` (Appendix B):
+    """Class log-probabilities (..., K) of the K-1 ordered cumulative logits ``o_k = logit P(Y > k)``:
     ``log(σ(o_{k-1}) - σ(o_k))`` with ``o_{-1} = +inf``, ``o_{K-1} = -inf``, in the stable form
     ``log σ(hi) + log σ(-lo) + log(-expm1(lo - hi))``; finite gradients at the padding."""
     hi = F.pad(o, (1, 0), value=math.inf)
@@ -221,9 +221,9 @@ def _sequence_terms(crit: Crit, pos: Tensor, seg: Optional[Tensor], y: Tensor, g
                     bag_head: str = "segment") -> Dict[str, Tensor]:
     """The four sequence-scope terms of one head family. pos/seg (B, N, K), GUID target y (B,), GUID
     weight g (B,) (0 = unlabeled), seg_mask (B, N), raw ω (B, N) for the segment-local term and ``w_pos`` (ω with
-    ``k_warm`` applied, §6.5) for the per-position term. Disabled terms are 0. Per-segment terms weigh ω / Σ_n ω, so
-    every GUID with Σω > 0 counts once (GUID-equal, §6.5). ``bag_head`` (``loss_weights.bag_head``): the bag pools
-    the segment-local head when present (``segment``) or the per-position head (``position``, §10.3)."""
+    ``k_warm`` applied) for the per-position term. Disabled terms are 0. Per-segment terms weigh ω / Σ_n ω, so
+    every GUID with Σω > 0 counts once (GUID-equal). ``bag_head`` (``loss_weights.bag_head``): the bag pools
+    the segment-local head when present (``segment``) or the per-position head (``position``)."""
     zero = pos.new_zeros(())
     b, n = mask.shape
     has = g * mask.any(1)
@@ -247,7 +247,7 @@ def compute_loss(out: Dict[str, Tensor], batch: Dict[str, Tensor], *, scope: str
                  train_cfg: Any, class_weights: Optional[Sequence[float]] = None,
                  priors: Optional[Sequence[float]] = None, lse_tau: float = 1.0, alpha: Optional[float] = None
                  ) -> Tuple[Tensor, Dict[str, Tensor]]:
-    """Total loss and its ``parts`` (always the five :data:`PARTS` keys) for one batch (§10.3).
+    """Total loss and its ``parts`` (always the five :data:`PARTS` keys) for one batch.
 
     ``class_weights``: main-head weights (``weighted_*``); ``priors``: main-head train priors
     (``logit_adjusted``); ``lse_tau``: ``model.lse_tau`` for the bag; ``alpha``: the FPR cap of ``pauc``.

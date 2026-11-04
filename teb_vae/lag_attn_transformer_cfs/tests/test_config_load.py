@@ -100,6 +100,11 @@ TASK_LEVEL_KEYS = (
     "event_weight_ua_valid",
     "target_quality_mask",
     "source_event_mask",
+    # The source-null penalty's weight, read by the task's objective.
+    "lambda_source_null",
+    # The scored-start rule: resolved by the trainer against the shards' novelty curves into the
+    # `target_scored_start` tuple the constructor takes.
+    "target_min_novelty",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -172,6 +177,23 @@ EVENT_KEYS = (
     "lambda_event_gate",
     "event_weight_floor",
     "event_weight_reach_steps",
+)
+
+#: The leaves the 2026-11-04 next-step ladder added, present in this config and in neither
+#: sibling's. Every one ships at its inert value, so the default trains the model it trained before
+#: the ladder; the `sweep_next_s*.yaml` rungs move them.
+NEXT_STEP_PATHS = (
+    # The decoder's multi-lag persistence skip; 1 is the single-lag term.
+    f"{_VAE}.persistence_lags",
+    # The bound on the AR(1) innovation coefficient; 1.0 is no bound.
+    f"{_VAE}.forecast_ar_max",
+    # The novelty threshold of a scored cell, per target block; null scores every cell.
+    f"{_VAE}.target_min_novelty.fhr_st",
+    f"{_VAE}.target_min_novelty.fhr_ph",
+    # The source-null KL penalty's weight; 0.0 adds nothing.
+    f"{_VAE}.lambda_source_null",
+    # The second checkpoint criterion's direction; "min" is the shared `mode`.
+    "advanced_config.callbacks.model_checkpoint.secondary_mode",
 )
 
 #: The two divergences the 2026-10-29 headline-run decision added to BOTH edges: this cell trains on
@@ -454,6 +476,7 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
         *(f"{_VAE}.{key}" for key in EVENT_KEYS),
         *QUALITY_PATHS,
+        *NEXT_STEP_PATHS,
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -530,6 +553,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         *(f"{_VAE}.{key}" for key in EVENT_KEYS),
         # The UA quality mask, carried here alone: only a causal signal-quality build has the bits.
         *QUALITY_PATHS,
+        # The next-step ladder's keys, carried here alone at their inert values.
+        *NEXT_STEP_PATHS,
     }
     assert set(theirs) - set(mine) == set()
 

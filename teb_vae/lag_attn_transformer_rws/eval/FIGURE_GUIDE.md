@@ -6,13 +6,13 @@ Almost every figure here is drawn by the shared pipeline in `teb_vae/lag_attn_rw
 
 A rule that applies to every figure here: **an empty panel is a statement, not a bug.** A panel that found no finite value draws the words `no finite values` rather than an empty frame, and that means the analysis measured nothing rather than that the plotting failed.
 
-A second rule applies to every *lag* axis this pipeline will ever draw: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$, the residual physiological delay after the model's own input delay $\delta$ is added back.
+A second rule applies to every *lag* axis this pipeline will ever draw: the seconds figure shown is the **compensated** lag $\tau = 4(\ell + \delta)$: the lag $\ell$ in 4-second steps plus the model's own input delay $\delta$, read from `model.source_delay_steps`.
 
 **A third rule is specific to this model, and it is the one most likely to be got wrong here.** This package draws two different attention mechanisms and their axes are not the same axis. The `attention/` and `lag_kl/` figures draw the **lag cross-attention**: $M = 4$ heads over $L = 91$ **lags**, which decides which past *source* neighbourhood informs the latent. The `encoder_attention/` figures draw the **encoder self-attention**: $H_e = 4$ heads over the within-stream **time axis**, which decides how each history state is built out of its own stream's past. A source encoder that attends 60 s back is not a model that found its coupling at 60 s.
 
 A fourth applies to every figure that resolves a quantity **by cohort**, and it is the one an operator is most likely to assume rather than check.
 
-**The order is clinical, not alphabetical.** Cohorts run left to right in ascending severity: `healthy`, `acidosis`, `hie` on the class axis, and on the subgroup axis `healthy_no_bg_no_cs`, `healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`, `acidosis_no_cs`, `acidosis_cs`, `hie_no_cs`, `hie_cs`. One function decides it — `cohort.ordered_groups` — and every figure and every CSV row order in this pipeline reads it, so a table can be read against the figure beside it row for row. A cohort the order does not know (a non-canonical shard stem) is drawn **after** the ones it does rather than dropped.
+**The order is clinical, not alphabetical, and it runs worst first.** Cohorts run left to right as `hie`, `acidosis`, `healthy` on the class axis, and on the subgroup axis `hie_cs`, `hie_no_cs`, `acidosis_cs`, `acidosis_no_cs`, `healthy_bg_cs`, `healthy_bg_no_cs`, `healthy_no_bg_cs`, `healthy_no_bg_no_cs`. One function decides it — `cohort.ordered_groups` — and every figure and every CSV row order in this pipeline reads it, so a table can be read against the figure beside it row for row. A cohort the order does not know (a non-canonical shard stem) is drawn **after** the ones it does rather than dropped.
 
 **The colour is the severity.** Green for healthy, amber for acidosis, red for HIE, and each subgroup a shade of its own class — light to dark in the order above, so the shading carries the ordering too and a violin's hue says which class it belongs to before its label is read. The mapping is a table rather than an assignment pass, so a cohort keeps its colour whichever other cohorts a figure happens to contain.
 
@@ -33,9 +33,9 @@ The recording is a fetal heart-rate trace (**FHR**) and a uterine-pressure trace
 
 Everything this evaluation reports is some version of *"how much better was the second one"*. If UP genuinely tells you something about the FHR two minutes ahead, the full forecast is better and the two beliefs differ. If it does not, they coincide and every number below is zero.
 
-**What this model is** is that same design with both history encoders replaced. Where the comparison architecture summarised each stream's history with a convolutional stem into a recurrent cell, this one uses a causal conv-Transformer: a dilated depthwise stem, then self-attention blocks with rotary position encoding — a **full causal prefix** on the FHR stream, and a **16-step sliding window** on the UP stream. Everything else is the same code: the objective, the geometry, the prior head, the lag cross-attention, the head-structured posterior, the shared horizon decoder. That is what makes the two comparable at all, and it is why only one directory of figures here is new.
+**What this model is** is that same design with both history encoders replaced. Where the comparison architecture summarised each stream's history with a dilated causal convolution stack in parallel with an LSTM, this one uses a causal conv-Transformer: a dilated depthwise stem, then self-attention blocks with rotary position encoding — a **full causal prefix** on the FHR stream, and a **16-step sliding window** on the UP stream. Everything else is the same code: the objective, the geometry, the prior head, the lag cross-attention, the head-structured posterior, the shared horizon decoder. That is what makes the two comparable at all, and it is why only one directory of figures here is new.
 
-The belief is a 48-dimensional Gaussian, and there are two of them per anchor:
+The belief is a $d_z$-dimensional Gaussian ($d_z = 64$ at the shipped configuration), and there are two of them per anchor:
 
 | Name | Symbol | What it is |
 |---|---|---|
@@ -77,7 +77,7 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 | `nll_persistence_block` | baseline: repeat the last **observed** FHR sample for two minutes | nats per anchor |
 | `nll_climatology_block` | baseline: predict the population mean ($z = 0$) | nats per anchor |
 | `nll_segment_mean_block` | baseline: predict this segment's own mean | nats per anchor |
-| `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the 48-dim bottleneck | nats per anchor |
+| `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the $d_z$-dimensional bottleneck | nats per anchor |
 
 **"nats per anchor" is the unit to internalise.** One score is a sum over all 480 raw samples of one forecast block, then averaged across the anchors that were scored. So it is a *large* number — hundreds — under every predictor including a perfect one, because it is 480 terms added up. Its absolute size says nothing; only differences and ratios between predictors are readable. Divide by 480 for a per-raw-sample figure, but note that this is a flat rescale and **not** a mean over unmasked samples, so it under-reports on any anchor with masked forecast steps.
 
@@ -87,7 +87,7 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 |---|---|---|
 | `pred_gap` | $D_{\mathrm{base}} - D_{\mathrm{full}}$ on the **single-draw** path. Positive = UP helped. | nats per anchor |
 | `mc_pred_gap` | the same difference on the marginalised scores. **This is the headline coupling number.** | nats per anchor |
-| `delta_suff_nats` | $D_{\mathrm{base}} - D_{\mathrm{oracle}}$: what the 48-dim bottleneck *costs* the forecast | nats per anchor |
+| `delta_suff_nats` | $D_{\mathrm{base}} - D_{\mathrm{oracle}}$: what the $d_z$-dimensional bottleneck *costs* the forecast | nats per anchor |
 | `mse_skill` | $1 - \mathrm{MSE}_{\mathrm{model}}/\mathrm{MSE}_{\mathrm{baseline}}$. $1$ = perfect, $0$ = no better than the baseline, negative = worse. | dimensionless |
 | `advantage_nats_per_anchor` | the NLL-space analogue of skill, and a **difference**, not $1 -$ a ratio — a log score has no natural zero | nats per anchor |
 | `pred_gap_rmse_pct` | $100\left(1 - \mathrm{RMSE}_{\mathrm{full}}/\mathrm{RMSE}_{\mathrm{base}}\right)$: the percentage of the FHR-only forecast's error the UP removed. **Scale-free** — the same number in $z$ units and in bpm. | percent |
@@ -126,13 +126,13 @@ $K_t = \mathrm{KL}(q_t \Vert p_t)$ measures how far reading UP moved the belief 
 | `source_conditioned_kl_raw` | $K_t$ averaged over the scored anchors. **The** KL readout. | nats per anchor |
 | `source_conditioned_kl_shuffled_raw` | the same under a **stranger's** UP — the control | nats per anchor |
 | `kld_per_t` | $K_t$ *before* averaging: one value per anchor | nats per anchor |
-| `kld_per_dim` | $K_t$ split across the 48 latent dimensions; sums back to the total | nats per anchor |
+| `kld_per_dim` | $K_t$ split across the $d_z$ latent dimensions; sums back to the total | nats per anchor |
 | `kld_per_head` | $K_t$ split across the 4 **lag-attention** heads; sums back to the total | nats per anchor |
 | `source_kl_lag_map` | $K_t$ split across the 91 lags; sums back to the total | nats per anchor |
 | `active_dims` | how many latent dimensions carry more than `KLD_ACTIVE_EPS` nats | count |
 | `top_dimension_share` | the largest dimension's fraction of the total — near $1$ means one dimension carries everything | fraction |
 
-Four warnings this pipeline repeats because each has cost a result somewhere:
+Four warnings this pipeline repeats:
 
 1. **Only the `_raw` (unfloored) KL is a rate.** A floored variant exceeds it by construction and would hide a collapsed source pathway.
 2. **The KL is inflated whenever the prior variance sits on its clamp**, because $K_t$ carries $(\mu^q - \mu^p)^2/\sigma_p^2$ and a pinned $\sigma_p^2$ divides by an arbitrarily small number. Check the `prior_variance_not_pinned` verdict before quoting a KL. `pred_gap` is immune to this, which is why the two travel together.
@@ -144,7 +144,7 @@ Four warnings this pipeline repeats because each has cost a result somewhere:
 | Name | Plain meaning |
 |---|---|
 | `delta_mu_sq` / `delta_mu_rms` | how far $\mu^q$ sits from $\mu^p$, **per latent coordinate** |
-| `mu_post_prior_gap_sq` / `_rms` | the same distance as a whole vector (summed over $d_z$ first) — larger by $\sqrt{48}$ |
+| `mu_post_prior_gap_sq` / `_rms` | the same distance as a whole vector (summed over $d_z$ first) — larger by up to $\sqrt{d_z}$ |
 | `mu_prior_rms` | the size of the prior belief itself, for scale |
 
 ### Lag attention — where in the past the model looked
@@ -173,7 +173,7 @@ Four warnings this pipeline repeats because each has cost a result somewhere:
 | Name | Plain meaning | Units |
 |---|---|---|
 | **stream** | `target` (the FHR history encoder) or `source` (the UP history encoder). Every table and figure here is resolved per stream. | — |
-| **block** | which self-attention block of that stream's stack. The target has 4, the source 3, at the shipped geometry. | index |
+| **block** | which self-attention block of that stream's stack. The target has 6, the source 3, at the shipped geometry. | index |
 | **head** $h$ | one of $H_e = 4$ encoder attention heads. Unrelated to the $M = 4$ lag-attention heads, which are a different mechanism entirely. | index |
 | **temporal distance** $t - j$ | how far back inside its own stream a key sits from the anchor attending to it. $0$ is the anchor's own step. | steps (and seconds, $\times 4$) |
 | `entropy_nats` | per head, how spread that block's attention is over its admitted keys, taken **per anchor and then averaged** | nats |
@@ -244,11 +244,11 @@ Anchors are **not independent**: consecutive anchors' forecast windows overlap i
 | $H$ | 30 | horizon steps = 2 minutes |
 | $R$ | 16 | raw samples per horizon step (4 Hz × 4 s) |
 | $H \cdot R$ | 480 | raw samples in one forecast block |
-| $d_z$ | 48 | latent dimensions |
+| $d_z$ | 64 | latent dimensions |
 | $L$ | 91 | lag bins = ~6 minutes of UP history; the furthest searched lag is 90 steps = 360 s |
 | $M$ | 4 | lag-attention heads |
 | $H_e$ | 4 | encoder self-attention heads |
-| $N_Y$ | 4 | target encoder attention blocks (full causal prefix) |
+| $N_Y$ | 6 | target encoder attention blocks (full causal prefix) |
 | $N_U$ | 3 | source encoder attention blocks |
 | $W_U$ | 16 | source attention window, in steps = 64 s |
 | $R_{\mathrm{conv}}$ | 21 | the depthwise stem's own reach, kernels $[5, 9]$ at dilations $[1, 2]$ |
@@ -267,7 +267,7 @@ Anchors are **not independent**: consecutive anchors' forecast windows overlap i
 
 These have no entry of their own because they are not one figure. Every analysis that writes a per-recording table declares it, and the **runner** fans one violin figure per cohort axis over whatever was declared — so the set of them grows with the analyses and each is named after the table it resolves. One panel per metric, one violin per cohort, in the clinical order and palette described at the top of this file.
 
-**Axes.** One row per metric; the metric's own units on the vertical axis, cohorts across in ascending severity. The CSV beside each figure carries its rows in that same order, so the two are read together rather than reconciled.
+**Axes.** One row per metric; the metric's own units on the vertical axis, cohorts across in the clinical order, worst first. The CSV beside each figure carries its rows in that same order, so the two are read together rather than reconciled.
 
 **Terms on these figures.** Which metrics appear depends on which analysis declared the table:
 
@@ -398,11 +398,11 @@ All of them are defined in **Terminology** above.
 - **middle violins** — the two error-space percentages. They are one ratio under a root and so can never disagree about the sign; their separation is arithmetic, not a finding.
 - **bottom violin** — `pred_gap_mc_likelihood_pct`: $100(e^{\Delta/480}-1)$, the extra probability density placed on each observed raw sample.
 
-**How it is misread.** Four ways. The two spaces are on **separate axes on purpose** — a per-sample density ratio and an error reduction routinely differ by an order of magnitude. The likelihood percentage divides by the **fixed** 480-sample block rather than by each anchor's own scored-sample count, so it under-reports wherever forecast steps are masked; it is a floor, not an estimate — and an **empty bottom panel means the checkpoint was scored under `mse`**, where the quantity is undefined, not that the source added nothing. The middle panel's two violins are **not two results**. And none of these is `pred_gap` divided by a block score: that ratio is not defined here, and a reader reconstructing it from `d_base_mc_nats` will get a number that changes sign with its own denominator.
+**How it is misread.** Four ways. The two spaces are on **separate axes on purpose** — a per-sample density ratio and an error reduction can differ by an order of magnitude. The likelihood percentage divides by the **fixed** 480-sample block rather than by each anchor's own scored-sample count, so it under-reports wherever forecast steps are masked; it is a floor, not an estimate — and an **empty bottom panel means the checkpoint was scored under `mse`**, where the quantity is undefined, not that the source added nothing. The middle panel's two violins are **not two results**. And none of these is `pred_gap` divided by a block score: that ratio is not defined here, and a reader reconstructing it from `d_base_mc_nats` will get a number that changes sign with its own denominator.
 
 ## `latent/kl_spectrum.pdf`
 
-**In plain terms.** *"How much of the 48-dimensional belief is actually doing anything?"* The model has 48 latent coordinates in which to record what UP told it. This bar chart shows how much each one carries, tallest first. A healthy spectrum has several bars above the line; a spectrum with one tall bar and 47 flat ones means the model compressed everything UP said into a single number, and a spectrum entirely below the line means UP is being ignored. The bars add up to the headline KL, so this is that number taken apart rather than a new one.
+**In plain terms.** *"How much of the $d_z$-dimensional belief is actually doing anything?"* The model has $d_z$ latent coordinates in which to record what UP told it. This bar chart shows how much each one carries, tallest first. A spectrum with several bars above the line spreads the information; a spectrum with one tall bar and the rest flat means the model compressed everything UP said into a single number, and a spectrum entirely below the line means UP is being ignored. The bars add up to the headline KL, so this is that number taken apart rather than a new one.
 
 **What it shows.** The per-dimension KL $\bar K_d$, sorted descending, with the activity threshold `KLD_ACTIVE_EPS` marked.
 
@@ -410,7 +410,7 @@ All of them are defined in **Terminology** above.
 
 **Terms on this figure.**
 
-- **bars** — `kld_per_dim`, the KL split across the 48 latent coordinates; they sum to `source_conditioned_kl_raw`.
+- **bars** — `kld_per_dim`, the KL split across the $d_z$ latent coordinates; they sum to `source_conditioned_kl_raw`.
 - **x position** — a **rank**, not a coordinate. "Dimension 0" here is the largest contributor; `latent_spectrum.csv` maps rank back to the real latent index.
 - **dashed horizontal** — `KLD_ACTIVE_EPS`, the threshold a dimension must clear to be counted in `active_dims`.
 - Read `prior_variance_not_pinned` before quoting the total: an inflated KL makes every bar taller by the same arbitrary factor.
@@ -430,7 +430,7 @@ All of them are defined in **Terminology** above.
 - **raw curve** — `lag_profile`: `source_kl_lag_map` averaged over anchors, every bin divided by the *same* anchor count. Sums over lags to `source_conditioned_kl_raw`.
 - **corrected curve** — `lag_profile_support_corrected`: each bin divided by the anchors at which that lag actually existed. Over the trained range lags 0–30 have 240 contributing anchors while lag 90 has 180, a 25% under-weight that biases the raw argmax short.
 - **bottom panel** — `lag_support`, the per-lag anchor count. It is the only difference between the two curves above.
-- **x axis** — compensated lag in seconds, $\tau = 4(\ell + \delta)$. Not the original-sensor figure; see the rule at the top of this file.
+- **x axis** — compensated lag in seconds, $\tau = 4(\ell + \delta)$, as the lag-axis rule at the top of this file defines it.
 - **argmax markers** — the peak of each curve. Check `degenerate` in `lag_kl_summary.csv` first: a flat profile has an argmax that names a bin, not a delay.
 
 **How it is misread.** The two curves are not two measurements of one quantity: only the raw one is a decomposition of the KL, and only the corrected one is a fair comparison *between* lags. Where their argmaxes disagree, the difference is the short-lag bias — a finding about the geometry, not about the model. And an argmax is not by itself a reading: `lag_kl_summary.csv` carries the peak width, the mass near the peak, any secondary peaks, and a mechanical `degenerate` flag.
@@ -498,7 +498,7 @@ All of them are defined in **Terminology** above.
 
 **In plain terms.** *"Does the encoder read history differently for the sick babies?"* The same entropy ratio as the figure above, averaged over blocks and heads, one bar per clinical class. If the acidosis bar sits well below the healthy one, that encoder is attending more narrowly on those recordings — which is a description of the mechanism, not a finding about the cohort.
 
-**What it shows.** Two panels, one per stream. One bar per clinical class in ascending severity, each the block- and head-averaged `entropy_ratio` for that class, with the pooled value drawn as a dashed line.
+**What it shows.** Two panels, one per stream. One bar per clinical class in the clinical order, each the block- and head-averaged `entropy_ratio` for that class, with the pooled value drawn as a dashed line.
 
 **Axes.** Clinical class across, in the clinical order and palette described at the top of this file; entropy ratio up.
 
@@ -512,7 +512,7 @@ All of them are defined in **Terminology** above.
 
 ## `encoder_attention/encoder_attention_distance.pdf`
 
-**In plain terms.** *"How far back does each head actually look?"* This is the figure the encoder replacement exists to be judged by. Every head's attention is collapsed onto one axis — how many seconds back from the anchor the key sat — and drawn as a profile. A curve that decays fast is a head reading the immediate past; a curve with weight far out is a head genuinely using long-range history, which is the thing the recurrent branch could not do on demand. On the source panels the dashed vertical is the window edge, and **there is nothing beyond it by construction**.
+**In plain terms.** *"How far back does each head actually look?"* Every head's attention is collapsed onto one axis — how many seconds back from the anchor the key sat — and drawn as a profile. A curve that decays fast is a head reading the immediate past; a curve with weight far out is a head using long-range history. On the source panels the dashed vertical is the window edge, and **there is nothing beyond it by construction**.
 
 **What it shows.** One panel per (stream, block), four curves per panel — one per encoder head — of attention mass against temporal distance $t - j$, pooled rows only. The source panels carry the window bound as a dashed vertical.
 
@@ -742,7 +742,7 @@ The two levels take **different forms on purpose**. There are hundreds to thousa
 
 **How it is misread.** The shape of the top panel is **structural before it is physiological**: the warm-up prefix carries no loss term, the lag support is truncated until $t \ge L - 1$, and the last $H$ anchors are never scored. On the bottom panel a **break is a break**: where a recording has a gap the line stops rather than being interpolated across, and a step at a segment join is an artifact of assembly, which is what `whole_delivery_boundaries.csv` exists to identify.
 
-**Why it is one readout.** The bottom panel is a single axis in nats per anchor, and $K_t$ on it beside `pred_gap` is routinely orders of magnitude larger — a shared page draws the gap as a flat line along the bottom of the KL's range. $K_t$ has its own page beside this one.
+**Why it is one readout.** The bottom panel is a single axis in nats per anchor, and $K_t$ on it beside `pred_gap` can be orders of magnitude larger — a shared page draws the gap as a flat line along the bottom of the KL's range. $K_t$ has its own page beside this one.
 
 ## `trajectory/trajectory_profile_kl.pdf`
 
@@ -922,7 +922,7 @@ And the `<left> vs <right>` naming inside each column runs the same way the colu
 
 ## `sufficiency/sufficiency.pdf`
 
-**In plain terms.** *"How much is the 48-number bottleneck costing us?"* Everything the model knows about the future has to squeeze through a 48-dimensional latent. This asks what would happen if it did not have to: a separate probe decoder is trained to forecast straight from the encoder's full internal state, skipping the bottleneck. The distance between that probe's score and the model's own is the price of the compression. It sits on the same axis as `pred_gap`, so the two are directly comparable: *what UP added* versus *what the bottleneck took away*. The lower panel is not decoration — it says whether the probe finished training, and an unfinished probe understates the cost.
+**In plain terms.** *"How much is the $d_z$-number bottleneck costing us?"* Everything the model knows about the future has to squeeze through a $d_z$-dimensional latent. This asks what would happen if it did not have to: a separate probe decoder is trained to forecast straight from the encoder's full internal state, skipping the bottleneck. The distance between that probe's score and the model's own is the price of the compression. It sits on the same axis as `pred_gap`, so the two are directly comparable: *what UP added* versus *what the bottleneck took away*. The lower panel is not decoration — it says whether the probe finished training, and an unfinished probe understates the cost.
 
 **What it shows.** Two panels. The upper one is three violins over the **held-out** recordings — $D_{\mathrm{oracle}}$, $D_{\mathrm{base}}$ and $D_{\mathrm{full}}$ — with both gaps annotated in the title. The lower one is the probe's own fit: held-out and fit score against optimizer step, for the comparison probe and for the doubled-width refit the capacity check uses.
 
@@ -961,7 +961,7 @@ These have no fixed filename, so like the grouped variants they are documented a
 | 1 | the raw **FHR** (the thing being forecast) and the raw **UP** (the source) on one time axis |
 | 2 | the **forecast**, tiled across the recording: both branches with their $\pm 2\sigma$ bands against the truth |
 | 3 | the **prior latent state** $\mu^p_t$ over the source-derived shift $\mu^q_t - \mu^p_t$ |
-| 4 | the **per-dimension KL** — which of the 48 coordinates carried UP's information, over time |
+| 4 | the **per-dimension KL** — which of the $d_z$ coordinates carried UP's information, over time |
 | 5 | $K_t$ (`kld_per_t`) — how much UP moved the belief at each anchor |
 | 6 | the head-averaged **lag attention** with its argmax marked |
 | 7 | `source_kl_lag_map` — the KL attributed across lags |

@@ -761,7 +761,7 @@ def test_a_novelty_vector_of_the_wrong_width_is_refused_naming_the_block(tmp_pat
 # =================================================================================================
 @pytest.fixture(scope="module")
 def physical_clock():
-    """The shipped aligned configuration scored on the physical clock, resolved once."""
+    """The aligned fixture configuration scored on the physical clock, resolved once."""
     resolved = resolve_warmup_budget(
         causal_config(causal_target_forecast_clock="physical")
     )

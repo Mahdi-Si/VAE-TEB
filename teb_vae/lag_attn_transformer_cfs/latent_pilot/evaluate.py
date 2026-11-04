@@ -1120,7 +1120,7 @@ def gate_decision(
 def nll_convergence(small: Mapping[str, Any], large: Mapping[str, Any]) -> Dict[str, Any]:
     """Compare the marginal NLL at two draw counts.
 
-    The optional check §6 asks for when a conclusion turns on a small NLL difference: the marginal
+    The optional check for a conclusion that turns on a small NLL difference: the marginal
     predictive score is a log of an average likelihood, so it falls as draws are added, and a
     difference between two models smaller than the difference between two draw counts is not a
     difference the estimator can see.
@@ -2076,7 +2076,7 @@ def subgroup_table(
 def coverage_contrast(recordings: pd.DataFrame) -> pd.DataFrame:
     """Compare time coverage and signal availability between the two outcome groups.
 
-    The control §7.3 asks for: a cloud separated mainly by ascertainment or by how much signal
+    The coverage control: a cloud separated mainly by ascertainment or by how much signal
     survived is not an outcome result, and the only way to see that is to put the two groups'
     coverage side by side before reading any separation.
 

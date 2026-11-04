@@ -709,11 +709,10 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
     largest attainable lag means the true maximum may lie beyond $L$. An argmax at the *smallest*
     attainable lag means exactly the mirror image: by the identity
     $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \kappa(\tau^u_{\mathrm{ref}}
-    - \tau^y_{\mathrm{ref}})$ on the canonical stored timeline, every physical delay shorter than
-    what that lag encodes is reported *at* it, because the window carries no bin below it. On this
-    cell's geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps
-    under the single reference and grazes lag $0$ only near the far horizon step $h = H - 1$ under
-    the dual reference, so a pin
+    - \tau^y_{\mathrm{ref}})$ on the stored timeline, every physical delay shorter than what that
+    lag encodes is reported *at* it, because the window carries no bin below it. On this cell's
+    geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps under the
+    single reference, so a pin
     at the floor is the readout hitting a wall rather than the machinery failing to look back --
     and reading it as inertness is a conclusion the geometry does not support.
 

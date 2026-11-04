@@ -2,9 +2,8 @@
 #
 # The target encoder is what the conditional prior p(z_t | Y_<=t) reads, so its depth sets how
 # much of the forecast the target-only branch can carry on its own. This arm is the lower bracket
-# on the capacity revision that raised the shipped depth from 4 to 6: 4 IS the value this package
-# shipped before that revision, so the arm asks directly whether the raise was needed -- and it
-# has to be read carefully, because a *weaker* prior raises the source-conditioned KL without the
+# on the shipped depth of 6, so it asks whether that depth is needed -- and it has to be read
+# carefully, because a *weaker* prior raises the source-conditioned KL without the
 # coupling having grown, which is exactly the number this study refuses to select on. Read it
 # against the base reconstruction D_0 and the base-minus-full gap.
 #

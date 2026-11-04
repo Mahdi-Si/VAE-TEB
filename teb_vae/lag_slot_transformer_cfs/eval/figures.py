@@ -25,7 +25,7 @@ into its own subdirectory; what is here is the drawing.
   travels in the summary and the figure guide, not across the image.
 
 The style is the shared evaluation publication style -- open frames, a 7 pt serif scale,
-unframed legends, panel letters, a double-column width -- applied once per process by
+borderless legends, panel letters, a double-column width -- applied once per process by
 :func:`configure_figure_style`; importing this module restyles nothing. Titles are short noun
 phrases, a figure carries at most one short note line, and what a panel means is written in its
 axis labels and in the figure guide beside this package, not in a sentence across its top.

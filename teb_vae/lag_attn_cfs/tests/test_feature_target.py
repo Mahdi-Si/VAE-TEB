@@ -410,7 +410,7 @@ def test_any_shift_at_all_costs_exactly_the_one_anchor_the_boundary_step_bought(
 
     $\max_c(W'_c + d_c) \ge \max_c W'_c = B$ because every $d_c \ge 0$, so the input-warmth half
     always exceeds the scored half by at least one. That is the whole price of the alignment on the
-    anchor axis, it is the same one anchor at the shipped reference, and it is a structural
+    anchor axis, it is the same one anchor at the target_max reference, and it is a structural
     statement rather than a property of the vectors below -- which is why it is asserted over three
     different shift arrangements including the one that puts the shift on the slowest channel.
     """

@@ -1,7 +1,7 @@
-r"""``impulse_response`` -- the model's effective FIR kernel, read off a synthetic contraction (E1-I).
+r"""``impulse_response`` -- the model's effective FIR kernel, read off a synthetic contraction.
 
-**Question.** With local K/V the lag attention is a data-dependent FIR filter over the UP history
-(plan A.3). What forecast does one contraction elicit, as a function of delay? Inject a bump into raw
+**Question.** With local K/V the lag attention is a data-dependent FIR filter over the UP history.
+What forecast does one contraction elicit, as a function of delay? Inject a bump into raw
 UP at a known time and read the response against
 
 $$d = 4(t + 1 + \tau) - t_0 \ \text{s},$$
