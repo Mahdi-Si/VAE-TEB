@@ -224,7 +224,9 @@ RUN_ARGS: Dict[str, Any] = {
     #   forecast, coupling, perm_control, latent, lag_kl, attention, calibration, residual,
     #   distributions, trajectory, time_to_delivery, second_stage, events, sufficiency, samples,
     #   recording_traces, warmup, source_null, time_shift, occlusion, lag_clocks, lag_kld_scaled,
-    #   lag_high_kl, spectral_skill, attribution, cross_subgroup
+    #   event_gate, lag_high_kl, spectral_skill, attribution, cross_subgroup
+    # ``event_gate`` reads the per-anchor table only, so "only": "event_gate" re-runs it against a
+    # finished output_dir with no checkpoint.
     # Not valid for either key: band_partition (always runs).
     # Example: "only": "samples,recording_traces"  or  "skip": "attribution,occlusion"
     "only": None,

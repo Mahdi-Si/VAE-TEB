@@ -142,6 +142,7 @@ class SeqVaeLagAttnTrfCfs(
         forecast_ar_max: float = 1.0,
         target_scored_start: Optional[Sequence[int]] = None,
         source_quality_mask: bool = False,
+        source_mask_mode: str = "hard",
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -216,6 +217,13 @@ class SeqVaeLagAttnTrfCfs(
                 steps leave the lag keys, and an anchor with no valid key keeps $q = p$. Paired
                 with the dataset's ``ua_step_mask``. ``False`` builds the model bitwise as before
                 the keyword existed; either value adds no parameter.
+            source_mask_mode: How ``source_quality_mask`` applies the mask. ``'hard'`` -- the
+                default -- removes bad keys and closes the gate where none is left, bitwise as
+                before the keyword existed. ``'soft'`` keeps every key and closes nothing. It
+                gives the UA adapter each channel's validity as an input beside the values, adds
+                a per-head score bias on bad keys, and feeds the gate the attention mass on them.
+                It needs ``source_quality_mask`` and ``posterior_event_gate``, and adds
+                $d_{\mathrm{model}} C_u + 2M$ parameters, all zero at init.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -246,6 +254,7 @@ class SeqVaeLagAttnTrfCfs(
             lag_floor=lag_floor,
             target_forecast_shift=target_forecast_shift,
             source_quality_mask=source_quality_mask,
+            source_mask_mode=source_mask_mode,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.
@@ -283,3 +292,6 @@ class SeqVaeLagAttnTrfCfs(
         self._register_channel_weights()
         # After the decoder exists, whose width the AR coefficient and the cell mask share.
         self._register_likelihood_structure()
+        # After the base, which builds the posterior's event gate and the lag attention the soft
+        # mask's parameters are sized against. Registers nothing in the hard mode.
+        self._build_soft_source_mask()

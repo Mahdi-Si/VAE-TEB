@@ -177,6 +177,9 @@ def score_pairs(task: Any, own: Any, partner: Any) -> Dict[str, np.ndarray]:
             partner_source.dtype,
         )
         posed = {**outputs, "source_key_mask": key_mask, "source_open": key_mask.any(dim=-1)}
+        if outputs.get("source_quality") is not None:
+            # The soft UA mask also feeds the adapter the per-channel flags; the partner's.
+            posed["source_quality"] = model.source_quality_input(partner_valid, partner_source.dtype)
     # A seeded generator only because the helper also decodes one draw, which nothing here reads;
     # it keeps the global stream untouched.
     generator = torch.Generator(device=gated.device).manual_seed(0)

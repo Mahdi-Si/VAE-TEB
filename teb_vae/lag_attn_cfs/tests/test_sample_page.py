@@ -62,10 +62,13 @@ _STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}
 #: The two rows this package's input builder adds, by title prefix.
 _INPUT_ROWS = ("Target input", "Source input")
 
-#: Every titled row of this package's page: the sibling's seven, the two input rows, and the six
-#: of ``CAUSAL_EXTRA_ROWS``. Stated as arithmetic rather than as ``15`` so a row added to the
-#: drawing module without one added to the layout -- or the reverse -- fails here by name.
-_PAGE_ROWS = 7 + len(_INPUT_ROWS) + len(sample_page.CAUSAL_EXTRA_ROWS)
+#: Every titled row of this package's page: the sibling's seven, the two input rows, the six of
+#: ``CAUSAL_EXTRA_ROWS`` and the two of ``MONITOR_ROWS``. Stated as arithmetic rather than as ``17``
+#: so a row added to the drawing module without one added to the layout -- or the reverse -- fails
+#: here by name.
+_PAGE_ROWS = (
+    7 + len(_INPUT_ROWS) + len(sample_page.CAUSAL_EXTRA_ROWS) + len(sample_page.MONITOR_ROWS)
+)
 
 
 def _forward(module: Any, data: Any) -> dict:
@@ -1229,6 +1232,8 @@ _UNGATED = dict(
 _COMPACT_ROW_TITLES = (
     "Raw target FHR",
     "Forecast",
+    "Signal-quality masks",
+    "Posterior event gate",
     "Target input",
     "Source input",
     "Latent state",

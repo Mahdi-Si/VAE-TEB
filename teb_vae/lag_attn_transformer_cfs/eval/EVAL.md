@@ -52,8 +52,8 @@ probe, the collection pass and its branches, every registered analysis, the read
 ten-verdict registry, the headline registry (the Monte Carlo error block included), the sanity
 block, the figure seam and the gate's criteria come from `teb_vae.lag_attn_cfs.eval` unchanged and
 are reached through the binding. The analyses only a causal cell can have (`warmup`,
-`source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `lag_high_kl` and
-`spectral_skill`) are registered on the *cfs* binding's `EXTRA_ANALYSES` and picked up here by
+`source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `event_gate`,
+`lag_high_kl` and `spectral_skill`) are registered on the *cfs* binding's `EXTRA_ANALYSES` and picked up here by
 binding that object rather than by re-registering it, so an analysis added there reaches this cell
 from one place. `tests/test_eval_binding.py` asserts the identity.
 

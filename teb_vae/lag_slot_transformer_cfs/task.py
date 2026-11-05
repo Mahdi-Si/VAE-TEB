@@ -277,6 +277,21 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
             likelihood_terms=model.forecast_likelihood_kwargs,
         )
 
+    @property
+    def forecast_extra_rows(self) -> Tuple[Tuple[str, float], ...]:
+        """The six forecast rows the causal parent reserves, without its two monitor rows.
+
+        The parent appends the signal-quality mask row and the event-gate row, which its own
+        ``forecast_rows`` draws. :attr:`forecast_rows` here is a different seam that does not
+        draw them, so inheriting the parent's list would reserve two blank rows on every page.
+
+        Returns:
+            ``(name, height_ratio)`` per row, in drawing order.
+        """
+        from teb_vae.lag_attn_cfs.sample_page import CAUSAL_EXTRA_ROWS
+
+        return CAUSAL_EXTRA_ROWS
+
     def _mu_gap_rms(
         self, forward_outputs: Dict[str, torch.Tensor], weight: torch.Tensor
     ) -> torch.Tensor:

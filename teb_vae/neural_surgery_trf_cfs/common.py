@@ -79,19 +79,24 @@ def guid_hash(guid: Any) -> int:
 
 
 def write_overrides(name: str = "eval_overrides_local.yaml",
-                    allowed_guids: Optional[Sequence[str]] = None) -> Path:
+                    allowed_guids: Optional[Sequence[str]] = None,
+                    data: Optional[Path] = None) -> Path:
     """Fill the override template with this machine's data and statistics paths.
 
     Args:
         name: File name inside ``results/generated``.
         allowed_guids: Optional GUID allow-list for the dataset filter; ``None`` keeps every
             recording.
+        data: Shard to evaluate; ``None`` uses :data:`DATA`, the acidosis shard. Every shard is
+            normalised with the same stand-in statistics, so features stay comparable across
+            shards.
 
     Returns:
         Path of the written override file.
     """
     GENERATED.mkdir(parents=True, exist_ok=True)
-    text = OVERRIDE_TEMPLATE.read_text().replace("<DATA>", DATA.as_posix()).replace("<STATS>", STATS.as_posix())
+    data = DATA if data is None else Path(data)
+    text = OVERRIDE_TEMPLATE.read_text().replace("<DATA>", data.as_posix()).replace("<STATS>", STATS.as_posix())
     overrides = yaml.safe_load(text)
     if allowed_guids is not None:
         overrides["dataset_config"]["dataloader_config"]["dataset_kwargs"]["allowed_guids"] = list(allowed_guids)

@@ -2855,6 +2855,11 @@ def evaluate_batch(
     if event_gate is not None:
         gate = event_gate[..., 0] if event_gate.dim() == 3 else event_gate
         per_anchor["event_gate"] = gate.gather(1, anchors).to(training_block.dtype)
+        # The learned gate $g_t$ before the UA mask closes it. Without the mask the forward
+        # returns no second tensor because the two are equal, so the effective one stands in.
+        learned = outputs.get("event_gate_learned", event_gate)
+        learned = learned[..., 0] if learned.dim() == 3 else learned
+        per_anchor["event_gate_learned"] = learned.gather(1, anchors).to(training_block.dtype)
     # The two per-anchor lag maps, gathered at the same anchors as the scalars above so a row of
     # the per-anchor table and a row of the per-anchor vector sidecar describe one anchor. The
     # pooled attribution rather than the per-head one: an anchor selection by $K_t$ is a selection

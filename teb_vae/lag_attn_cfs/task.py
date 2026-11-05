@@ -162,6 +162,14 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 name: None if value is None else value.detach()
                 for name, value in model.forecast_likelihood_kwargs().items()
             },
+            # The three facts the mask row needs: which UA channels the model reads, in which
+            # block order the stream concatenates them, and whether the objective removes
+            # flagged target steps.
+            source_keep_index=None if model.source_gate is None else model.source_gate.keep_index,
+            source_blocks=(
+                ("up_st", "up_ph") if bool(getattr(model, "use_up_st", False)) else ("up_ph",)
+            ),
+            target_quality_mask=bool(self.hparams.get("target_quality_mask", False)),
         )
 
     @property
@@ -175,12 +183,15 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         name reserved and not drawn is a blank row on every page of the run, and a name drawn and
         not reserved is a ``KeyError`` raised inside a handler that swallows it.
 
+        The six forecast rows come first, then the two monitor rows -- the signal-quality masks and
+        the posterior event gate -- which sit directly above the input rows whose masks they show.
+
         Returns:
             ``(name, height_ratio)`` per row, in drawing order.
         """
-        from teb_vae.lag_attn_cfs.sample_page import CAUSAL_EXTRA_ROWS
+        from teb_vae.lag_attn_cfs.sample_page import CAUSAL_EXTRA_ROWS, MONITOR_ROWS
 
-        return CAUSAL_EXTRA_ROWS
+        return CAUSAL_EXTRA_ROWS + MONITOR_ROWS
 
     @property
     def input_stream_panels(self) -> Callable[..., Sequence[InputStreamPanel]]:

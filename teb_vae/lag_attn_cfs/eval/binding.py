@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import event_gate as event_gate_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
@@ -290,6 +291,10 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # divide out, the lags a geometry-fixed partition says are worth asking about, and the heads
     # the pooled profile averages. Reads the tables and the vector sidecar only.
     "lag_kld_scaled": lag_kld_scaled_analysis.run_lag_kld_scaled_analysis,
+    # The posterior event gate: which anchors it shuts, whether the data or the model shut them,
+    # and what an open gate buys in KL and forecast gain. Reads the per-anchor table only, and
+    # records a skip on a model that builds neither a gate nor a UA mask.
+    "event_gate": event_gate_analysis.run_event_gate_analysis,
     # Third of the lag-against-the-clocks trio: the same two clocks, read on the ANCHORS that carry
     # the coupling rather than on all of them. It selects anchors by a quantile band of the pooled
     # per-anchor KL and reads the lag structure of the selection off the per-anchor vector sidecar
@@ -419,6 +424,16 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         ("lag_high_kl", "headline", "high_minus_rest_pred_gap_nats"),
     ),
     ("high_gain_overlap_share", ("lag_high_kl", "headline", "high_gain_overlap_share")),
+    # The posterior event gate's own. The learned gate over the anchors whose UA keys are open,
+    # the applied gate over all anchors, and the share of anchors in each of the four states.
+    # The forced share is a property of the data's UA mask; the model-shut share is the model's
+    # decision. ``None`` on a model without a gate or a UA mask.
+    ("event_gate_learned_mean", ("event_gate", "headline", "learned_gate_mean_open_keys")),
+    ("event_gate_applied_mean", ("event_gate", "headline", "applied_gate_mean")),
+    ("event_gate_forced_shut_frac", ("event_gate", "headline", "forced_shut_frac")),
+    ("event_gate_model_shut_frac", ("event_gate", "headline", "model_shut_frac")),
+    ("event_gate_open_frac", ("event_gate", "headline", "open_frac")),
+    ("event_gate_kl_spearman", ("event_gate", "headline", "gate_kl_spearman")),
 )
 
 

@@ -307,6 +307,21 @@ model_config:
     # and its own statistics file. The pre-flight refuses this flag without `ua_step_mask`, and the
     # reverse. false applies no source mask.
     source_quality_mask: true
+    # HOW the mask above is applied.
+    #   hard (SHIPPED): as described above. Bad keys leave the attention; the gate is forced shut
+    #     where no key is left.
+    #   soft: every key stays. The UA adapter (the UA encoder under `lag_kv_source: adapter`)
+    #     reads each channel's validity as an input beside its value, before its nonlinearity, and
+    #     the value is not zeroed. A learned per-head score bias acts on bad keys, and the event
+    #     gate also reads the attention mass that fell on bad keys. Nothing is forced shut, so the
+    #     model decides how far to trust bad UA. All three terms start at zero, i.e. at "treat
+    #     every step as valid". No anchor is closed, so `source_mask_fraction` reads 0 and
+    #     `event_gate_mean` averages every KL anchor. The source-null control keeps the recording's
+    #     own flags and zeroes the values, so its KL is what the missingness pattern alone buys.
+    #     Needs `posterior_event_gate: true`; refuses `source_event_mask`. Adds
+    #     d_model * C_u + 2 * num_heads parameters, so a hard-mode checkpoint warm-starts a soft
+    #     model only through a seeded copy (`neural_surgery_trf_cfs/surgery/init_s6.py`).
+    source_mask_mode: hard
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256

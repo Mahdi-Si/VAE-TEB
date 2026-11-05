@@ -486,7 +486,7 @@ def test_a_rendered_page_has_fifteen_rows_and_logs_no_warning(tmp_path, caplog) 
 
     assert failures == [], failures
     assert n_input_rows == 2
-    assert 2 + 6 + n_input_rows + 5 == samples_analysis.EXPECTED_PAGE_ROWS
+    assert 2 + 6 + 2 + n_input_rows + 5 == samples_analysis.EXPECTED_PAGE_ROWS
     assert "warning" not in caplog.text.lower(), caplog.text
 
     # One segment, both variants, and the reduced one named by the tail rather than by position:

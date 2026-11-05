@@ -364,6 +364,23 @@ class PosteriorHead(nn.Module):
         Returns:
             The gate ``(B, T, 1)``, or ``None`` when no gate was built.
         """
+        logits = self.event_gate_logits(a)
+        return None if logits is None else torch.sigmoid(logits)
+
+    def event_gate_logits(self, a: torch.Tensor) -> Optional[torch.Tensor]:
+        r"""The event gate before its sigmoid, $w^\top \tilde a_t + b$, or ``None`` without a gate.
+
+        Exposed so a caller can add a term of its own to the logit and keep the gate in
+        $(0, 1)$. The soft source-quality mask adds a learned function of the attention mass that
+        fell on invalid UA keys. :meth:`event_gate_values` is the sigmoid of this value.
+
+        Args:
+            a: Attended source summary -- ``(B, T, d_model)`` flat, or
+                ``(B, T, num_heads, d_head)`` head-structured.
+
+        Returns:
+            The logit ``(B, T, 1)``, or ``None`` when no gate was built.
+        """
         if self.event_gate_head is None:
             return None
         if self.head_structured:
@@ -372,7 +389,7 @@ class PosteriorHead(nn.Module):
             )
         else:
             summary = self.a_norm(a)
-        return torch.sigmoid(self.event_gate_head(summary))
+        return self.event_gate_head(summary)
 
     def forward(
         self,

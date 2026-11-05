@@ -555,6 +555,7 @@ __all__ = [
     "CLINICAL_CLASS_COLORS",
     "COLOR_MAGENTA",
     "FIGURE_WIDTH",
+    "LINE_PALETTE",
     "PANEL_HEIGHT",
     "SERIES_STYLES",
     "integer_counts",

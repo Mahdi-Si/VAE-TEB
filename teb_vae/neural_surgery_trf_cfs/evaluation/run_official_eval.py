@@ -20,6 +20,8 @@ RUN_ARGS = {
         "orig": common.CHECKPOINT,
         "v3": common.checkpoint_variant("v3"),
         "v4": common.checkpoint_variant("v4"),
+        "v5": common.checkpoint_variant("v5"),
+        "v6": common.checkpoint_variant("v6"),
     },
     "out_root": common.RESULTS / "official_eval",
     "skip": "sufficiency,attribution,samples,recording_traces,cross_subgroup,time_to_delivery,"

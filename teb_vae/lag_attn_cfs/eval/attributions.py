@@ -1033,6 +1033,40 @@ def unsigned_log_norm(field: np.ndarray) -> Optional[Any]:
     return mcolors.LogNorm(vmin=top * 10.0 ** (-LOG_DECADES), vmax=top)
 
 
+class _SymlogFloorFormatter(mticker.LogFormatterSciNotation):
+    r"""Scientific symlog tick labels with the two labels at $\pm$ the linear floor left blank.
+
+    The linear region of a symmetric-log axis is one decade tall, so the labels at $+t$, $0$ and
+    $-t$ (with $t$ the floor) print on top of one another. Only $0$ keeps its label there.
+    """
+
+    def __init__(self, linthresh: float) -> None:
+        super().__init__(base=10, linthresh=linthresh)
+        self._floor = float(linthresh) * (1.0 + 1e-6)
+
+    def __call__(self, x: float, pos: Optional[int] = None) -> str:
+        if x != 0.0 and abs(x) <= self._floor:
+            return ""
+        return super().__call__(x, pos)
+
+
+def _legend_room(ax: Any, share: float) -> None:
+    """Raise the top of the y axis until the added strip is ``share`` of the axis height.
+
+    The strip is measured on the drawn scale, so on a symmetric-log axis a three-row key gets
+    several decades and a one-row key one, instead of one decade for every key.
+    """
+    low, high = ax.get_ylim()
+    grow = share / (1.0 - share)
+    if ax.get_yscale() == "symlog":
+        transform = ax.yaxis.get_transform()
+        t_low, t_high = transform.transform(np.array([[low], [high]], dtype=np.float64)).ravel()
+        t_top = t_high + grow * (t_high - t_low)
+        ax.set_ylim(low, float(transform.inverted().transform(np.array([[t_top]]))[0, 0]))
+    else:
+        ax.set_ylim(low, high + grow * (high - low))
+
+
 def symlog_axis(ax: Any, *values: Any, axis: str = "y", headroom: float = 0.0) -> None:
     """Put an axis on a symmetric-log scale floored :data:`LOG_DECADES` below the data's largest magnitude.
 
@@ -1048,6 +1082,7 @@ def symlog_axis(ax: Any, *values: Any, axis: str = "y", headroom: float = 0.0) -
         return
     threshold = float(np.abs(finite).max()) * 10.0 ** (-LOG_DECADES)
     (ax.set_yscale if axis == "y" else ax.set_xscale)("symlog", linthresh=threshold, base=10)
+    (ax.yaxis if axis == "y" else ax.xaxis).set_major_formatter(_SymlogFloorFormatter(threshold))
     if headroom > 0.0:
         low, high = ax.get_ylim() if axis == "y" else ax.get_xlim()
         high = max(float(high), threshold) * 10.0 ** float(headroom)
@@ -1057,12 +1092,20 @@ def symlog_axis(ax: Any, *values: Any, axis: str = "y", headroom: float = 0.0) -
 def symlog_legend(
     ax: Any, *values: Any, ncol: int = 2, axis: str = "y", legend: bool = True, **kwargs: Any
 ) -> None:
-    """A symmetric-log axis with a decade of headroom and the legend placed in it.
+    """A symmetric-log axis with headroom sized to the legend, and the legend placed in it.
 
-    ``legend=False`` keeps the axis and its headroom and draws no legend, for a panel whose keys
-    a neighbouring panel of the same figure already carries.
+    On a y axis the headroom grows with the legend's row count: $6\\%$ of the axis height
+    plus $5.5\\%$ per row, so a three-row key clears the data. ``legend=False`` keeps a one-row
+    strip and draws no legend, for a panel whose keys a neighbouring panel of the same figure
+    already carries. An x axis keeps the fixed one decade of headroom.
     """
-    symlog_axis(ax, *values, axis=axis, headroom=1.0)
+    if axis != "y":
+        symlog_axis(ax, *values, axis=axis, headroom=1.0)
+    else:
+        symlog_axis(ax, *values, axis=axis)
+        handles = len(ax.get_legend_handles_labels()[0]) if legend else 0
+        rows = -(-handles // max(int(ncol), 1)) if handles else 1
+        _legend_room(ax, min(0.06 + 0.055 * rows, 0.4))
     if legend:
         ax.legend(loc="upper left", ncol=int(ncol), fontsize=figures.FONT_TINY, **kwargs)
 
@@ -2638,9 +2681,10 @@ def build_channel_figure(
             if stream == STREAM_TARGET and n_scattering and 0 < int(n_scattering) < width:
                 ax.axvline(float(n_scattering) - 0.5, color=figures.COLOR_BLACK, linewidth=figures.LINE_HAIRLINE,
                            linestyle="--")
+                # On the title line, right of the rule: inside the axes it sat on the legend.
                 if not keyed[stream]:
-                    ax.text(float(n_scattering) - 0.5, 0.98, " phase-harmonic block", transform=ax.get_xaxis_transform(),
-                            ha="left", va="top", fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY)
+                    ax.text(float(n_scattering) - 0.5, 1.01, " phase-harmonic block", transform=ax.get_xaxis_transform(),
+                            ha="left", va="bottom", fontsize=figures.FONT_SMALL, color=figures.COLOR_GRAY)
             if not keyed[stream]:
                 for label, colour in legend:
                     ax.plot([], [], marker="s", linestyle="none", color=colour, label=label)
