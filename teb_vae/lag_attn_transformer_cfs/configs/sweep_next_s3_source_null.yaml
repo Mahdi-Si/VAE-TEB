@@ -1,0 +1,38 @@
+# Next-step ladder, rung 3 of 6: rung 2 plus a source-null KL penalty, sampled decoding of both
+# branches, and checkpoint selection on the mean-decoded forecast gain.
+#
+# WHAT THIS RUNG MOVES.
+#   * `lambda_source_null: 1.0` adds beta * KL(q_null || p) to the loss, where q_null is the
+#     posterior rebuilt against a zeroed source stream. At epoch 524 the posterior kept 1.37 of its
+#     1.81 nats of KL with no source values, so most of the KL bought nothing from the source.
+#   * `base_decode: sample` decodes the base branch from a prior sample, as the full branch is
+#     decoded from a posterior sample. Under `mean`, the full branch paid the sampling noise and
+#     the base branch did not: the Monte-Carlo gap was -5.18 nats while the mean-decoded gap was
+#     positive.
+#     RISK, accepted on this rung only: under `sample` the base reconstruction D_0 again prefers a
+#     narrow prior without limit, which is why the default ships `mean`. Watch the prior's mean
+#     log-variance in the run's history; if it falls toward the clamp floor, drop this key and keep
+#     the other two.
+#   * The second checkpoint criterion becomes `val/pred_gap_mean`, maximised, so the weights with
+#     the best source-conditioned forecast gain are kept on disk.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s3_source_null.yaml
+base: sweep_next_s2_likelihood.yaml
+
+model_config:
+  VAE_model:
+    lambda_source_null: 1.0
+    base_decode: sample
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s3_source_null
+      tags:
+        variant: lag_attn_trf_cfs_next_s3_source_null
+  callbacks:
+    model_checkpoint:
+      secondary_monitor: "val/pred_gap_mean"
+      secondary_mode: "max"

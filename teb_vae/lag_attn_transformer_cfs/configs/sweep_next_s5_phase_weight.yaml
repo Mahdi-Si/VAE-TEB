@@ -1,0 +1,25 @@
+# Next-step ladder, rung 5 of 6: rung 4 plus full weight on the phase block.
+#
+# WHAT THIS RUNG MOVES. `target_weight_ph: 1.0` (was 0.1) scores the phase channels at the same
+# weight as the scattering channels. At epoch 524 the model was close to a shrunk persistence on
+# phase (MSE 0.081 against 0.016 for a linear AR(6)), which a 0.1 weight does little to correct.
+#
+# WHY LAST. Rung 1 adds the multi-lag skip that phase most needs; raising the weight before that
+# would make the latent spend its capacity on a linear trend. Read this rung against rung 4 on the
+# phase forecast skill and on whether the scattering skill held.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s5_phase_weight.yaml
+base: sweep_next_s4_event_reach.yaml
+
+model_config:
+  VAE_model:
+    target_weight_ph: 1.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s5_phase_weight
+      tags:
+        variant: lag_attn_trf_cfs_next_s5_phase_weight

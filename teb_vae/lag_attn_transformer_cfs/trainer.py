@@ -146,7 +146,7 @@ def _resolve_cli_config_path(config_path: str) -> str:
 #:
 #: default.yaml is the headline run on the 2026-10-27 build, quality masks on. The two-arm
 #: quality-mask experiment that chose it is configs/prod_q4_*.yaml.
-RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/default.yaml"
+RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s6_soft_ua_mask.yaml"
 
 
 if __name__ == "__main__":
