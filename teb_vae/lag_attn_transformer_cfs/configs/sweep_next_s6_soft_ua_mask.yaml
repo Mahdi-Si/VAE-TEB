@@ -5,13 +5,14 @@
 # default's value). Rungs 1-5 stay as separate files for the step-by-step comparison; this file
 # does not read them.
 #
-# WARM START. The run starts from `lag-attn-trf-cfs-epoch=524-s6init.ckpt`, which
-# `teb_vae/neural_surgery_trf_cfs/surgery/init_s6.py` builds from the epoch-524 checkpoint: every
-# trained weight is copied; the five extra AR-lag weights are a ridge fit of the epoch-524
-# residual on the channel's own lags; phi and a per-channel decoder log-variance shift are chosen
-# jointly by held-out likelihood; the soft-mask terms start at zero. Its `.json` report beside it
-# holds the held-out numbers. The file is written under tmp/ locally: copy it to the training
-# machine and set `core_model_checkpoint` below to where it lands.
+# WARM START. The run starts from `lag-attn-trf-cfs-epoch=524-s6init.ckpt`. Every trained weight
+# is copied from the epoch-524 checkpoint; the five extra AR-lag weights are a ridge fit of the
+# epoch-524 residual on the channel's own lags; phi and a per-channel decoder log-variance shift
+# are chosen jointly by held-out likelihood; the soft-mask terms start at zero. The fit ran in
+# `teb_vae/neural_surgery_trf_cfs/surgery/init_s6.py`; on any machine that holds the epoch-524
+# checkpoint, `teb_vae/neural_surgery_trf_cfs/surgery/make_s6init.py` rebuilds the same file with
+# no data, checked by digest. Its `.json` report beside it holds the held-out numbers. Set
+# `core_model_checkpoint` below to where the file is.
 #
 # THE WARM START FIXES FOUR KEYS. The init file was built for persistence_lags 6, forecast_ar_max
 # 0.95 and source_mask_mode soft (and with posterior_event_gate on, as in the default). Change one
@@ -38,9 +39,10 @@
 base: default.yaml
 
 model_config:
-  # The rung-6 warm start; see the header. A strict load: the driver refuses a file that does not
-  # align, rather than training from random weights. [null]
-  core_model_checkpoint: tmp/latest-results-2026-11-04/lag-attn-trf-cfs-epoch=524-s6init.ckpt
+  # The rung-6 warm start; see the header. SET THIS PATH to the file make_s6init.py wrote on the
+  # training machine. The placeholder fails loudly at load time rather than training from random
+  # weights; the load is strict, so a file that does not align is refused too. [null]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=524-s6init.ckpt
 
   VAE_model:
     # --- Rung 1: a direct AR(6) skip on the target's own history -------------------------------
