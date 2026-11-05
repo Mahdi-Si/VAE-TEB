@@ -1,0 +1,31 @@
+# Next-step ladder, rung 1 of 6: a direct AR(6) skip on the target's own history.
+#
+# The rungs are CUMULATIVE: each file takes the rung before it as its base and moves one more
+# axis, so the difference between two adjacent rungs is that rung's own change and nothing else.
+#
+# WHAT THIS RUNG MOVES. `persistence_lags: 6` lets the persistence term read the six most recent
+# stored target values, through a per-channel, per-horizon-step linear filter whose extra-lag
+# weights start at zero. The run therefore starts at the default's forecast and can only move
+# away from it where the data pays for it.
+#
+# WHY. At the epoch-524 checkpoint of the default, an own-channel linear AR(6) beat the model at
+# tau = 0 (scattering MSE 0.009 vs 0.015, phase MSE 0.016 vs 0.081). The model then spends its
+# latent capacity on the local trend a linear filter carries for free, and the posterior's
+# advantage over the prior is measured against a weak baseline.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s1_ar_skip.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    persistence_lags: 6
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the rung in the name, on both keys.
+      run_name: lag_attn_trf_cfs_next_s1_ar_skip
+      tags:
+        variant: lag_attn_trf_cfs_next_s1_ar_skip

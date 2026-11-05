@@ -1,0 +1,28 @@
+# Next-step ladder, rung 4 of 6: rung 3 plus a short event-weight reach.
+#
+# WHAT THIS RUNG MOVES. `event_weight_reach_steps: 15` (60 s; was 55 steps, 220 s) gives weight 1
+# only to anchors in the first minute after a contraction onset.
+#
+# WHY. The 220-s reach was sized so the ANCHOR itself could sit anywhere in the FHR response. That
+# is not needed: an anchor 60 s after onset already holds the response up to 180 s after onset in
+# its 120-s horizon. With contractions every 2-3 min, a 220-s reach gives weight 1 to almost every
+# anchor in active labour, so the weighting selects little. At epoch 524 the deceleration-band
+# gap was -0.02 nats: the model gained nothing where the coupling should be largest.
+#
+# READ THIS RUNG ON THE DECELERATION-BAND GAP, which is the main coupling result of the ladder.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s4_event_reach.yaml
+base: sweep_next_s3_source_null.yaml
+
+model_config:
+  VAE_model:
+    event_weight_reach_steps: 15
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s4_event_reach
+      tags:
+        variant: lag_attn_trf_cfs_next_s4_event_reach

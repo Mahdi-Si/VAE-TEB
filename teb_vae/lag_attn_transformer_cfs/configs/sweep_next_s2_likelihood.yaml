@@ -1,0 +1,32 @@
+# Next-step ladder, rung 2 of 6: rung 1 plus a bounded AR(1) coefficient and novelty-scored cells.
+#
+# WHAT THIS RUNG MOVES.
+#   * `forecast_ar_max: 0.95` bounds phi_c = 0.95 * tanh(a_c). At epoch 524 phi reached 1.000 on
+#     60 of 76 channels, so a level error that lasted the whole horizon was charged on one cell.
+#   * `target_min_novelty.fhr_st: 0.05` scores scattering channel c only from the first horizon
+#     step whose coefficient draws at least 5% of its weight from samples after the anchor. The
+#     slow channels' early cells are almost all seen history. At epoch 524 this removes 264 of the
+#     960 scored scattering cells, 76% of which sat on the log-variance floor, and leaves 696 cells
+#     of which 6% did (25% before). The phase block is left alone: there the rule removed floor
+#     and non-floor cells alike (52% and 37% on the floor) and would delete 459 of 620 cells.
+#
+# READ THIS RUNG AGAINST RUNG 1 ON ITS FORECAST SKILL, NOT ITS NLL: removing cells changes the
+# scale of the NLL, so two rungs with different scored sets cannot be ranked by their nats.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s2_likelihood.yaml
+base: sweep_next_s1_ar_skip.yaml
+
+model_config:
+  VAE_model:
+    forecast_ar_max: 0.95
+    target_min_novelty:
+      fhr_st: 0.05
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s2_likelihood
+      tags:
+        variant: lag_attn_trf_cfs_next_s2_likelihood

@@ -1,0 +1,109 @@
+# Next-step ladder, rung 6: every change of rungs 1-5 plus the soft UA quality mask, in one file.
+#
+# This file takes `default.yaml` as its base and sets every key the ladder moves, so each change
+# can be switched here. To turn a change off, set its key back to the value in brackets (the
+# default's value). Rungs 1-5 stay as separate files for the step-by-step comparison; this file
+# does not read them.
+#
+# WARM START. The run starts from `lag-attn-trf-cfs-epoch=524-s6init.ckpt`, which
+# `teb_vae/neural_surgery_trf_cfs/surgery/init_s6.py` builds from the epoch-524 checkpoint: every
+# trained weight is copied; the five extra AR-lag weights are a ridge fit of the epoch-524
+# residual on the channel's own lags; phi and a per-channel decoder log-variance shift are chosen
+# jointly by held-out likelihood; the soft-mask terms start at zero. Its `.json` report beside it
+# holds the held-out numbers. The file is written under tmp/ locally: copy it to the training
+# machine and set `core_model_checkpoint` below to where it lands.
+#
+# THE WARM START FIXES FOUR KEYS. The init file was built for persistence_lags 6, forecast_ar_max
+# 0.95 and source_mask_mode soft (and with posterior_event_gate on, as in the default). Change one
+# of those and the strict loader refuses the file, or phi means something else: then rebuild the
+# file with init_s6.py (edit its S6_MODEL_OVERRIDES), or set core_model_checkpoint to null and
+# train from scratch. Every other key below is free to change with the same init file.
+#
+# READ THIS RUN AGAINST THE EPOCH-524 DEFAULT AND, WHERE RUN, AGAINST RUNG 5 ON:
+#   * forecast skill against the own-channel AR(6) baseline (`eval/linear_baselines.py`), not on
+#     NLL: the novelty rule and the phi bound change the scale of the NLL;
+#   * the deceleration-band gap on anchors with valid UA;
+#   * the KL and the forecast gap against time to delivery, split by the per-anchor label
+#     `ua_key_open` (the eval derives it from the batch, whatever the model's mask mode);
+#   * the source-null KL (`kld_source_null`). Under the soft mask this control zeroes the UA values
+#     and KEEPS the recording's bad-step flags, so its KL is what the missingness pattern alone
+#     buys. If it rises toward the matched KL, the model reads "UA is missing" as a clock of labour
+#     stage;
+#   * the learned `source_invalid_key_bias` per head, `source_invalid_gate` weight and
+#     `source_adapter.quality_proj` in the checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s6_soft_ua_mask.yaml
+base: default.yaml
+
+model_config:
+  # The rung-6 warm start; see the header. A strict load: the driver refuses a file that does not
+  # align, rather than training from random weights. [null]
+  core_model_checkpoint: tmp/latest-results-2026-11-04/lag-attn-trf-cfs-epoch=524-s6init.ckpt
+
+  VAE_model:
+    # --- Rung 1: a direct AR(6) skip on the target's own history -------------------------------
+    # The persistence term reads the six most recent stored target values through a per-channel,
+    # per-horizon-step linear filter. WHY: at epoch 524 an own-channel linear AR(6) beat the model
+    # at tau = 0 (scattering MSE 0.009 vs 0.015, phase 0.016 vs 0.081). [1]
+    persistence_lags: 6
+
+    # --- Rung 2: the likelihood ------------------------------------------------------------------
+    # Bound on the AR(1) coefficient, phi_c = forecast_ar_max * tanh(a_c). At epoch 524 phi reached
+    # 1.000 on 60 of 76 channels, so a level error that lasted the whole horizon was charged on one
+    # cell. [1.0]
+    forecast_ar_max: 0.95
+    # Score scattering channel c only from the first horizon step whose coefficient draws at least
+    # 5% of its weight from samples after the anchor. At epoch 524 this removes 264 of 960 scored
+    # scattering cells, 76% of them on the log-variance floor. Phase is left alone: there the rule
+    # removed floor and non-floor cells alike and would delete 459 of 620 cells. [null, null]
+    target_min_novelty:
+      fhr_st: 0.05
+      fhr_ph: null
+
+    # --- Rung 3: the source-null penalty and sampled base decoding -------------------------------
+    # Adds beta * KL(q_null || p), q_null being the posterior rebuilt against a zeroed source. At
+    # epoch 524 the posterior kept 1.37 of its 1.81 nats of KL with no source values. [0.0]
+    lambda_source_null: 1.0
+    # Decode the base branch from a prior sample, as the full branch is decoded from a posterior
+    # sample; under `mean` the Monte-Carlo gap was -5.18 nats while the mean-decoded gap was
+    # positive. RISK: the base reconstruction then prefers a narrow prior without limit. Watch
+    # `mean_logvar_prior` (-3.99 at epoch 524); if it falls toward the clamp floor, set mean. [mean]
+    base_decode: sample
+
+    # --- Rung 4: a short event-weight reach ------------------------------------------------------
+    # Weight 1 only for anchors in the first minute after a contraction onset (15 steps = 60 s). An
+    # anchor 60 s after onset already holds the response up to 180 s after onset in its 120-s
+    # horizon, and a 220-s reach gives weight 1 to almost every anchor in active labour. [55]
+    event_weight_reach_steps: 15
+
+    # --- Rung 5: full weight on the phase block --------------------------------------------------
+    # At epoch 524 the phase forecast was close to a shrunk persistence (MSE 0.081 against 0.016 for
+    # a linear AR(6)), which a 0.1 weight does little to correct. [0.1]
+    target_weight_ph: 1.0
+
+    # --- Rung 6: the soft UA quality mask -------------------------------------------------------
+    # Bad UA steps stay in the lag keys and the posterior is never forced back to the prior.
+    # Instead the UA adapter reads each channel's validity beside its value, a learned per-head
+    # score bias acts on bad keys, and the event gate reads the attention mass on bad keys. All
+    # three start at zero ("every UA step is valid"). WHY: at epoch 524 the all-anchor KL fell
+    # toward delivery only because the share of anchors with an open source fell from 89% to 48%
+    # in the last 15 min; on anchors with valid UA it rose (1.2 -> 1.7 nats), and marking every UA
+    # step valid raised the source gain from 5.0 to 6.3 nats per anchor. Needs
+    # `posterior_event_gate: true` and refuses `source_event_mask`, both as in the default. [hard]
+    source_mask_mode: soft
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the rung in the name, on both keys.
+      run_name: lag_attn_trf_cfs_next_s6_soft_ua_mask
+      tags:
+        variant: lag_attn_trf_cfs_next_s6_soft_ua_mask
+  callbacks:
+    model_checkpoint:
+      # Rung 3: also keep the weights with the best source-conditioned forecast gain.
+      # ["val/nll_full_block", "min"]
+      secondary_monitor: "val/pred_gap_mean"
+      secondary_mode: "max"
