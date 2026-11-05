@@ -256,7 +256,7 @@ The shared evaluation package (`teb_vae/lag_attn/eval`) is reachable only throug
 
 `run.main` uses `CFS_BINDING` by default. The transformer sibling, `teb_vae/lag_attn_transformer_cfs/eval`, uses this runner, collection pass and analyses through its own binding for `SeqVaeLagAttnTrfCfs`. It reuses this module's `EXTRA_ANALYSES` and `HEADLINE_SCALARS`, so both cells run the same registry.
 
-`EXTRA_ANALYSES` holds the analyses registered on the binding, in run order: `samples`, `recording_traces`, `warmup`, `source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `lag_high_kl`, `spectral_skill`, `attribution`. `attribution` is last because it reads the tables of `occlusion` and `spectral_skill`. The runner merges the extras after the shared analyses and before the trailing `cross_subgroup`. `HEADLINE_SCALARS` appends their headline entries to the shared registry. A headline path may also start from a result block that the collection pass writes; `COLLECTION_HEADLINE_BLOCKS` names those (`mc_error`).
+`EXTRA_ANALYSES` holds the analyses registered on the binding, in run order: `samples`, `recording_traces`, `warmup`, `source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `event_gate`, `lag_high_kl`, `spectral_skill`, `attribution`. `attribution` is last because it reads the tables of `occlusion` and `spectral_skill`. The runner merges the extras after the shared analyses and before the trailing `cross_subgroup`. `HEADLINE_SCALARS` appends their headline entries to the shared registry. A headline path may also start from a result block that the collection pass writes; `COLLECTION_HEADLINE_BLOCKS` names those (`mc_error`).
 
 `GEOMETRY_KEYS` holds `sequence_length`, `d_model`, `d_z`, `horizon`, `raw_per_step`, `warmup_period`, `c_y`, `c_u`, `use_up_st`, `max_lag`, `num_heads`, `d_head`, `horizon_attention_blocks`, `causal_norm`, `anchor_stride`, `lag_floor`, `prior_availability_input`, `lag_kv_source` and `persistence_residual`. The transformer cell's tuple also carries `forecast_ar_residual` and its encoder keys.
 
@@ -535,7 +535,7 @@ The probe's convergence flag is a precondition. Convergence is decided from the 
 
 ### samples
 
-This analysis selects segments for visual inspection. The full page has fifteen rows and uses the task's `forecast_rows`, `forecast_extra_rows` and `input_stream_panels` helpers, so the layout matches the training diagnostics.
+This analysis selects segments for visual inspection. The full page has seventeen rows and uses the task's `forecast_rows`, `forecast_extra_rows` and `input_stream_panels` helpers, so the layout matches the training diagnostics.
 
 The analysis writes three selections:
 
@@ -543,7 +543,12 @@ The analysis writes three selections:
 - `by_class/` holds a class-balanced draw: the same number of segments from every clinical class.
 - One directory per headline metric and tail holds the segments at the extremes of that metric. These pages are selected on the quantity they display, so they illustrate and do not measure frequency.
 
-Every selected segment is drawn twice from one forward pass. The full page has fifteen rows. The `_compact` page keeps five rows: the raw context, the target block as the encoder receives it, the latent state, $K_t$, and the lag attention on a logarithmic colour scale.
+Every selected segment is drawn twice from one forward pass. The full page has seventeen rows. The `_compact` page keeps ten rows: the raw context, the forecast lanes, the signal-quality masks, the event gate, both input streams, the latent state, $K_t$, and both lag maps. Both lag-attention rows use a logarithmic colour scale.
+
+Two rows monitor what the model was allowed to read:
+
+- **Signal-quality masks.** One lane per mask, shaded where the mask flags the signal. `FHR raw` and `UP raw` show the raw-grid validity (`emit_quality_mask`). `FHR ST`, `FHR PH`, `UP ST` and `UP PH` show the coefficient step masks (`fhr_step_mask`, `ua_step_mask`); the opacity of a step is the share of the block's kept channels that the mask flags. `FHR loss` shows the target steps that the objective removes under `target_quality_mask`. `UA keys` shows the anchors with no valid lag key ($o_t = 0$) under `source_quality_mask`. This last lane is on the anchor grid and includes the alignment shifts and the key reach, so it can sit later than the `UP` lanes. The right gutter gives the flagged share of each lane over the segment.
+- **Posterior event gate.** The learned gate $g_t$ as a line and the applied gate $g_t\,o_t$ as a filled area, over the trained anchors. Hatched grey marks the anchors that the UA mask shut ($o_t = 0$). Red marks the anchors that the model shut ($o_t = 1$, $g_t < 0.2$). The dotted lines are the thresholds $0.2$ and $0.8$, and the scaled raw UP trace is drawn behind the gate. The title gives the mean $g_t$ where the keys are open and the share of each state.
 
 `sample_pages.csv` has one row per file, with a `variant` column for the page type.
 
@@ -722,6 +727,35 @@ The emission is long-form: `source` and `statistic` are row keys. `num_heads` ca
 The outputs are `lag_kld_scaled_per_recording.csv`, `lag_kld_scaled_trajectory.csv`, `lag_kld_scaled_selection.csv` and one figure per clock. The selection table records which lags were kept and with what weight.
 
 `occlusion_bands` is read by both `occlusion` and this analysis. With `{}`, this analysis records a named skip.
+
+### event_gate
+
+This analysis reports how the posterior event gate behaves. The posterior applies $g^{\mathrm{eff}}_t = g_t\,o_t$, where $g_t$ is the learned gate and $o_t$ is $1$ when at least one UA lag key survives the signal-quality mask. The applied gate is $0$ for two different reasons, so the analysis assigns every scored anchor to one of four states (`teb_vae/lag_attn_cfs/gate_states.py`):
+
+| State | Rule | Meaning |
+|---|---|---|
+| `forced_shut` | $o_t = 0$ | The UA mask removed every key, so $q = p$. |
+| `model_shut` | $o_t = 1$, $g_t < 0.2$ | The UA was available and the model did not read it. |
+| `partly_open` | $0.2 \le g_t < 0.8$ | The posterior residual is partly applied. |
+| `open` | $g_t \ge 0.8$ | The posterior residual is almost fully applied. |
+
+The sample page uses the same rule, so a state on a page and in a table is one rule.
+
+The analysis reads the per-anchor table only (`event_gate`, `event_gate_learned`, `source_open`, `kld_per_t`, `mc_pred_gap` and `seconds_since_contraction`), so it runs without a checkpoint. A run collected before the forward returned `event_gate_learned` still gives exact states: where $o_t = 1$ the applied gate equals the learned gate, and where $o_t = 0$ the anchor is forced shut. `plan.learned_gate_recovered` records this case. A model with neither a gate nor a UA mask records a skip.
+
+Each summary is a mean within each recording, then a mean over recordings, with a percentile bootstrap interval over recordings. The two time profiles are anchor-level means per bin.
+
+The outputs are:
+
+- `event_gate_states.csv`: per state, the share of anchors, the mean $K_t$ and the mean forecast gain.
+- `event_gate_per_recording.csv`: per recording, the state shares, the mean $g_t$ where the keys are open, the mean applied gate, and the Spearman correlation of $g_t$ with $K_t$. The runner fans this table out by class and by subgroup.
+- `event_gate_by_time_to_delivery.csv`: 30-minute bins of the anchor's time before delivery.
+- `event_gate_by_contraction_age.csv`: 15-second bins of the time since the last contraction onset, up to 300 s.
+- `event_gate.pdf`: the distribution of $g_t$ per class, the state shares and the gate means against time before delivery, $g_t$ against contraction age, the gain and $K_t$ per state, and $K_t$ and gain against $g_t$.
+
+The headline block adds `event_gate_learned_mean`, `event_gate_applied_mean`, `event_gate_forced_shut_frac`, `event_gate_model_shut_frac`, `event_gate_open_frac` and `event_gate_kl_spearman`. `results.event_gate.blinks` gives the count and the median length of the model-shut runs, in seconds.
+
+Read the forced-shut share as a property of the data, and the model-shut share as a decision of the model. A gate that responds to contractions shows a peak in $g_t$ shortly after a contraction onset. A gate that only follows the mask is flat wherever the keys are open.
 
 ### lag_high_kl
 
@@ -945,7 +979,7 @@ The table below summarises the entries. `divergences.json` is the authoritative 
 | `analyses/latent.py` | equivalent | `test_eval_sibling_agreement.py::test_the_latent_spectrum_is_laid_out_the_same_way_in_both_packages`, `::test_the_latent_diagnostics_are_the_same_thirteen_reductions_in_both_packages`, `::test_the_only_gloss_that_differs_is_the_one_naming_this_target_domains_unit` |
 | `analyses/perm_control.py` | equivalent | `test_eval_sibling_agreement.py::test_the_specificity_outcome_is_named_the_same_way_in_both_packages`, `::test_the_three_paired_controls_keep_the_same_sign_convention_in_both_packages`, `::test_the_branch_summary_and_the_kl_description_agree_in_both_packages` |
 | `analyses/residual.py` | divergent | Reports the forecast-difference RMS in $z$ units. |
-| `analyses/samples.py` | divergent | Draws the fifteen-row page through the task's page seams, plus a five-row compact page with a log-scale attention panel. Adds the class-balanced `by_class/` draw and one manifest row per file with a `variant` column. |
+| `analyses/samples.py` | divergent | Draws the seventeen-row page through the task's page seams, plus a ten-row compact page with a log-scale attention panel. Adds the class-balanced `by_class/` draw and one manifest row per file with a `variant` column. |
 | `analyses/second_stage.py` | equivalent | `test_eval_second_stage.py::test_the_analysis_writes_its_five_tables_and_both_figures`, `test_eval_sibling_agreement.py::test_the_second_stage_clock_reaches_the_same_verdicts`, `::test_the_two_second_stage_modules_are_one_file_with_two_import_lines` |
 | `analyses/sufficiency.py` | equivalent | `test_eval_sibling_agreement.py::test_the_sufficiency_scores_and_both_gaps_are_defined_identically_in_both_packages`, `::test_the_oracle_score_join_and_its_summary_rows_agree` |
 | `analyses/time_to_delivery.py` | equivalent | `test_eval_sibling_agreement.py::test_the_time_before_delivery_grid_and_its_readouts_are_the_same_in_both_packages`, `::test_the_three_layers_of_inference_reach_the_same_verdicts`, `::test_the_two_time_to_delivery_modules_are_one_file_with_two_import_lines` |

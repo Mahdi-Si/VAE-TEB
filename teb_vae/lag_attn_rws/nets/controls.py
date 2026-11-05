@@ -136,6 +136,10 @@ def _attend_and_pose(
     * Under ``source_quality_mask`` the matched forward's key mask ``source_key_mask`` replaces
       the lag mask, and an anchor with no valid key keeps its gate closed, as in the forward. An
       arm that moves the source between recordings passes the donor's mask as ``key_mask``.
+      Under ``source_mask_mode='soft'`` the same key mask is the model's validity input instead
+      (``attend_lagged_source``), so the source-null arm keeps the recording's own flags: it
+      removes the UA values and leaves the missingness pattern, and its KL is the part the
+      pattern alone buys.
 
     Args:
         model: The model whose modules are re-run.
@@ -159,15 +163,23 @@ def _attend_and_pose(
     )
     if key_mask is None:
         key_mask = forward_outputs.get("source_key_mask")
-    _, alpha, attended_heads = model.lag_attn(
-        model.query_proj(query),
-        h_u,
-        model.build_lag_mask(h_u.shape[1], h_u.device) if key_mask is None else key_mask,
-    )
-    gate = model.posterior_head.event_gate_values(attended_heads)
-    applied = gate
-    if key_mask is not None:
-        applied, gate = model._close_gate(gate, key_mask.any(dim=-1), attended_heads.dtype)
+    attend = getattr(model, "attend_lagged_source", None)
+    if attend is not None:
+        # The causal cells apply the UA mask in one method, hard or soft, and the forward calls
+        # the same one, so this arm cannot apply the mask differently from the matched forward.
+        attended = attend(model.query_proj(query), h_u, key_mask)
+        alpha, attended_heads = attended.alpha, attended.heads
+        applied, gate = attended.gate, attended.event_gate
+    else:
+        _, alpha, attended_heads = model.lag_attn(
+            model.query_proj(query),
+            h_u,
+            model.build_lag_mask(h_u.shape[1], h_u.device) if key_mask is None else key_mask,
+        )
+        gate = model.posterior_head.event_gate_values(attended_heads)
+        applied = gate
+        if key_mask is not None:
+            applied, gate = model._close_gate(gate, key_mask.any(dim=-1), attended_heads.dtype)
     mu_post, logvar_post = model.posterior_head(
         forward_outputs["target_state"],
         attended_heads,
@@ -312,7 +324,12 @@ def perm_forward_outputs(
     if key_mask is not None:
         # The arm attended under the donor's mask, so its readouts must count the donor's anchors.
         permuted["source_key_mask"] = key_mask[perm_index]
-        permuted["source_open"] = permuted["source_key_mask"].any(dim=-1)
+        # The soft mode closes no anchor, so it has no ``source_open`` to carry. Its flags are
+        # already inside the permuted ``source_state``; the donor's copy is carried for readers.
+        if getattr(model, "source_mask_mode", "hard") != "soft":
+            permuted["source_open"] = permuted["source_key_mask"].any(dim=-1)
+        elif forward_outputs.get("source_quality") is not None:
+            permuted["source_quality"] = forward_outputs["source_quality"][perm_index]
     return permuted
 
 
@@ -413,11 +430,18 @@ def source_null_posterior(
     """
     zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
     gated = zeros if model.source_gate is None else model.source_gate(zeros)
-    encoded = model.encode_source_kv(gated)  # (1, T, d_model)
-    # expand, not repeat: the attention's projections materialise their own tensors anyway, and
-    # what this arm saves is the encode -- the gate, the adapter and whichever key/value body the
-    # model built -- not the attention.
-    h_u_null = encoded.expand(u_stream.shape[0], -1, -1)
+    quality = forward_outputs.get("source_quality")
+    if quality is None:
+        encoded = model.encode_source_kv(gated)  # (1, T, d_model)
+        # expand, not repeat: the attention's projections materialise their own tensors anyway,
+        # and what this arm saves is the encode -- the gate, the adapter and whichever key/value
+        # body the model built -- not the attention.
+        h_u_null = encoded.expand(u_stream.shape[0], -1, -1)
+    else:
+        # The soft UA mask: the adapter reads each recording's own flags, so the encode is per
+        # sample. The values are zeroed and the flags are kept, so this arm's KL is what the
+        # missingness pattern alone buys.
+        h_u_null = model.encode_source_kv(gated.expand(u_stream.shape[0], -1, -1), quality)
 
     alpha_null, mu_post_null, logvar_post_null, gate_null = _attend_and_pose(
         model, forward_outputs, h_u_null
@@ -528,7 +552,14 @@ def occluded_forward_outputs(
         keep = (~occlusion.to(torch.bool)).to(source.dtype)
         occluded = source * (keep[:, :, None] if keep.dim() == 2 else keep[None, :, None])
 
-    h_u = model.encode_source_kv(occluded)
+    # Under the soft UA mask the re-encode carries the forward's per-channel flags (or a caller's
+    # substitute under the same key), so the band moves the values and not the flags.
+    quality = forward_outputs.get("source_quality")
+    h_u = (
+        model.encode_source_kv(occluded)
+        if quality is None
+        else model.encode_source_kv(occluded, quality)
+    )
     alpha, mu_post, logvar_post, gate = _attend_and_pose(model, forward_outputs, h_u)
 
     # Drawn rather than reused from the matched forward: the posterior moved, so its own

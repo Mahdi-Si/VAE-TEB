@@ -724,7 +724,7 @@ The `source_null` analysis (`analyses/source_null.py`) writes these figures into
 
 **Purpose.** Show at which lags the matched-source KL attribution exceeds or falls below the zero-source attribution.
 
-**What it shows.** Top ("Lag profile"): the matched attribution and the null arm, both in nats per anchor. `matched` is $\mathrm{KL}(q(z|Y,U)\,\|\,p(z|Y))$, and `source-null` is the same divergence with a zeroed source. Bottom: their signed difference with zero drawn, the four `occlusion_bands` shaded and labelled, and the delta mask where one is emitted. The bottom panel can carry two notes: `degenerate, no mask` (no mask emitted) and `edge-censored peak` (the peak is on the longest searched lag, so the true peak can lie beyond the window).
+**What it shows.** Top ("Lag profile"): the matched attribution and the null arm, both in nats per anchor. `matched` is $\mathrm{KL}(q(z|Y,U)\,\|\,p(z|Y))$, and `source-null` is the same divergence with a zeroed source. Bottom: their signed difference with zero drawn, and the delta mask where one is emitted. The four `occlusion_bands` are shaded on both panels and named under the top panel. The title of the bottom legend can carry two notes: `degenerate, no mask` (no mask emitted) and `edge-censored peak` (the peak is on the longest searched lag, so the true peak can lie beyond the window).
 
 **Axes.** Compensated lag in seconds (stored-coefficient time) across; nats per anchor up on both panels.
 

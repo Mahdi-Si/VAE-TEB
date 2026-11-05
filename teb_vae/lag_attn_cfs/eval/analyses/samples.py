@@ -6,16 +6,17 @@ individual segments, in full, so that a number nobody believes can be looked at.
 training callback draws through -- reached through **the task's own three seams**
 (``forecast_rows``, ``forecast_extra_rows``, ``input_stream_panels``) rather than through a second
 builder that could disagree with the one the fit was watched through. On this cell those seams
-produce a **fifteen-row** page: the raw-context row, the forecast lanes, the six causal extra rows
-(truth, both branch means, the signed skill difference, $\sigma^q$, and the per-window score), two
-gated-input rows, and the five latent and lag rows the layout owns.
+produce a **seventeen-row** page: the raw-context row, the forecast lanes, the six causal extra
+rows (truth, both branch means, the signed skill difference, $\sigma^q$, and the per-window score),
+the two monitor rows (the signal-quality masks and the posterior event gate), two gated-input rows,
+and the five latent and lag rows the layout owns.
 
 **Every selected segment is drawn twice**, from one forward pass -- see :data:`PAGE_VARIANTS`.
-The full page is the fifteen-row one above. The reduced page beside it, named with a ``_compact``
-tail, keeps :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`: the raw FHR and UP, the
-forecast lanes (truth against both branches, their bands, the scored-horizon mask), both input
-streams, the latent state and its shift, $K_t$, and both lag maps -- the whole segment at a
-glance, without the per-channel field rows.
+The full page is the seventeen-row one above. The reduced page beside it, named with a
+``_compact`` tail, keeps :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`: the raw FHR
+and UP, the forecast lanes (truth against both branches, their bands, the scored-horizon mask), the
+signal-quality masks and the event gate, both input streams, the latent state and its shift,
+$K_t$, and both lag maps -- the whole segment at a glance, without the per-channel field rows.
 
 **Colours are comparable across segments; y-axes are fitted to the segment.** The normalised
 coefficient maps sit on one fixed range set by the page builder, and the latent, KL, attention,
@@ -174,11 +175,12 @@ EXTREME_METRICS: Tuple[Tuple[str, str], ...] = (
 PAGE_SEAMS: Tuple[str, ...] = ("forecast_rows", "forecast_extra_rows", "input_stream_panels")
 
 #: How many rows the page has when every seam resolves: two the layout always reserves, the six
-#: :data:`~teb_vae.lag_attn_cfs.sample_page.CAUSAL_EXTRA_ROWS`, the two gated input streams, and
-#: the five latent and lag rows. Recorded in the analysis's ``plan`` rather than asserted here --
+#: :data:`~teb_vae.lag_attn_cfs.sample_page.CAUSAL_EXTRA_ROWS`, the two
+#: :data:`~teb_vae.lag_attn_cfs.sample_page.MONITOR_ROWS`, the two gated input streams, and the
+#: five latent and lag rows. Recorded in the analysis's ``plan`` rather than asserted here --
 #: this module owns none of those counts -- so a page that quietly lost its input rows is visible
 #: in ``summary.json`` instead of only in a PDF nobody opened.
-EXPECTED_PAGE_ROWS = 15
+EXPECTED_PAGE_ROWS = 17
 
 #: What a rendered page is called. The pattern is asserted by test, because these filenames are
 #: the only index a reader has: a GUID carrying a path separator, a space or a non-ASCII character

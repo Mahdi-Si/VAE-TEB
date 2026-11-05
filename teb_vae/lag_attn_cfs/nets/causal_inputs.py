@@ -72,10 +72,11 @@ each cell's constructor is a signature plus two calls and holds no validation of
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from teb_vae.lag_attn.nets.delays import ChannelGate
 from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter
@@ -109,12 +110,46 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "forecast_ar_max",
     "target_scored_start",
     "source_quality_mask",
+    "source_mask_mode",
 )
+
+#: The two ways ``source_quality_mask`` can apply the UA step mask. ``'hard'`` removes the keys of
+#: bad steps and shuts the posterior where none is left; ``'soft'`` keeps every key, tells the model
+#: which ones are bad and lets it learn how far to trust them. See
+#: :meth:`CausalWarmupInputs.attend_lagged_source`.
+SOURCE_MASK_MODES: Tuple[str, ...] = ("hard", "soft")
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
 #: base. ``__class__`` appears because a method referencing ``super()`` gets an implicit closure
 #: cell of that name in its locals.
 FORWARDED_EXCLUSIONS: Tuple[str, ...] = ("self", "__class__") + CAUSAL_ONLY_KEYWORDS
+
+
+class LaggedSourceAttention(NamedTuple):
+    r"""What :meth:`CausalWarmupInputs.attend_lagged_source` returns.
+
+    Attributes:
+        alpha: Attention weights ``(B, T, M, L)`` in lag order.
+        heads: Per-head attended summaries ``(B, T, M, d_head)``.
+        gate: The gate the posterior head applies ``(B, T, 1)``, or ``None`` when the model has
+            neither an event gate nor a hard mask.
+        event_gate: The gate returned and charged as ``event_gate``: the effective gate
+            $g_t\,o_t$ in the hard mode, the learned gate in the soft mode, ``None`` without a
+            gate.
+        event_gate_learned: The learned gate before the hard mask closes it. ``None`` in the soft
+            mode and without a hard mask, where it equals ``event_gate``.
+        source_open: $o_t = \exists \ell: K_{t\ell}$ ``(B, T)`` in the hard mode, else ``None``.
+        invalid_mass: The soft mode's attention mass on invalid keys per head ``(B, T, M)``, else
+            ``None``.
+    """
+
+    alpha: torch.Tensor
+    heads: torch.Tensor
+    gate: Optional[torch.Tensor]
+    event_gate: Optional[torch.Tensor]
+    event_gate_learned: Optional[torch.Tensor]
+    source_open: Optional[torch.Tensor]
+    invalid_mass: Optional[torch.Tensor]
 
 
 def _refuse_phase_outside(phase: torch.Tensor, stride: int) -> None:
@@ -186,6 +221,7 @@ class CausalWarmupInputs:
         lag_floor: int,
         target_forecast_shift: Optional[Sequence[int]] = None,
         source_quality_mask: bool = False,
+        source_mask_mode: str = "hard",
     ) -> None:
         r"""Validate this mixin's keywords and set them, **before** the base constructor runs.
 
@@ -217,11 +253,17 @@ class CausalWarmupInputs:
                 and an anchor with no valid key keeps its posterior on the prior. ``False``, the
                 default, refuses the mask and builds a model bitwise identical to one built before
                 the keyword existed. It adds no parameter and no buffer.
+            source_mask_mode: How the mask is applied, one of :data:`SOURCE_MASK_MODES`.
+                ``'hard'`` -- the default -- is the behaviour described above, bitwise.
+                ``'soft'`` keeps the keys of bad steps and gives the model the mask as an input
+                instead; it needs ``source_quality_mask`` and adds three zero-initialised
+                parameters, built by :meth:`_build_soft_source_mask`.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, if
-                a warm-up vector arrives without its keep-index, or if a forecast shift arrives
-                without its keep-index or mixes signs.
+                a warm-up vector arrives without its keep-index, if a forecast shift arrives
+                without its keep-index or mixes signs, or if ``source_mask_mode`` is unknown or
+                ``'soft'`` without ``source_quality_mask``.
         """
         if not 1 <= int(anchor_stride) <= int(horizon):
             raise ValueError(
@@ -233,6 +275,16 @@ class CausalWarmupInputs:
         if int(lag_floor) < 0:
             raise ValueError(f"lag_floor must be >= 0, got {lag_floor}")
         self.source_quality_mask = bool(source_quality_mask)
+        if source_mask_mode not in SOURCE_MASK_MODES:
+            raise ValueError(
+                f"source_mask_mode must be one of {SOURCE_MASK_MODES}, got {source_mask_mode!r}"
+            )
+        if source_mask_mode == "soft" and not self.source_quality_mask:
+            raise ValueError(
+                "source_mask_mode='soft' needs source_quality_mask=True: the soft mode gives the "
+                "model the UA step mask as an input, so every forward must carry source_valid."
+            )
+        self.source_mask_mode = str(source_mask_mode)
 
         # The two vectors are positional against their keep-indices, and the adapters are told
         # apart by which gate they were built for -- so a warm-up arriving without its keep-index
@@ -864,6 +916,16 @@ class CausalWarmupInputs:
               ``source_open`` -- $o_t = \exists \ell: K_{t\ell}$, $(B, T)$ -- **only** under
               ``source_quality_mask``. Returned so every control that re-attends this forward's
               source applies the same mask.
+            * ``event_gate_learned`` -- the learned gate $g_t$ $(B, T, 1)$ before the mask closes
+              it, **only** when ``posterior_event_gate`` and ``source_quality_mask`` are both on.
+              It is the one way to tell an anchor the model shut ($o_t = 1$, small $g_t$) from an
+              anchor the data shut ($o_t = 0$), because ``event_gate`` is $0$ in both.
+            * Under ``source_mask_mode='soft'`` the three mask keys above change: ``source_open``
+              and ``event_gate_learned`` are absent, because nothing is closed and ``event_gate``
+              is the learned gate itself; ``source_key_mask`` is still returned; and two keys
+              are added: ``source_invalid_mass``, the attention mass each head put on invalid
+              keys, $(B, T, M)$, and ``source_quality``, the adapter's per-channel flags,
+              $(B, T, C_u)$.
 
         Raises:
             ValueError: If ``source_valid`` is missing under ``source_quality_mask``, given without
@@ -905,7 +967,12 @@ class CausalWarmupInputs:
         # ``lag_kv_source`` selects. Localising the keys alone would leave the lag-0 value
         # informationally dominant and the degeneracy standing under a better-looking map, so the
         # one tensor serves both by construction rather than by convention.
-        h_u = self.encode_source_kv(source)
+        # Under the soft UA mask the adapter also reads each channel's validity; ``None`` -- every
+        # other configuration -- is the plain encode.
+        quality: Optional[torch.Tensor] = None
+        if source_valid is not None and getattr(self, "source_mask_mode", "hard") == "soft":
+            quality = self.source_quality_input(source_valid, source.dtype)
+        h_u = self.encode_source_kv(source, quality)
 
         # The prior is conditioned on the source pathway's response to a source that says nothing,
         # when the flag is on, and on nothing else new. That tensor is a deterministic function of
@@ -928,19 +995,18 @@ class CausalWarmupInputs:
             if self.query_uses_logvar
             else mu_prior
         )
-        key_mask = self.build_lag_mask(h_u.shape[1], h_u.device)
-        source_open: Optional[torch.Tensor] = None
+        # The UA quality key mask, under ``source_quality_mask`` only. The attention, the event
+        # gate and -- in the hard mode -- the gate closing all happen in one method, which the
+        # source controls call too, so a control cannot apply the mask differently from the forward.
+        key_mask: Optional[torch.Tensor] = None
         if source_valid is not None:
-            key_mask = self.source_key_mask(source_valid, key_mask, u_stream.dtype)
-            source_open = key_mask.any(dim=-1)
-        _, alpha, attended_heads = self.lag_attn(self.query_proj(query), h_u, key_mask)
-
-        # The event gate, when the model built one: computed from the attended summary and
-        # threaded into the head so it can be returned and charged. ``None`` otherwise.
-        event_gate = self.posterior_head.event_gate_values(attended_heads)
-        gate = event_gate
-        if source_open is not None:
-            gate, event_gate = self._close_gate(event_gate, source_open, attended_heads.dtype)
+            key_mask = self.source_key_mask(
+                source_valid, self.build_lag_mask(h_u.shape[1], h_u.device), u_stream.dtype
+            )
+        attended = self.attend_lagged_source(self.query_proj(query), h_u, key_mask)
+        alpha, attended_heads = attended.alpha, attended.heads
+        gate, event_gate = attended.gate, attended.event_gate
+        event_gate_learned, source_open = attended.event_gate_learned, attended.source_open
         mu_post, logvar_post = self.posterior_head(
             h_y, attended_heads, mu_prior, raw_logvar_prior, gate=gate
         )
@@ -1014,10 +1080,24 @@ class CausalWarmupInputs:
         if event_gate is not None:
             # Present only under ``posterior_event_gate``, for the reason ``persistence`` is.
             outputs["event_gate"] = event_gate
+        if attended.invalid_mass is not None:
+            # The soft mode closes nothing, so it returns no ``source_open``: the objective and
+            # the task then treat every anchor as open, which is the soft mode's meaning. The key
+            # mask is still returned, because every control must hand the attention the same
+            # validity input the forward used.
+            outputs["source_key_mask"] = key_mask
+            outputs["source_invalid_mass"] = attended.invalid_mass
+            # The adapter's per-channel flags, so the controls that re-encode a source (the null
+            # and the occlusion arms) encode it with this recording's flags.
+            outputs["source_quality"] = quality
         if source_open is not None:
             # Present only under ``source_quality_mask``, for the reason ``persistence`` is.
             outputs["source_key_mask"] = key_mask
             outputs["source_open"] = source_open
+            if event_gate_learned is not None:
+                # Only where the mask can make it differ from ``event_gate``: without the mask the
+                # two are one tensor, and a second key would carry a copy.
+                outputs["event_gate_learned"] = event_gate_learned
         return outputs
 
     # ------------------------------------------------------------------
@@ -1120,6 +1200,170 @@ class CausalWarmupInputs:
             return 1
         reach = getattr(body, "receptive_field", 1)
         return int(num_steps) if reach is None else max(1, min(int(reach), int(num_steps)))
+
+    def _build_soft_source_mask(self) -> None:
+        r"""Build the soft mask's three parameters, or set them to ``None`` in the hard mode.
+
+        Called by a composing constructor **after** the base constructor, because the parameters
+        need the module machinery, the model width, the head count and the posterior's event gate.
+        In the hard mode it registers nothing, so the state dict is the one a model built before
+        the keyword existed holds.
+
+        The three parameters, each zero-initialised so that at step $0$ the soft model treats an
+        invalid UA step exactly like a valid one -- the "mark all UA valid" model -- and moves
+        away from it only where the data pays for it:
+
+        * ``source_adapter.quality_proj`` $W_q \in \mathbb R^{d_{\mathrm{model}} \times C_u}$, the
+          UA adapter's per-channel quality input: $W_q (v_t - \mathbf 1)$ is added to the
+          adapter's first projection, before its normalisation and nonlinearity, so the encoder
+          can learn per channel what a bad value is worth. It is attached here rather than by the
+          adapter's constructor, because the base's generic initialisation would refill a
+          ``Linear`` built there.
+        * ``source_invalid_key_bias`` $b \in \mathbb R^{M}$, one score offset per head on every
+          invalid key. A negative $b_m$ is head $m$ learning to discount invalid UA.
+        * ``source_invalid_gate``, a bias-free linear map $\mathbb R^{M} \to \mathbb R$ from the
+          per-head attention mass on invalid keys to the event gate's logit, so the gate can
+          close where the posterior would rest on invalid UA.
+
+        Raises:
+            ValueError: In the soft mode, if the model was built without ``posterior_event_gate``:
+                the gate is the soft mode's only way to shut the posterior.
+        """
+        if getattr(self, "source_mask_mode", "hard") != "soft":
+            self.source_invalid_key_bias = None
+            self.source_invalid_gate = None
+            return
+        if getattr(self.posterior_head, "event_gate_head", None) is None:
+            raise ValueError(
+                "source_mask_mode='soft' needs posterior_event_gate=True: without the hard mask "
+                "the learned event gate is the only way the model can shut its posterior where "
+                "the UA is bad."
+            )
+        if not hasattr(self.source_adapter, "quality_proj"):
+            raise ValueError(
+                f"source_mask_mode='soft' needs an availability-aware UA adapter; this model's "
+                f"source_adapter is a {type(self.source_adapter).__name__}."
+            )
+        num_heads = int(self.lag_attn.num_heads)
+        adapter = self.source_adapter
+        adapter.quality_proj = nn.Linear(int(adapter.in_dim), int(self.d_model), bias=False)
+        nn.init.zeros_(adapter.quality_proj.weight)
+        self.source_invalid_key_bias = nn.Parameter(torch.zeros(num_heads))
+        self.source_invalid_gate = nn.Linear(num_heads, 1, bias=False)
+        nn.init.zeros_(self.source_invalid_gate.weight)
+
+    def source_quality_input(
+        self, source_valid: torch.Tensor, dtype: torch.dtype = torch.float32
+    ) -> torch.Tensor:
+        r"""The soft mode's per-channel UA validity at the adapter's width, $v \in \{0,1\}$.
+
+        A per-channel mask goes through the source gate, so it is gathered to the surviving
+        channels and delayed exactly as the values are; a per-step mask is broadcast to every
+        surviving channel.
+
+        Args:
+            source_valid: ``(B, T)`` or ``(B, T, c_u)`` boolean, ``True`` = usable.
+            dtype: The float dtype of the returned flags.
+
+        Returns:
+            ``(B, T, C_u)`` floats in $\{0, 1\}$, $C_u$ the surviving source width.
+        """
+        valid = source_valid.to(dtype)
+        if valid.dim() == 2:
+            return valid[..., None].expand(-1, -1, int(self.source_adapter.in_dim))
+        if self.source_gate is not None:
+            valid = (self.source_gate(valid) > 0.5).to(dtype)
+        return valid
+
+    def encode_source_kv(
+        self, source: torch.Tensor, quality: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        r"""The architecture's key/value encode, with the soft mode's per-channel flags.
+
+        Without ``quality`` this is the architecture's own method, unchanged. With it, the UA
+        adapter receives the flags beside the values (:class:`AvailabilityInputAdapter`), and the
+        key/value body, where the model has one, runs on the adapter's output as before.
+
+        Args:
+            source: The source stream after the channel gate, ``(B, T, C_u)``.
+            quality: The flags from :meth:`source_quality_input`, ``(B, T, C_u)``, or ``None``.
+                The prior clock passes ``None``: its stream carries no recording, so every value
+                counts as valid and the flag term is zero.
+
+        Returns:
+            The K/V representation, ``(B, T, d_model)``.
+        """
+        if quality is None:
+            return super().encode_source_kv(source)  # type: ignore[misc]
+        encoded = self.source_adapter(source, quality=quality)
+        body = self.source_kv_body()
+        return encoded if body is None else body(encoded)
+
+    def attend_lagged_source(
+        self,
+        query: torch.Tensor,
+        h_u: torch.Tensor,
+        key_mask: Optional[torch.Tensor] = None,
+    ) -> LaggedSourceAttention:
+        r"""Run the lag attention and the event gate under the configured UA mask mode.
+
+        The one place the mask mode is applied. The forward and every source control
+        (:func:`~teb_vae.lag_attn_rws.nets.controls._attend_and_pose`) call it, so the permuted,
+        the null and the occluded arms see the validity input exactly as the forward does.
+
+        **No quality mask** (``key_mask`` ``None``): the attention runs under the model's lag mask,
+        and the gate is the learned gate.
+
+        **Hard mode**: the keys of bad steps are removed, and the gate is closed where no key is
+        left, $g^{\mathrm{eff}}_t = g_t\,o_t$ (:meth:`_close_gate`).
+
+        **Soft mode**: every key the lag mask admits stays. The per-channel flags already entered
+        $h^u$ through the UA adapter (:meth:`encode_source_kv`). Here, with
+        $\bar v_{t\ell} = 1 - K_{t\ell}$ on the keys the lag mask admits,
+
+        $$\mathrm{score}_{t,m,\ell} \mathrel{+}= b_m\,\bar v_{t\ell}, \qquad
+          \rho_{t,m} = \sum_\ell \alpha_{t,m,\ell}\,\bar v_{t\ell}, \qquad
+          g_t = \sigma\!\left(w^\top \tilde a_t + c + w_\rho^\top \rho_t\right).$$
+
+        A key counts as invalid when any UA channel of its step is invalid, which is the hard
+        mode's rule; the adapter's input keeps the per-channel detail.
+
+        Args:
+            query: The projected query, ``query_proj`` of $\mu^p$ or of $[\mu^p \Vert \log\sigma^{2,p}]$.
+            h_u: The source state ``(B, T, d_model)``, as :meth:`encode_source_kv` built it --
+                with the soft mode's per-channel flags already in it.
+            key_mask: The quality key mask ``(B, T, L)`` from :meth:`source_key_mask`, or ``None``
+                for a model without ``source_quality_mask``.
+
+        Returns:
+            A :class:`LaggedSourceAttention`.
+        """
+        lag_mask = self.build_lag_mask(h_u.shape[1], h_u.device)
+        if key_mask is not None and getattr(self, "source_mask_mode", "hard") == "soft":
+            lag_mask = lag_mask.to(torch.bool)
+            key_mask = key_mask.to(torch.bool)
+            invalid = (lag_mask[None] & ~key_mask).to(h_u.dtype)  # (B, T, L)
+            bias = invalid[:, :, None, :] * self.source_invalid_key_bias[None, None, :, None]
+            _, alpha, heads = self.lag_attn(query, h_u, lag_mask, score_bias=bias)
+            invalid_mass = (alpha * invalid[:, :, None, :]).sum(dim=-1)  # (B, T, M)
+            logits = self.posterior_head.event_gate_logits(heads)
+            gate = torch.sigmoid(logits + self.source_invalid_gate(invalid_mass))
+            return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+
+        _, alpha, heads = self.lag_attn(
+            query, h_u, lag_mask if key_mask is None else key_mask
+        )
+        # The event gate, when the model built one: computed from the attended summary and
+        # threaded into the head so it can be returned and charged. ``None`` otherwise.
+        event_gate = self.posterior_head.event_gate_values(heads)
+        if key_mask is None:
+            return LaggedSourceAttention(alpha, heads, event_gate, event_gate, None, None, None)
+        # The learned gate before the mask closes it. Kept so a reader can tell an anchor the
+        # model shut ($o_t = 1$, $g_t$ small) from one the data shut ($o_t = 0$): the effective
+        # gate is zero in both cases.
+        source_open = key_mask.any(dim=-1)
+        gate, closed = self._close_gate(event_gate, source_open, heads.dtype)
+        return LaggedSourceAttention(alpha, heads, gate, closed, event_gate, source_open, None)
 
     @staticmethod
     def _close_gate(

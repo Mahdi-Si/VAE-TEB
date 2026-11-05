@@ -185,6 +185,7 @@ class LagCrossAttention(nn.Module):
         h_y: torch.Tensor,
         h_u: torch.Tensor,
         m_lag: torch.Tensor,
+        score_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the attention.
 
@@ -195,6 +196,8 @@ class LagCrossAttention(nn.Module):
             h_u: Source state ``(B, T, d_model)``.
             m_lag: Key-validity mask in lag order: ``(T, L)``, shared by the batch, or
                 ``(B, T, L)``, per sample.
+            score_bias: Optional additive score bias ``(B, T, num_heads, L)`` in lag order, applied
+                after the scale and before the mask. ``None`` adds nothing.
 
         Returns:
             The attended output, the attention weights in lag order, and the per-head summaries.
@@ -224,6 +227,11 @@ class LagCrossAttention(nn.Module):
         scores = scores * self.scale
         if self.lag_score_bias is not None:
             scores = scores + self.lag_score_bias.flip(-1)[None, None, :, :]
+        if score_bias is not None:
+            # A per-sample additive bias in lag order, e.g. the soft source-quality mask's learned
+            # penalty on keys read from a UA step marked invalid. Added before the mask, so a key
+            # the mask removes still gets exactly zero weight.
+            scores = scores + score_bias.flip(-1)
 
         # Key validity in window order: position j holds lag L-1-j. A (T, L) mask is shared by
         # the batch; a (B, T, L) one is per sample, e.g. the source-quality key mask.
@@ -261,6 +269,7 @@ class LagCrossAttention(nn.Module):
         h_y: torch.Tensor,
         h_u: torch.Tensor,
         m_lag: Optional[torch.Tensor] = None,
+        score_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Attend from ``h_y`` over lagged projections of ``h_u``.
 
@@ -270,6 +279,9 @@ class LagCrossAttention(nn.Module):
             m_lag: Optional key-validity mask in lag order. ``(T, L)`` is shared by the batch;
                 ``(B, T, L)`` is applied per sample, which is how a source-quality mask removes
                 the keys of bad source steps. Built on the fly when ``None``.
+            score_bias: Optional additive score bias ``(B, T, num_heads, L)`` in lag order. The
+                soft source-quality mask uses it to down-weight, rather than remove, the keys of
+                bad source steps. ``None`` leaves the scores bitwise unchanged.
 
         Returns:
             ``(A, alpha, a_heads)``: the attended output ``(B, T, d_model)``; the attention
@@ -281,6 +293,6 @@ class LagCrossAttention(nn.Module):
         if self.grad_checkpoint and self.training:
             return cast(
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                checkpoint(self._attend, h_y, h_u, m_lag, use_reentrant=False),
+                checkpoint(self._attend, h_y, h_u, m_lag, score_bias, use_reentrant=False),
             )
-        return self._attend(h_y, h_u, m_lag)
+        return self._attend(h_y, h_u, m_lag, score_bias)

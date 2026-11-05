@@ -775,7 +775,13 @@ def build_band_figure(
         if len(trajectory)
         else trajectory
     )
-    groups = sorted({str(value) for value in subset["group"]}) if len(subset) else []
+    # The clinical order (hie, acidosis, healthy), so the legend reads as on every other page.
+    groups = (
+        cohort.ordered_groups(
+            sorted({str(value) for value in subset["group"]}), labels.CLASS_COLUMN
+        )
+        if len(subset) else []
+    )
     colors = figures.group_colors(groups) if groups else {}
     for index, name in enumerate(names):
         panel = axes[index][0]

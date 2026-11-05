@@ -21,6 +21,8 @@ RUN_ARGS = {
         "orig": common.RESULTS / "official_eval" / "orig",
         "v3": common.RESULTS / "official_eval" / "v3",
         "v4": common.RESULTS / "official_eval" / "v4",
+        "v5": common.RESULTS / "official_eval" / "v5",
+        "v6": common.RESULTS / "official_eval" / "v6",
     },
     "out": common.RESULTS / "official_eval" / "comparison.md",
 }

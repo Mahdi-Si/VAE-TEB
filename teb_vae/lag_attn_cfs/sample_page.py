@@ -40,6 +40,19 @@ reduces, so a window's height on the row is in the same nats as the ``nll_base_b
 rather than lays out, and it is deliberate: an error curve drawn from a re-derived formula is the
 one diagnostic that can disagree with the run it is diagnosing.
 
+**Two monitor rows follow the six**, reserved through :data:`MONITOR_ROWS`, and they show what the
+model was allowed to read and whether it read it:
+
+* ``quality_mask`` -- one lane per signal-quality mask: the raw FHR and UP validity, the four
+  coefficient step masks shaded by the share of kept channels flagged, the target steps the
+  objective removes under ``target_quality_mask``, and the anchors with no valid UA key under
+  ``source_quality_mask``;
+* ``event_gate`` -- the learned gate $g_t$ and the applied gate $g_t\,o_t$, with the anchors the
+  data shut ($o_t = 0$) told apart from the anchors the model shut ($g_t$ small while the UA is
+  there), against the raw UP trace.
+
+Both read the batch and the forward dict only, and neither scores anything.
+
 **Every channel axis reads top-down**, through
 :func:`~teb_vae.lag_attn_rws.sample_page.top_down_extent`: coefficient $0$ at the top, the
 scattering block above the phase block, on the input rows, the error map and all five field rows
@@ -107,6 +120,8 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib.ticker import MaxNLocator  # noqa: E402
 
+from matplotlib.colors import to_rgb  # noqa: E402
+
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
     COLOR_BLUE,
@@ -114,6 +129,7 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_GREEN,
     COLOR_LIGHT_GRAY,
     COLOR_ORANGE,
+    COLOR_PURPLE,
     COLOR_VERMILLION,
     select_forecast_channels,
     sample_cell_edges,
@@ -124,6 +140,14 @@ from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
     ALIGNMENT_DELAY_FACTOR,
     SOURCE_BLOCKS,
     TARGET_BLOCKS,
+)
+from teb_vae.lag_attn_cfs.gate_states import (  # noqa: E402
+    FORCED_SHUT,
+    GATE_OPEN_FROM,
+    GATE_SHUT_BELOW,
+    MODEL_SHUT,
+    OPEN,
+    gate_states,
 )
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import (  # noqa: E402
     pooled_scored_weight,
@@ -151,7 +175,10 @@ from utils.style import style_axes  # noqa: E402
 __all__ = [
     "CAUSAL_EXTRA_ROWS",
     "COMPACT_PAGE_ROWS",
+    "EVENT_GATE_ROW",
     "LAG_TIME_CAVEAT",
+    "MONITOR_ROWS",
+    "QUALITY_MASK_ROW",
     "WARMUP_STAIRCASE_LABEL",
     "causal_forecast_rows",
     "causal_stream_panels",
@@ -206,13 +233,30 @@ CAUSAL_EXTRA_ROWS: Tuple[Tuple[str, float], ...] = (
     ("pred_gap", 1.5),
 )
 
+#: The row that shows which samples and steps the signal-quality masks flag.
+QUALITY_MASK_ROW = "quality_mask"
+
+#: The row that shows the posterior event gate, and why it is shut where it is shut.
+EVENT_GATE_ROW = "event_gate"
+
+#: Two rows that monitor **what the model was allowed to read and whether it read it**, as
+#: ``(name, height_ratio)``. Separate from :data:`CAUSAL_EXTRA_ROWS` because a sibling task that
+#: replaces ``forecast_rows`` but inherits ``forecast_extra_rows`` would otherwise reserve two rows
+#: its own seam never draws. The task appends them to :data:`CAUSAL_EXTRA_ROWS`, so they sit
+#: directly above the two input rows whose masks they show.
+MONITOR_ROWS: Tuple[Tuple[str, float], ...] = (
+    (QUALITY_MASK_ROW, 1.0),
+    (EVENT_GATE_ROW, 1.0),
+)
+
 #: The rows the **reduced** page keeps, in the full page's own order, handed to
 #: :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` through its ``rows``
 #: argument. A complete summary of one segment on half the page: the raw FHR and UP, the forecast
 #: -- truth against the base and full means with their $\pm 2\sigma$ bands and the per-channel
-#: scored-horizon mask marked on each lane -- both input streams as the encoders receive them,
-#: the latent state and its source-derived shift, $K_t$, and both lag maps. What it drops is the
-#: per-channel detail: the five field rows, the per-window score and the per-dimension KL.
+#: scored-horizon mask marked on each lane -- the signal-quality masks and the event gate, both
+#: input streams as the encoders receive them, the latent state and its source-derived shift,
+#: $K_t$, and both lag maps. What it drops is the per-channel detail: the five field rows, the
+#: per-window score and the per-dimension KL.
 #:
 #: ``input_target`` and ``input_source`` are the names the layout derives from
 #: :func:`causal_stream_panels`'s panels, which is why this constant lives here rather than beside
@@ -220,6 +264,8 @@ CAUSAL_EXTRA_ROWS: Tuple[Tuple[str, float], ...] = (
 COMPACT_PAGE_ROWS: Tuple[str, ...] = (
     "raw",
     FORECAST_ROW,
+    QUALITY_MASK_ROW,
+    EVENT_GATE_ROW,
     "input_target",
     "input_source",
     "latent",
@@ -1468,6 +1514,338 @@ def _draw_lane_row(
 
 
 
+# =================================================================================================
+# The two monitor rows: the signal-quality masks and the posterior event gate
+# =================================================================================================
+#: A sixth lane colour beside the five the palette defines, for the UA phase-harmonic mask. It is
+#: the evaluation figures' magenta, restated because this module may not import that package.
+_COLOR_MAGENTA = "#E87BA4"
+
+#: The raw-grid lanes of the mask row, as ``(label, batch field, colour)``. The dataset writes
+#: these under ``emit_quality_mask``: $(B, L)$ booleans on the trimmed raw grid, ``True`` = valid.
+_RAW_MASK_LANES: Tuple[Tuple[str, str, str], ...] = (
+    ("FHR raw", "fhr_valid", COLOR_VERMILLION),
+    ("UP raw", "up_valid", COLOR_ORANGE),
+)
+
+#: The coefficient-grid lanes, as ``(label, block, colour)``. The dataset writes
+#: ``<block>_step_valid`` under ``fhr_step_mask`` and ``ua_step_mask``: $(B, T, C)$ booleans on
+#: the block's own step grid, ``True`` = the coefficient may be used.
+_STEP_MASK_LANES: Tuple[Tuple[str, str, str], ...] = (
+    ("FHR ST", "fhr_st", COLOR_BLUE),
+    ("FHR PH", "fhr_ph", COLOR_PURPLE),
+    ("UP ST", "up_st", COLOR_GREEN),
+    ("UP PH", "up_ph", _COLOR_MAGENTA),
+)
+
+#: Half the height of one lane, in lane units, so a thin gap separates two lanes.
+_LANE_HALF_HEIGHT = 0.42
+
+
+def _kept_block_shares(
+    batch: Any,
+    sample_index: int,
+    blocks: Sequence[str],
+    keep_index: Optional[Sequence[int]],
+) -> Tuple[Dict[str, Tuple[np.ndarray, int]], Optional[np.ndarray]]:
+    r"""Return, per block, the share of its kept channels the step mask flags at each step.
+
+    A model reads only the channels its gate keeps, so a flag on a dropped channel changes
+    nothing it sees. The share is therefore taken over the kept channels of each block: the
+    keep-index is positional into the stream, which concatenates ``blocks`` in order, so the
+    block of a kept channel follows from the blocks' widths.
+
+    Args:
+        batch: The loader batch.
+        sample_index: Which sample of the batch to read.
+        blocks: The stream's blocks, in concatenation order.
+        keep_index: The stream gate's kept channels, positional into the stream, or ``None`` for
+            an ungated stream.
+
+    Returns:
+        ``(shares, step_valid)``. ``shares`` maps a block to ``(share (T,), kept count)``, for
+        every block the batch carries a mask for. ``step_valid`` is $(T,)$ ``True`` where every
+        kept channel of the stream is valid, which is the step rule ``target_quality_mask``
+        applies; ``None`` unless every block's mask is present.
+    """
+    masks: Dict[str, np.ndarray] = {}
+    for name in blocks:
+        field = _batch_field(batch, f"{name}_step_valid")
+        if field is not None:
+            masks[name] = np.asarray(to_numpy(field[sample_index])).astype(bool)
+    complete = len(masks) == len(blocks)
+    # A keep-index can be split by block only when every block's width is known.
+    keep = (
+        np.asarray(to_numpy(keep_index), dtype=int).ravel()
+        if complete and keep_index is not None else None
+    )
+    shares: Dict[str, Tuple[np.ndarray, int]] = {}
+    kept_masks: List[np.ndarray] = []
+    offset = 0
+    for name in blocks:
+        valid = masks.get(name)
+        if valid is None:
+            continue
+        width = int(valid.shape[-1])
+        columns = (
+            np.arange(width) if keep is None
+            else keep[(keep >= offset) & (keep < offset + width)] - offset
+        )
+        offset += width
+        if columns.size == 0:
+            continue
+        kept = valid[:, columns]
+        kept_masks.append(kept)
+        shares[name] = (1.0 - kept.mean(axis=-1), int(columns.size))
+    step_valid = (
+        np.concatenate(kept_masks, axis=-1).all(axis=-1) if complete and kept_masks else None
+    )
+    return shares, step_valid
+
+
+def _shade_lane(
+    ax: Any, lane: int, flagged: np.ndarray, *, left: float, spacing: float, colour: str
+) -> None:
+    """Paint one lane of the mask row: the lane colour at an opacity equal to the flagged share.
+
+    Args:
+        ax: The mask row's axes.
+        lane: The lane's position, from $0$ at the top.
+        flagged: Per-cell flagged share in $[0, 1]$, in time order.
+        left: The centre of the first cell, in seconds.
+        spacing: The cell width in seconds.
+        colour: The lane colour.
+    """
+    values = np.clip(np.nan_to_num(np.asarray(flagged, dtype=float)), 0.0, 1.0)
+    rgba = np.zeros((1, values.size, 4), dtype=float)
+    rgba[..., :3] = to_rgb(colour)
+    rgba[..., 3] = values
+    ax.imshow(
+        rgba, aspect="auto", interpolation=_IMSHOW_INTERPOLATION,
+        extent=[
+            left - 0.5 * spacing, left + (values.size - 0.5) * spacing,
+            lane + _LANE_HALF_HEIGHT, lane - _LANE_HALF_HEIGHT,
+        ],
+    )
+
+
+def _draw_quality_mask_row(
+    rows: ForecastRowInputs,
+    *,
+    keep_index: Optional[Sequence[int]],
+    source_keep_index: Optional[Sequence[int]],
+    source_blocks: Sequence[str],
+    target_quality_mask: bool,
+) -> None:
+    r"""Draw :data:`QUALITY_MASK_ROW`: one lane per mask, shaded where the mask flags the signal.
+
+    The lanes, from the top:
+
+    * **FHR raw** and **UP raw** -- the raw-grid validity, $1$ sample $= 0.25$ s, shaded where a
+      sample is invalid (bridged or missing).
+    * **FHR ST**, **FHR PH**, **UP ST**, **UP PH** -- the coefficient step masks, one per stored
+      block, shaded at an opacity equal to the share of the block's **kept** channels the mask
+      flags at that step. A full-colour step has every kept channel flagged.
+    * **target loss** -- only under ``target_quality_mask``: the steps the objective removes,
+      where at least one kept target channel is flagged.
+    * **UA keys closed** -- only under ``source_quality_mask``: the anchors with no valid lag key,
+      $o_t = 0$, where the posterior is forced back to the prior.
+
+    The step lanes are on the stored step grid. The last lane is on the anchor grid and already
+    includes each source channel's alignment shift and the key body's reach.
+
+    Args:
+        rows: The row inputs and the layout hooks.
+        keep_index: The target gate's kept channels, positional into the declared target stream.
+        source_keep_index: The source gate's kept channels, positional into the source stream.
+        source_blocks: The source stream's blocks, in concatenation order.
+        target_quality_mask: Whether the objective removes flagged target steps.
+    """
+    ax, cax = rows.row_axes(QUALITY_MASK_ROW)
+    cax.set_visible(False)
+    index, geometry = rows.sample_index, rows.geometry
+    seconds_per_step = rows.t_max / float(geometry.t)
+    raw_spacing = float(rows.time_raw[1] - rows.time_raw[0]) if len(rows.time_raw) > 1 else 1.0
+
+    target_shares, target_valid = _kept_block_shares(
+        rows.batch, index, TARGET_BLOCKS, keep_index
+    )
+    source_shares, _ = _kept_block_shares(rows.batch, index, source_blocks, source_keep_index)
+    shares = {**target_shares, **source_shares}
+
+    # (label, note, flagged share per cell, first cell centre, cell width, colour). The label is
+    # short so it fits the page's left margin; the note goes in the right gutter.
+    lanes: List[Tuple[str, str, np.ndarray, float, float, str]] = []
+    for label, field_name, colour in _RAW_MASK_LANES:
+        field = _batch_field(rows.batch, field_name)
+        if field is None:
+            continue
+        valid = np.asarray(to_numpy(field[index])).astype(bool).ravel()
+        if valid.size != len(rows.time_raw):
+            continue
+        lanes.append(
+            (label, "samples", (~valid).astype(float), float(rows.time_raw[0]), raw_spacing, colour)
+        )
+    for label, block, colour in _STEP_MASK_LANES:
+        if block in shares:
+            share, kept = shares[block]
+            lanes.append((label, f"of {kept} ch", share, 0.0, seconds_per_step, colour))
+    if target_quality_mask and target_valid is not None:
+        lanes.append(
+            ("FHR loss", "steps", (~target_valid).astype(float), 0.0, seconds_per_step,
+             COLOR_BLACK)
+        )
+    source_open = rows.outs.get("source_open")
+    if source_open is not None:
+        closed = ~np.asarray(to_numpy(source_open[index])).astype(bool).ravel()
+        lanes.append(
+            ("UA keys", "anchors", closed.astype(float), 0.0, seconds_per_step, COLOR_GRAY)
+        )
+
+    ax.set_title(
+        "Signal-quality masks: shaded = flagged; step lanes shade by the share of kept channels "
+        "flagged",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
+    if not lanes:
+        # The row keeps its title, its axis and its place, so the rows below stay column-aligned
+        # and the absence is visible.
+        ax.text(
+            0.5, 0.5,
+            "the batch carries no quality mask (set dataset_kwargs.emit_quality_mask, "
+            "ua_step_mask or fhr_step_mask)",
+            transform=ax.transAxes, ha="center", va="center", fontsize=8, color=COLOR_GRAY,
+        )
+        ax.set_yticks([])
+        rows.finalise_time_axis(ax)
+        return
+
+    for lane, (_, note, flagged, left, spacing, colour) in enumerate(lanes):
+        _shade_lane(ax, lane, flagged, left=left, spacing=spacing, colour=colour)
+        if lane:
+            ax.axhline(lane - 0.5, color=COLOR_LIGHT_GRAY, linewidth=0.6)
+        # The flagged share of the whole segment, in the right gutter, so a lane that is almost
+        # clean still says how much it removed.
+        ax.text(
+            1.004, lane, f"{100.0 * float(np.nanmean(flagged)):.1f}% {note}",
+            transform=ax.get_yaxis_transform(), ha="left", va="center", fontsize=6,
+            color=COLOR_GRAY, clip_on=False,
+        )
+    ax.set_ylim(len(lanes) - 0.5, -0.5)
+    ax.set_yticks(range(len(lanes)))
+    ax.set_yticklabels([label for label, *_ in lanes], fontsize=6.5)
+    ax.tick_params(axis="y", length=0)
+    rows.heatmap_spines(ax)
+    rows.finalise_time_axis(ax)
+
+
+def _draw_event_gate_row(rows: ForecastRowInputs) -> None:
+    r"""Draw :data:`EVENT_GATE_ROW`: the learned gate, the effective gate, and why it is shut.
+
+    Over the trained anchors, the row draws the learned gate $g_t$ as a line and the effective
+    gate $g_t\,o_t$ as a filled area. Two kinds of shut anchor are shaded behind them, because the
+    effective gate is $0$ for both and they mean different things: **forced shut** (hatched grey,
+    $o_t = 0$), where the UA mask removed every key, and **model shut** (red, $o_t = 1$ and
+    $g_t < g_{\mathrm{shut}}$), where the UA was there and the model chose not to read it. The two
+    dotted lines are $g_{\mathrm{shut}}$ and $g_{\mathrm{open}}$, and the raw UP trace, scaled to
+    $[0, 1]$, is drawn faintly behind everything so a gate change can be read against a
+    contraction.
+
+    A model with a UA mask and no learned gate applies $o_t$ itself as the gate, and the row draws
+    that. A model with neither keeps the row and says so.
+
+    Args:
+        rows: The row inputs and the layout hooks.
+    """
+    ax, cax = rows.row_axes(EVENT_GATE_ROW)
+    cax.set_visible(False)
+    ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
+    ax.set_ylabel("gate", fontsize=8)
+    style_axes(ax, grid="both")
+    outs, index, geometry = rows.outs, rows.sample_index, rows.geometry
+
+    effective = outs.get("event_gate")
+    opened = outs.get("source_open")
+    if effective is None and opened is None:
+        ax.set_title("Posterior event gate", fontsize=9, pad=6)
+        ax.text(
+            0.5, 0.5, "this model builds no posterior event gate and applies no UA mask",
+            transform=ax.transAxes, ha="center", va="center", fontsize=8, color=COLOR_GRAY,
+        )
+        rows.finalise_time_axis(ax, tail=True)
+        return
+
+    def per_step(tensor: Any) -> np.ndarray:
+        """One sample's $(T,)$ trace of a $(B, T)$ or $(B, T, 1)$ tensor."""
+        return np.asarray(to_numpy(tensor[index]), dtype=float).reshape(-1)
+
+    open_steps = None if opened is None else per_step(opened) >= 0.5
+    learned_tensor = outs.get("event_gate_learned", effective)
+    learned = (
+        np.ones(int(geometry.t)) if learned_tensor is None else per_step(learned_tensor)
+    )
+    applied = (
+        per_step(effective) if effective is not None
+        else open_steps.astype(float)  # type: ignore[union-attr]
+    )
+
+    # The trained anchors only, as on the KL rows below: nothing outside them is decoded.
+    seconds_per_step = rows.t_max / float(geometry.t)
+    start, stop = int(geometry.warmup), int(geometry.t_valid)
+    time = np.arange(int(geometry.t), dtype=float)[start:stop] * seconds_per_step
+    learned, applied = learned[start:stop], applied[start:stop]
+    open_cut = None if open_steps is None else open_steps[start:stop]
+    states = gate_states(learned, open_cut)
+
+    up = rows.up_raw
+    if up is not None:
+        trace = np.asarray(to_numpy(up[index]), dtype=float).ravel()
+        if trace.size == len(rows.time_raw) and np.isfinite(trace).any():
+            low, high = np.nanmin(trace), np.nanmax(trace)
+            scaled = (trace - low) / (high - low) if high > low else np.zeros_like(trace)
+            ax.plot(
+                rows.time_raw, scaled, color=COLOR_ORANGE, linewidth=0.6, alpha=0.55,
+                label="UP (scaled)", zorder=1,
+            )
+    for state, colour, alpha, hatch, label in (
+        (FORCED_SHUT, COLOR_GRAY, 0.22, "///", "forced shut ($o_t = 0$)"),
+        (MODEL_SHUT, COLOR_VERMILLION, 0.25, None, "model shut"),
+    ):
+        where = states == state
+        if where.any():
+            ax.fill_between(
+                time, 0.0, 1.05, where=where, step="mid", color=colour, alpha=alpha,
+                hatch=hatch, linewidth=0, label=label, zorder=0,
+            )
+    ax.fill_between(
+        time, 0.0, applied, step="mid", color=COLOR_BLUE, alpha=0.28, linewidth=0,
+        label="$g_t o_t$ applied", zorder=2,
+    )
+    if learned_tensor is not None:
+        ax.step(
+            time, learned, where="mid", color=COLOR_BLUE, linewidth=1.0, label="$g_t$ learned",
+            zorder=3,
+        )
+    for level in (GATE_SHUT_BELOW, GATE_OPEN_FROM):
+        ax.axhline(level, color=COLOR_GRAY, linewidth=0.6, linestyle=":", zorder=1)
+    ax.set_ylim(-0.03, 1.08)
+
+    counted = states >= 0
+    total = max(int(counted.sum()), 1)
+    available = counted & (states != FORCED_SHUT)
+    mean_open = f"{float(np.mean(learned[available])):.2f}" if available.any() else "n/a"
+    ax.set_title(
+        f"Posterior event gate: mean $g_t$ {mean_open} where UA keys are open; "
+        f"forced shut {100.0 * np.sum(states == FORCED_SHUT) / total:.1f}%, "
+        f"model shut {100.0 * np.sum(states == MODEL_SHUT) / total:.1f}%, "
+        f"open {100.0 * np.sum(states == OPEN) / total:.1f}%",
+        fontsize=9, pad=6,
+    )
+    ax.legend(loc="upper right", fontsize=6, framealpha=0.95, ncol=5)
+    rows.finalise_time_axis(ax, tail=True)
+
+
 def causal_forecast_rows(
     rows: ForecastRowInputs,
     *,
@@ -1480,6 +1858,9 @@ def causal_forecast_rows(
     forecast_clock_delay_s: Optional[float] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    source_keep_index: Optional[Sequence[int]] = None,
+    source_blocks: Sequence[str] = SOURCE_BLOCKS,
+    target_quality_mask: bool = False,
 ) -> None:
     r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
 
@@ -1526,6 +1907,13 @@ def causal_forecast_rows(
             block scores. ``None`` scores every cell.
         ar_coef: The model's AR(1) residual coefficient $\phi_c$, or ``None`` for the factorised
             score.
+        source_keep_index: The source gate's kept channels, positional into the source stream,
+            so the mask row shades a UA block by the share of the channels the model reads.
+            ``None`` takes every channel.
+        source_blocks: The source stream's blocks in concatenation order -- both UA blocks, or
+            ``up_ph`` alone when the model does not read ``up_st``.
+        target_quality_mask: Whether the objective removes flagged target steps, so the mask row
+            draws the steps it removed.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -1543,6 +1931,19 @@ def causal_forecast_rows(
         0.5, 0.004, LAG_TIME_CAVEAT,
         ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
     )
+
+    # The two monitor rows read the batch and the forward dict only, so they are drawn before the
+    # forecast is stitched and on any page that reserved them.
+    if rows.wants(QUALITY_MASK_ROW):
+        _draw_quality_mask_row(
+            rows,
+            keep_index=keep_index,
+            source_keep_index=source_keep_index,
+            source_blocks=tuple(source_blocks),
+            target_quality_mask=bool(target_quality_mask),
+        )
+    if rows.wants(EVENT_GATE_ROW):
+        _draw_event_gate_row(rows)
 
     # Everything below belongs to the forecast row and the six rows reserved under it. A page
     # built without any of them has no axes for it, and ``row_axes`` raises rather than inventing

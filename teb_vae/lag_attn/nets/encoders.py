@@ -226,6 +226,10 @@ class AvailabilityInputAdapter(nn.Module):
 
         self.mask_proj: Optional[nn.Linear] = None
         self.start_embed: Optional[nn.Parameter] = None
+        # The per-sample quality announcement, $W_q (v_t - 1)$. Not built here: a model that wants
+        # it (the soft source-quality mask) attaches a bias-free Linear after its generic
+        # initialisation, so it can be zero at step 0. ``None`` keeps the adapter as it was.
+        self.quality_proj: Optional[nn.Linear] = None
         if self.max_delay > 0:
             pattern = self._availability_pattern(delay_values, self.sequence_length)
             # Non-persistent, like every geometry- and budget-shaped tensor in these models: its
@@ -284,20 +288,27 @@ class AvailabilityInputAdapter(nn.Module):
         steps = torch.arange(sequence_length).unsqueeze(-1)
         return (steps >= torch.tensor(list(delays), dtype=torch.long)).to(torch.float32)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project the stream and add whichever availability terms were built.
+    def forward(self, x: torch.Tensor, quality: Optional[torch.Tensor] = None) -> torch.Tensor:
+        r"""Project the stream and add whichever availability terms were built.
 
         Args:
             x: Feature stream ``(B, T, in_dim)`` at the surviving width. Whatever it holds inside
                 each channel's unavailable prefix is masked away here, so a caller need not have
                 zeroed it.
+            quality: Optional per-sample channel validity $v_{t,c} \in \{0, 1\}$,
+                ``(B, T, in_dim)``. When given, $W_q (v_t - \mathbf 1)$ is added beside the
+                availability term, so the stack is told which values are bad **without** those
+                values being zeroed. It is exactly zero where every channel is valid, and it is
+                held at zero inside a channel's warm-up prefix, which the availability term
+                already announces. Needs ``quality_proj``; ``None`` adds nothing.
 
         Returns:
             The projected stream ``(B, T, d_model)``.
 
         Raises:
-            ValueError: If the channel count is not ``in_dim``, or if the sequence is longer than
-                the availability pattern was built for.
+            ValueError: If the channel count is not ``in_dim``, if the sequence is longer than
+                the availability pattern was built for, or if ``quality`` is given to an adapter
+                without ``quality_proj``.
         """
         seq_len = int(x.shape[1])
         self._validate_stream(x)
@@ -313,6 +324,16 @@ class AvailabilityInputAdapter(nn.Module):
             embedded = self.linear(x)
         if self.start_embed is not None:
             embedded = embedded + self._slice(self.start_indicator, seq_len) * self.start_embed
+        if quality is not None:
+            if self.quality_proj is None:
+                raise ValueError(
+                    "a quality mask was given to an adapter built without quality_proj; the soft "
+                    "source-quality mask attaches it"
+                )
+            flag = quality.to(embedded.dtype) - 1.0
+            if self.mask_proj is not None:
+                flag = flag * self._slice(self.availability, seq_len)
+            embedded = embedded + self.quality_proj(flag)
 
         return self.res_mlp(self.drop(self.act(self.norm(embedded))))
 
