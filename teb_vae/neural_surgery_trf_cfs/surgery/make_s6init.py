@@ -49,8 +49,9 @@ from train.graph_models_utils import check_model_class, load_checkpoint_strict  
 
 #: The committed fit: the six non-epoch-524 tensors, the two digests and the fit's report.
 ASSET = _REPO / "teb_vae" / "neural_surgery_trf_cfs" / "assets" / "s6init_fitted.npz"
-#: The run directory both checkpoints live in, relative to the repository root.
-RUN_DIR = _REPO / "tmp" / "latest-results-2026-11-04"
+#: The value every path in :data:`RUN_ARGS` starts at. A path that still holds it is refused by
+#: :func:`main` with a message, so a forgotten path cannot reach ``torch.load``.
+PLACEHOLDER = "SET_ME"
 #: The state-dict prefix the epoch-524 file and the warm start both use.
 PREFIX = "model."
 #: The tensors the warm start does not take from epoch 524.
@@ -63,12 +64,14 @@ FITTED_KEYS = (
     "source_invalid_gate.weight",
 )
 
-#: The IDE entry: edit these and press Run. ``export`` is ``False`` on the training machine.
+#: The IDE entry: set the paths and press Run. ``source`` is the epoch-524 checkpoint and
+#: ``output`` the warm start to write; the s6 config's ``core_model_checkpoint`` must name the same
+#: file. ``export`` is ``False`` on the training machine, and ``fitted`` is read only by an export.
 RUN_ARGS: Dict[str, Any] = dict(
-    source=str(RUN_DIR / "lag-attn-trf-cfs-epoch=524.ckpt"),
-    output=str(RUN_DIR / "lag-attn-trf-cfs-epoch=524-s6init.ckpt"),
+    source=f"{PLACEHOLDER}/lag-attn-trf-cfs-epoch=524.ckpt",
+    output=f"{PLACEHOLDER}/lag-attn-trf-cfs-epoch=524-s6init.ckpt",
     export=False,
-    fitted=str(RUN_DIR / "lag-attn-trf-cfs-epoch=524-s6init.ckpt"),
+    fitted=f"{PLACEHOLDER}/lag-attn-trf-cfs-epoch=524-s6init.ckpt",
 )
 
 
@@ -213,7 +216,18 @@ def main(args: Dict[str, Any]) -> Path:
 
     Returns:
         The written path.
+
+    Raises:
+        ValueError: If a path the chosen mode reads or writes still starts at
+            :data:`PLACEHOLDER`.
     """
+    needed = ("source", "fitted") if args["export"] else ("source", "output")
+    unset = [name for name in needed if str(args[name]).startswith(PLACEHOLDER)]
+    if unset:
+        raise ValueError(
+            f"set {', '.join(unset)} in RUN_ARGS (or pass --{' --'.join(unset)}); the defaults "
+            f"are placeholders"
+        )
     if args["export"]:
         path = export(Path(args["source"]), Path(args["fitted"]))
         print(f"wrote {path}")
