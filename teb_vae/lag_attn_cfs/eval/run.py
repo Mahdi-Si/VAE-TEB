@@ -102,6 +102,7 @@ from teb_vae.lag_attn_cfs.eval import (  # noqa: E402
     metrics,
     preflight,
     probe as probe_module,
+    run_dashboard,
 )
 from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
     REPRESENTATION_KEY,
@@ -1623,6 +1624,14 @@ def main(
             # producing a file only Python can read back.
             json.dump(json_safe(summary), handle, indent=2, allow_nan=False)
         logger.info(f"wrote {summary_path}")
+
+        # The interactive page, after the summary it reads. It is built from the files this pass
+        # and every earlier pass left in the directory, so a one-analysis re-run refreshes the
+        # whole page. A failure here costs the page and nothing else.
+        try:
+            run_dashboard.write_dashboard(results_dir)
+        except Exception as error:  # noqa: BLE001 - the page is a view of the results, not one
+            logger.warning(f"run dashboard not written: {type(error).__name__}: {error}")
 
         logger.info(console_summary(report.results, report.steps))
         # At the end deliberately: in a run whose log is tens of thousands of lines the original

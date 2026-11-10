@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>__BASE_CSS__</style>
+<style>__CSS__</style>
+<script src="__PLOTLY__"></script>
+</head>
+<body>
+<div class="viz-root" id="root">
+  <header class="topbar">
+    <div class="brand"><span class="title" id="run-title"></span><span class="sub" id="run-sub"></span></div>
+    <div class="globals">
+      <label title="Which anchors the gate-aware plots use. A plot marked 'all anchors only' does not change.">Anchors
+        <span class="seg" id="pop-select"></span>
+      </label>
+      <input type="search" id="search" placeholder="Find a plot" style="min-width:170px">
+      <button class="btn" id="theme-toggle" aria-label="Switch colour theme">Dark</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav class="sidebar" id="sidebar"></nav>
+    <main class="content" id="content"></main>
+  </div>
+</div>
+<script>window.__RUN__=__PAYLOAD__;</script>
+<script>__JS__</script>
+</body>
+</html>

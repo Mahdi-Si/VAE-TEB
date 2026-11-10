@@ -1,0 +1,79 @@
+/* The run dashboard's own rules. The page loads the sample dashboard's stylesheet first, so the
+   colour tokens, the buttons and the top bar are one visual language across both dashboards. */
+:root { --ok: #1f9d6b; --warn: #d98a00; --bad: #c0392b; --note-bg: rgba(42, 120, 214, .08); }
+:root[data-theme="dark"] { --ok: #2fc08f; --warn: #eda100; --bad: #e66767; --note-bg: rgba(57, 135, 229, .14); }
+
+body { font-size: 13.5px; }
+.layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: calc(100vh - 46px); }
+.sidebar { position: sticky; top: 46px; align-self: start; height: calc(100vh - 46px); overflow-y: auto; padding: 12px 10px 24px; border-right: 1px solid var(--border); background: var(--surface-1); }
+.sidebar .nav-title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); margin: 4px 8px 6px; }
+.sidebar button.sec { display: flex; justify-content: space-between; align-items: baseline; width: 100%; text-align: left; border: 0; background: transparent; padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+.sidebar button.sec:hover { background: var(--surface-2); }
+.sidebar button.sec.active { background: var(--note-bg); color: var(--text-primary); font-weight: 650; }
+.sidebar button.sec .count { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.sidebar .side-links { margin: 14px 8px 0; display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+
+.topbar .title { font-size: 15px; font-weight: 650; }
+.topbar .sub { color: var(--text-muted); font-weight: 500; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-right: 1px solid var(--border); border-radius: 0; padding: 4px 10px; cursor: pointer; background: var(--surface-1); color: var(--text-secondary); }
+.seg button:last-child { border-right: 0; }
+.seg button.active { background: var(--accent); color: #fff; font-weight: 600; }
+.seg button .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+
+main.content { padding: 14px 20px 60px; min-width: 0; }
+.section-head { margin: 2px 0 12px; }
+.section-head h1 { font-size: 20px; margin: 0 0 4px; font-weight: 680; }
+.section-head p { margin: 0; color: var(--text-secondary); max-width: 110ch; }
+
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 9px; margin-bottom: 14px; overflow: hidden; }
+.card-head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--grid); }
+.card-head h2 { font-size: 14.5px; }
+.badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--surface-2); color: var(--text-secondary); white-space: nowrap; }
+.badge.pop { background: var(--note-bg); color: var(--accent); font-weight: 600; }
+.card-head .local { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; color: var(--text-secondary); font-size: 12px; }
+.card-body { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, 1fr); }
+.card-body.full { grid-template-columns: minmax(0, 1fr); }
+.plot-wrap { min-width: 0; padding: 6px 6px 2px; }
+.plot { width: 100%; }
+.explain { padding: 12px 16px 12px 14px; border-left: 1px solid var(--grid); font-size: 13px; line-height: 1.5; }
+.card-body.full .explain { border-left: 0; border-top: 1px solid var(--grid); display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 4px 22px; }
+.explain h4 { margin: 0 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); font-weight: 650; }
+.explain p { margin: 0 0 10px; color: var(--text-secondary); }
+.explain .run-note { background: var(--note-bg); border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0; padding: 7px 10px; margin: 2px 0 8px; }
+.explain .run-note p { margin: 0; color: var(--text-primary); }
+.card-foot { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 7px 14px; border-top: 1px solid var(--grid); font-size: 12px; color: var(--text-muted); }
+.card-foot .lab { font-weight: 600; }
+.missing { padding: 18px 16px; color: var(--text-muted); }
+
+.tiles { padding: 0 0 12px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.tile .value { font-size: 20px; }
+.tile .note { color: var(--text-muted); font-size: 11.5px; margin-top: 2px; line-height: 1.35; }
+.tile.good { border-left: 3px solid var(--ok); }
+.tile.warn { border-left: 3px solid var(--warn); }
+.tile.bad { border-left: 3px solid var(--bad); }
+
+table.data { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+table.data th, table.data td { padding: 5px 10px; border-bottom: 1px solid var(--grid); text-align: left; vertical-align: top; }
+table.data th { color: var(--text-muted); font-weight: 600; font-size: 11.5px; position: sticky; top: 0; background: var(--surface-1); }
+table.data td.num { text-align: right; white-space: nowrap; }
+.table-wrap { max-height: 460px; overflow: auto; }
+.pill { display: inline-block; padding: 0 8px; border-radius: 9px; font-size: 11px; font-weight: 650; color: #fff; }
+.pill.pass { background: var(--ok); } .pill.fail { background: var(--bad); } .pill.inc { background: var(--warn); } .pill.skip { background: var(--text-muted); }
+.findings { margin: 0; padding: 10px 16px 12px 32px; }
+.findings li { margin-bottom: 6px; color: var(--text-secondary); }
+.findings li b { color: var(--text-primary); }
+.prose { padding: 10px 16px; color: var(--text-secondary); max-width: 120ch; }
+.prose p { margin: 0 0 8px; }
+.explorer-tools { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--grid); color: var(--text-secondary); }
+.explorer-tools label { display: inline-flex; gap: 5px; align-items: center; }
+.hidden { display: none !important; }
+
+@media (max-width: 1150px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: static; height: auto; display: flex; flex-wrap: wrap; gap: 4px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar .nav-title, .sidebar .side-links { display: none; }
+  .sidebar button.sec { width: auto; gap: 6px; }
+  .card-body { grid-template-columns: minmax(0, 1fr); }
+  .explain { border-left: 0; border-top: 1px solid var(--grid); }
+}

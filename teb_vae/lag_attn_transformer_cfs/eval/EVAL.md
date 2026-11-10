@@ -40,7 +40,15 @@ python -m teb_vae.lag_attn_transformer_cfs.eval.compare_quality_arms \
     --output-dir <dir>
 ```
 
-Or with no command line at all: `run.py`, `verify.py`, `run_quality_arms.py` and
+Every pass also writes `eval_results/dashboard.html`, the interactive page of the run. `dashboard.py` in this package rebuilds that page from a finished run directory without a checkpoint:
+
+```bash
+python -m teb_vae.lag_attn_transformer_cfs.eval.dashboard --output-dir <a finished run>
+```
+
+`teb_vae/lag_attn_cfs/eval/EVAL.md` describes the page under "The run dashboard", and the `gate_open` analysis that supplies its gate populations under "gate_open".
+
+Or with no command line at all: `run.py`, `verify.py`, `dashboard.py`, `run_quality_arms.py` and
 `compare_quality_arms.py` each carry a `RUN_ARGS` dictionary at the bottom of the file. Edit the
 values there and press the IDE's Run button; a flag given on the command line wins over the
 dictionary, and the console line prints where each value came from.
