@@ -45,6 +45,9 @@
       "class_histograms.pdf",
       "subgroup_histograms.pdf"
     ],
+    "event_gate": [
+      "event_gate.pdf"
+    ],
     "events": [
       "conditioned_coupling.pdf",
       "contraction_detection.pdf"
@@ -54,6 +57,11 @@
       "baseline_comparison.pdf",
       "forecast_overlay.pdf",
       "horizon_skill.pdf"
+    ],
+    "gate_open": [
+      "gate_open.pdf",
+      "gate_open_lags.pdf",
+      "gate_open_trajectory.pdf"
     ],
     "lag_clocks": [
       "lag_second_stage.pdf",

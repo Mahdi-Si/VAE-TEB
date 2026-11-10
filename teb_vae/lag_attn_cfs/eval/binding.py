@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import event_gate as event_gate_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import gate_open as gate_open_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
@@ -295,6 +296,12 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # and what an open gate buys in KL and forecast gain. Reads the per-anchor table only, and
     # records a skip on a model that builds neither a gate nor a UA mask.
     "event_gate": event_gate_analysis.run_event_gate_analysis,
+    # Directly after the gate's own states, because it answers the question they raise: what the
+    # run looks like on the anchors where the gate is on, and on those where it is off. It reports
+    # the KL, the forecast gain and the lag structure per gate population, against time before
+    # delivery, contraction age and the gate value. Reads the per-anchor table and the vector
+    # sidecar only.
+    "gate_open": gate_open_analysis.run_gate_open_analysis,
     # Third of the lag-against-the-clocks trio: the same two clocks, read on the ANCHORS that carry
     # the coupling rather than on all of them. It selects anchors by a quantile band of the pooled
     # per-anchor KL and reads the lag structure of the selection off the per-anchor vector sidecar
@@ -434,6 +441,21 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("event_gate_model_shut_frac", ("event_gate", "headline", "model_shut_frac")),
     ("event_gate_open_frac", ("event_gate", "headline", "open_frac")),
     ("event_gate_kl_spearman", ("event_gate", "headline", "gate_kl_spearman")),
+    # The run split by gate regime: the share of anchors with the gate on, and how much of the
+    # run's mean KL and mean forecast gain the gate-on and the gate-off anchors each supply. These
+    # four are sums over a population divided by ALL scored anchors, so each is finite whenever
+    # the analysis runs, an empty population included; the per-population means, which are not,
+    # stay in the analysis's own headline block. ``None`` on a model without a gate or a UA mask.
+    ("gate_on_frac", ("gate_open", "headline", "gate_on_frac")),
+    ("gate_on_kl_contribution_nats", ("gate_open", "headline", "gate_on_kl_contribution_nats")),
+    (
+        "gate_on_gain_mc_contribution_nats",
+        ("gate_open", "headline", "gate_on_gain_mc_contribution_nats"),
+    ),
+    (
+        "gate_off_gain_mc_contribution_nats",
+        ("gate_open", "headline", "gate_off_gain_mc_contribution_nats"),
+    ),
 )
 
 

@@ -185,13 +185,30 @@ Everything goes to `<run>/eval_results/`:
 | `eval.log` | The run's log, including any refusal. |
 | `per_sample.csv`, `per_sample_vectors.npz` | One row per segment: every scalar readout plus labels and provenance; the vector readouts in row order. |
 | `per_anchor.parquet` | Per-anchor scores, KL, argmax lag, coverage and `seconds_since_contraction`, keyed on `(guid, epoch, anchor)` with the forward's own `anchor_index`. Every row also carries its recording's `subgroup` and `clinical_class`. |
-| `per_anchor_vectors.npz` | The per-anchor lag maps (the pooled KL attribution and the head-averaged attention at every contributing anchor), row for row with `per_anchor.parquet`, in `float16`. Only `lag_high_kl` reads it. |
+| `per_anchor_vectors.npz` | The per-anchor lag maps (the pooled KL attribution and the head-averaged attention at every contributing anchor), row for row with `per_anchor.parquet`, in `float16`. `lag_high_kl` and `gate_open` read it. |
 | `retained_arrays.npz` | The opt-in retention for the capped sample set. `waveforms` holds the gathered target, the mean-decoded forecast pair (`mu_base`/`logvar_base` at the prior mean, `mu_full`/`logvar_full` at the posterior mean), the raw `up_raw` and `fhr_raw` traces where loaded, `weight`, and `anchor_index`. `attention` holds the per-step attention weights. |
 | `collection.json` | The collection record: readouts, provenance (checkpoint hash, seed, the $K$ actually used, `max_batches`, `eval_config` digest), denominators, retention plan, the cost of the pass, `likelihood_structure`, and `target_keep_index`. |
 | `band_partition.json`, `band_channel_map.csv`, `band_channel_map_kept.csv` | The input channel map on the declared axis and on the kept axis. |
+| `dashboard.html`, `plotly.min.js` | The interactive page of the run and its plotting library. See [The run dashboard](#the-run-dashboard). |
 | `<analysis>/…` | One subdirectory per analysis, with its CSVs and figures. |
 | `attribution/…` | The Captum attribution tables, arrays and figures. [ATTRIBUTION.md](ATTRIBUTION.md#6-output-files-and-figures) lists them. |
 | `recording_traces/…` | `recording_traces.csv` (the manifest), `segment_summary.csv` (one row per segment), `anchor_trace.parquet` (one row per decoded anchor), and per recording, under its class directory, the full vectors (`<guid>_<subgroup>_full.npz`) and the figure. |
+
+### The run dashboard
+
+Every pass also writes `dashboard.html` into the results directory, with a copy of `plotly.min.js` beside it. The page draws the results of every analysis with Plotly. Each plot has a text beside it that states how the plot was made, what it shows and how to read it, and a note with this run's numbers. Each card links the PDF figures and the tables it was drawn from. The PDF figures stay the printed record.
+
+The page has ten sections: an overview with the headline numbers, the verdicts and the population; the gate; the results on the gate populations; single segments with the gate drawn on the FHR and UA signals; the lags; forecast quality; coupling and controls; labour time and cohorts; attribution; and an index of every file.
+
+The `Anchors` filter at the top of the page chooses the gate population of the `gate_open` analysis: every scored anchor, the gate-on anchors, the fully open anchors or the gate-off anchors. A card that follows the filter says so. The other cards use every scored anchor.
+
+`run_dashboard.py` builds the page from the files of the results directory. It builds no model and needs no GPU. A plot whose table is absent becomes a card that names the missing file and the analysis that writes it. A directory filled by several passes is read as one run: the builder merges `summary.json` with the backups that earlier passes left, newest first. The consistency checks and the coverage record are the exception. A pass can test only the analyses it ran, so the page takes those two blocks from the pass that ran the most steps. To rebuild the page alone:
+
+```bash
+python -m teb_vae.lag_attn_cfs.eval.run_dashboard --output-dir <a finished run>
+```
+
+The module also carries a `RUN_ARGS` dictionary for the IDE's Run button. The panels live in `run_dashboard_gate.py` (gate, gate populations, lags, signal view) and `run_dashboard_analyses.py` (one card per table of the other analyses). `run_dashboard_core.py` holds the file reader, the trace helpers and the array encoding that the sample dashboards share, and `run_dashboard_assets/` holds the page template, its stylesheet and its script.
 
 ### Summary blocks
 
@@ -256,7 +273,7 @@ The shared evaluation package (`teb_vae/lag_attn/eval`) is reachable only throug
 
 `run.main` uses `CFS_BINDING` by default. The transformer sibling, `teb_vae/lag_attn_transformer_cfs/eval`, uses this runner, collection pass and analyses through its own binding for `SeqVaeLagAttnTrfCfs`. It reuses this module's `EXTRA_ANALYSES` and `HEADLINE_SCALARS`, so both cells run the same registry.
 
-`EXTRA_ANALYSES` holds the analyses registered on the binding, in run order: `samples`, `recording_traces`, `warmup`, `source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `event_gate`, `lag_high_kl`, `spectral_skill`, `attribution`. `attribution` is last because it reads the tables of `occlusion` and `spectral_skill`. The runner merges the extras after the shared analyses and before the trailing `cross_subgroup`. `HEADLINE_SCALARS` appends their headline entries to the shared registry. A headline path may also start from a result block that the collection pass writes; `COLLECTION_HEADLINE_BLOCKS` names those (`mc_error`).
+`EXTRA_ANALYSES` holds the analyses registered on the binding, in run order: `samples`, `recording_traces`, `warmup`, `source_null`, `time_shift`, `occlusion`, `lag_clocks`, `lag_kld_scaled`, `event_gate`, `gate_open`, `lag_high_kl`, `spectral_skill`, `attribution`. `attribution` is last because it reads the tables of `occlusion` and `spectral_skill`. The runner merges the extras after the shared analyses and before the trailing `cross_subgroup`. `HEADLINE_SCALARS` appends their headline entries to the shared registry. A headline path may also start from a result block that the collection pass writes; `COLLECTION_HEADLINE_BLOCKS` names those (`mc_error`).
 
 `GEOMETRY_KEYS` holds `sequence_length`, `d_model`, `d_z`, `horizon`, `raw_per_step`, `warmup_period`, `c_y`, `c_u`, `use_up_st`, `max_lag`, `num_heads`, `d_head`, `horizon_attention_blocks`, `causal_norm`, `anchor_stride`, `lag_floor`, `prior_availability_input`, `lag_kv_source` and `persistence_residual`. The transformer cell's tuple also carries `forecast_ar_residual` and its encoder keys.
 
@@ -287,7 +304,7 @@ Set evaluation choices in the override file's `eval_config` block, so the run sa
 | `figure_format` | `null` | The image format of every figure, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …). Config load validates it against the installed matplotlib. `null` keeps the `pdf` default, which `figure_manifest.json` and FIGURE_GUIDE.md record. |
 | `max_hours_before_delivery` | `null` | How far before delivery a segment may be recorded and still be evaluated, in hours. `null` evaluates everything. Minimum one $0.5$ h bin. |
 
-**`caps`.** The cap names are `waveforms`, `attention`, `pages`, `pages_per_class`, `traces_per_class`, `oracle`, `occlusion`, `time_shift`, `attribution_segments`, `attribution_segments_per_recording`, `attribution_cohort_segments` and `attribution_strata_segments`. The committed values are `waveforms: 64`, `attention: 64`, `pages: 24`, `pages_per_class: 10`, `traces_per_class: 10`, `attribution_segments: 144`, `attribution_segments_per_recording: 4`, `attribution_cohort_segments: 150`, `attribution_strata_segments: 72`, `occlusion: 512` and `time_shift: 512`. Omitted array-retention caps retain no samples. Omitted `oracle` and `occlusion` caps allow every segment. Omitted `time_shift`, trace and attribution caps use their analysis defaults. Cap names are not validated: a cap that nothing reads is inert and the run reports it. Cap values are validated, and zero is refused. `collection.json`'s retention block records the bytes that the retention caps actually hold.
+**`caps`.** The cap names are `waveforms`, `attention`, `pages`, `pages_per_class`, `traces_per_class`, `oracle`, `occlusion`, `time_shift`, `attribution_segments`, `attribution_segments_per_recording`, `attribution_cohort_segments`, `attribution_strata_segments` and `dashboards`. The committed values are `waveforms: 64`, `attention: 64`, `pages: 24`, `pages_per_class: 10`, `traces_per_class: 10`, `attribution_segments: 144`, `attribution_segments_per_recording: 4`, `attribution_cohort_segments: 150`, `attribution_strata_segments: 72`, `occlusion: 512` and `time_shift: 512`. Omitted array-retention caps retain no samples. Omitted `oracle` and `occlusion` caps allow every segment. Omitted `time_shift`, trace and attribution caps use their analysis defaults. Cap names are not validated: a cap that nothing reads is inert and the run reports it. Cap values are validated, and zero is refused. `collection.json`'s retention block records the bytes that the retention caps actually hold.
 
 **`event_lag_window_s`.** At `null`, `config_schema.resolve_event_lag_window_s` derives the window from the checkpoint's `event_weight_reach_steps` $R$:
 
@@ -550,7 +567,17 @@ Two rows monitor what the model was allowed to read:
 - **Signal-quality masks.** One lane per mask, shaded where the mask flags the signal. `FHR raw` and `UP raw` show the raw-grid validity (`emit_quality_mask`). `FHR ST`, `FHR PH`, `UP ST` and `UP PH` show the coefficient step masks (`fhr_step_mask`, `ua_step_mask`); the opacity of a step is the share of the block's kept channels that the mask flags. `FHR loss` shows the target steps that the objective removes under `target_quality_mask`. `UA keys` shows the anchors with no valid lag key ($o_t = 0$) under `source_quality_mask`. This last lane is on the anchor grid and includes the alignment shifts and the key reach, so it can sit later than the `UP` lanes. The right gutter gives the flagged share of each lane over the segment.
 - **Posterior event gate.** The learned gate $g_t$ as a line and the applied gate $g_t\,o_t$ as a filled area, over the trained anchors. Hatched grey marks the anchors that the UA mask shut ($o_t = 0$). Red marks the anchors that the model shut ($o_t = 1$, $g_t < 0.2$). The dotted lines are the thresholds $0.2$ and $0.8$, and the scaled raw UP trace is drawn behind the gate. The title gives the mean $g_t$ where the keys are open and the share of each state.
 
-`sample_pages.csv` has one row per file, with a `variant` column for the page type.
+`sample_pages.csv` has one row per file, with a `variant` column for the page type and a `dashboard_file` column for the segment's interactive page.
+
+**Interactive dashboards.** Every selected segment also gets one HTML page, `<stem>_dashboard.html`, beside its full and compact printed pages in the folder of each draw that picked it. The page comes from the same forward pass as those printed pages. Open `samples/index.html` for a sortable gallery of the whole run, or the `index.html` of one folder for that draw. Each folder holds its own `plotly.min.js`, so the pages need no network and a folder can be moved as a whole. A page must stay beside that file. A page is about 5 MB. `eval_config.caps.dashboards` bounds the number of segments that get a page, and without it every selected segment gets one.
+
+The page has four figures on one time axis, with one plot area in pixels, so a column of the page is one instant in every figure. Zoom and the crosshair are linked across the figures.
+
+- **Figure A and Figure B** are exact copies. The list on the left draws against the left $y$ axis in solid lines, and the list on the right draws against the right $y$ axis in solid lines, with an `R` mark in the legend. A raw trace is drawn across an invalid gap of at most 1 s, so that isolated invalid samples do not break the line. The readouts and the validity traces keep the true gaps. With one trace on each side, the header gives their Pearson correlation over the visible window.
+- **Heatmap A and Heatmap B** are exact copies. The left list selects the map, and the right list draws traces over the map against the right $y$ axis.
+- **The anchor inspector** shows the anchor that was last clicked: the forecast of one channel with its $\pm 2\sigma$ bands, the attention over lags with the UP trace or the KL attribution, and the KL per latent dimension.
+
+The time axis can read minutes to delivery, segment minutes, segment seconds or stored steps. A second axis along the top of each figure shows seconds from the segment start, or minutes relative to delivery when the bottom axis already reads seconds. Both axes share one grid of major and minor lines, which refines as the reader zooms. In the same way, each tick of a right $y$ axis sits on a grid line of the left $y$ axis. A forecast entry sits at the step it is scored against, $(a + 1 + \tau)\Delta$ for anchor $a$ and horizon step $\tau$, so it lines up with its truth. A forecast cell appears only where the model scores it, and an entry that reads the truth also needs the step to pass the objective's forecast mask. Under an AR(1) residual, $\sigma$ is the innovation scale for $\tau \ge 1$, so the inspector's bands use the implied marginal scale, and the forecast $z$ score is the standardised innovation. The "Unscored anchors" overlay marks the anchors the objective excludes. The KL and latent traces are still drawn there, and the mean KL tile covers scored anchors only. The scores marked "this forward" come from the one forward pass of the page, so they differ from the Monte Carlo readouts in `per_sample.csv` by sampling noise. The selected view carries over when the previous and next links are used.
 
 `eval_config.caps.pages` sets the stratified count, and `eval_config.caps.pages_per_class` sets the balanced draw's per-class count. The extremes take up to ten per tail, fewer when a metric has too few scored segments. The two tails of one metric are disjoint. Pages are named `sample<index>_<guid>_<subgroup>_epoch<epoch>[_compact]`, with `na` for a missing subgroup or epoch. The `<index>` is the position in the evaluation dataset, not in `per_sample.csv`, because the collection pass runs under a seeded shuffle. A `guid`/`epoch` round trip reconciles the two before rendering.
 
@@ -756,6 +783,49 @@ The outputs are:
 The headline block adds `event_gate_learned_mean`, `event_gate_applied_mean`, `event_gate_forced_shut_frac`, `event_gate_model_shut_frac`, `event_gate_open_frac` and `event_gate_kl_spearman`. `results.event_gate.blinks` gives the count and the median length of the model-shut runs, in seconds.
 
 Read the forced-shut share as a property of the data, and the model-shut share as a decision of the model. A gate that responds to contractions shows a peak in $g_t$ shortly after a contraction onset. A gate that only follows the mask is flat wherever the keys are open.
+
+### gate_open
+
+This analysis reports the run on the anchors where the posterior event gate is on, and on the anchors where it is off. While the gate is off the posterior equals the prior, so the source adds no information and the two forecast branches agree. A mean over every anchor therefore mixes two regimes. On a run whose gate is off at most anchors, that mean mostly describes the off regime.
+
+The analysis splits the scored anchors into four populations by the effective gate $g^{\mathrm{eff}}_t = g_t\,o_t$, with the thresholds of `teb_vae/lag_attn_cfs/gate_states.py`:
+
+| Population | Rule | Meaning |
+|---|---|---|
+| `all` | every scored anchor | The standard reading. |
+| `gate_on` | $g^{\mathrm{eff}}_t \ge 0.2$ | The source can move the belief. |
+| `fully_open` | $g^{\mathrm{eff}}_t \ge 0.8$ | A subset of `gate_on`. |
+| `gate_off` | $g^{\mathrm{eff}}_t < 0.2$ | Shut by the model or by the UA mask. |
+
+`gate_on` and `gate_off` partition `all`. For each population the analysis reports $K_t$, the three forecast gains (`mc_pred_gap`, `mean_pred_gap`, `pred_gap`), the two block scores, and the lag structure. The lag structure comes from the two per-anchor lag maps of `per_anchor_vectors.npz`: the KL attribution $K_{t,\ell}$, which sums over lags to $K_t$, and the attention weight $a_{t,\ell}$, which sums to $1$. The centroid of a profile $p_\ell$ on the lag axis $\tau_\ell$ is
+
+$$\bar\tau = \frac{\sum_\ell \tau_\ell\,\max(p_\ell, 0)}{\sum_\ell \max(p_\ell, 0)}.$$
+
+The analysis reads the per-anchor table and the vector sidecar only, so it runs without a checkpoint. A model with neither a gate nor a UA mask records a skip, and so does a run that predates the sidecar.
+
+**Two aggregation rules.** A summary, a lag profile and a class trajectory are statistics over recordings of the recording's own anchor mean. A clock profile is an anchor-level mean per bin, because one recording rarely spans every bin.
+
+**The contribution columns add up.** For a readout $x$, the contribution of population $P$ is $\frac{1}{N}\sum_{t \in P} x_t$, with $N$ the recording's scored anchors. The `gate_on` and `gate_off` contributions sum to the `all` mean. They say how much of the run's mean $K_t$ or gain each regime supplies.
+
+The outputs are:
+
+- `gate_open_summary.csv`: per population and cohort (every class pooled, then each clinical class), the anchor share, the readout means, their contributions, the lag centroids, the lag-$0$ share of the KL, and the intervals.
+- `gate_open_per_recording.csv`: the same quantities per recording, as `<population>_<quantity>` columns. The runner fans the `gate_on` columns out by class and by subgroup.
+- `gate_open_lag_profile.csv`: per population, cohort and lag, the KL attribution in nats with its interval, its share, the attention weight, and the share of anchors whose largest attribution sits at that lag.
+- `gate_open_by_time_to_delivery.csv` and `gate_open_by_contraction_age.csv`: per population and cohort, 30-minute bins of the time before delivery and 15-second bins of the time since the last contraction onset.
+- `gate_open_by_gate.csv`: every scored anchor in ten bins of the gate value.
+- `gate_open_lag_by_time_to_delivery.csv`, `gate_open_lag_by_contraction_age.csv` and `gate_open_lag_by_gate.csv`: the lag profile in each bin of the three clocks, in long format.
+- `gate_open_trajectory.csv`: the class trajectory over labour. Per population, metric, cohort and 30-minute window, the median, the quartiles and the mean over recordings. A recording gives one value per window, the mean over its own anchors of the population, and counts only with at least 10 such anchors there. The metrics are $K_t$, the two gains, the population's share of the anchors, the KL lag centroid and the lag-$0$ share.
+- `gate_open_trajectory_significance.csv`: per population, metric and window, the Kruskal-Wallis test of the class difference over the classes with at least three recordings, with the $p$-values Holm-adjusted over the windows of one population and metric.
+- `gate_open_run_durations.csv`: a histogram of the lengths of the runs of consecutive gate-on anchors and gate-off anchors within a segment.
+- `gate_open_distributions.csv`: histograms of the per-anchor $K_t$ and Monte Carlo gain per population.
+- `gate_open.pdf`: the anchor share, $K_t$ and the gain per population and class, the gain against time before delivery, the population shares against contraction age, and the run durations.
+- `gate_open_trajectory.pdf`: the gate-on $K_t$, forecast gain, anchor share and KL lag centroid per class against time before delivery, as the median and the quartiles over recordings. A dotted line marks a window whose class test is significant.
+- `gate_open_lags.pdf`: the gate-on KL share per lag against contraction age, time before delivery and gate value on a logarithmic colour scale, the KL attribution per lag per population, the lag shares, and the gate-on KL share per class.
+
+The headline block adds `gate_on_frac`, `gate_on_kl_contribution_nats`, `gate_on_gain_mc_contribution_nats` and `gate_off_gain_mc_contribution_nats`. Each is finite whenever the analysis runs, because a contribution divides by every scored anchor. `results.gate_open.headline` also holds the per-population means, the share of the run's KL on the gate-on anchors, the gate-on lag centroid and the gate-on lag-$0$ share; those are `NaN` when a population is empty. `results.gate_open.trajectory` counts the significant class tests per population and metric. `results.gate_open.runs` gives the count, the median and the 90th percentile of the run lengths, and the number of runs that touch a segment edge.
+
+Read the `gate_on` gain as the size of the source's effect where the model reads the source, and the `all` gain as that effect diluted by the gate-off anchors. A `gate_off` gain near zero is the expected result. A segment holds a bounded number of anchors, so a run that touches a segment edge is cut short, and the run-length histogram under-states long runs. The lag axis is stored-coefficient time, as for every lag-resolved output.
 
 ### lag_high_kl
 

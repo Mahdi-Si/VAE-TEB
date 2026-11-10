@@ -45,6 +45,10 @@ Three draws, and they answer different questions:
 A segment picked by more than one draw is rendered once and its files copied into the other
 directories, so the two copies are the same picture rather than two stochastic forwards.
 
+**Each selected segment also gets one interactive page**, written from the same forward as its
+printed pages by :mod:`~teb_vae.lag_attn_cfs.eval.sample_dashboard`. The page sits beside the two
+printed pages in the folder of every draw that picked the segment.
+
 **This is one of the two analyses that touch the model**, and it is worth being explicit about why
 the alternative does not work. A page needs the entire forward output of one segment -- and here
 that is four $(A_{\max}, H, C_{\mathrm{keep}})$ forecast tensors beside the latent and attention
@@ -77,6 +81,7 @@ import torch
 from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval import sample_dashboard, traces
 from teb_vae.lag_attn_cfs.eval._reuse import labels, subsample_indices
 from teb_vae.lag_attn_cfs.eval.cohort import SECONDS_PER_HOUR
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
@@ -128,7 +133,8 @@ PAGE_SCALARS: Tuple[str, ...] = (
 #: directory of pages can be filtered by subgroup and class without opening one, and so the
 #: sanitised subgroup in a filename can be read back as the label it was drawn from.
 MANIFEST_COLUMNS: Tuple[str, ...] = (
-    "selection", "variant", "file", "full_file", "compact_file", "dataset_index", "guid",
+    "selection", "variant", "file", "full_file", "compact_file", "dashboard_file",
+    "dataset_index", "guid",
     labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN, "epoch", "hours_before_delivery",
     *PAGE_SCALARS,
 )
@@ -435,6 +441,7 @@ def render_pages(
     seams: Dict[str, Any],
     row_limits: Optional[Mapping[str, float]] = None,
     rendered: Optional[Dict[int, Dict[str, Path]]] = None,
+    dashboards: Optional[sample_dashboard.DashboardSet] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[int]]:
     """Render every page variant of every row, recording any that fail rather than losing the rest.
 
@@ -454,6 +461,9 @@ def render_pages(
             one segment in two directories, and it would double the analysis's only real cost.
             Updated in place with every segment this call draws in full. ``None`` renders
             everything.
+        dashboards: The run's interactive pages, written from the same forward as the printed
+            pages, or ``None`` for no interactive pages. A failure here is recorded on the set
+            and never costs the printed pages.
 
     Returns:
         ``(written, failures, input rows drawn)``. ``written`` carries one :func:`page_record`
@@ -480,9 +490,12 @@ def render_pages(
         index = int(row["dataset_index"])
         drawn = (rendered or {}).get(index)
         if drawn:
+            dashboard = (
+                None if dashboards is None else dashboards.place_copy(index, directory, directory.name)
+            )
             for variant, source in drawn.items():
                 shutil.copy2(source, directory / source.name)
-                written.append(page_record(row, variant, source.name))
+                written.append(page_record(row, variant, source.name, dashboard=dashboard))
             continue
         # The forward is separated from the drawing so that both variants come off **one** dict. A
         # second forward would double this analysis's model time, and -- the real reason -- would
@@ -512,6 +525,23 @@ def render_pages(
                              "error": f"{type(error).__name__}: {error}"})
             continue
         n_input_rows = len(panels)
+
+        dashboard_file: Optional[str] = None
+        if dashboards is not None:
+            dashboard_file = dashboards.write(
+                task,
+                sample_dashboard.SegmentInputs(
+                    batch=moved, outs=outs, target_features=target_features, weight=_weight,
+                    u_stream=u_stream,
+                    source_valid=forward_kwargs(task, moved, u_stream).get("source_valid"),
+                    kld_per_dim=kld_per_dim,
+                ),
+                row,
+                index=index,
+                stem=page_filename(index, row["guid"], _label(row, labels.SUBGROUP_COLUMN), row["epoch"]),
+                directory=directory,
+                selection=directory.name,
+            )
 
         # One try per variant rather than one around both: a reduced page that fails must not turn
         # a full page that already wrote into a recorded failure. They are independent drawings of
@@ -566,7 +596,7 @@ def render_pages(
                 figures.mark_laid_out(figure)
                 page = figures.render_figure(figure, directory / name, crop=False)
                 files[variant] = page
-                written.append(page_record(row, variant, page.name))
+                written.append(page_record(row, variant, page.name, dashboard=dashboard_file))
             except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
                 logger.warning(
                     f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "
@@ -637,13 +667,16 @@ def page_title(row: Any, index: int) -> str:
     )
 
 
-def page_record(row: Any, variant: str, file: str) -> Dict[str, Any]:
+def page_record(
+    row: Any, variant: str, file: str, *, dashboard: Optional[str] = None
+) -> Dict[str, Any]:
     """One manifest row: the file, both variants' names, the segment's identity and its readouts.
 
     Args:
         row: The resolved row the page was drawn from, carrying ``dataset_index``.
         variant: Which of :data:`PAGE_VARIANTS` the file is.
         file: The file's name as written.
+        dashboard: The segment's interactive page, by name, or ``None`` when it has none.
 
     Returns:
         Every :data:`MANIFEST_COLUMNS` entry but ``selection``, which the caller adds. The pair's
@@ -661,6 +694,7 @@ def page_record(row: Any, variant: str, file: str) -> Dict[str, Any]:
         "compact_file": figures.figure_filename(
             page_filename(index, row["guid"], subgroup, row["epoch"], compact=True)
         ),
+        "dashboard_file": dashboard,
         **page_identity(row),
         "dataset_index": index,
         "hours_before_delivery": hours_before_delivery(row["epoch"]),
@@ -854,6 +888,16 @@ def run_samples_analysis(
     # A capped run is capped in every selection, the extremes included.
     per_tail = min(EXTREME_PAGES_PER_TAIL, cap)
     rendered: Dict[int, Dict[str, Path]] = {}
+    # A segment's interactive page sits beside its printed pages in the folder of each draw.
+    dashboard_cap = caps.get(sample_dashboard.DASHBOARD_CAP)
+    dashboards = sample_dashboard.DashboardSet(
+        root=directory,
+        scales=traces.raw_signal_scales(context.config, loader),
+        row_limits=row_limits,
+        delay_steps=delay_steps,
+        run_label=str(((context.config or {}).get("general_config") or {}).get("tag") or ""),
+        cap=None if dashboard_cap is None else int(dashboard_cap),
+    )
 
     manifest: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -876,7 +920,7 @@ def run_samples_analysis(
         records, failed, observed = render_pages(
             task, loader, rows, directory / selection,
             delay_steps=delay_steps, normalization=normalization, seams=seams,
-            row_limits=row_limits, rendered=rendered,
+            row_limits=row_limits, rendered=rendered, dashboards=dashboards,
         )
         manifest.extend({"selection": selection, **record} for record in records)
         failures.extend({"selection": selection, **entry} for entry in failed)
@@ -916,6 +960,17 @@ def run_samples_analysis(
     pd.DataFrame(manifest, columns=list(MANIFEST_COLUMNS)).to_csv(
         directory / MANIFEST_FILENAME, index=False
     )
+    # The galleries and the per-folder plotting library are a view of pages that are already on
+    # disk, so a failure to write them is recorded and does not fail the step.
+    try:
+        dashboard_record = dashboards.finalise()
+    except Exception as error:  # noqa: BLE001 - the pages and their manifest are already written
+        logger.warning(f"{ANALYSIS_DIRNAME}: the dashboard galleries were not written: {error}")
+        dashboard_record = {
+            "n_segments": len(dashboards.entries), "n_files": 0,
+            "failures": list(dashboards.failures),
+            "gallery_error": f"{type(error).__name__}: {error}",
+        }
     logger.info(
         f"{ANALYSIS_DIRNAME}: rendered {written} segment(s) as {len(manifest)} page(s), "
         f"{len(failures)} failed, {len(index_map)} dataset row(s) locatable"
@@ -961,6 +1016,7 @@ def run_samples_analysis(
             "compact_page_rows": len(COMPACT_PAGE_ROWS),
             "expected_compact_page_rows": EXPECTED_COMPACT_PAGE_ROWS,
         },
+        "dashboards": dashboard_record,
         # By index, so a failure is recoverable rather than merely counted.
         "failures": failures,
         "missing_metrics": missing,

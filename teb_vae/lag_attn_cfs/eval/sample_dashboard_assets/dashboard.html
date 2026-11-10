@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>__CSS__</style>
+<script src="__PLOTLY__"></script>
+<script src="__INDEX__"></script>
+</head>
+<body>
+<div class="viz-root" id="root">
+  <header class="topbar">
+    <div class="brand"><a id="gallery-link" href="__GALLERY__">Gallery</a><span id="nav-pos" class="muted"></span></div>
+    <div class="nav">
+      <a id="nav-prev" class="btn" title="Previous sample. Your view carries over.">&#8592; Previous</a>
+      <a id="nav-next" class="btn" title="Next sample. Your view carries over.">Next &#8594;</a>
+    </div>
+    <div class="globals">
+      <label>Time axis
+        <select id="x-mode">
+          <option value="to_delivery">minutes to delivery</option>
+          <option value="seg_min">segment minutes</option>
+          <option value="seg_s">segment seconds</option>
+          <option value="step">stored step</option>
+        </select>
+      </label>
+      <label class="chk"><input type="checkbox" id="ov-contractions" checked><span class="swatch sw-contraction"></span>Contractions</label>
+      <label class="chk"><input type="checkbox" id="ov-decelerations"><span class="swatch sw-deceleration"></span>Decelerations</label>
+      <label class="chk"><input type="checkbox" id="ov-warmup" checked><span class="swatch sw-warmup"></span>Warm-up</label>
+      <label class="chk"><input type="checkbox" id="ov-gaps"><span class="swatch sw-gap"></span>UA gaps</label>
+      <label class="chk"><input type="checkbox" id="ov-unscored" checked><span class="swatch sw-unscored"></span>Unscored anchors</label>
+      <button class="btn" id="reset-zoom">Reset zoom</button>
+      <button class="btn" id="theme-toggle" aria-label="Switch colour theme">Dark</button>
+    </div>
+  </header>
+
+  <section class="identity" id="identity"></section>
+  <section class="tiles" id="tiles"></section>
+
+  <main id="figures"></main>
+
+  <section class="inspector">
+    <div class="inspector-head">
+      <h2>Anchor inspector</h2>
+      <p class="muted" id="inspector-where">Click any figure to pin an anchor.</p>
+      <label>FHR channel <select id="insp-channel"></select></label>
+      <label>Right axis
+        <select id="insp-right">
+          <option value="up">UA at anchor minus lag</option>
+          <option value="kl">KL attribution by lag</option>
+        </select>
+      </label>
+    </div>
+    <div class="inspector-grid">
+      <div><h3>Forecast of the selected channel</h3><div id="insp-forecast" class="insp-plot"></div></div>
+      <div><h3>Attention over lags</h3><div id="insp-lag" class="insp-plot"></div></div>
+      <div><h3>KL per latent dimension</h3><div id="insp-kl" class="insp-plot"></div></div>
+    </div>
+  </section>
+  <footer class="muted" id="foot"></footer>
+  <div id="tooltip" class="tooltip" hidden></div>
+</div>
+<script>window.__DASH__=__PAYLOAD__;</script>
+<script>__JS__</script>
+</body>
+</html>

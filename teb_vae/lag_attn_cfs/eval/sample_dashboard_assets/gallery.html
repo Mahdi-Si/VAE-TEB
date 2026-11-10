@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sample dashboards</title>
+<style>__CSS__</style>
+<script src="__INDEX__"></script>
+</head>
+<body>
+<div class="viz-root">
+  <div class="gallery-tools">
+    <h2>Sample dashboards</h2>
+    <input type="search" id="filter" placeholder="Filter by class, subgroup, GUID or draw" style="min-width:320px">
+    <span class="muted" id="count"></span>
+  </div>
+  <div class="gallery-wrap"><table class="gallery" id="table"></table></div>
+</div>
+<script>
+(function () {
+  const rows = window.DASHBOARD_INDEX || [];
+  const metrics = __METRICS__;
+  const columns = [
+    ["Sample", r => r.index], ["Class", r => r.class || ""], ["Subgroup", r => r.subgroup || ""],
+    ["GUID", r => r.guid], ["Hours before delivery", r => r.hours],
+    ...metrics.map(m => [m[1], r => r.metrics[m[0]]]),
+    ["Contractions", r => r.contractions], ["Decelerations", r => r.decelerations],
+    ["Draws", r => r.selections.join(", ")],
+  ];
+  let sortAt = 4, ascending = true, text = "";
+  const table = document.getElementById("table");
+  const format = v => typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(2)) : (v == null ? "n/a" : v);
+  function draw() {
+    const kept = rows.filter(r => [r.class, r.subgroup, r.guid, r.selections.join(" ")].join(" ").toLowerCase().includes(text));
+    kept.sort((a, b) => {
+      const x = columns[sortAt][1](a), y = columns[sortAt][1](b);
+      if (x == null) return 1; if (y == null) return -1;
+      return (x < y ? -1 : x > y ? 1 : 0) * (ascending ? 1 : -1);
+    });
+    document.getElementById("count").textContent = kept.length + " of " + rows.length + " pages";
+    const head = "<thead><tr>" + columns.map((c, i) => "<th data-i='" + i + "'>" + c[0] + (i === sortAt ? (ascending ? " ▲" : " ▼") : "") + "</th>").join("") + "</tr></thead>";
+    const body = kept.map(r => "<tr>" + columns.map((c, i) => {
+      const value = format(c[1](r));
+      return "<td>" + (i === 0 ? "<a href='" + encodeURI(r.file) + "'>" + String(r.index).padStart(4, "0") + "</a>" : value) + "</td>";
+    }).join("") + "</tr>").join("");
+    table.innerHTML = head + "<tbody>" + body + "</tbody>";
+    table.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {
+      const i = +th.dataset.i;
+      if (i === sortAt) ascending = !ascending; else { sortAt = i; ascending = true; }
+      draw();
+    }));
+  }
+  document.getElementById("filter").addEventListener("input", e => { text = e.target.value.toLowerCase(); draw(); });
+  draw();
+})();
+</script>
+</body>
+</html>

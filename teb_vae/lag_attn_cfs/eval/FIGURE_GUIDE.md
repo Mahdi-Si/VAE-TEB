@@ -31,6 +31,7 @@ A suggested reading order is `forecast/baseline_comparison.pdf`, then `coupling/
 - [Time-shift figure](#time-shift-figure)
 - [Occlusion figures](#occlusion-figures)
 - [Band-resolved lag-KL figures](#band-resolved-lag-kl-figures)
+- [Gate figures](#gate-figures)
 - [High-KL anchor figures](#high-kl-anchor-figures)
 - [Spectral-skill figure](#spectral-skill-figure)
 - [Recording-trace figures](#recording-trace-figures)
@@ -824,6 +825,71 @@ The `lag_kld_scaled` analysis (`analyses/lag_kld_scaled.py`) writes these figure
 **What it shows.** The panels of the delivery-clock page against signed hours from second-stage onset, drawn left to right with the onset marked.
 
 **How to read it.** The notes above apply. The population is the subset of recordings with a recorded onset, under the eligibility rule of the `second_stage` analysis.
+
+---
+
+## Gate figures
+
+The posterior applies the effective gate $g^{\mathrm{eff}}_t = g_t\,o_t$. Two analyses draw it. `event_gate` describes the gate itself. `gate_open` reads the run's results on the anchors where the gate is on and on those where it is off. Both use the thresholds of `teb_vae/lag_attn_cfs/gate_states.py`: $g_{\mathrm{shut}} = 0.2$ and $g_{\mathrm{open}} = 0.8$.
+
+### `event_gate/event_gate.pdf`
+
+**Purpose.** Show when the gate is shut, whether the data or the model shut it, and what an open gate gives (`analyses/event_gate.py`).
+
+**What it shows.** Six panels:
+
+- **a:** the distribution of the learned gate $g_t$ where a UA key is open, per clinical class, with the two thresholds dotted.
+- **b:** the share of anchors in each of the four gate states against time before delivery, stacked.
+- **c:** the mean learned gate where a key is open, and the mean applied gate, against time before delivery.
+- **d:** the mean learned gate against the time since the last contraction onset.
+- **e:** the forecast gain and $K_t$ per gate state, as means over recordings with $95\%$ bootstrap intervals.
+- **f:** $K_t$ and the forecast gain against the learned gate, in decile bins of the gate.
+
+**How to read it.** The forced-shut share is a property of the data. The model-shut share is a decision of the model. A gate that responds to contractions shows a peak in panel d shortly after an onset.
+
+### `gate_open/gate_open.pdf`
+
+**Purpose.** Compare the run on four populations of anchors: every scored anchor, the gate-on anchors ($g^{\mathrm{eff}}_t \ge g_{\mathrm{shut}}$), the fully open anchors ($g^{\mathrm{eff}}_t \ge g_{\mathrm{open}}$) and the gate-off anchors (`analyses/gate_open.py`).
+
+**What it shows.** Six panels:
+
+- **a:** the share of scored anchors in each population, per clinical class.
+- **b:** $K_t$ per population and class.
+- **c:** the Monte Carlo forecast gain per population and class.
+- **d:** the forecast gain of each population against time before delivery, pooled over classes.
+- **e:** the share of anchors in the gate-on, fully open and gate-off populations against the time since the last contraction onset.
+- **f:** the run-duration histogram of the gate-on and the gate-off runs, weighted by time.
+
+**Axes.** a to c: the populations across, one bar per cohort, with a $95\%$ bootstrap interval over recordings. d and e: the clock across, anchor-level means per bin. f: run duration in seconds across, the share of the state's anchors up.
+
+**How to read it.** The `all` bars are the standard evaluation and mix two regimes. The gate-on bars give the size of the source's effect where the model reads the source. A gate-off gain near zero is the expected result. A run that touches a segment edge is cut short, so panel f under-states long runs.
+
+### `gate_open/gate_open_lags.pdf`
+
+**Purpose.** Show where on the lag axis the gate-on KL comes from, and whether that changes with the contraction, over labour, or with the gate value.
+
+**What it shows.** Six panels. The heatmaps take the left column:
+
+- **a:** the gate-on KL share per lag against the time since the last contraction onset.
+- **c:** the same against time before delivery.
+- **e:** the KL share per lag of every scored anchor, against the gate value in ten bins.
+- **b:** the KL attribution per lag in nats, one line per population, with a $95\%$ bootstrap band over recordings.
+- **d:** the KL share per lag of the gate-on, fully open and gate-off populations, with the gate-on attention weight dashed.
+- **f:** the gate-on KL share per lag, per clinical class.
+
+**Axes.** Every lag axis is in seconds of stored-coefficient time. Each heatmap row is one bin of its clock and sums to $1$. The heatmap colour and the share axes are logarithmic, with a floor of $10^{-3}$, so the lags beyond the first few stay visible. A clock bin that holds no anchors is drawn empty.
+
+**How to read it.** If the model tracked the contraction onset, the bright area of panel a would move to longer lags as the contraction ages and form a diagonal. A bright column at lag $0$ with no diagonal means that the model reads the current source level. The populations differ in height in panel b by construction, so compare their shapes in panel d. The lag axis is not a physiological latency.
+
+### `gate_open/gate_open_trajectory.pdf`
+
+**Purpose.** Follow the gate-on anchors through labour per clinical class, with one value per recording, and mark where the classes differ.
+
+**What it shows.** Four panels, each against hours before delivery with delivery at the right edge: the gate-on $K_t$, the gate-on Monte Carlo forecast gain, the gate-on share of the anchors, and the gate-on KL lag centroid. Each line is the median over the recordings of one class, and the band is the range between the quartiles. A dotted vertical line marks a half hour whose class test is significant after the Holm adjustment.
+
+**How it is computed.** In each half hour a recording gives one value: the mean over its own gate-on anchors there. A recording counts only with at least $10$ such anchors in the half hour. The class test is the Kruskal-Wallis test over the classes with at least three recordings. `gate_open_trajectory.csv` holds the same statistics for all four populations and six metrics, and `gate_open_trajectory_significance.csv` holds every test.
+
+**How to read it.** Over all anchors, a change in $K_t$ over labour can come from the gate opening more often or from a larger $K_t$ per open anchor. On the gate-on anchors only the second cause is left, and the share panel shows the first. Class lines that stay inside each other's bands do not differ. A class with few recordings gives a noisy line.
 
 ---
 
