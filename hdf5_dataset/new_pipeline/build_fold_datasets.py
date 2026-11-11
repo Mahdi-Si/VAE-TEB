@@ -449,7 +449,7 @@ def _prepare_state(device: Optional[str], settings: Mapping[str, Any]) -> None:
         transform=settings["transform"], leg_alignment=settings["leg_alignment"],
         phase_operator=settings["phase_operator"])
     if settings.get("signal_quality"):
-        cnp.attach_signal_quality(masks)
+        cnp.attach_signal_quality(masks, cnp.quality_config(bool(settings.get("quality_valid_boxes"))))
     labor_onset_map, second_stage_map = cnp.load_csv_metadata(settings["tlo_csv_path"],
                                                               verbose=False)
     _STATE.update(cnp=cnp, masks=masks, settings=dict(settings),
@@ -870,7 +870,8 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
          pretrain_guids_per_shard: Optional[int] = None, seed: Optional[int] = None,
          assembly_workers: Optional[int] = None, keep_units: Optional[bool] = None,
          dry_run: Optional[bool] = None, signal_quality: Optional[bool] = None,
-         quality_examples: Optional[int] = None) -> int:
+         quality_examples: Optional[int] = None,
+         quality_valid_boxes: Optional[bool] = None) -> int:
     """Apply the defaults, plan the build, and run it.
 
     Args:
@@ -897,6 +898,10 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
         signal_quality: Causal only: the signal-quality step of ``create_new_pipeline.py``, and
             the report in ``quality_report/`` at the end. Default: off.
         quality_examples: Example pages per category in the report; 0 draws none. Default: 4.
+        quality_valid_boxes: Only with *signal_quality*: keep a UA box that returns to the rest
+            as valid data (``create_new_pipeline.quality_config``). The stored UA fields differ
+            from a build without it, and a complete file is recognized by its GUID digest and
+            ``quality_version`` only, so such a build needs its own output path. Default: off.
 
     Returns:
         The process exit code.
@@ -916,6 +921,9 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     if signal_quality and transform != cnp.CAUSAL:
         raise ValueError("signal_quality=True needs transform='causal'")
     quality_version = cnp.sq.QUALITY_VERSION if signal_quality else None
+    quality_valid_boxes = bool(quality_valid_boxes)
+    if quality_valid_boxes and not signal_quality:
+        raise ValueError("quality_valid_boxes=True needs signal_quality=True")
     quality_examples = 4 if quality_examples is None else int(quality_examples)
     eligibility = pretrain_eligibility or PRETRAIN_ELIGIBILITY[0]
     test_fraction = 0.1 if pretrain_test_fraction is None else float(pretrain_test_fraction)
@@ -956,7 +964,7 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
                 "phase_operator": phase_operator, "tlo_csv_path": str(tlo_csv_path),
                 "scatter_batch_size": int(scatter_batch_size or 128), "verbose": bool(verbose),
                 "source_pickle_path": str(pickle_path), "signal_quality": signal_quality,
-                "quality_version": quality_version}
+                "quality_version": quality_version, "quality_valid_boxes": quality_valid_boxes}
     manifest = {
         "fold_dir": str(fold_dir), "fold_partitions_sha256": fold_digest,
         "fold_run_config": run_config, "screening_csv_path": str(screening_csv_path),
@@ -1128,6 +1136,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--signal-quality", dest="signal_quality",
                    action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--quality-examples", dest="quality_examples", type=int)
+    p.add_argument("--quality-valid-boxes", dest="quality_valid_boxes",
+                   action=argparse.BooleanOptionalAction, default=None)
     return p
 
 
@@ -1187,6 +1197,13 @@ RUN_ARGS: Dict[str, Any] = {
     #          Root attribute quality_version. Ends with quality_report/ (clinical traces: keep it
     #          on this box). Needs its OWN output_base_path and statistics file.
     "signal_quality": True,
+    # bool | None -- only with signal_quality: the valid-box rule.    (None -> False)
+    #   True : a UA run that the jump rules marked, that stands at least 10 units above the rest
+    #          for 16-64 s and returns to it, stays in the signal as a valid BOX. Without it the
+    #          run is invalid and the bridge draws a line through it. The stored up, up_st and
+    #          up_ph differ from a build without it, and a rerun skips every complete file, so
+    #          use a NEW output_base_path. Root attribute quality_box_valid.
+    "quality_valid_boxes": False,
     # int | None -- example pages per category in quality_report/; 0 draws none.  (None -> 4)
     "quality_examples": 100,
 

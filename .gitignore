@@ -27,3 +27,6 @@ mlflow.db
 
 # Scratch work, never tracked
 tmp/
+
+# Probe outputs of the session-7 neural surgery (9.5 GB of per-anchor tables and checkpoints)
+teb_vae/neural_surgery_trf_cfs/session7/out/

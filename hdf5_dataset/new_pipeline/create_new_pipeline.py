@@ -11,6 +11,7 @@ Self-contained script that:
 """
 
 import argparse
+import dataclasses
 import os
 import sys
 import math
@@ -1352,6 +1353,20 @@ def mimo_fill(enabled: bool):
         yield
     finally:
         cls.interpolate_input = original
+
+
+def quality_config(valid_boxes: bool = False) -> Any:
+    """Return the quality thresholds of a build.
+
+    Args:
+        valid_boxes: Switch on ``QualityConfig.box_valid``: a UA run that the jump rules marked,
+            that stands above the rest and that returns to it stays in the signal as a valid
+            ``BOX``. Off gives the default thresholds, bit for bit.
+
+    Returns:
+        A ``signal_quality.QualityConfig``.
+    """
+    return dataclasses.replace(sq.DEFAULT_CONFIG, box_valid=True) if valid_boxes else sq.DEFAULT_CONFIG
 
 
 def attach_signal_quality(masks: Dict[str, Any], cfg: Optional[Any] = None) -> Dict[str, Any]:
@@ -3889,6 +3904,7 @@ def create_new_pipeline(
     device: Optional[str] = None,
     phase_operator: str = PHASE_OPERATOR_LEGACY,
     signal_quality: bool = False,
+    quality_valid_boxes: bool = False,
     bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
     no_bg_cls_fraction: Optional[float] = HEALTHY_NO_BG_CLS_FRACTION,
     selection_only: bool = False,
@@ -3953,6 +3969,9 @@ def create_new_pipeline(
             every kept segment, and store the quality datasets beside the coefficients (see
             :func:`attach_signal_quality`). ``fhr``/``up`` then hold the bridged signals, so
             write such a build to a **separate** output path with its own statistics.
+        quality_valid_boxes: Only with *signal_quality*. Keep a UA box that returns to the rest
+            as valid data (:func:`quality_config`). The stored UA fields differ from a build
+            without it, so it needs its **own** output path too.
         bg_cls_fraction: Step 2: fraction of each eligible healthy BG subgroup in the
             classification pool. Ignored when resuming from a pickle.
         no_bg_cls_fraction: Step 2: fraction of each eligible healthy no-BG subgroup in the
@@ -3977,6 +3996,8 @@ def create_new_pipeline(
     validate_test_mode(test_mode)
     if signal_quality and transform != CAUSAL:
         raise ValueError("signal_quality=True needs transform='causal'")
+    if quality_valid_boxes and not signal_quality:
+        raise ValueError("quality_valid_boxes=True needs signal_quality=True")
     if not 0.0 < bg_cls_fraction <= 1.0:
         raise ValueError(f"bg_cls_fraction={bg_cls_fraction}; use a value in (0, 1]")
     if no_bg_cls_fraction is not None and not 0.0 <= no_bg_cls_fraction <= 1.0:
@@ -4017,11 +4038,12 @@ def create_new_pipeline(
         leg_alignment=leg_alignment, phase_operator=phase_operator,
     )
     if signal_quality:
-        attach_signal_quality(masks)
+        attach_signal_quality(masks, quality_config(quality_valid_boxes))
         logger.info(
             f"Signal quality: rules version {sq.QUALITY_VERSION}, look-ahead "
-            f"{sq.DEFAULT_CONFIG.lookahead_s:g} s. The MIMO fill is off, and fhr/up store the "
-            f"bridged signals."
+            f"{masks['signal_quality']['config'].lookahead_s:g} s, valid boxes "
+            f"{'on' if quality_valid_boxes else 'off'}. The MIMO fill is off, and fhr/up store "
+            f"the bridged signals."
         )
     # Log the resolved layout and the active selection parameters: this is the
     # operator's confirmation that the intended variant is running, and it
@@ -4320,6 +4342,10 @@ def build_parser() -> argparse.ArgumentParser:
                         action=argparse.BooleanOptionalAction, default=None,
                         help="Causal only: read with the MIMO fill off, store the bridged signals "
                              "and the quality datasets. Default: off.")
+    parser.add_argument("--quality-valid-boxes", dest="quality_valid_boxes",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Only with --signal-quality: keep a UA box that returns to the rest "
+                             "as valid data. Needs its own output path. Default: off.")
     parser.add_argument("--bg-cls-fraction", dest="bg_cls_fraction", type=float,
                         help="Step 2: fraction of each eligible healthy BG subgroup in the "
                              f"classification pool. Default: {HEALTHY_BG_CLS_FRACTION}.")
@@ -4352,6 +4378,7 @@ def main(
     device: Optional[str] = None,
     phase_operator: Optional[str] = None,
     signal_quality: Optional[bool] = None,
+    quality_valid_boxes: Optional[bool] = None,
     bg_cls_fraction: Optional[float] = None,
     no_bg_cls_fraction: Optional[float] = None,
     selection_only: Optional[bool] = None,
@@ -4378,6 +4405,8 @@ def main(
         device: Torch device for the transform.
         phase_operator: Causal phase-harmonic operator version.
         signal_quality: Causal only: the signal-quality step.
+        quality_valid_boxes: Only with *signal_quality*: keep a UA box that returns to the rest
+            as valid data.
         bg_cls_fraction: Fraction of each eligible healthy BG subgroup in the classification
             pool.
         no_bg_cls_fraction: Fraction of each eligible healthy no-BG subgroup in the
@@ -4405,6 +4434,7 @@ def main(
         device=device,
         phase_operator=phase_operator or PHASE_OPERATOR_LEGACY,
         signal_quality=bool(signal_quality),
+        quality_valid_boxes=bool(quality_valid_boxes),
         bg_cls_fraction=HEALTHY_BG_CLS_FRACTION if bg_cls_fraction is None else bg_cls_fraction,
         no_bg_cls_fraction=no_bg_cls_fraction,
         selection_only=bool(selection_only),
@@ -4514,6 +4544,14 @@ RUN_ARGS: Dict[str, Any] = {
     #          attribute quality_version. Needs its OWN output path and statistics file.
     #   build_fold_datasets.py has the same switch for the minimization-fold build.
     "signal_quality": False,
+
+    # bool | None -- only with signal_quality: the valid-box rule.  (None -> False)
+    #   True : a UA run that the jump rules marked, that stands at least 10 units above the rest
+    #          for 16-64 s and returns to it, stays in the signal as a valid BOX. Without it the
+    #          run is invalid and the bridge draws a line through it. The stored up, up_st and
+    #          up_ph differ from a build without it: use its OWN output path. Recorded as the
+    #          root attribute quality_box_valid.
+    "quality_valid_boxes": False,
 
     # ========================= Everything below has a default =========================
     # str | None -- torch device for the transform, e.g. "cuda:3" to pin one GPU of eight.

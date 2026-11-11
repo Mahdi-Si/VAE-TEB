@@ -829,3 +829,268 @@ within the first epochs.
 - **The model reads UA almost only at lags 0 and 10 s** and its KL peaks at the contraction peak.
   A late-deceleration response would need a longer reward reach; s7 does not address this.
 - **Pre-existing test failures** (15 in the selection) remain in the repository.
+
+
+## E8. Masked boxes near contractions (pre-registered 2026-11-10, after the s7 commit, before any FHR or model result)
+
+**Origin (user).** Some UA traces jump shortly after what looks like a contraction onset, hold a
+flat top (a box), and fall back to the rest level. The quality mask marks the whole box, and the
+bridge then draws a monotone line through it. Does the box carry information about the FHR, and
+should the transfer-entropy estimate use it?
+
+**What was looked at before this text.** UA only: the lengths, heights and ceiling shares of the
+masked runs, and 16 plots of raw UA, stored UA and FHR. No FHR statistic and no model output was
+computed.
+
+**Box event (fixed).** A maximal invalid run of `up_quality` on split codes 0 and 2 that meets all
+of these conditions:
+
+1. `TRANSIENT` on more than 90% of its samples, no other invalid bit, and no raw value above 127 or below 0;
+2. length $16 < L \le 64$ s (longer than the s7 tolerance; the builder closes a box within 60 s);
+3. height $h = \operatorname{median}(x_{\text{inside}}) - r \ge 10$ units, where the rest level $r$ is
+   the 10th percentile of the valid raw UA within 180 s on both sides;
+4. return: the median valid raw UA from 5 to 30 s after the run is at most $r + 0.5\,h$;
+5. at least 60 s of the segment on both sides. Events are de-duplicated by recording and absolute start.
+
+The scan gave 648 such runs in about 100 recordings.
+
+### E8.1 Model-free FHR response
+
+**Hypothesis.** A box event is a real uterine event with a distorted shape, so the FHR responds
+to it as it responds to a clean contraction.
+
+**Metric.** For an event at time $t_0$, with the valid FHR $f$ smoothed by a 10-s median,
+the dip is $D = \bar f_{[t_0-60,\,t_0-10]} - \min_{\tau \in [0, 90]} \tilde f(t_0 + \tau)$ in bpm and
+the absolute response is $A = \operatorname{mean}_{\tau \in [0, 90]} |f(t_0+\tau) - \bar f_{[t_0-60,\,t_0-10]}|$.
+An event counts when at least 70% of the FHR samples are valid in both windows. Three groups in
+the same recordings: box events ($t_0$ = run start), clean contractions (detector events with no
+invalid UA sample in their span; $t_0$ = onset) and random times (at least 90 s from every
+contraction span and every invalid run). The statistic is the recording-level mean difference,
+with a bootstrap over recordings (2000 resamples).
+
+**Predictions.** (1) $D_{\text{box}} - D_{\text{random}} > 0$ and the interval excludes 0.
+(2) $D_{\text{box}} - D_{\text{random}}$ is at least half of $D_{\text{clean}} - D_{\text{random}}$.
+
+**Common-cause check.** The share of invalid FHR samples in $[t_0, t_0 + 90]$ s per group. If the
+box group exceeds the clean group by more than 10 points, prediction 1 is repeated on events with
+at least 95% valid FHR, and that result decides.
+
+**Kill.** The interval of $D_{\text{box}} - D_{\text{random}}$ includes 0 (after the common-cause
+rule). Then the mask is right and the boxes stay out.
+
+### E8.2 Model-level value of the box (epoch 424, intervention, no training)
+
+**Hypothesis.** The raw box gives the model forecast gain that the bridge removes.
+
+**Variants** of the UA source of each segment that holds a box event; only box runs change, every
+other invalid run keeps its stored values and strict flags:
+
+- `strict`: stored values (bridged), stored flags. This is rung 6.
+- `erased`: stored values (bridged), flags recomputed with the box runs removed from the invalid
+  mask. The event is erased but the flags are valid. This is what a tolerance of 64 s would do.
+- `raw`: values rebuilt by the builder's chain with the box runs removed from the invalid mask, so
+  the raw box passes; the same flags as `erased`.
+- `slew`: as `raw`, but inside each box run the raw UA is replaced by a causal slew-limited copy,
+  $y[n] = y[n-1] + \operatorname{clip}(x[n] - y[n-1], \pm 1)$ per sample (4 units/s), which removes the
+  sharp edges and keeps the timing.
+
+**Metric.** Source gain $G = \mathrm{NLL}_{\text{base}} - \mathrm{NLL}_{\text{full}}$ with mean decoding
+on affected anchors (the 38-step key window holds at least one step of a box run), by timing
+(inside the run, 0-60 s after it, 60-152 s after it). Paired bootstrap over recordings.
+
+**Predictions.** (1) $G_{\text{raw}} - G_{\text{erased}} > 0$ on affected anchors, interval excludes 0.
+(2) $G_{\text{raw}} - G_{\text{strict}} > 0$. (3) `slew` is at least as good as `raw`.
+
+**Caveats fixed beforehand.** The network never trained on a box, so a null result here is weak
+evidence against the box and a positive result is a lower bound. Inside a run, `erased` reads the
+first valid sample after the run through the bridge, so it has a look-ahead advantage over `raw`.
+
+**Kill.** Both `raw` and `slew` fail prediction 1.
+
+### E8 decision rule
+
+- E8.1 killed: no change, and the boxes stay masked.
+- E8.1 passes: the boxes are real events. A change of the stored features belongs to the dataset
+  builder, and it needs new shards and a pilot fine-tune on them before it enters a rung. s7
+  launches unchanged unless a pilot on rebuilt features passes on the select code in this session.
+
+### E8.1 result (2026-11-10; codes 0 and 2; `out/phase6/box_fhr_response.json`): the FHR responds to a box more than to a clean contraction
+
+649 box events in 104 recordings (acidosis 388, healthy 219, HIE 42). Median length 32 s, median
+height 74 units above the rest. 61% hold the ceiling value on at least 30% of their samples, and
+68% lie in the second stage.
+
+| Group | Events measured | Recordings | Mean dip $D$ (bpm) | Invalid FHR share in $[t_0, t_0+90]$ s |
+|---|---|---|---|---|
+| box | 524 | 96 | 19.2 | 13.8% |
+| clean contraction | 18,920 | 170 | 9.1 | 3.6% |
+| random, quiet | 9,169 | 168 | 6.7 | 3.6% |
+| random, any | 102,513 | 170 | 7.7 | 3.2% |
+
+| Recording-level difference of $D$ | bpm |
+|---|---|
+| box minus random quiet | +10.71 [7.80, 13.61] |
+| clean minus random quiet | +2.50 [1.60, 3.30] |
+| box minus clean | +8.78 [6.15, 11.60] |
+| box minus random quiet, events with at least 95% valid FHR | +9.73 [7.07, 12.87] |
+| box minus random any, first stage only (204 events) | +4.54 [1.88, 7.51] |
+| box minus random any, second stage only (443 events) | +14.16 [10.35, 18.04] |
+| box minus random any, ceiling share below 0.3 (250 events) | +7.33 [4.64, 10.17] |
+
+**Predictions.** (1) HOLDS. (2) HOLDS: the box effect is 5.6 times the clean-contraction effect
+[3.6, 13.1]. The invalid FHR share of the box group exceeds the clean group by 10.2 points, so the
+common-cause rule applies; the comparison on events with at least 95% valid FHR decides, and it
+holds. **Not killed.**
+
+**Reading.** The masked boxes are the UA events with the largest FHR response in the data, in
+both stages and with or without the ceiling. Most are bearing-down efforts or clamped crests. One
+confound stays open: in the second stage the FHR sensor can pick up the maternal heart rate
+during a push, which looks like a deceleration. The first-stage result, where this is rare, is
+smaller but clear.
+
+### E8.2 result (2026-11-10; codes 0 and 2; 306 segments; `out/phase6/box_model.json`): the raw box gives the epoch-424 model a gain that the bridge removes
+
+Checks: the rebuild reproduces the stored `up_st` exactly; the flags built here equal the loader's;
+$\mathrm{NLL}_{\text{base}}$ does not change across variants.
+
+| Scope | Anchors (recordings) | $G$ strict | $G$ erased | $G$ raw | $G$ slew |
+|---|---|---|---|---|---|
+| affected | 7,747 (87) | 0.77 | 5.10 | 8.39 | 5.00 |
+| affected, inside the run | 1,188 (63) | 0.32 | 29.95 | 50.32 | 30.06 |
+| affected, 0-60 s after | 2,803 (76) | 0.05 | 0.58 | 1.61 | 0.37 |
+| affected, 60-152 s after | 3,756 (81) | 1.44 | 0.62 | 0.18 | 0.52 |
+| not affected | 19,994 (101) | 4.73 | 4.67 | 4.75 | 4.74 |
+
+| Difference on affected anchors | nats |
+|---|---|
+| raw minus erased | +3.29 [1.05, 5.80] |
+| raw minus strict | +7.62 [4.47, 10.95] |
+| slew minus raw | -3.39 [-5.82, -1.21] |
+| raw minus erased, inside the run | +20.37 [9.33, 34.85] |
+| raw minus erased, 0-152 s after the run | +0.19 [-0.66, 1.05] |
+
+**Predictions.** (1) HOLDS. (2) HOLDS. (3) REFUTED: the slew-limited copy loses what the raw box
+adds, so the sharp shape is the information and smoothing is the wrong treatment. **Not killed.**
+
+**Reading.** The whole effect sits at anchors inside the box. There the raw box gives 50 nats with
+no look-ahead, against 30 nats for the bridge, which reads the first valid sample after the run,
+and 0.3 nats for rung 6. After the run the variants do not differ. The network never trained on a
+box, so these sizes are lower bounds.
+
+**A fault found on the way.** The dataset builder module sets `torch.backends.cudnn.enabled =
+False` when it is imported. A probe that builds features and runs the network in one process then
+runs the network about 300 times slower. `p1_rebuild.Rebuilder` now restores the switch and turns
+cuDNN off only around the builder's transform; the rebuild is still exact. Earlier probes that
+used the rebuilder (Phase 1, T4) were slow but their numbers are not affected.
+
+### E8.3 Pilot fine-tune on rebuilt features (pre-registered 2026-11-10, before any pilot result)
+
+**Hypothesis.** Rung 7 forecasts better near a box when it trains on UA features in which the
+box runs are valid and hold the raw values.
+
+**Arms** (`p6_box_pilot.py`; rung-7 warm start; the fixed pilot budget; seeds 0 and 1; fit on code
+0; scored on code 2):
+
+- `s7ref`: the stored segments.
+- `s7box`: the fit and scored segments with a box event are rebuilt by the builder's chain with
+  the box runs removed from the invalid mask (values, flags, raw validity and the UA trace that
+  the event weight reads).
+- `s7ref_onbox`: the `s7ref` network scored on the rebuilt segments (no training on them).
+
+**Predictions** (differences `s7box` minus `s7ref`, recording-level intervals):
+
+1. On affected anchors, $\Delta\mathrm{NLL}_{\text{full}} < 0$ and the interval excludes 0.
+2. On affected anchors, $\Delta G > 0$ and the interval excludes 0.
+3. No harm: on the anchors that are not affected, the interval of $\Delta\mathrm{NLL}_{\text{full}}$
+   includes 0 or lies below it.
+4. Training adds to the data effect: `s7box` minus `s7ref_onbox` on affected anchors is negative
+   (direction only).
+
+**Kill.** Prediction 1 fails, or the interval of prediction 3 lies above 0.
+
+**What a pass allows.** The official evaluation needs shards, and the test half was opened once
+for the s7 decision, so neither can be run for this arm here. A pass therefore supports a builder
+change and new shards; it does not put the change into the s7 files of this session.
+
+### E8.3 result (2026-11-11; select code 2; 78 recordings, 48,020 anchors; two seeds; `out/phase6/box_pilot.json`): the pilot PASSES
+
+The self-check of the field construction is exact (all six fields equal the loader's on stored
+data). 145 fit segments and 161 scored segments were replaced.
+
+| Scope | Anchors (recordings) | $\Delta\mathrm{NLL}_{\text{full}}$, `s7box` minus `s7ref` | $G$ ref -> box | gate ref -> box |
+|---|---|---|---|---|
+| all | 48,020 (78) | -0.23 [-0.31, -0.15] | 2.37 -> 2.50 | 0.27 -> 0.28 |
+| affected | 1,505 (51) | -4.24 [-6.32, -2.40] | 0.53 -> 4.70 | 0.13 -> 0.35 |
+| affected, unseen cohorts | 1,029 (35) | -3.33 [-5.46, -0.94] | 0.76 -> 4.04 | 0.13 -> 0.35 |
+| affected, inside the run | 308 (48) | -21.74 [-31.61, -13.74] | 1.61 -> 23.13 | 0.27 -> 0.76 |
+| affected, 0-152 s after | 1,197 (51) | +0.27 [-0.54, 1.13] | 0.26 -> -0.04 | 0.10 -> 0.24 |
+| not affected | 46,515 (78) | -0.10 [-0.12, -0.08] | 2.43 -> 2.43 | 0.27 -> 0.27 |
+
+Inside the run the scattering MSE of the full branch falls to 0.946 of the reference, so the
+gain is in the mean forecast too. The calibration does not move (tail error 0.99 and 1.01
+against 0.99 and 1.02; 1-sigma coverage equal to three decimals).
+
+**Predictions.** (1) HOLDS. (2) HOLDS ($\Delta G$ +4.17 [2.33, 6.25]). (3) HOLDS: no harm on the
+anchors that are not affected. (4) Direction only, and not clear: `s7box` minus `s7ref_onbox` on
+affected anchors is -0.04 [-0.09, 0.02]. **Not killed.**
+
+**Reading.** The rung-7 network uses a box as soon as the data shows it. `s7ref_onbox` (no
+training on boxes) reaches the same gain as `s7box`. So a rung-7 run on the present shards loses
+nothing that a later switch to rebuilt shards cannot recover. The gain is at anchors inside the
+box; after the box the forecast does not change in 300 steps.
+
+**A bound on the look-ahead of the rule.** The rule decides after the run whether the box
+returned, so a valid flag inside a running box tells the model one binary fact about the future.
+78% of the TRANSIENT-only runs of 16-64 s pass the rule, so that fact carries at most 0.53 nats
+of entropy per event, against a gain of 22 nats per anchor inside the run. The raw values
+themselves are causal: no bridge writes them.
+
+### E8.4 The builder option (2026-11-11; `p6_box_builder_check.py`; `out/phase6/box_builder_check.json`)
+
+The rule is now in the dataset builder as `QualityConfig.box_valid` (off by default), with a new
+valid bit `BOX = 4096`, and both builders take `quality_valid_boxes` (off by default).
+
+- With the option off, `ua_quality` does not call the rule, and the look-ahead stays 180 s.
+- With the option on, the bits equal the bits with the option off except in the runs that
+  `p6_box_events.box_runs` selects: 0 of 3,712 segments differ. 630 runs turn valid.
+- The option on drops the level shift of a neighbouring invalid span in 6 segments. This is
+  correct: the valid box samples now count in the builder's return test.
+- A re-run of the rules on a stored segment differs from the stored bits in 653 segments (the
+  file keeps the raw UA as `float16`); 91.8% of the stored box samples turn valid in the re-run.
+- Unit tests: five new tests in `hdf5_dataset/tests/test_signal_quality_rules.py`. The dataset
+  tests give 234 passes; two import tests of `test_causal_torch.py` and the collection of
+  `test_causal_loader.py` fail on the last commit too.
+
+### E8 decision
+
+Boxes that return to the rest are real UA events with the largest FHR response in the data, and
+rung 7 forecasts better with them. The change is a change of the stored features, so it enters
+through a new dataset build with `quality_valid_boxes: True`, not through the s7 config.
+
+**The s7 files do not change.** The official verdicts and the test half were not run for this
+arm: the official evaluation needs rebuilt shards, and the test half was opened once for the s7
+decision. Those two checks belong to the first evaluation on rebuilt shards.
+
+**Predictions for a run on rebuilt shards** (against the same network on the present shards):
+the gain on anchors inside a box rises by at least 10 nats; the forecast NLL over all anchors
+falls by 0.1 to 0.4 nats; the calibration and the ten s7 predictions of E7 do not move. Refuted
+when the gain inside a box rises by less than 5 nats, or the NLL over anchors without a box in
+the key window rises.
+
+**Open point.** In the second stage the FHR sensor can record the maternal heart rate during a
+push, and that looks like a deceleration. The first-stage boxes show the effect too (+4.5 bpm
+[1.9, 7.5]), so the finding does not rest on the second stage, but the size there may be
+inflated.
+
+## E9. Final pass before the s7 launch (2026-11-11)
+
+| Check | Result |
+|---|---|
+| s7 config against the config of the epoch-424 run | differs only in the four rung-7 keys, the two inert keys, the run names and the warm-start path |
+| Warm start rebuilt from the committed files with `init_s7 --mode build` | 386 tensors, largest difference 0.0 against the existing file; digest verified; strict load passes |
+| Tests of the changed model code (12 files of `lag_attn_transformer_cfs/tests`) | 305 pass; the 5 failures are those recorded in E6 |
+| Words that the stored-timeline rule forbids, in every file of the commit and of this pass | none |
+| Markdown references in docstrings or comments of the Python files | none |
+| Entry points without defaults | none |
+| `session7/out/` (9.5 GB) | now in `.gitignore`; it was not ignored, and `git add -A` would have staged it |
+| cuDNN switch | `p1_rebuild.Rebuilder` no longer leaves cuDNN off for the process (see E8.2) |
