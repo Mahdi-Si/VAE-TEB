@@ -59,6 +59,37 @@ draw a crest (peak error -10.9% at 16 s, -28.8% at 32 s) and is weak on the rise
 | 6. `logvar_clamp` is shared; `named_parameters()` dedups shared tensors | Confirmed; s7 gives the decoder its own bound, and `init_s7.py` copies with `remove_duplicate=False`. |
 | Soft-mask parameters | Only the adapter's flag input learned. The per-head key bias (at most +0.29) and the gate's invalid-mass weight (at most 0.26) stayed near zero. |
 
+## Masked boxes near contractions (added 2026-11-11, after the s7 commit)
+
+Some UA traces jump shortly after a contraction onset, hold a flat top and fall back to the rest.
+The quality mask marks the whole box, and the bridge draws a line through it. The local fit and
+select recordings hold 649 such runs of 16 to 64 s in 104 recordings. They are the UA events with
+the largest FHR response in the data:
+
+| Evidence | Value |
+|---|---|
+| FHR dip after a box, minus a random quiet time | +10.7 bpm [7.8, 13.6]; a clean contraction gives +2.5 [1.6, 3.3] |
+| The same, first stage only | +4.5 bpm [1.9, 7.5] |
+| Epoch 424 with the raw box in place of the bridge, anchors with a box in the lag window | source gain 0.8 to 8.4 nats; raw minus bridge +3.3 [1.1, 5.8] |
+| Rung-7 pilot on rebuilt features, select code, same anchors | forecast NLL -4.24 nats [-6.32, -2.40]; unseen cohorts -3.33 [-5.46, -0.94] |
+| The same, anchors inside the box | -21.7 nats [-31.6, -13.7]; gate 0.27 to 0.76; scattering MSE 0.946 of the reference |
+| Anchors without a box in the lag window | -0.10 nats [-0.12, -0.08]: no harm |
+| A slew-limited (smoothed) box against the raw box | worse by 3.4 nats [1.2, 5.8]: the sharp shape is the information |
+
+The rung-7 network reaches the same gain with no training on boxes, so a run on the present
+shards loses nothing that rebuilt shards cannot recover later.
+
+**What changed.** The dataset builder has a new option, off by default: `quality_valid_boxes`
+in the run arguments of `build_fold_datasets.py` and `create_new_pipeline.py`
+(`QualityConfig.box_valid`, valid bit `BOX`). With it, a box that returns to the rest stays in
+the signal as valid data. The option equals the rule of the probes on 3,712 segments, and five
+unit tests cover it. **The s7 config and warm start do not change.** A build with the option
+needs its own output path. Keep the present statistics file for it, so that the warm start reads
+the same input scale.
+
+**Not yet checked.** The official verdicts and the test half need rebuilt shards. One confound
+stays open: in the second stage the FHR sensor can record the maternal heart rate during a push.
+
 ## Killed
 
 | Hypothesis | Why |
@@ -117,6 +148,10 @@ Relative to the rung-6 run at epoch 424, same validation data.
   `lag_attn_cfs/nets/causal_inputs.py`, `lag_attn_cfs/task.py`, `lag_attn_cfs/trainer.py`,
   `lag_attn_rws/nets/losses.py`, `lag_attn_rws/nets/controls.py`, the two cell constructors, the
   evaluation's calibration and metrics modules, and `configs/default.yaml`.
+- Box probes: `session7/p6_box_events.py` (selection, FHR response), `p6_box_model.py`
+  (epoch-424 intervention), `p6_box_pilot.py` (pilot on rebuilt features),
+  `p6_box_builder_check.py` (builder rule against the probes), `p6_box_figure.py`. Builder rule:
+  `hdf5_dataset/signal_quality.py` (`_mark_valid_boxes`).
 - Probes: `session7/p0_*.py` to `p5_*.py`, shared code in `s7common.py`, `s7_interventions.py`,
   `s7_tolerance.py`, `s7_pilot.py`, `detectors7.py`. Outputs under `session7/out/`.
 - Evaluation: official test-half runs in `session7/out/phase5/official/`; the epoch-424 run

@@ -44,6 +44,16 @@
 #     slightly worse over all anchors.
 #   * a per-band key rule and a rescaled source adapter: their premises did not hold at epoch 424.
 #
+# A DATA OPTION THAT IS NOT PART OF THIS FILE. The quality mask marks a UA box that jumps up near
+# a contraction and returns to the rest, and the bridge draws a line through it. Those boxes are
+# the UA events with the largest FHR response (dip +10.7 bpm [7.8, 13.6] over a random time,
+# against +2.5 for a contraction with clean UA). The dataset builder can keep them as valid data
+# (`quality_valid_boxes: True` in its run arguments; off by default). In a pilot of this rung on
+# features rebuilt that way, the forecast NLL fell by 4.2 nats [2.4, 6.3] on anchors with a box in
+# the lag window, by 21.7 nats on anchors inside the box, and did not rise elsewhere. The network
+# reached that gain with no training on boxes, so this run can start on the present shards and
+# move to rebuilt shards later. No key of this file changes for it; keep the same statistics file.
+#
 # READ THIS RUN AGAINST THE RUNG-6 RUN (lag_attn_trf_cfs_next_s6_soft_ua_mask):
 #   * forecast NLL (`val/nll_full_block`): expected to fall by about 150-200 nats per anchor block
 #     once the decoder variance has adapted. The NLL of this rung is a Student-t log score with a

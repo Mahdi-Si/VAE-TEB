@@ -64,6 +64,11 @@ class Rebuilder:
     def __init__(self, device: str = "cuda:0", n_signal: int = C.N_RAW) -> None:
         import torch
 
+        # The builder module switches cuDNN off for the whole process when it is imported. A
+        # network that runs in the same process then falls back to the native convolutions and
+        # is about 300 times slower. The switch is restored here, and :meth:`transform` switches
+        # cuDNN off only around the builder's own transform, so the rebuild stays exact.
+        cudnn_was = torch.backends.cudnn.enabled
         import hdf5_dataset.new_pipeline.create_new_pipeline as P
         from hdf5_dataset import signal_quality as sq
 
@@ -97,6 +102,7 @@ class Rebuilder:
         self.rho_banks = {block: sq.ContaminationBank(masks["signal_quality"]["kernels"][block],
                                                       n_signal, P.QUALITY_DECIMATION)
                           for block in P.CAUSAL_BLOCKS}
+        torch.backends.cudnn.enabled = cudnn_was
 
     def bridge(self, up_raw: np.ndarray, invalid: np.ndarray) -> np.ndarray:
         """Bridge and sanitise a batch of raw UA traces as the builder does.
@@ -125,14 +131,17 @@ class Rebuilder:
         Returns:
             ``{'up_st': (B, 36, T), 'up_ph': (B, 10, T)}`` ``float32``.
         """
+        import torch
+
         up = np.atleast_2d(np.asarray(up, dtype=np.float32))
         outs: Dict[str, List[np.ndarray]] = {"up_st": [], "up_ph": []}
         for i in range(0, up.shape[0], batch):
             part = up[i:i + batch]
-            got = self.P.transform_batch_numpy(
-                self.torch_bank, np.zeros_like(part), part, self.target_pairs, self.source_pairs,
-                plan=self.masks["channel_plan"], leg_alignment=self.leg_alignment,
-                phase_operator=self.phase_operator)
+            with torch.backends.cudnn.flags(enabled=False):
+                got = self.P.transform_batch_numpy(
+                    self.torch_bank, np.zeros_like(part), part, self.target_pairs, self.source_pairs,
+                    plan=self.masks["channel_plan"], leg_alignment=self.leg_alignment,
+                    phase_operator=self.phase_operator)
             for block in outs:
                 outs[block].append(np.asarray(got[block], dtype=np.float32))
         return {block: np.concatenate(v, axis=0) for block, v in outs.items()}

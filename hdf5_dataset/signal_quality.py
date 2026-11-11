@@ -43,6 +43,17 @@ known, a ``TRANSIENT`` run that rides on a contraction, stays above the rest and
 gap or ceiling is a valid ``PUSH`` (:attr:`QualityConfig.push_on_units`). Without the onset the
 rule is off.
 
+**Boxes that return to the rest.** A jump to a flat top that falls back to the rest level within
+about a minute is marked ``TRANSIENT`` as a whole, and the bridge then draws a monotone line
+through it. In the local shards the FHR dips by about $19$ bpm after such a run, against $9$ bpm
+after a contraction with clean UA and $7$ bpm at a random time, in the first stage and in the
+second, with or without a ceiling value. Most of these runs are bearing-down efforts or clamped
+crests, so their timing is information although their shape is not a contraction's. With
+:attr:`QualityConfig.box_valid` a run of $16$--$64$ s that carries only ``TRANSIENT``, stands at
+least :attr:`QualityConfig.box_valid_height_units` above the rest and returns to it is a valid
+``BOX``: its raw samples stay in the signal. The rule is off by default, and a build with it on
+writes other ``up``, ``up_st`` and ``up_ph`` values, so it needs its own output path.
+
 **Level shifts.** A step leaves a new level in valid samples, and a coefficient whose kernel
 spans the step responds to the jump although few of its samples are invalid. Every ``STEP``, and
 every short invalid span between two settled levels that differ by
@@ -91,6 +102,8 @@ marked inside a wave too.
   :attr:`QualityConfig.flat_merge_gap_s` plus :attr:`QualityConfig.flat_run_min_s`, and once
   its region reaches :attr:`QualityConfig.pulse_region_s`;
 * a push is judged by the :attr:`QualityConfig.push_context_s` after it;
+* a valid box (only with :attr:`QualityConfig.box_valid`) is judged by the
+  :attr:`QualityConfig.box_valid_context_s` after it;
 * the transient after a gap ends at the start of a settled window of
   :attr:`QualityConfig.settle_window_s`;
 * a spike is measured over :attr:`QualityConfig.spike_side_s` on both sides;
@@ -146,6 +159,9 @@ class UaBit(enum.IntFlag):
             contraction: a bearing-down effort. Valid.
         FLAT: A sample of a flat region more than :attr:`QualityConfig.rest_max_s` after its
             start. Invalid: it carries no information.
+        BOX: Only with :attr:`QualityConfig.box_valid`: a run the jump rules marked that stands
+            above the rest and returns to it. Valid; its level is a device level, its timing is
+            the event's.
     """
 
     MISSING = 1
@@ -160,6 +176,7 @@ class UaBit(enum.IntFlag):
     REST = 512
     PUSH = 1024
     FLAT = 2048
+    BOX = 4096
 
 
 class FhrBit(enum.IntFlag):
@@ -181,10 +198,10 @@ class FhrBit(enum.IntFlag):
     LINEAR = 64
 
 
-#: Storage type of the UA bits: :class:`UaBit` has twelve bits.
+#: Storage type of the UA bits: :class:`UaBit` has thirteen bits.
 UA_DTYPE = np.uint16
-#: The UA bits that make a sample invalid. ``CENSORED``, ``OSCILLATION``, ``REST`` and ``PUSH``
-#: samples stay valid.
+#: The UA bits that make a sample invalid. ``CENSORED``, ``OSCILLATION``, ``REST``, ``PUSH`` and
+#: ``BOX`` samples stay valid.
 UA_INVALID = int(
     UaBit.MISSING | UaBit.CODE | UaBit.TRANSIENT | UaBit.STEP | UaBit.HOLD | UaBit.FLOOR
     | UaBit.ISLAND | UaBit.FLAT
@@ -280,6 +297,20 @@ class QualityConfig:
             percentile of the :attr:`rest_context_s` before it).
         push_max_s: Longest push run.
         push_context_s: Window before and after a run that gives the contraction level.
+        box_valid: Turn a ``TRANSIENT`` run that stands above the rest and returns to it into a
+            valid ``BOX``. Off by default; with it off no bit and no stored value changes.
+        box_valid_min_s: A valid box is longer than this.
+        box_valid_max_s: A valid box is at most this long.
+        box_valid_height_units: The median of a valid box lies at least this far above the rest
+            level (the 10th percentile of the valid samples within
+            :attr:`box_valid_context_s` on both sides).
+        box_valid_return_share: After a valid box, the median of the valid samples in
+            :attr:`box_valid_post_s` is at most the rest level plus this share of the height.
+        box_valid_context_s: Window on each side of a run that gives its rest level.
+        box_valid_min_context_s: Fewest seconds of valid samples in the two context windows.
+        box_valid_post_s: Start and end, after the run, of the window of the return test.
+        box_valid_min_post_s: Fewest seconds of valid samples in that window.
+        box_valid_margin_s: A valid box keeps at least this distance from both segment ends.
         shift_span_max_s: Longest invalid span that can carry a level shift.
         shift_search_s: A level shift needs a settled window that starts within this after its
             span.
@@ -339,6 +370,16 @@ class QualityConfig:
     push_on_units: float = 10.0
     push_max_s: float = 60.0
     push_context_s: float = 10.0
+    box_valid: bool = False
+    box_valid_min_s: float = 16.0
+    box_valid_max_s: float = 64.0
+    box_valid_height_units: float = 10.0
+    box_valid_return_share: float = 0.5
+    box_valid_context_s: float = 180.0
+    box_valid_min_context_s: float = 50.0
+    box_valid_post_s: Tuple[float, float] = (5.0, 30.0)
+    box_valid_min_post_s: float = 5.0
+    box_valid_margin_s: float = 60.0
     shift_span_max_s: float = 60.0
     shift_search_s: float = 30.0
     fhr_hold_min_s: float = 15.0
@@ -367,6 +408,8 @@ class QualityConfig:
                          # A pulse is marked only once its flat region reaches pulse_region_s.
                          self.pulse_region_s + self.flat_merge_gap_s,
                          self.push_max_s + self.push_context_s,
+                         # Only a build with the valid-box rule reads this far.
+                         (self.box_valid_max_s + self.box_valid_context_s) if self.box_valid else 0.0,
                          self.shift_span_max_s + max(self.step_confirm_s,
                                                      self.shift_search_s + self.settle_window_s)))
 
@@ -659,6 +702,10 @@ def ua_quality(
         _mark_pushes(x, data, ceiling, q, np.asarray(stage2, dtype=bool), cfg)
     # Last, because an island is judged by every other invalid bit around it.
     _mark_islands(q, cfg)
+    if cfg.box_valid:
+        # After the islands, so that a box is judged on the bits every other rule left, and
+        # before the span shifts, so that a valid box carries no level shift.
+        _mark_valid_boxes(x, q, cfg)
     shifts = kept + _span_shifts(x, data & ~ceiling, q, kept, cfg)
     return q, sorted(shifts, key=lambda event: event.at)
 
@@ -1197,6 +1244,68 @@ def _mark_pushes(
             continue
         q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
         q[start:stop] |= UA_DTYPE(UaBit.PUSH)
+
+
+def _mark_valid_boxes(x: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
+    r"""Turn ``TRANSIENT`` runs that stand above the rest and return to it into valid ``BOX``.
+
+    A maximal invalid run $[a, b)$ qualifies when every one of its samples carries ``TRANSIENT``
+    and no other invalid bit, and:
+
+    * its length $L$ satisfies :attr:`QualityConfig.box_valid_min_s` $< L \le$
+      :attr:`QualityConfig.box_valid_max_s`;
+    * it keeps :attr:`QualityConfig.box_valid_margin_s` from both segment ends;
+    * no sample lies above :attr:`QualityConfig.code_threshold` or below $0$;
+    * with the rest level $r$ the 10th percentile of the valid samples within
+      :attr:`QualityConfig.box_valid_context_s` on both sides, the height
+      $h = \operatorname{median}(x[a..b)) - r$ is at least
+      :attr:`QualityConfig.box_valid_height_units`;
+    * the median of the valid samples in :attr:`QualityConfig.box_valid_post_s` after the run is
+      at most $r + $ :attr:`QualityConfig.box_valid_return_share` $\cdot\, h$: the signal came
+      back, so the run is not a level shift.
+
+    "Valid" is read from the bits as they are when the function starts, for every run alike: a
+    run that this function turns valid does not change the context of the next one.
+
+    Args:
+        x: UA in TOCO units.
+        q: UA bits, changed in place.
+        cfg: The thresholds.
+    """
+    transient = int(UaBit.TRANSIENT)
+    invalid = (q & UA_DTYPE(UA_INVALID)) != 0
+    only = ((q & UA_DTYPE(transient)) != 0) & ((q & UA_DTYPE(UA_INVALID ^ transient)) == 0)
+    n = x.size
+    shortest = cfg.box_valid_min_s * cfg.fs
+    longest = cfg.box_valid_max_s * cfg.fs
+    margin = cfg.samples(cfg.box_valid_margin_s)
+    context = cfg.samples(cfg.box_valid_context_s)
+    post_from, post_to = (cfg.samples(seconds) for seconds in cfg.box_valid_post_s)
+    found: List[Tuple[int, int]] = []
+    for start, stop in runs(invalid):
+        if not (shortest < stop - start <= longest) or start < margin or stop > n - margin:
+            continue
+        if not only[start:stop].all():
+            continue
+        inside = x[start:stop]
+        if ((inside > cfg.code_threshold) | (inside < 0.0)).any():
+            continue
+        lo, hi = max(start - context, 0), min(stop + context, n)
+        around = np.concatenate([x[lo:start][~invalid[lo:start]], x[stop:hi][~invalid[stop:hi]]])
+        after = x[stop + post_from:stop + post_to][~invalid[stop + post_from:stop + post_to]]
+        if (around.size < cfg.box_valid_min_context_s * cfg.fs
+                or after.size < cfg.box_valid_min_post_s * cfg.fs):
+            continue
+        rest = float(np.percentile(around, 10))
+        height = float(np.median(inside)) - rest
+        if height < cfg.box_valid_height_units:
+            continue
+        if float(np.median(after)) > rest + cfg.box_valid_return_share * height:
+            continue
+        found.append((start, stop))
+    for start, stop in found:
+        q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
+        q[start:stop] |= UA_DTYPE(UaBit.BOX)
 
 
 def _span_shifts(

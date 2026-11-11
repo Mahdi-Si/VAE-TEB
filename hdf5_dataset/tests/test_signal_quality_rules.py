@@ -11,8 +11,13 @@ the rules give it:
 * bursts on contractions: ``TRANSIENT`` in the first stage, ``PUSH`` in the second;
 * a level shift across a gap: one ``'span'`` shift;
 * :meth:`ContaminationBank.step_term`: zero before a shift and after the kernel has passed it.
+* the valid-box rule (``QualityConfig.box_valid``): off by default and then without effect; with
+  it, a box of $30$ s that returns to the rest is a valid ``BOX`` and the bridge keeps its raw
+  samples, while a short box, a box with a code and a level step stay as they were.
 """
 from __future__ import annotations
+
+import dataclasses
 
 import numpy as np
 
@@ -124,3 +129,90 @@ def test_the_step_term_covers_the_kernel_after_the_shift() -> None:
     assert term.max() > 0.99
     masked = clock[term > 0.1]
     assert abs((masked.max() - masked.min()) - 0.9 * 512) <= 8
+
+
+# -------------------------------------------------------------------------------------------------
+# The valid-box rule (``QualityConfig.box_valid``, off by default)
+
+BOX_ON = dataclasses.replace(sq.DEFAULT_CONFIG, box_valid=True)
+
+
+def _wiggling_contractions() -> np.ndarray:
+    """Contractions on a rest that alternates by one unit each second, so no rest run is constant."""
+    return _contractions() + (np.arange(N) // FS) % 2
+
+
+def _top(level: float, seconds: float) -> np.ndarray:
+    """A flat top that steps through three values, one per second, so it is not a frozen run."""
+    return level + (np.arange(_s(seconds)) // FS) % 3
+
+
+def _invalid(q: np.ndarray) -> np.ndarray:
+    return (q & sq.UA_INVALID) != 0
+
+
+def test_the_valid_box_rule_is_off_by_default_and_changes_nothing_then() -> None:
+    x = _wiggling_contractions()
+    x[_s(345):_s(375)] = _top(80, 30)
+    q_default, shifts_default = sq.ua_quality(x, PRESENT)
+    q_off, shifts_off = sq.ua_quality(x, PRESENT, cfg=dataclasses.replace(sq.DEFAULT_CONFIG, box_valid=False))
+    assert sq.DEFAULT_CONFIG.box_valid is False
+    assert np.array_equal(q_default, q_off) and shifts_default == shifts_off
+    assert _share(q_default, B.BOX) == 0.0
+    assert _share(q_default, B.TRANSIENT, _s(345), _s(375)) == 1.0
+    # The look-ahead of the default rules does not move; the option's own look-ahead is longer.
+    assert sq.DEFAULT_CONFIG.lookahead_s == 180.0 and BOX_ON.lookahead_s == 244.0
+    assert int(B.BOX) & sq.UA_INVALID == 0
+
+
+def test_a_box_that_returns_to_the_rest_is_valid_with_the_option() -> None:
+    for level in (80.0, 100.0):                      # below the ceiling, and a clamp at it
+        x = _wiggling_contractions()
+        x[_s(345):_s(375)] = _top(80, 30) if level == 80.0 else 100.0
+        q_off, _ = sq.ua_quality(x, PRESENT)
+        q_on, _ = sq.ua_quality(x, PRESENT, cfg=BOX_ON)
+        was = sq.runs(_invalid(q_off))
+        assert len(was) == 1 and 16 * FS < was[0][1] - was[0][0] <= 64 * FS
+        start, stop = was[0]
+        assert not _invalid(q_on).any()
+        assert _share(q_on, B.BOX, start, stop) == 1.0 and _share(q_on, B.TRANSIENT) == 0.0
+        # Every bit outside the run is the bit of the default rules.
+        outside = np.ones(N, dtype=bool)
+        outside[start:stop] = False
+        assert np.array_equal(q_on[outside], q_off[outside])
+        # The bridge then leaves the raw box in the signal; without the option it removes it.
+        assert np.array_equal(sq.bridge(x, _invalid(q_on)), x)
+        assert sq.bridge(x, _invalid(q_off))[start + _s(5):stop - _s(5)].max() < 40.0
+
+
+def test_a_short_box_a_low_box_and_a_box_with_a_code_stay_as_they_were() -> None:
+    cases = {}
+    x = _wiggling_contractions()
+    x[_s(345):_s(357)] = _top(80, 12)                # 12 s: at most the minimum length
+    cases["short"] = x
+    x = _wiggling_contractions()
+    x[_s(345):_s(375)] = _top(80, 30)
+    x[_s(355)] = 255.0                               # an invalid code inside the box
+    cases["code"] = x
+    for name, x in cases.items():
+        q_off, shifts_off = sq.ua_quality(x, PRESENT)
+        q_on, shifts_on = sq.ua_quality(x, PRESENT, cfg=BOX_ON)
+        assert _invalid(q_off).any(), name
+        assert np.array_equal(q_on, q_off) and shifts_on == shifts_off, name
+
+
+def test_a_level_step_is_not_a_valid_box() -> None:
+    x = _wiggling_contractions()
+    x[_s(345):] += 40.0                              # the level does not come back
+    q_off, shifts_off = sq.ua_quality(x, PRESENT)
+    q_on, shifts_on = sq.ua_quality(x, PRESENT, cfg=BOX_ON)
+    assert len(shifts_off) == 1
+    assert np.array_equal(q_on, q_off) and shifts_on == shifts_off
+    assert _share(q_on, B.BOX) == 0.0
+
+
+def test_the_option_is_recorded_in_the_file_attributes() -> None:
+    off, on = sq.DEFAULT_CONFIG.as_attrs(), BOX_ON.as_attrs()
+    assert float(off["quality_box_valid"]) == 0.0 and float(on["quality_box_valid"]) == 1.0
+    assert float(on["quality_lookahead_s"]) == 244.0
+    assert off["quality_version"] == on["quality_version"] == sq.QUALITY_VERSION
