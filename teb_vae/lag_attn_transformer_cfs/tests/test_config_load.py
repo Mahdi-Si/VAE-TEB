@@ -105,6 +105,11 @@ TASK_LEVEL_KEYS = (
     # The scored-start rule: resolved by the trainer against the shards' novelty curves into the
     # `target_scored_start` tuple the constructor takes.
     "target_min_novelty",
+    # The UA tolerance rules the task reads: the bridge guard of the running-gap removal mask, the
+    # tolerant per-channel flags and the tolerant contraction reward.
+    "ua_bridge_guard_s",
+    "source_valid_tolerance_s",
+    "event_weight_ua_tolerance_s",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -195,6 +200,21 @@ NEXT_STEP_PATHS = (
     # The second checkpoint criterion's direction; "min" is the shared `mode`.
     "advanced_config.callbacks.model_checkpoint.secondary_mode",
 )
+
+#: The leaves the 2026-11-10 UA tolerance port added, present in this config and in neither
+#: sibling's, every one at its inert value: the running-gap key removal and its guard, the
+#: tolerant flags, the decoder's own log-variance bound and the tolerant contraction reward.
+UA_TOLERANCE_PATHS = (
+    f"{_VAE}.source_running_gap_keys",
+    f"{_VAE}.ua_bridge_guard_s",
+    f"{_VAE}.source_valid_tolerance_s",
+    f"{_VAE}.decoder_logvar_clamp",
+    f"{_VAE}.event_weight_ua_tolerance_s",
+)
+
+#: The leaf the 2026-11-10 Student-t density added, present in this config and in neither
+#: sibling's, at its inert value: null is the Gaussian innovation density.
+STUDENT_T_PATHS = (f"{_VAE}.forecast_student_nu",)
 
 #: The two divergences the 2026-10-29 headline-run decision added to BOTH edges: this cell trains on
 #: the quality-version-4 build, and its decoder log-variance floor moved from -5 to -6 because the
@@ -477,6 +497,8 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         *(f"{_VAE}.{key}" for key in EVENT_KEYS),
         *QUALITY_PATHS,
         *NEXT_STEP_PATHS,
+        *UA_TOLERANCE_PATHS,
+        *STUDENT_T_PATHS,
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -555,6 +577,10 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         *QUALITY_PATHS,
         # The next-step ladder's keys, carried here alone at their inert values.
         *NEXT_STEP_PATHS,
+        # The UA tolerance port's keys, carried here alone at their inert values.
+        *UA_TOLERANCE_PATHS,
+        # The Student-t innovation density, carried here alone at its inert (Gaussian) value.
+        *STUDENT_T_PATHS,
     }
     assert set(theirs) - set(mine) == set()
 

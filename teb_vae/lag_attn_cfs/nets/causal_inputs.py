@@ -72,6 +72,7 @@ each cell's constructor is a signature plus two calls and holds no validation of
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
@@ -109,9 +110,17 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "forecast_ar_residual",
     "forecast_ar_max",
     "target_scored_start",
+    "forecast_student_nu",
     "source_quality_mask",
     "source_mask_mode",
+    "source_running_gap_keys",
+    "decoder_logvar_clamp",
 )
+
+#: The two values of ``source_running_gap_keys``. ``'keep'`` is the model before the keyword
+#: existed; ``'remove'`` takes, per anchor, every key whose value can rest on bridged UA after the
+#: anchor out of the lag attention. See :meth:`CausalWarmupInputs.attend_lagged_source`.
+SOURCE_RUNNING_GAP_MODES: Tuple[str, ...] = ("keep", "remove")
 
 #: The two ways ``source_quality_mask`` can apply the UA step mask. ``'hard'`` removes the keys of
 #: bad steps and shuts the posterior where none is left; ``'soft'`` keeps every key, tells the model
@@ -139,6 +148,7 @@ class LaggedSourceAttention(NamedTuple):
         event_gate_learned: The learned gate before the hard mask closes it. ``None`` in the soft
             mode and without a hard mask, where it equals ``event_gate``.
         source_open: $o_t = \exists \ell: K_{t\ell}$ ``(B, T)`` in the hard mode, else ``None``.
+            Under running-gap removal $K$ is first reduced to $K \wedge \lnot R$.
         invalid_mass: The soft mode's attention mass on invalid keys per head ``(B, T, M)``, else
             ``None``.
     """
@@ -222,6 +232,7 @@ class CausalWarmupInputs:
         target_forecast_shift: Optional[Sequence[int]] = None,
         source_quality_mask: bool = False,
         source_mask_mode: str = "hard",
+        source_running_gap_keys: str = "keep",
     ) -> None:
         r"""Validate this mixin's keywords and set them, **before** the base constructor runs.
 
@@ -258,12 +269,20 @@ class CausalWarmupInputs:
                 ``'soft'`` keeps the keys of bad steps and gives the model the mask as an input
                 instead; it needs ``source_quality_mask`` and adds three zero-initialised
                 parameters, built by :meth:`_build_soft_source_mask`.
+            source_running_gap_keys: One of :data:`SOURCE_RUNNING_GAP_MODES`. ``'keep'`` -- the
+                default -- is the model before the keyword existed, bitwise. ``'remove'`` makes
+                every forward require ``source_key_removed``, the per-anchor removal mask
+                $R_{t\ell}$ of :func:`~teb_vae.lag_attn_cfs.ua_tolerance.removed_keys`, and takes
+                those keys out of the lag attention in both mask modes. It needs
+                ``source_quality_mask``, because the removal is applied to the quality key mask
+                and travels beside ``source_valid``. It adds no parameter and no buffer.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, if
                 a warm-up vector arrives without its keep-index, if a forecast shift arrives
-                without its keep-index or mixes signs, or if ``source_mask_mode`` is unknown or
-                ``'soft'`` without ``source_quality_mask``.
+                without its keep-index or mixes signs, if ``source_mask_mode`` is unknown or
+                ``'soft'`` without ``source_quality_mask``, or if ``source_running_gap_keys`` is
+                unknown or ``'remove'`` without ``source_quality_mask``.
         """
         if not 1 <= int(anchor_stride) <= int(horizon):
             raise ValueError(
@@ -285,6 +304,18 @@ class CausalWarmupInputs:
                 "model the UA step mask as an input, so every forward must carry source_valid."
             )
         self.source_mask_mode = str(source_mask_mode)
+        if source_running_gap_keys not in SOURCE_RUNNING_GAP_MODES:
+            raise ValueError(
+                f"source_running_gap_keys must be one of {SOURCE_RUNNING_GAP_MODES}, got "
+                f"{source_running_gap_keys!r}"
+            )
+        if source_running_gap_keys == "remove" and not self.source_quality_mask:
+            raise ValueError(
+                "source_running_gap_keys='remove' needs source_quality_mask=True: the removal "
+                "mask is applied to the quality key mask, and it travels as the forward's seventh "
+                "argument, after source_valid."
+            )
+        self.source_running_gap_keys = str(source_running_gap_keys)
 
         # The two vectors are positional against their keep-indices, and the adapters are told
         # apart by which gate they were built for -- so a warm-up arriving without its keep-index
@@ -352,6 +383,58 @@ class CausalWarmupInputs:
         if not shift:
             return int(self.geometry.t_valid)
         return int(self.geometry.t_valid) - max(0, max(shift))
+
+    def _set_decoder_logvar_clamp(
+        self, decoder_logvar_clamp: Optional[Sequence[float]] = None
+    ) -> None:
+        r"""Give the shared decoder its own log-variance bound, **after** the base constructor.
+
+        The base builds the decoder with the shared ``logvar_clamp``, which also bounds the prior
+        and the posterior heads. A decoder pinned on that floor cannot express a narrower forecast
+        without the prior and posterior moving too, so this keyword bounds the decoder alone:
+
+        $$\log\hat\sigma^2 = \mathrm{lo}_d + (\mathrm{hi}_d - \mathrm{lo}_d)\,\sigma(r).$$
+
+        The bound is applied at every decoder call, so setting the attribute after construction
+        is enough and the state dict is unchanged. Under ``head_init_calibration`` the base seeds
+        the log-variance bias at the pre-image of $0$ under the SHARED bound; that bias is moved
+        to the pre-image of $0$ under the decoder's bound, $\log(-\mathrm{lo}_d/\mathrm{hi}_d)$,
+        so the decoder still starts at $\sigma = 1$. That is an initialisation only, and a loaded
+        checkpoint overwrites it.
+
+        Args:
+            decoder_logvar_clamp: $(\mathrm{lo}_d, \mathrm{hi}_d)$, or ``None`` -- the default --
+                for the shared ``logvar_clamp``, which is the model before the keyword existed.
+
+        Raises:
+            ValueError: If the bound is not two numbers with $\mathrm{lo}_d < \mathrm{hi}_d$.
+        """
+        if decoder_logvar_clamp is None:
+            self.decoder_logvar_clamp = None
+            return
+        bound = tuple(float(value) for value in decoder_logvar_clamp)
+        if len(bound) != 2 or not bound[0] < bound[1]:
+            raise ValueError(
+                f"decoder_logvar_clamp must be (lo, hi) with lo < hi, got {decoder_logvar_clamp!r}"
+            )
+        self.decoder_logvar_clamp = bound
+        self.decoder.logvar_clamp = bound
+        lo, hi = bound
+        if bool(getattr(self, "head_init_calibration", False)) and lo < 0.0 < hi:
+            with torch.no_grad():
+                self.decoder.logvar_head.bias.fill_(math.log(-lo / hi))
+
+    @property
+    def decoder_logvar_bound(self) -> Tuple[float, float]:
+        r"""The bound the decoder applies to its log-variance, $(\mathrm{lo}_d, \mathrm{hi}_d)$.
+
+        ``decoder_logvar_clamp`` when the model was built with it, the shared ``logvar_clamp``
+        otherwise. Read off the decoder itself, which is the module that applies it, so a reader
+        of the forecast's log-variance (the floor and ceiling fractions, the calibration census)
+        cannot use another bound than the one in force.
+        """
+        lo, hi = self.decoder.logvar_clamp
+        return float(lo), float(hi)
 
     def _validate_causal_geometry(self) -> None:
         r"""Check what only the base's resolved geometry can decide, and resolve the readouts.
@@ -868,6 +951,7 @@ class CausalWarmupInputs:
         anchor_phase: Optional[Union[int, torch.Tensor]] = None,
         anchor_stride: Optional[int] = None,
         source_valid: Optional[torch.Tensor] = None,
+        source_key_removed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         r"""Run the full pipeline, decoding a tiled anchor set.
 
@@ -897,6 +981,9 @@ class CausalWarmupInputs:
             source_valid: Under ``source_quality_mask`` only, and required there: which source
                 values are usable, ``(B, T)`` per step or ``(B, T, c_u)`` per declared channel,
                 ``True`` = usable. See :meth:`source_key_mask` for how it becomes a key mask.
+            source_key_removed: Under ``source_running_gap_keys='remove'`` only, and required
+                there: the per-anchor removal mask $R_{t\ell}$, ``(B, T, L)`` boolean in lag
+                order, ``True`` = removed. See :meth:`attend_lagged_source`.
 
         Returns:
             The base's twenty keys, with ``mu_base``, ``logvar_base``, ``mu_full`` and
@@ -926,12 +1013,18 @@ class CausalWarmupInputs:
               are added: ``source_invalid_mass``, the attention mass each head put on invalid
               keys, $(B, T, M)$, and ``source_quality``, the adapter's per-channel flags,
               $(B, T, C_u)$.
+            * ``source_key_removed`` -- the removal mask the forward applied, **only** under
+              ``source_running_gap_keys='remove'``. Returned so every control re-attends with the
+              same removal. In the hard mode ``source_key_mask`` stays the quality key mask $K$,
+              and ``source_open`` is computed from $K \wedge \lnot R$.
 
         Raises:
             ValueError: If ``source_valid`` is missing under ``source_quality_mask``, given without
-                it, or of the wrong shape.
+                it, or of the wrong shape; or if ``source_key_removed`` is missing under
+                ``source_running_gap_keys='remove'``, given without it, or of the wrong shape.
         """
         self._check_source_valid(source_valid, u_stream)
+        self._check_source_key_removed(source_key_removed, u_stream)
         anchor_index, anchor_valid = self._build_anchor_index(
             batch=int(y_st.shape[0]),
             device=y_st.device,
@@ -1003,7 +1096,13 @@ class CausalWarmupInputs:
             key_mask = self.source_key_mask(
                 source_valid, self.build_lag_mask(h_u.shape[1], h_u.device), u_stream.dtype
             )
-        attended = self.attend_lagged_source(self.query_proj(query), h_u, key_mask)
+        attended = (
+            self.attend_lagged_source(self.query_proj(query), h_u, key_mask)
+            if source_key_removed is None
+            else self.attend_lagged_source(
+                self.query_proj(query), h_u, key_mask, removed=source_key_removed
+            )
+        )
         alpha, attended_heads = attended.alpha, attended.heads
         gate, event_gate = attended.gate, attended.event_gate
         event_gate_learned, source_open = attended.event_gate_learned, attended.source_open
@@ -1098,6 +1197,10 @@ class CausalWarmupInputs:
                 # Only where the mask can make it differ from ``event_gate``: without the mask the
                 # two are one tensor, and a second key would carry a copy.
                 outputs["event_gate_learned"] = event_gate_learned
+        if source_key_removed is not None:
+            # Under ``source_running_gap_keys='remove'`` only, so every control that re-attends
+            # this forward's source removes the same keys.
+            outputs["source_key_removed"] = source_key_removed.to(torch.bool)
         return outputs
 
     # ------------------------------------------------------------------
@@ -1133,6 +1236,42 @@ class CausalWarmupInputs:
             raise ValueError(
                 f"source_valid has shape {shape}; expected ({batch}, {steps}) per step or "
                 f"({batch}, {steps}, {width}) per declared source channel."
+            )
+
+    def _check_source_key_removed(
+        self, source_key_removed: Optional[torch.Tensor], u_stream: torch.Tensor
+    ) -> None:
+        """Refuse a removal mask that disagrees with ``source_running_gap_keys`` or the stream.
+
+        Both directions raise, for the reason :meth:`_check_source_valid` gives: a model trained
+        with the removal and run without it, or the reverse, would attend over keys it was never
+        trained to read, and the numbers would look plausible.
+
+        Raises:
+            ValueError: As :meth:`forward` documents.
+        """
+        enabled = getattr(self, "source_running_gap_keys", "keep") == "remove"
+        if source_key_removed is None:
+            if enabled:
+                raise ValueError(
+                    "source_running_gap_keys is 'remove', so every forward needs "
+                    "source_key_removed: the keys whose value rests on bridged UA after the "
+                    "anchor. A caller that builds the inputs itself must pass it as the seventh "
+                    "argument (task._build_forward_inputs builds it from the batch's up_valid)."
+                )
+            return
+        if not enabled:
+            raise ValueError(
+                "source_key_removed was given to a model built with source_running_gap_keys="
+                f"{getattr(self, 'source_running_gap_keys', 'keep')!r}. Build the model with "
+                "source_running_gap_keys='remove' to apply it."
+            )
+        batch, steps = int(u_stream.shape[0]), int(u_stream.shape[1])
+        expected = (batch, steps, int(self.lag_attn.L))
+        if tuple(source_key_removed.shape) != expected:
+            raise ValueError(
+                f"source_key_removed has shape {tuple(source_key_removed.shape)}; expected "
+                f"{expected}, (batch, steps, lags) in lag order."
             )
 
     def source_key_mask(
@@ -1304,6 +1443,7 @@ class CausalWarmupInputs:
         query: torch.Tensor,
         h_u: torch.Tensor,
         key_mask: Optional[torch.Tensor] = None,
+        removed: Optional[torch.Tensor] = None,
     ) -> LaggedSourceAttention:
         r"""Run the lag attention and the event gate under the configured UA mask mode.
 
@@ -1328,28 +1468,56 @@ class CausalWarmupInputs:
         A key counts as invalid when any UA channel of its step is invalid, which is the hard
         mode's rule; the adapter's input keeps the per-channel detail.
 
+        **Running-gap removal** (``removed`` given, ``source_running_gap_keys='remove'``): the
+        keys with $R_{t\ell}$ leave the attention mask in both modes, because their value can rest
+        on bridged UA after the anchor. In the soft mode the attention runs under
+        $\mathrm{lag\_mask} \wedge \lnot R$ while $\bar v$ and the score bias stay as above, and
+        an anchor with no key left gets $g_t \cdot \mathbb 1[\exists \ell: \lnot R_{t\ell}]$. In
+        the hard mode the attention runs under $K \wedge \lnot R$, and $o_t$ is computed from that
+        reduced mask, so the gate closes where no key is left.
+
         Args:
             query: The projected query, ``query_proj`` of $\mu^p$ or of $[\mu^p \Vert \log\sigma^{2,p}]$.
             h_u: The source state ``(B, T, d_model)``, as :meth:`encode_source_kv` built it --
                 with the soft mode's per-channel flags already in it.
             key_mask: The quality key mask ``(B, T, L)`` from :meth:`source_key_mask`, or ``None``
                 for a model without ``source_quality_mask``.
+            removed: The running-gap removal mask $R$ ``(B, T, L)`` in lag order, ``True`` =
+                removed, or ``None`` -- every model without ``source_running_gap_keys='remove'``.
 
         Returns:
             A :class:`LaggedSourceAttention`.
+
+        Raises:
+            ValueError: If ``removed`` is given without ``key_mask``.
         """
+        if removed is not None and key_mask is None:
+            raise ValueError(
+                "a running-gap removal mask needs the quality key mask beside it: the removal is "
+                "applied to that mask, and a model built with source_running_gap_keys='remove' "
+                "always has one."
+            )
         lag_mask = self.build_lag_mask(h_u.shape[1], h_u.device)
         if key_mask is not None and getattr(self, "source_mask_mode", "hard") == "soft":
             lag_mask = lag_mask.to(torch.bool)
             key_mask = key_mask.to(torch.bool)
             invalid = (lag_mask[None] & ~key_mask).to(h_u.dtype)  # (B, T, L)
             bias = invalid[:, :, None, :] * self.source_invalid_key_bias[None, None, :, None]
-            _, alpha, heads = self.lag_attn(query, h_u, lag_mask, score_bias=bias)
+            # The removed keys leave the attention; the invalid indicator and its bias do not
+            # change, so a kept key is judged exactly as before.
+            kept = lag_mask if removed is None else lag_mask[None] & ~removed.to(torch.bool)
+            _, alpha, heads = self.lag_attn(query, h_u, kept, score_bias=bias)
             invalid_mass = (alpha * invalid[:, :, None, :]).sum(dim=-1)  # (B, T, M)
             logits = self.posterior_head.event_gate_logits(heads)
             gate = torch.sigmoid(logits + self.source_invalid_gate(invalid_mass))
+            if removed is not None:
+                # An anchor with no key left attends to nothing, but the gate reads a LayerNorm of
+                # a zero summary and stays open; closing it keeps q = p there.
+                gate = gate * kept.any(dim=-1, keepdim=True).to(gate.dtype)
             return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
 
+        if removed is not None:
+            key_mask = key_mask.to(torch.bool) & ~removed.to(torch.bool)
         _, alpha, heads = self.lag_attn(
             query, h_u, lag_mask if key_mask is None else key_mask
         )
@@ -1394,4 +1562,9 @@ class CausalWarmupInputs:
         return effective, effective
 
 
-__all__ = ["CAUSAL_ONLY_KEYWORDS", "FORWARDED_EXCLUSIONS", "CausalWarmupInputs"]
+__all__ = [
+    "CAUSAL_ONLY_KEYWORDS",
+    "FORWARDED_EXCLUSIONS",
+    "SOURCE_RUNNING_GAP_MODES",
+    "CausalWarmupInputs",
+]

@@ -111,6 +111,7 @@ def _attend_and_pose(
     forward_outputs: Dict[str, torch.Tensor],
     h_u: torch.Tensor,
     key_mask: Optional[torch.Tensor] = None,
+    removed: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Run the query, the lag attention and the posterior head against a substituted source state.
 
@@ -140,6 +141,10 @@ def _attend_and_pose(
       (``attend_lagged_source``), so the source-null arm keeps the recording's own flags: it
       removes the UA values and leaves the missingness pattern, and its KL is the part the
       pattern alone buys.
+    * Under ``source_running_gap_keys='remove'`` the matched forward's ``source_key_removed``
+      $R_{t\ell}$ takes the same keys out of this arm's attention. The removal depends on the raw
+      UA validity of the recording the keys were read from, so an arm that moves the source
+      between recordings passes the donor's mask as ``removed``, beside the donor's key mask.
 
     Args:
         model: The model whose modules are re-run.
@@ -148,6 +153,9 @@ def _attend_and_pose(
         h_u: The source state to attend over, ``(B, T, d_model)``.
         key_mask: The per-sample key mask ``(B, T, L)`` to attend under. ``None`` takes the
             matched forward's ``source_key_mask`` when it returned one, and the model's lag mask
+            otherwise.
+        removed: The running-gap removal mask ``(B, T, L)`` to attend under. ``None`` takes the
+            matched forward's ``source_key_removed`` when it returned one, and removes nothing
             otherwise.
 
     Returns:
@@ -163,11 +171,19 @@ def _attend_and_pose(
     )
     if key_mask is None:
         key_mask = forward_outputs.get("source_key_mask")
+    if removed is None:
+        removed = forward_outputs.get("source_key_removed")
     attend = getattr(model, "attend_lagged_source", None)
     if attend is not None:
         # The causal cells apply the UA mask in one method, hard or soft, and the forward calls
         # the same one, so this arm cannot apply the mask differently from the matched forward.
-        attended = attend(model.query_proj(query), h_u, key_mask)
+        # The removal is passed only when there is one, so a model without the keyword is called
+        # with the three arguments it has always taken.
+        attended = (
+            attend(model.query_proj(query), h_u, key_mask)
+            if removed is None
+            else attend(model.query_proj(query), h_u, key_mask, removed=removed)
+        )
         alpha, attended_heads = attended.alpha, attended.heads
         applied, gate = attended.gate, attended.event_gate
     else:
@@ -285,11 +301,15 @@ def perm_forward_outputs(
     # The donor's source arrives with the donor's quality mask: a key is judged by the recording
     # it came from.
     key_mask = forward_outputs.get("source_key_mask")
+    # The running-gap removal travels with the donor too: it is a function of the donor's raw UA
+    # validity, which is what decides whether the donor's key at a lag can read past the anchor.
+    removed = forward_outputs.get("source_key_removed")
     alpha_perm, mu_post_perm, logvar_post_perm, gate_perm = _attend_and_pose(
         model,
         forward_outputs,
         h_u[perm_index],
         key_mask=None if key_mask is None else key_mask[perm_index],
+        removed=None if removed is None else removed[perm_index],
     )
     z_post_perm = mu_post_perm + torch.randn_like(mu_post_perm) * torch.exp(
         0.5 * logvar_post_perm
@@ -324,10 +344,17 @@ def perm_forward_outputs(
     if key_mask is not None:
         # The arm attended under the donor's mask, so its readouts must count the donor's anchors.
         permuted["source_key_mask"] = key_mask[perm_index]
+        if removed is not None:
+            permuted["source_key_removed"] = removed[perm_index]
         # The soft mode closes no anchor, so it has no ``source_open`` to carry. Its flags are
         # already inside the permuted ``source_state``; the donor's copy is carried for readers.
         if getattr(model, "source_mask_mode", "hard") != "soft":
-            permuted["source_open"] = permuted["source_key_mask"].any(dim=-1)
+            # The keys the arm attended under: the donor's key mask less the donor's removal, the
+            # set the forward's own ``source_open`` is computed from.
+            open_keys = permuted["source_key_mask"]
+            if removed is not None:
+                open_keys = open_keys & ~permuted["source_key_removed"]
+            permuted["source_open"] = open_keys.any(dim=-1)
         elif forward_outputs.get("source_quality") is not None:
             permuted["source_quality"] = forward_outputs["source_quality"][perm_index]
     return permuted

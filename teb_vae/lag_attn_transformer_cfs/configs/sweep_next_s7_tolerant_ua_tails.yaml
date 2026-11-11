@@ -1,0 +1,201 @@
+# Next-step ladder, rung 7: rung 6 plus four changes that the session-7 probes of the epoch-424
+# rung-6 checkpoint support. Two of them change how the model reads uterine activity (UA) around
+# short invalid runs; two change how the forecast is scored.
+#
+# This file takes `default.yaml` as its base and sets every key the ladder moves, so each change
+# can be switched here. To turn a change off, set its key back to the value in brackets (the
+# default's value). Rungs 1-6 stay as separate files; this file does not read them.
+#
+# WHERE THE EVIDENCE IS. Every rung-7 key was tested in `teb_vae/neural_surgery_trf_cfs/session7`
+# on local recordings split by crc32(guid) mod 4: probes and pilot fine-tunes were fitted on code 0
+# and read on code 2, and the stack was read once on codes 1 and 3. The numbers below are paired
+# differences against a control fine-tune with the same budget, in nats per anchor block, with
+# recording-level bootstrap 95% intervals. The local statistics file is a stand-in, so read the
+# sizes as relative effects. The decision log is `session7/DECISIONS.md`.
+#
+# THE TEST HALF (159 recordings, read once). The four keys together, fine-tuned through the
+# production code from the warm start, against the control fine-tune: forecast NLL -197 nats
+# [-210, -185]; gain at contractions with a short invalid UA run +1.51 [0.51, 2.55]; calibration
+# tail error 0.89 against 1.18; decoder floor share 0.02 against 0.34; KL minus source-null KL 0.41
+# against 0.21 nats; source gain 2.57 against 3.27 nats; scattering MSE against AR(6) 0.931 against
+# 0.884. All ten official verdicts keep their status (eight PASS, calibration FAIL, clock
+# INCONCLUSIVE).
+#
+# WARM START. The run starts from `lag-attn-trf-cfs-epoch=424-s7init.ckpt`: every tensor of the
+# epoch-424 rung-6 checkpoint, except the decoder's log-variance head, which is refitted per
+# channel for the new decoder bound. `teb_vae/neural_surgery_trf_cfs/session7/init_s7.py --mode
+# build` rebuilds the file from the epoch-424 checkpoint with no data and checks it by digest; its
+# `.json` report beside it holds the held-out numbers. Set `core_model_checkpoint` below to where
+# the file is. The refit is approximate (the decoder log-variance moves by about 0.5 on average at
+# the start), so the first epochs show a worse forecast NLL than epoch 424 before it falls.
+#
+# THE WARM START FIXES FIVE KEYS. The file was built for persistence_lags 6, forecast_ar_max 0.95,
+# source_mask_mode soft and decoder_logvar_clamp [-9, 3] (and with posterior_event_gate on, as in
+# the default). Change one of those and the strict loader refuses the file, or the refitted head
+# means something else: then rebuild with init_s7.py (edit its S7_MODEL_OVERRIDES, mode fit), or
+# set core_model_checkpoint to null and train from scratch. Every other key below is free.
+#
+# TESTED AND NOT ADOPTED (their keys stay at the default; do not switch them on without a new test):
+#   * lambda_source_null 1 -> 3: no effect at all. The reconstruction gradient is about 1000 times
+#     the KL gradient, so the penalty does not act; 75% of the KL still needs no UA values.
+#   * target_weight_ph 1 -> 3: phase MSE unchanged, forecast NLL slightly worse.
+#   * event_weight_ua_tolerance_s 16: no rise of the gain at the contractions it adds, twice.
+#   * event_weight_ua_valid false, and a contraction detector with absolute thresholds: both
+#     slightly worse over all anchors.
+#   * a per-band key rule and a rescaled source adapter: their premises did not hold at epoch 424.
+#
+# READ THIS RUN AGAINST THE RUNG-6 RUN (lag_attn_trf_cfs_next_s6_soft_ua_mask):
+#   * forecast NLL (`val/nll_full_block`): expected to fall by about 150-200 nats per anchor block
+#     once the decoder variance has adapted. The NLL of this rung is a Student-t log score with a
+#     lower variance floor, so compare it with rung 6 only as a log score, never cell by cell;
+#   * the share of decoder cells on the floor (`logvar_full_floor_frac`): rung 6 sat near 0.34
+#     overall and 0.5 in the phase block; expected below 0.05;
+#   * calibration: 1-sigma coverage of the scattering block near 0.68, and a smaller 3-sigma tail
+#     error than rung 6. The pilot stack reached a tail error of 0.98 against 1.14, so the
+#     `calibration_near_nominal` verdict is expected to improve, not yet to pass;
+#   * the source gain (`val/pred_gap_mean`): expected LOWER in nats than rung 6 (about two thirds),
+#     because a heavy-tailed density pays less for large errors. Judge the source by the gain on
+#     anchors after a contraction onset and by the MSE of the full branch against the base branch;
+#   * scattering MSE against the own-channel AR(6) (`eval/linear_baselines.py`): the pilots paid
+#     about 5% here (ratio 0.93 against 0.89), because cells with a small variance now weigh more.
+#     If the ratio rises above 1.0, set decoder_logvar_clamp to [-8.0, 3.0] and rebuild the warm start;
+#   * the gain at contractions whose span holds a short invalid UA run (the anchors that
+#     `event_weight_ua_valid` leaves unrewarded): rung 6 gave 1.7 nats there, the pilots 4.8 under
+#     the Gaussian score and 3.7 under the Student-t score. If it decays over the epochs, switch on
+#     `event_weight_ua_tolerance_s: 16.0`;
+#   * the source-null KL (`kld_source_null`) against the KL: still about two thirds of it. The
+#     `coupling_exceeds_availability_clock` verdict is expected to stay INCONCLUSIVE.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s7_tolerant_ua_tails.yaml
+base: default.yaml
+
+general_config:
+  # The rung-6 run trained at 0.003 and dropped to 0.0003 at epoch 400, so the epoch-424 weights
+  # sit at 0.0003. A warm start continues there. [0.0003, the default; stated because the rung-6
+  # run's own file differed]
+  lr: 0.0003
+
+model_config:
+  # The rung-7 warm start; see the header. SET THIS PATH to the file init_s7.py wrote on the
+  # training machine. The placeholder fails loudly at load time rather than training from random
+  # weights; the load is strict, so a file that does not align is refused too. [null]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=424-s7init.ckpt
+
+  VAE_model:
+    # THE KL WARM-UP OF THE DEFAULT STAYS (beta from 0 to 1 over 50 epochs), as in rung 6, which was
+    # warm-started the same way. The warm-started posterior was trained at beta = 1, so expect the
+    # KL to rise during the first 50 epochs and to come back after them. The session-7 pilots ran
+    # at beta = 1 from the first step; read the first 50 epochs of this run with that in mind.
+
+    # --- Rung 1: a direct AR(6) skip on the target's own history -------------------------------
+    # The persistence term reads the six most recent stored target values through a per-channel,
+    # per-horizon-step linear filter. [1]
+    persistence_lags: 6
+
+    # --- Rung 2: the likelihood ------------------------------------------------------------------
+    # Bound on the AR(1) coefficient, phi_c = forecast_ar_max * tanh(a_c). [1.0]
+    forecast_ar_max: 0.95
+    # Score scattering channel c only from the first horizon step whose coefficient draws at least
+    # 5% of its weight from samples after the anchor. Phase is left alone. [null, null]
+    target_min_novelty:
+      fhr_st: 0.05
+      fhr_ph: null
+
+    # --- Rung 3: the source-null penalty and sampled base decoding -------------------------------
+    # Adds beta * KL(q_null || p). Kept at the rung-6 value. Session 7 found that this term has no
+    # measurable effect on training at 1.0 or at 3.0 (see the header); it stays so that the
+    # `source_null_kl_penalty` metric is still logged. [0.0]
+    lambda_source_null: 1.0
+    # Decode the base branch from a prior sample, as the full branch is decoded from a posterior
+    # sample. Watch `mean_logvar_prior`; if it falls toward the clamp floor, set mean. [mean]
+    base_decode: sample
+
+    # --- Rung 4: a short event-weight reach ------------------------------------------------------
+    # Weight 1 only for anchors in the first minute after a contraction onset (15 steps = 60 s).
+    # Session 7: the gate and the KL follow this window (gate 0.60 at the contraction peak, 0.18
+    # between contractions), and the shipped detector's onsets are sound (spread 5 s). [55]
+    event_weight_reach_steps: 15
+
+    # --- Rung 5: full weight on the phase block --------------------------------------------------
+    # Kept at 1.0. A weight of 3.0 did not lower the phase MSE in the pilots. [0.1]
+    target_weight_ph: 1.0
+
+    # --- Rung 6: the soft UA quality mask -------------------------------------------------------
+    # Bad UA steps stay in the lag keys; the UA adapter reads each channel's validity beside its
+    # value. Session 7: of the three soft-mask terms only the adapter's flag input learned (norm
+    # 125.7 against 107.7 for the value projection); the per-head key bias (at most +0.29) and the
+    # gate's invalid-mass weight (at most 0.26) stayed near zero. [hard]
+    source_mask_mode: soft
+
+    # --- Rung 7a: remove the keys of a still-running invalid UA run, per anchor -------------------
+    # The builder's bridge across an invalid run reads the first valid sample after the run and 4 s
+    # of slope, so a key inside a run that has not ended yet holds UA from after the anchor. Under
+    # the rung-6 soft mask such keys reached the adapter with a flag. `remove` takes them out of the
+    # attention for that anchor only and closes the gate where no key is left; once the run has
+    # ended, its keys return. WHY: with every flag set valid, anchors inside a running run gained
+    # 15.1 nats, above the 9.7 of clean rewarded anchors, which is look-ahead. Removal alone costs
+    # nothing (-0.00 [-0.04, 0.03] nats over all anchors), and it is what makes rung 7b causal.
+    # Adds no parameter. WATCH: nothing should move from this key alone. [keep]
+    source_running_gap_keys: remove
+    # The bridge's end-slope window in seconds, the guard of the rule above (the builder's 4 s).
+    # [4.0, the default; stated because rung 7a depends on it]
+    ua_bridge_guard_s: 4.0
+
+    # --- Rung 7b: tolerant validity flags for short invalid UA runs ------------------------------
+    # An invalid UA run of at most 16 s is short. A channel's flag turns valid at every step whose
+    # causal window holds no sample of a longer run, also inside the short run itself (rung 7a
+    # keeps that causal). WHY: 83% of invalid UA runs are at most 16 s (median 5 s), and 14% of
+    # contractions touch one. With synthetic gaps in clean UA, the bridged signal with valid flags
+    # costs 1.0% [-2.2, 4.6] of the source gain at 16 s, against 11.7% [6.9, 17] with the strict
+    # flags; it costs 4.6% at 32 s and 12.6% at 64 s, and the bridge cannot draw a contraction
+    # crest (peak error -10.9% at 16 s, -28.8% at 32 s). In the pilots this key with rung 7a raised
+    # the gain at contractions with a short invalid run by 3.19 nats [1.24, 5.41] (3.59 [1.46, 6.32]
+    # on the cohorts the run never trained on) at no cost over all anchors; on top of rungs 7c and
+    # 7d it lowered the forecast NLL by 0.11 [0.03, 0.20]. 8 s gave less (2.84), 32 s and 64 s no
+    # more. Needs `source_running_gap_keys: remove`. Adds no parameter.
+    # WATCH: the gate on anchors within 60 s after an onset whose lag window holds a short invalid
+    # run (0.16 at epoch 424, 0.34-0.37 in the pilots). [null]
+    source_valid_tolerance_s: 16.0
+    # The reward keeps the rung-6 rule: a contraction whose span touches one invalid UA sample earns
+    # no reward. A tolerance of 16 s here was tested twice and did not raise the gain at those
+    # contractions, so it stays off. Switch it on only under the condition in the header. [null]
+    event_weight_ua_tolerance_s: null
+
+    # --- Rung 7c: the decoder's own log-variance floor -------------------------------------------
+    # The prior and posterior heads keep `logvar_clamp` [-6, 3]; only the decoder's floor moves.
+    # WHY: at epoch 424, 49.5% of the scored phase cells (and 1.7% of the scattering cells) sat on
+    # the floor of -6 with a mean squared standardised innovation of 0.125: the floor made the
+    # model about 5 times too wide in standard deviation there. In the pilots a floor of -9 emptied
+    # the floor (share 0.00) and lowered the forecast NLL by 133 nats [110, 156]. COST: alone it
+    # made the 3-sigma tail error worse (2.60 against 1.14), which rung 7d corrects, and the
+    # scattering MSE against AR(6) rose by about 5%. The warm start is built for this value.
+    # WATCH: `logvar_full_floor_frac` (near 0), and the scattering MSE against AR(6). [null]
+    decoder_logvar_clamp: [-9.0, 3.0]
+
+    # --- Rung 7d: a Student-t innovation density -------------------------------------------------
+    # Each innovation is scored under a scaled Student-t with 8 degrees of freedom; the
+    # evaluation's coverage, PIT and CRPS read the same density. WHY: on cells off the floor a
+    # scaled Student-t fits the epoch-424 innovations best at nu = 8 (0.017-0.022 nats per cell
+    # over the Gaussian; excess kurtosis 1.7 in the scattering block and 11 in the phase block).
+    # In the pilots it brought the 3-sigma tail error from 1.14 to 0.35 alone, and on top of rung
+    # 7c it lowered the forecast NLL by a further 54 nats [49, 59] and gave nominal 1-sigma coverage
+    # in the scattering block (0.684). COST: the source gain in nats falls by about one third,
+    # while the MSE gain of the full branch over the base branch does not fall. Adds no parameter.
+    # WATCH: `val/pred_gap_mean` stays positive; the calibration verdict's tail error. [null]
+    forecast_student_nu: 8.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the rung in the name, on both keys.
+      run_name: lag_attn_trf_cfs_next_s7_tolerant_ua_tails
+      tags:
+        variant: lag_attn_trf_cfs_next_s7_tolerant_ua_tails
+  callbacks:
+    model_checkpoint:
+      # Rung 3: also keep the weights with the best source-conditioned forecast gain.
+      # ["val/nll_full_block", "min"]
+      secondary_monitor: "val/pred_gap_mean"
+      secondary_mode: "max"

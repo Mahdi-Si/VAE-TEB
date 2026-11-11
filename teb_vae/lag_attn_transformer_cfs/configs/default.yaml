@@ -322,6 +322,20 @@ model_config:
     #     d_model * C_u + 2 * num_heads parameters, so a hard-mode checkpoint warm-starts a soft
     #     model only through a seeded copy (`neural_surgery_trf_cfs/surgery/init_s6.py`).
     source_mask_mode: hard
+    # RUNNING-GAP KEYS. The bridge across an invalid UA run [a, b] reads `ua_bridge_guard_s` of
+    # samples after b, so a key whose step starts at or after a can rest on UA after the anchor
+    # while the run is still running. `remove` takes those keys out of the attention per anchor
+    # (both mask modes) and closes the gate where none is left; the forward then takes a seventh
+    # input built from `up_valid`. Needs `source_quality_mask` and `emit_quality_mask`. No
+    # parameter. keep = the model without the rule, bitwise.
+    source_running_gap_keys: keep
+    # The bridge's end-slope window in seconds (the builder's 4 s), the guard of the rule above.
+    ua_bridge_guard_s: 4.0
+    # TOLERANT FLAGS (seconds). An invalid UA run of at most this length is short; a channel's
+    # flag turns valid at every step whose causal window holds no sample of a longer run. Needs
+    # `source_running_gap_keys: remove`, which keeps the steps inside a short run causal; the
+    # pre-flight refuses it otherwise. null = the dataset's flags, bitwise.
+    source_valid_tolerance_s: null
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256
@@ -334,6 +348,10 @@ model_config:
     # every log-variance in the model, so the latent heads' calibrated initial constant moves with
     # it; the KL is still exactly 0 at step 0.
     logvar_clamp: [-6.0, 3.0]
+    # The DECODER's own [lo, hi] for the forecast log-variance; the prior and posterior heads keep
+    # `logvar_clamp`. The two forecast floor/ceiling fractions and the calibration verdict read
+    # it. No parameter. null = the shared `logvar_clamp`, bitwise.
+    decoder_logvar_clamp: null
     # Latent stabilisers: saturation magnitudes of the tanh-bounded latent heads.
     mu_scale: 5.0
     delta_mu_scale: 3.0
@@ -761,6 +779,12 @@ model_config:
     # on the change of the residual alone and a level error lasting the whole horizon cost one
     # cell. A bound below 1 keeps part of the level error in every innovation. 1.0 = no bound.
     forecast_ar_max: 1.0
+    # Student-t innovation density: each innovation is scored under a scaled Student-t with this
+    # many degrees of freedom (must be > 2), with the decoder's sigma = exp(logvar / 2) as its
+    # scale; the evaluation's coverage, PIT and CRPS read the same density. WHY: the innovations
+    # are heavy-tailed (best fit nu = 8), and under a Gaussian a few large ones push the variance
+    # up everywhere and fail the 3-sigma coverage. null = the Gaussian density, bitwise.
+    forecast_student_nu: null
     # Per-channel scored horizon H_c, resolved from the shards' `sel_xi_i_hz` by
     # teb_vae/lag_attn_cfs/scored_horizon.py: an `fhr_ph` channel whose slow leg sits above the
     # cutoff is scored over its first `target_phase_fast_horizon` steps only; every other channel
@@ -831,6 +855,10 @@ model_config:
     event_weight_ua_valid: true
     target_quality_mask: true
     source_event_mask: false
+    # TOLERANT REWARD (seconds). With `event_weight_ua_valid`, the detector counts the samples of
+    # an invalid UA run of at most this length as valid, so a contraction is dropped only when it
+    # touches a longer run. Needs `event_weight_ua_valid: true`. null = the validity unchanged.
+    event_weight_ua_tolerance_s: null
     num_heads: 4
     d_head: 32
     use_entmax: true       # exact zeros in the lag distribution, not merely small weights

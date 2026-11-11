@@ -66,6 +66,79 @@ DERIVATIVE_HUBER_DELTA = 1.0
 
 _LOG_2PI = math.log(2.0 * math.pi)
 
+
+def validate_student_nu(student_nu: Optional[float]) -> Optional[float]:
+    r"""Check the degrees of freedom $\nu$ of a Student-$t$ forecast density.
+
+    The density must have a finite variance, which needs $\nu > 2$. With $\nu \le 2$ the decoder's
+    scale $\sigma$ would no longer set a predictive variance $\sigma^2 \nu / (\nu - 2)$, and every
+    calibration read-out that standardises by that variance would divide by an infinite number.
+
+    Args:
+        student_nu: $\nu$, or ``None`` for the Gaussian density.
+
+    Returns:
+        ``None``, or $\nu$ as a Python ``float``.
+
+    Raises:
+        ValueError: If $\nu$ is set and is not a finite number above $2$ (``NaN`` included).
+    """
+    if student_nu is None:
+        return None
+    nu = float(student_nu)
+    if not (math.isfinite(nu) and nu > 2.0):
+        raise ValueError(
+            f"student_nu must be a finite number > 2 so that the density has a finite variance, "
+            f"got {student_nu!r}. Pass None for the Gaussian density."
+        )
+    return nu
+
+
+def student_t_log_normaliser(student_nu: float) -> float:
+    r"""The constant part of the scaled Student-$t$ negative log-density.
+
+    $$c_\nu = -\log\Gamma\!\left(\tfrac{\nu + 1}{2}\right) + \log\Gamma\!\left(\tfrac{\nu}{2}\right)
+    + \tfrac{1}{2}\log(\nu\pi).$$
+
+    Args:
+        student_nu: $\nu > 2$.
+
+    Returns:
+        $c_\nu$ as a Python ``float``.
+    """
+    nu = float(student_nu)
+    return -math.lgamma(0.5 * (nu + 1.0)) + math.lgamma(0.5 * nu) + 0.5 * math.log(nu * math.pi)
+
+
+def student_t_nll(diff2: torch.Tensor, logvar: torch.Tensor, student_nu: float) -> torch.Tensor:
+    r"""The per-cell negative log-density of a scaled Student-$t$ innovation.
+
+    With the innovation $\varepsilon$, its squared value $\varepsilon^2$ (``diff2``) and the
+    log-squared scale $\log\sigma^2$ (``logvar``),
+
+    $$-\log p(\varepsilon) = c_\nu + \tfrac{1}{2}\log\sigma^2
+    + \tfrac{\nu + 1}{2}\,\operatorname{log1p}\!\left(\frac{\varepsilon^2 e^{-\log\sigma^2}}{\nu}\right),$$
+
+    with $c_\nu$ from :func:`student_t_log_normaliser`. The scale $\sigma$ is the decoder's own
+    $\exp(\log\sigma^2 / 2)$, so the predictive variance is $\sigma^2 \nu / (\nu - 2)$ and not
+    $\sigma^2$. As $\nu \to \infty$ the term tends to the Gaussian one.
+
+    Args:
+        diff2: $\varepsilon^2$.
+        logvar: $\log\sigma^2$, broadcastable to ``diff2``.
+        student_nu: $\nu > 2$.
+
+    Returns:
+        The term, in the broadcast shape.
+    """
+    nu = float(student_nu)
+    return (
+        student_t_log_normaliser(nu)
+        + 0.5 * logvar
+        + 0.5 * (nu + 1.0) * torch.log1p(diff2 * torch.exp(-logvar) / nu)
+    )
+
+
 # "On the floor" for a log-variance: within this fraction of the clamp range of the lower
 # asymptote (and, symmetrically, of the upper one for "on the ceiling"). The smooth bound never
 # reaches an asymptote exactly, so an equality test would report 0.0 forever while the variance
@@ -205,6 +278,7 @@ def raw_sample_score(
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
     step_mask: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> torch.Tensor:
     r"""The unmasked, unsummed score of every raw forecast sample.
 
@@ -215,6 +289,18 @@ def raw_sample_score(
 
     so summing it over an anchor's $H \cdot R$ forecast samples gives a true negative log-density
     in nats. Under ``'mse'`` the per-sample term is $(x - \mu)^2$.
+
+    With ``student_nu`` $= \nu$ the ``'gaussian_nll'`` term becomes the scaled Student-$t$
+    negative log-density of the same residual (or AR(1) innovation) $\varepsilon$, with the scale
+    $\sigma = \exp(\log\sigma^2 / 2)$ (:func:`student_t_nll`):
+
+    $$-\log p(\varepsilon) = c_\nu + \tfrac{1}{2}\log\sigma^2
+    + \tfrac{\nu + 1}{2}\,\operatorname{log1p}\!\left(\varepsilon^2 e^{-\log\sigma^2} / \nu\right).$$
+
+    The heavier tails charge a large innovation about logarithmically instead of quadratically,
+    so a few contraction-driven outliers no longer force the scale up everywhere. The block sum
+    is still a joint negative log-density in nats, because the AR(1) map has a unit Jacobian
+    under any innovation density.
 
     Exposed separately from :func:`masked_raw_block_per_anchor` because the *same* elementwise
     term is reduced over two different axis sets: over $(\tau, r)$ for the per-anchor block score
@@ -272,6 +358,9 @@ def raw_sample_score(
             density given the last valid residual, with the masked steps marginalised
             (:func:`ar_innovation`); no masked target is read. The mask itself is still applied
             by the caller afterwards.
+        student_nu: Optional degrees of freedom $\nu > 2$ of a Student-$t$ innovation density,
+            read only under ``'gaussian_nll'``. ``None`` is the Gaussian density, bitwise;
+            ``'mse'`` ignores it, because a squared error has no density to change.
 
     Returns:
         The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
@@ -279,10 +368,11 @@ def raw_sample_score(
     Raises:
         ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, a
             ``horizon_weight`` that is not a 1-D tensor of the score's own horizon length, an
-            ``ar_coef`` that is not 1-D of the channel width, or a ``cell_mask`` that is not
-            $(H, C)$.
+            ``ar_coef`` that is not 1-D of the channel width, a ``cell_mask`` that is not
+            $(H, C)$, or a ``student_nu`` that is not above $2$.
     """
     validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
+    student_nu = validate_student_nu(student_nu)
 
     residual = target - mu
     if ar_coef is not None:
@@ -305,6 +395,8 @@ def raw_sample_score(
         raise ValueError(
             "likelihood='gaussian_nll' requires logvar; only 'mse' works without one"
         )
+    elif student_nu is not None:
+        score = student_t_nll(diff2, logvar, student_nu)
     else:
         score = 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
 
@@ -343,6 +435,7 @@ def masked_raw_block_per_anchor(
     horizon_weight: Optional[torch.Tensor] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Each anchor's own masked block score, before any averaging.
 
@@ -371,6 +464,11 @@ def masked_raw_block_per_anchor(
             block every raw-signal cell scores.
         horizon_weight: Per-step weight on the horizon axis, applied at the same site. ``None`` is
             the horizon-uniform block.
+        cell_mask: The optional $(H, C)$ scored-cell mask; see :func:`raw_sample_score`.
+        ar_coef: The optional $(C,)$ AR(1) coefficient; see :func:`raw_sample_score`. The
+            forecast mask doubles as its ``step_mask``.
+        student_nu: Optional $\nu > 2$ of a Student-$t$ innovation density; see
+            :func:`raw_sample_score`. ``None`` is the Gaussian block, bitwise.
 
     Returns:
         ``(block_per_anchor, contributing)``, both $(B, T_{\mathrm{valid}})$: the summed block
@@ -389,6 +487,7 @@ def masked_raw_block_per_anchor(
         horizon_weight=horizon_weight,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+        student_nu=student_nu,
         step_mask=mask,
     )
 
@@ -451,6 +550,7 @@ def masked_raw_likelihood(
     horizon_weight: Optional[torch.Tensor] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Masked reconstruction loss, summed over the forecast block, averaged over anchors.
 
@@ -470,6 +570,10 @@ def masked_raw_likelihood(
             ``d_block`` it always was rather than becoming a weighted mean.
         horizon_weight: Per-step weight on the horizon axis, under the same contract: ``d_sample``
             still divides by $H \cdot R$, so it remains a fixed rescaling of ``d_block``.
+        cell_mask: The optional $(H, C)$ scored-cell mask; see :func:`raw_sample_score`.
+        ar_coef: The optional $(C,)$ AR(1) coefficient; see :func:`raw_sample_score`.
+        student_nu: Optional $\nu > 2$ of a Student-$t$ innovation density; see
+            :func:`raw_sample_score`. ``None`` is the Gaussian score, bitwise.
 
     Returns:
         ``(d_block, d_sample)``: the per-anchor block value (summed over the $H \cdot R$
@@ -490,6 +594,7 @@ def masked_raw_likelihood(
         horizon_weight=horizon_weight,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+        student_nu=student_nu,
     )
     return _reduce_block(block_per_anchor, contributing, target, cell_mask)
 
@@ -924,8 +1029,10 @@ def compute_loss(
     horizon_weight: Optional[torch.Tensor] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
     lambda_event_gate: float = 0.0,
     full_anchor_weight: Optional[torch.Tensor] = None,
+    decoder_logvar_clamp: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, Any]:
     r"""Compute the seven-term objective, per anchor.
 
@@ -1042,6 +1149,12 @@ def compute_loss(
         ar_coef: Optional $(C,)$ AR(1) residual coefficient, reaching both reconstruction terms;
             see :func:`raw_sample_score`. Both branches are scored under the same $\phi$, so
             ``pred_gap`` remains a difference of two joint log-densities of one family.
+        student_nu: Optional $\nu > 2$ of a Student-$t$ innovation density, reaching both
+            reconstruction terms; see :func:`raw_sample_score`. Both branches are scored under
+            the same $\nu$, so ``pred_gap`` stays a difference of two log-densities of one
+            family. ``None`` is the Gaussian objective, bitwise. The floor and ceiling fractions
+            and the ``mean_logvar_*`` metrics read the log-variance itself, which is the
+            log-squared scale under either density, so they do not change.
         lambda_event_gate: Weight $\lambda_g$ on the posterior's **event gate** sparsity term,
             $\lambda_g \, \beta \, \mathbb E_t[g_t]$ over the KL's anchor support, read off
             ``forward_outputs['event_gate']``. It rides $\beta$'s schedule for the same reason
@@ -1059,6 +1172,10 @@ def compute_loss(
             ``event_anchor_frac``, the share of contributing anchors at weight $1$ ($1.0$ when no
             weight is given). The base branch and the KL are never weighted: between events the
             source pathway then has its cost and no reward.
+        decoder_logvar_clamp: The decoder's own $(\mathrm{lo}_d, \mathrm{hi}_d)$, which
+            ``logvar_full_floor_frac`` and ``logvar_full_ceil_frac`` are read against when the
+            model bounds its decoder apart from its prior and posterior. ``None`` -- the default --
+            reads them against ``logvar_clamp``, as before the argument existed.
 
     Returns:
         ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
@@ -1115,6 +1232,7 @@ def compute_loss(
         horizon_weight=horizon_weight,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+        student_nu=student_nu,
     )
     nll_full_block, nll_full_sample = _reduce_block(
         full_block_per_anchor, full_contributing, target, cell_mask
@@ -1129,6 +1247,7 @@ def compute_loss(
         horizon_weight=horizon_weight,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+        student_nu=student_nu,
     )
 
     # The event weighting of the FULL branch alone. ``nll_full_block`` above stays the unweighted
@@ -1265,13 +1384,16 @@ def compute_loss(
         # like from the inside); pinned at the ceiling it has given up and is predicting
         # noise, which reads as a healthy falling NLL while pred_gap goes to zero.
         lo, hi = logvar_clamp
-        bound_margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+        # The decoder's own bound when it has one; the prior's floor watch below keeps the shared
+        # bound, which is the one the prior head applies.
+        dec_lo, dec_hi = logvar_clamp if decoder_logvar_clamp is None else decoder_logvar_clamp
+        bound_margin = LOGVAR_FLOOR_MARGIN_FRAC * (dec_hi - dec_lo)
         logvar_full = forward_outputs["logvar_full"]
         logvar_full_floor_frac = (
-            (logvar_full <= lo + bound_margin).to(dtype) * elem_mask
+            (logvar_full <= dec_lo + bound_margin).to(dtype) * elem_mask
         ).sum() / elem_denom
         logvar_full_ceil_frac = (
-            (logvar_full >= hi - bound_margin).to(dtype) * elem_mask
+            (logvar_full >= dec_hi - bound_margin).to(dtype) * elem_mask
         ).sum() / elem_denom
 
         # The prior-variance floor watch. The KL carries (mu_q - mu_p)^2 / sigma_p^2, so

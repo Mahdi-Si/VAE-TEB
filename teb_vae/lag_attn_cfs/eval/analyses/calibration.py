@@ -36,6 +36,14 @@ This is the one analysis whose output changes a config value: it states a recomm
 ``model_config.VAE_model.logvar_clamp``, derived from the observed distribution rather than from
 an opinion, and says plainly when no revision is warranted.
 
+**Under a Student-$t$ innovation density** (the model keyword ``forecast_student_nu`` $= \nu$)
+every reading above uses the model's own density, with $z = e / \sigma$ and $\sigma$ the scale.
+The PIT is $F_\nu(z)$. Coverage keeps the three nominal masses and counts $|z| \le q_k$, with
+$q_k = F_\nu^{-1}(\tfrac12 + \tfrac{p_k}{2})$ (about $1.067$, $2.366$, $4.277$ at $\nu = 8$). CRPS is
+the Student-$t$ closed form, and the standardised variance divides by $\sigma^2 \nu / (\nu - 2)$.
+The record carries ``student_nu`` and ``density`` so that a reader knows which density it
+describes. The homoscedastic alternative stays Gaussian.
+
 An ``mse`` checkpoint records a **skip**. Its log-variance head is never trained, so a probability
 integral transform of its output would be arithmetic over an untrained tensor -- a number, and a
 meaningless one.
@@ -78,6 +86,10 @@ REQUIRED_LIKELIHOOD = "gaussian_nll"
 #: The config key a revision would be written to. Named in the output rather than described, so a
 #: reader can act on the recommendation without going looking for where it lands.
 CLAMP_CONFIG_KEY = "model_config.VAE_model.logvar_clamp"
+
+#: The config key a recommendation names when the model bounds its decoder apart from its prior
+#: and posterior: the revision then concerns the decoder's bound alone.
+DECODER_CLAMP_CONFIG_KEY = "model_config.VAE_model.decoder_logvar_clamp"
 
 #: The per-recording columns reduced beside the pooled census: these *are* on the aggregation
 #: chain, unlike the PIT and the coverage, which are statements about a distribution.
@@ -247,6 +259,27 @@ def histogram_quantile(frame: pd.DataFrame, quantile: float) -> float:
     return left + min(max(position, 0.0), 1.0) * (right - left)
 
 
+def _decoder_clamp(bounds: Dict[str, Any]) -> Tuple[List[float], float, str]:
+    """The bound the forecast's log-variance lives under, its margin and its config key.
+
+    The decoder's own clamp when the bound record carries one that differs from the shared
+    clamp (a model built with ``decoder_logvar_clamp``); the shared clamp otherwise, which is
+    every record written before the decoder could have its own.
+
+    Args:
+        bounds: The model's bound record.
+
+    Returns:
+        ``(clamp, margin, config_key)``; ``clamp`` is empty when the record has none.
+    """
+    shared = list(bounds.get("logvar_clamp") or [])
+    own = list(bounds.get("decoder_logvar_clamp") or [])
+    if own and own != shared:
+        margin = float(bounds.get("decoder_logvar_margin", float("nan")))
+        return own, margin, DECODER_CLAMP_CONFIG_KEY
+    return shared, float(bounds.get("logvar_margin", float("nan"))), CLAMP_CONFIG_KEY
+
+
 def clamp_recommendation(
     report: Dict[str, Any], bounds: Dict[str, Any], per_recording: Dict[str, float]
 ) -> Dict[str, Any]:
@@ -270,8 +303,8 @@ def clamp_recommendation(
     Returns:
         The config key, the current clamp, whether each end binds, and the proposed value.
     """
-    clamp = list(bounds.get("logvar_clamp") or [float("nan"), float("nan")])
-    margin = float(bounds.get("logvar_margin", float("nan")))
+    clamp, margin, config_key = _decoder_clamp(bounds)
+    clamp = clamp or [float("nan"), float("nan")]
     histogram = logvar_frame(report)
     low = histogram_quantile(histogram, _CLAMP_QUANTILES[0])
     high = histogram_quantile(histogram, _CLAMP_QUANTILES[1])
@@ -286,7 +319,7 @@ def clamp_recommendation(
     if ceil_binds and np.isfinite(high):
         proposed[1] = float(np.ceil((high + _CLAMP_HEADROOM) * 2.0) / 2.0)
     return {
-        "config_key": CLAMP_CONFIG_KEY,
+        "config_key": config_key,
         "current": clamp,
         "margin": margin,
         "floor_frac": floor_frac,
@@ -299,11 +332,11 @@ def clamp_recommendation(
         "proposed": proposed,
         "change_recommended": bool(floor_binds or ceil_binds),
         "detail": (
-            f"neither end of {CLAMP_CONFIG_KEY} is binding; leave it at {clamp}"
+            f"neither end of {config_key} is binding; leave it at {clamp}"
             if not (floor_binds or ceil_binds)
             else f"the decoder log-variance is pressed against its "
                  f"{'floor' if floor_binds else ''}{' and ' if floor_binds and ceil_binds else ''}"
-                 f"{'ceiling' if ceil_binds else ''}; widen {CLAMP_CONFIG_KEY} to {proposed}"
+                 f"{'ceiling' if ceil_binds else ''}; widen {config_key} to {proposed}"
         ),
     }
 
@@ -413,8 +446,7 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
 
-    clamp = list(bounds.get("logvar_clamp") or [])
-    margin = float(bounds.get("logvar_margin", float("nan")))
+    clamp, margin, _ = _decoder_clamp(bounds)
     if len(clamp) == 2 and np.isfinite(margin):
         lo, hi = float(clamp[0]), float(clamp[1])
         for position, label in (
@@ -469,7 +501,7 @@ def run_calibration_analysis(
     # a finished directory produces the identical block from the identical sums.
     report = dict(results.get("calibration") or {})
     if not report:
-        report = calibration_report({}, logvar_clamp=bounds.get("logvar_clamp"))
+        report = calibration_report({}, logvar_clamp=_decoder_clamp(bounds)[0] or None)
     if not report:
         return skip_record(likelihood)
 
@@ -520,6 +552,11 @@ def run_calibration_analysis(
         "composition": {"n_recordings": int(len(per_guid))},
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "likelihood": likelihood,
+        # Which innovation density the PIT, the coverage, the CRPS and the NLL describe: None is
+        # the Gaussian one; a number is the Student-t degrees of freedom. A report written before
+        # the key existed is Gaussian.
+        "student_nu": report.get("student_nu"),
+        "density": report.get("density", "gaussian"),
         # The scored unit, named rather than implied: it is a target coefficient, and the sibling's
         # per-raw-sample denominator is a different count, so the two are not comparable.
         "n_coefficients": int(report.get("n_coefficients", 0)),

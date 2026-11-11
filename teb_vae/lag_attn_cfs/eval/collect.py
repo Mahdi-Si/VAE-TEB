@@ -98,7 +98,9 @@ from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval import events
 from teb_vae.lag_attn_cfs.eval._reuse import labels, subsample_indices
+from teb_vae.lag_attn_cfs.ua_tolerance import tolerant_reward_validity
 from teb_vae.lag_attn_cfs.eval.metrics import (
+    decoder_logvar_bound,
     DENSE_ANCHOR_GEOMETRY,
     VECTOR_READOUTS,
     BatchReadout,
@@ -539,6 +541,10 @@ class Collector:
         device: The device the pass runs on, for the cost record.
         ua_valid_events: Detect contractions under the batch's ``up_valid`` as well as its
             ``weight``, as a run trained with ``event_weight_ua_valid`` did.
+        ua_valid_tolerance_s: The run's ``event_weight_ua_tolerance_s``: with
+            ``ua_valid_events``, the samples of invalid UA runs of at most this many seconds
+            count as valid, as the training detector counted them. ``None`` -- the default --
+            reads ``up_valid`` unchanged.
     """
 
     def __init__(
@@ -549,9 +555,11 @@ class Collector:
         num_mc_samples: Optional[int] = None,
         device: Any = None,
         ua_valid_events: bool = False,
+        ua_valid_tolerance_s: Optional[float] = None,
     ) -> None:
         self._plan = plan
         self._ua_valid_events = bool(ua_valid_events)
+        self._ua_valid_tolerance_s = ua_valid_tolerance_s
         self._model = model
         self._num_mc_samples = num_mc_samples
         self._device = device
@@ -789,7 +797,11 @@ class Collector:
             mask = batch_field(batch, "up_valid")
             if not isinstance(mask, torch.Tensor):
                 return ages
-            given = mask.detach().cpu().to(torch.bool).numpy().reshape(batch_size, -1)[:, :raw_len]
+            given_t = mask.detach().cpu().to(torch.bool).reshape(batch_size, -1)
+            # The training detector's tolerance, so a table bin and a training weight name one
+            # event; a no-op when the run set none.
+            given_t = tolerant_reward_validity(given_t, self._ua_valid_tolerance_s)
+            given = given_t.numpy()[:, :raw_len]
             # A short mask leaves its tail invalid, as traces.up_event_validity does for the
             # retained traces, so the two readers of one batch find the same contractions.
             ua_valid = np.zeros((batch_size, raw_len), dtype=bool)
@@ -1100,14 +1112,20 @@ def bounds_record(model: Any) -> Dict[str, Any]:
 
     Returns:
         The log-variance clamp, the margin fraction that decides "on the clamp" and the absolute
-        margin it works out to, and the two tanh bounds the saturation fractions are measured
-        against.
+        margin it works out to, the decoder's own clamp and margin, and the two tanh bounds the
+        saturation fractions are measured against.
     """
     lo, hi = float(model.logvar_clamp[0]), float(model.logvar_clamp[1])
+    # The decoder's own bound, which the forecast's log-variance figure and the clamp
+    # recommendation read; equal to the shared one unless the model was built with
+    # ``decoder_logvar_clamp``.
+    dec_lo, dec_hi = decoder_logvar_bound(model)
     return {
         "logvar_clamp": [lo, hi],
         "logvar_margin_frac": float(LOGVAR_FLOOR_MARGIN_FRAC),
         "logvar_margin": float(LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)),
+        "decoder_logvar_clamp": [dec_lo, dec_hi],
+        "decoder_logvar_margin": float(LOGVAR_FLOOR_MARGIN_FRAC * (dec_hi - dec_lo)),
         "mu_scale": float(model.mu_scale),
         "delta_mu_scale": float(model.delta_mu_scale),
         "saturation_frac": float(SATURATION_FRAC),
@@ -1260,6 +1278,7 @@ def collect_tables(
         # The training detector's own validity, read off the run's hparams, so a table bin and a
         # training weight name one event.
         ua_valid_events=bool(getattr(task, "hparams", {}).get("event_weight_ua_valid", False)),
+        ua_valid_tolerance_s=getattr(task, "hparams", {}).get("event_weight_ua_tolerance_s"),
     )
     results = evaluate(
         task,

@@ -1041,6 +1041,7 @@ def _window_block_scores(
     target_forecast_shift: Optional[Sequence[int]] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Optional[Dict[str, np.ndarray]]:
     r"""Each drawn window's own block score, under the objective's likelihood and its mask.
 
@@ -1060,6 +1061,8 @@ def _window_block_scores(
         cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``: part of the
             density the logged block scores are sums of, so a window scores the same cells.
         ar_coef: The model's AR(1) coefficient $\phi_c$, or ``None``, for the same reason.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density, for
+            the same reason.
 
     Returns:
         ``{'base': (W,), 'full': (W,)}`` over the drawn windows, ``NaN`` for a window whose
@@ -1114,6 +1117,7 @@ def _window_block_scores(
                 per_element = raw_sample_score(
                     mean[position], target, likelihood=likelihood, logvar=logvar[position],
                     cell_mask=cell_mask, ar_coef=ar_coef, step_mask=step_mask,
+                    student_nu=student_nu,
                 )
                 window_scores.append(float((per_element * step_mask[:, None]).sum()))
             scores[branch] = np.asarray(window_scores, dtype=float)
@@ -1231,6 +1235,7 @@ def _draw_gap_row(
     target_forecast_shift: Optional[Sequence[int]] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> None:
     r"""Draw ``pred_gap``: each drawn window's block score, base against full, plus the profiles.
 
@@ -1248,6 +1253,8 @@ def _draw_gap_row(
         target_forecast_shift: The model's own forecast clock, for the window scorer.
         cell_mask: The model's scored-cell mask, for the window scorer.
         ar_coef: The model's AR(1) coefficient, for the window scorer.
+        student_nu: The model's Student-$t$ $\nu$, for the window scorer. The $\pm 2\sigma$
+            inset stays a scale band; it is a figure, not a score.
     """
     ax, cax = rows.row_axes("pred_gap")
     cax.set_visible(False)
@@ -1265,6 +1272,7 @@ def _draw_gap_row(
         target_forecast_shift=target_forecast_shift,
         cell_mask=cell_mask,
         ar_coef=ar_coef,
+        student_nu=student_nu,
     )
     if scores is None:
         # The row keeps its title, its axis and its place, so the rows below stay column-aligned
@@ -1858,6 +1866,7 @@ def causal_forecast_rows(
     forecast_clock_delay_s: Optional[float] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
     source_keep_index: Optional[Sequence[int]] = None,
     source_blocks: Sequence[str] = SOURCE_BLOCKS,
     target_quality_mask: bool = False,
@@ -1907,6 +1916,8 @@ def causal_forecast_rows(
             block scores. ``None`` scores every cell.
         ar_coef: The model's AR(1) residual coefficient $\phi_c$, or ``None`` for the factorised
             score.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density. Bound
+            by the task from the same ``forecast_likelihood_kwargs``, only when the model sets it.
         source_keep_index: The source gate's kept channels, positional into the source stream,
             so the mask row shades a UA block by the share of the channels the model reads.
             ``None`` takes every channel.
@@ -2019,4 +2030,5 @@ def causal_forecast_rows(
             target_forecast_shift=target_forecast_shift,
             cell_mask=cell_mask,
             ar_coef=ar_coef,
+            student_nu=student_nu,
         )

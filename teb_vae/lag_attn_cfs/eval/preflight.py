@@ -163,6 +163,7 @@ TARGET_FIELDS: Tuple[str, ...] = ("fhr_st", "fhr_ph")
 OBJECTIVE_KEYS: Tuple[str, ...] = (
     "likelihood", "free_bits", "lambda_full", "lambda_base",
     "event_weight_ua_valid", "target_quality_mask", "source_event_mask",
+    "source_valid_tolerance_s", "event_weight_ua_tolerance_s", "ua_bridge_guard_s",
 )
 
 #: Recorded from the checkpoint but never compared: $\beta$ and its ramp weight the *training* total

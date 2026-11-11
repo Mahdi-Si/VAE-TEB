@@ -387,12 +387,28 @@ class LagAttnRwsTrainer(GraphModelBase):
             target_quality_mask=bool(vae_config.get("target_quality_mask", False)),
             source_event_mask=bool(vae_config.get("source_event_mask", False)),
             compile_model=self.compile_model_requested(),
+            **self._extra_task_kwargs(vae_config),
         )
         # Re-forces the config's values onto hparams, so a checkpoint-restored run follows the
         # config it was launched with rather than the one it was originally trained under.
         self.apply_config_hyperparameters(
             {"lr": self.lr, "lr_milestones": self.lr_milestones}, self.pl_model
         )
+
+    def _extra_task_kwargs(self, vae_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Task keywords a subclass's task takes beyond the shared objective's.
+
+        Empty here, so every task of the family is built with exactly the keywords it was built
+        with before the hook existed. A subclass whose task class takes more keywords returns
+        them, and they reach ``save_hyperparameters`` and the checkpoint like the others.
+
+        Args:
+            vae_config: The ``model_config.VAE_model`` block.
+
+        Returns:
+            Extra keyword arguments for ``TASK_CLS``.
+        """
+        return {}
 
     def compile_model_requested(self) -> bool:
         """Whether to wrap this architecture's net in ``torch.compile``.

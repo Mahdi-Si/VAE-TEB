@@ -67,6 +67,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     forecast_likelihood_terms,
 )
 from teb_vae.lag_attn_cfs.sample_page import _scored_clock_view
+from teb_vae.lag_attn_cfs.ua_tolerance import tolerant_reward_validity
 from teb_vae.lag_attn_rws.nets.losses import KLD_ACTIVE_EPS, raw_sample_score
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors
 
@@ -406,6 +407,8 @@ def _forecast_readouts(
                 mean, target, likelihood=likelihood,
                 logvar=outs[f"logvar_{branch}"][0, position],
                 cell_mask=cell_mask, ar_coef=ar_coef, step_mask=step_mask,
+                # The model's own innovation density; absent (Gaussian) on most models.
+                student_nu=terms.get("student_nu"),
             )
             columns[f"nll_{branch}"][position] = float((score * step_mask[:, None]).sum())
             columns[f"mse_{branch}"][position] = float(
@@ -507,7 +510,12 @@ def build_payload(
         # The detector's validity as the collection pass builds it, so a contraction on the page is
         # the contraction the tables and the training weight name.
         if raw_valid.get("up") is not None and bool(task.hparams.get("event_weight_ua_valid", False)):
-            valid = raw_valid["up"] if valid is None else (np.asarray(valid, dtype=bool) & raw_valid["up"])
+            # With the training detector's tolerance for short UA runs, when the run set one.
+            up_ok = tolerant_reward_validity(
+                torch.as_tensor(np.asarray(raw_valid["up"], dtype=bool))[None],
+                task.hparams.get("event_weight_ua_tolerance_s"),
+            )[0].numpy()
+            valid = up_ok if valid is None else (np.asarray(valid, dtype=bool) & up_ok)
         found = events.detect_contractions(arrays["up_stored"], valid=valid)
         event_spans["contractions"] = [
             [float(a), float(b), float(c)]

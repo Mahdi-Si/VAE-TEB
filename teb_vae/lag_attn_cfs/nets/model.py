@@ -113,7 +113,10 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         target_forecast_shift: Optional[Sequence[int]] = None,
         target_scored_horizon: Optional[Sequence[int]] = None,
         forecast_ar_residual: bool = False,
+        forecast_student_nu: Optional[float] = None,
         source_quality_mask: bool = False,
+        source_running_gap_keys: str = "keep",
+        decoder_logvar_clamp: Optional[Tuple[float, float]] = None,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -169,10 +172,21 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             forecast_ar_residual: Score the horizon under a per-channel AR(1) residual with a
                 learnable $\phi_c = \tanh(a_c)$, seeded at $0$. ``False`` builds no parameter and
                 is the factorised score.
+            forecast_student_nu: $\nu > 2$, the degrees of freedom of a scaled Student-$t$
+                innovation density with the decoder's $\sigma$ as its scale. ``None`` -- the
+                default -- is the Gaussian density; either value adds no parameter or buffer.
             source_quality_mask: Require ``source_valid`` in every forward and apply it: bad UA
                 steps leave the lag keys, and an anchor with no valid key keeps $q = p$. Paired
                 with the dataset's ``ua_step_mask``. ``False`` builds the model bitwise as before
                 the keyword existed; either value adds no parameter.
+            source_running_gap_keys: ``'keep'`` -- the default -- builds the model bitwise as
+                before the keyword existed. ``'remove'`` requires ``source_key_removed`` in every
+                forward and takes, per anchor, every lag key whose value can rest on bridged UA
+                after the anchor out of the attention; an anchor with no key left keeps $q = p$.
+                It needs ``source_quality_mask`` and adds no parameter.
+            decoder_logvar_clamp: $(\mathrm{lo}_d, \mathrm{hi}_d)$, the decoder's own bound on the
+                forecast log-variance; the prior and posterior heads keep ``logvar_clamp``.
+                ``None`` -- the default -- is the shared bound, bitwise. It adds no parameter.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -202,6 +216,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             lag_floor=lag_floor,
             target_forecast_shift=target_forecast_shift,
             source_quality_mask=source_quality_mask,
+            source_running_gap_keys=source_running_gap_keys,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.
@@ -217,6 +232,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         self._set_likelihood_structure(
             target_scored_horizon=target_scored_horizon,
             forecast_ar_residual=forecast_ar_residual,
+            forecast_student_nu=forecast_student_nu,
         )
 
         # The alignment shifts reach the base under ITS names, which is the one place in this
@@ -237,3 +253,5 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         self._register_channel_weights()
         # After the decoder exists, whose width the AR coefficient and the cell mask share.
         self._register_likelihood_structure()
+        # After the base, which builds the decoder with the shared bound. Inert at None.
+        self._set_decoder_logvar_clamp(decoder_logvar_clamp)
