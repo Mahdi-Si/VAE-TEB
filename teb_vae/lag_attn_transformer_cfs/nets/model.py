@@ -141,8 +141,11 @@ class SeqVaeLagAttnTrfCfs(
         forecast_ar_residual: bool = False,
         forecast_ar_max: float = 1.0,
         target_scored_start: Optional[Sequence[int]] = None,
+        forecast_student_nu: Optional[float] = None,
         source_quality_mask: bool = False,
         source_mask_mode: str = "hard",
+        source_running_gap_keys: str = "keep",
+        decoder_logvar_clamp: Optional[Tuple[float, float]] = None,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -211,6 +214,14 @@ class SeqVaeLagAttnTrfCfs(
                 curve and ``target_min_novelty``. A cell is scored when
                 $\tau^{0}_c \le \tau < H_c$; a channel with $\tau^{0}_c \ge H_c$ is not scored at
                 all. ``None`` -- the default -- starts every channel at step $0$.
+            forecast_student_nu: $\nu > 2$, the degrees of freedom of a scaled Student-$t$
+                density for each forecast innovation, with the decoder's
+                $\sigma = \exp(\log\sigma^2 / 2)$ as its scale. The innovations are heavy-tailed,
+                and under the Gaussian density a few large ones force the variance up everywhere
+                and leave the 3-sigma coverage short. Every scorer, in training and in the
+                evaluation, reads it through ``forecast_likelihood_kwargs``. ``None`` -- the
+                default -- is the Gaussian density, bitwise. It adds no parameter or buffer, so a
+                Gaussian checkpoint loads strictly into a Student-$t$ model.
             persistence_lags: $P$, the number of the target's own most recent stored values the
                 decoder's persistence term reads. ``1`` -- the default -- is the single-lag term.
             source_quality_mask: Require ``source_valid`` in every forward and apply it: bad UA
@@ -224,11 +235,20 @@ class SeqVaeLagAttnTrfCfs(
                 a per-head score bias on bad keys, and feeds the gate the attention mass on them.
                 It needs ``source_quality_mask`` and ``posterior_event_gate``, and adds
                 $d_{\mathrm{model}} C_u + 2M$ parameters, all zero at init.
+            source_running_gap_keys: ``'keep'`` -- the default -- builds the model bitwise as
+                before the keyword existed. ``'remove'`` requires ``source_key_removed`` in every
+                forward and takes, per anchor, every lag key whose value can rest on bridged UA
+                after the anchor out of the attention; an anchor with no key left keeps $q = p$.
+                It needs ``source_quality_mask`` and adds no parameter.
+            decoder_logvar_clamp: $(\mathrm{lo}_d, \mathrm{hi}_d)$, the decoder's own bound on the
+                forecast log-variance; the prior and posterior heads keep ``logvar_clamp``.
+                ``None`` -- the default -- is the shared bound, bitwise. It adds no parameter.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
                 if ``lag_floor`` is negative; if a warm-up vector arrives without its keep-index;
-                if a forecast shift arrives without its keep-index or mixes signs; or if
+                if a forecast shift arrives without its keep-index or mixes signs; if
+                ``forecast_student_nu`` is set and not above $2$; or if
                 ``warmup_period`` is below the floor the kept channels require. Everything
                 else is the architecture parent's own validation, including the five encoder
                 refusals a conv-LSTM cell has no analogue of.
@@ -255,6 +275,7 @@ class SeqVaeLagAttnTrfCfs(
             target_forecast_shift=target_forecast_shift,
             source_quality_mask=source_quality_mask,
             source_mask_mode=source_mask_mode,
+            source_running_gap_keys=source_running_gap_keys,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.
@@ -272,6 +293,7 @@ class SeqVaeLagAttnTrfCfs(
             forecast_ar_residual=forecast_ar_residual,
             forecast_ar_max=forecast_ar_max,
             target_scored_start=target_scored_start,
+            forecast_student_nu=forecast_student_nu,
         )
 
         # The alignment shifts reach the base under ITS names, which is the one place in this
@@ -295,3 +317,5 @@ class SeqVaeLagAttnTrfCfs(
         # After the base, which builds the posterior's event gate and the lag attention the soft
         # mask's parameters are sized against. Registers nothing in the hard mode.
         self._build_soft_source_mask()
+        # After the base, which builds the decoder with the shared bound. Inert at None.
+        self._set_decoder_logvar_clamp(decoder_logvar_clamp)

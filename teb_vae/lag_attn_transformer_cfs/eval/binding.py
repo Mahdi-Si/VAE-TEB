@@ -134,6 +134,12 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     # Part of the density for the same reason: the bound sets every evaluated innovation's
     # coefficient, so a config disagreeing about it would report one likelihood under another's name.
     "forecast_ar_max",
+    # Part of the density for the same reason: it replaces the Gaussian innovation density by a
+    # Student-t one, so every evaluated nat, coverage and PIT changes meaning with it. It adds no
+    # parameter, so a checkpoint loads under either value; a config disagreeing about it would
+    # report one density's numbers under another's name. A checkpoint written before the key
+    # existed has no entry, which the reconciliation skips.
+    "forecast_student_nu",
     # Changes what the forecast is, as ``persistence_residual`` does: the decoder's mean carries a
     # linear filter over the target's last P stored values rather than over the last one alone.
     "persistence_lags",

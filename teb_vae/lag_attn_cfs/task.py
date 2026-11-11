@@ -57,6 +57,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from teb_vae.lag_attn_cfs import ua_tolerance
 from teb_vae.lag_attn_cfs.causal_warmup import WarmupBudget
 from teb_vae.lag_attn_cfs.eval import events as cfs_events
 from teb_vae.lag_attn_fs.task import SeqVaeLagAttnFsTask
@@ -88,7 +89,17 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
     from the one the comparison model is scored through.
     """
 
-    def __init__(self, base_model: Any, *, seed: int = 0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        base_model: Any,
+        *,
+        seed: int = 0,
+        ua_bridge_guard_s: float = 4.0,
+        source_valid_tolerance_s: Optional[float] = None,
+        event_weight_ua_tolerance_s: Optional[float] = None,
+        source_valid_windows: Optional[Sequence[int]] = None,
+        **kwargs: Any,
+    ) -> None:
         r"""Initialize the task.
 
         Args:
@@ -99,11 +110,88 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 into ``save_hyperparameters``, which is what makes a **resumed** run reproduce the
                 phases it was drawing before it stopped. Defaults to $0$ so a unit-constructed task
                 needs no run to exist.
+            ua_bridge_guard_s: $g$ in seconds, the bridge's end-slope window: how far past an
+                invalid run the dataset's bridge reads. Read only when the net is built with
+                ``source_running_gap_keys='remove'``, for the removal mask of
+                :meth:`_build_source_key_removed`. Defaults to the builder's $4$ s.
+            source_valid_tolerance_s: $T_{\mathrm{tol}}$ in seconds. When set, an invalid UA run
+                of at most $T_{\mathrm{tol}}$ is short, and a source channel's flag turns valid
+                at every step whose causal window holds no sample of a long run
+                (:func:`~teb_vae.lag_attn_cfs.ua_tolerance.tolerant_flags`). It needs the net's
+                ``source_running_gap_keys='remove'``. ``None`` -- the default -- hands the
+                dataset's flags through unchanged.
+            event_weight_ua_tolerance_s: $T_{\mathrm{tol}}$ in seconds for the contraction
+                detector's UA validity: the samples of short runs count as valid, so a
+                contraction is dropped only when its span touches a long run. It needs
+                ``event_weight_ua_valid``. ``None`` -- the default -- is the validity unchanged.
+            source_valid_windows: $W_c$ per DECLARED source channel in feature steps on the
+                untrimmed grid, the windows of ``source_valid_tolerance_s``. The trainer reads them
+                off the shards; they are a hyperparameter so a task rebuilt from a checkpoint gets
+                them too. ``None`` falls back to :meth:`_source_valid_windows`.
             **kwargs: Every other keyword, forwarded to the inherited constructor unchanged. A
                 second keyword schema for the same objective could only drift from the first.
+
+        Raises:
+            ValueError: If a tolerance is not positive or the guard is negative, if
+                ``source_valid_tolerance_s`` is set on a net without running-gap removal, or if
+                ``event_weight_ua_tolerance_s`` is set without ``event_weight_ua_valid``.
         """
         super().__init__(base_model, **kwargs)
         self.save_hyperparameters("seed")
+        # Saved as plain floats and ints, so the checkpoint's hyperparameters stay YAML-safe.
+        self.save_hyperparameters(
+            {
+                "ua_bridge_guard_s": float(ua_bridge_guard_s),
+                "source_valid_tolerance_s": (
+                    None if source_valid_tolerance_s is None else float(source_valid_tolerance_s)
+                ),
+                "event_weight_ua_tolerance_s": (
+                    None
+                    if event_weight_ua_tolerance_s is None
+                    else float(event_weight_ua_tolerance_s)
+                ),
+                "source_valid_windows": (
+                    None
+                    if source_valid_windows is None
+                    else [int(step) for step in source_valid_windows]
+                ),
+            }
+        )
+        self._check_ua_tolerance_switches()
+
+    def _check_ua_tolerance_switches(self) -> None:
+        r"""Refuse a UA tolerance key that the net or the objective cannot serve.
+
+        Raises:
+            ValueError: Naming the key and the reason.
+        """
+        if float(self.hparams.get("ua_bridge_guard_s", 4.0)) < 0:
+            raise ValueError(
+                f"ua_bridge_guard_s must be >= 0, got {self.hparams.get('ua_bridge_guard_s')}"
+            )
+        for key in ("source_valid_tolerance_s", "event_weight_ua_tolerance_s"):
+            value = self.hparams.get(key)
+            if value is not None and float(value) <= 0:
+                raise ValueError(f"{key} must be > 0 or None, got {value}")
+        if self.hparams.get("source_valid_tolerance_s") is not None and (
+            getattr(self.orig_model, "source_running_gap_keys", "keep") != "remove"
+        ):
+            raise ValueError(
+                "source_valid_tolerance_s is set, but the net was not built with "
+                "source_running_gap_keys='remove'. The tolerant flags turn the steps inside a "
+                "short UA run valid, and the bridge across that run reads samples after it: "
+                "without the per-anchor key removal an anchor inside the run would attend to "
+                "keys that look ahead through the bridge. Set model_config.VAE_model."
+                "source_running_gap_keys: remove."
+            )
+        if self.hparams.get("event_weight_ua_tolerance_s") is not None and not bool(
+            self.hparams.get("event_weight_ua_valid", False)
+        ):
+            raise ValueError(
+                "event_weight_ua_tolerance_s is set, but event_weight_ua_valid is off, so the "
+                "contraction detector reads no UA validity for the tolerance to relax. Set "
+                "event_weight_ua_valid: true, or turn the tolerance off."
+            )
 
     # ------------------------------------------------------------------
     # The diagnostic page's three seams
@@ -157,9 +245,10 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             ),
             # The rest of the objective's density -- the scored-cell mask and the AR(1)
             # coefficient -- so a window's score row is a partial sum of the block scores in the
-            # page's title. Detached: the page draws, it never backpropagates.
+            # page's title. Detached: the page draws, it never backpropagates. A Student-t model
+            # adds ``student_nu``, a float, which passes through as it is.
             **{
-                name: None if value is None else value.detach()
+                name: value.detach() if torch.is_tensor(value) else value
                 for name, value in model.forecast_likelihood_kwargs().items()
             },
             # The three facts the mask row needs: which UA channels the model reads, in which
@@ -427,14 +516,15 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         change reaches nothing else -- the diagnostic callback star-splats it, and the objective
         never sees it at all. A model built with ``source_quality_mask`` gets a sixth, the
         source-validity mask of :meth:`_build_source_valid`, last so every positional reader of
-        the first five is unchanged.
+        the first five is unchanged. A model built with ``source_running_gap_keys='remove'`` gets
+        a seventh, the removal mask of :meth:`_build_source_key_removed`.
 
         Args:
             batch: A batch from the data module.
 
         Returns:
             ``(y_st, y_ph, u_stream, anchor_phase, anchor_stride)``, plus ``source_valid`` under
-            ``source_quality_mask``.
+            ``source_quality_mask``, plus ``source_key_removed`` under running-gap removal.
         """
         y_st, y_ph = self._build_target_streams(batch)
         source = self._build_source_stream(batch)
@@ -444,8 +534,84 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         # instance for exactly the length of one step; see ``compute_loss_and_metrics``'s caller.
         phase, stride = self.resolve_anchor_geometry(self._stage, batch)
         if bool(getattr(self.orig_model, "source_quality_mask", False)):
-            return y_st, y_ph, source, phase, stride, self._build_source_valid(batch, source)
+            valid = self._build_source_valid(batch, source)
+            if getattr(self.orig_model, "source_running_gap_keys", "keep") == "remove":
+                removed = self._build_source_key_removed(batch, source)
+                return y_st, y_ph, source, phase, stride, valid, removed
+            return y_st, y_ph, source, phase, stride, valid
         return y_st, y_ph, source, phase, stride
+
+    def _build_source_key_removed(self, batch: Any, source: torch.Tensor) -> torch.Tensor:
+        r"""The per-anchor running-gap removal mask $R_{t\ell}$ of this batch.
+
+        Built from the batch's raw UA validity ``up_valid`` by
+        :func:`~teb_vae.lag_attn_cfs.ua_tolerance.removed_keys`, with the guard
+        ``ua_bridge_guard_s``, the net's decimation and its lag count. A key is removed for an
+        anchor when an invalid run that started at or before the key's step is still running at
+        the anchor, i.e. the bridge across it reads samples after the anchor.
+
+        Args:
+            batch: A batch from the data module.
+            source: The assembled source stream $(B, T, c_u)$, for $T$ and the device.
+
+        Returns:
+            Boolean $(B, T, L)$ in lag order, ``True`` = removed.
+
+        Raises:
+            RuntimeError: If the batch carries no ``up_valid``.
+        """
+        up_valid = getattr(batch, "up_valid", None)
+        if up_valid is None:
+            raise RuntimeError(
+                "the model was built with source_running_gap_keys='remove' but the batch has no "
+                "`up_valid` field. Set dataset_kwargs.emit_quality_mask: true; it needs a "
+                "signal-quality build."
+            )
+        model = self.orig_model
+        removed = ua_tolerance.removed_keys(
+            up_valid.to(torch.bool),
+            num_steps=int(source.shape[1]),
+            num_lags=int(model.lag_attn.L),
+            decimation=int(model.geometry.decimation),
+            guard_s=float(self.hparams.get("ua_bridge_guard_s", 4.0)),
+        )
+        return removed.to(device=source.device)
+
+    def _source_valid_windows(self) -> torch.Tensor:
+        r"""$W_c$ per declared source channel on the untrimmed grid, for the tolerant flags.
+
+        The hyperparameter ``source_valid_windows`` when it is set, which is every task the
+        trainer builds and every task rebuilt from its checkpoint. A hand-built task without it
+        falls back to the resolved budget's TRIMMED warm-up plus the trim,
+        $W'_c + n_{\mathrm{trim}}$. That fallback equals the stored window where
+        $W_c \ge n_{\mathrm{trim}}$. For a faster channel, which the trim clipped to $W'_c = 0$,
+        it reads $n_{\mathrm{trim}} > W_c$; a longer window can only find more long-run samples,
+        so the fallback turns fewer flags valid, never more. The trimmed vector alone is not
+        used: its fast channels read $0$, and a window of $0$ steps would turn their flags valid
+        whatever the UA did.
+
+        Returns:
+            A ``long`` tensor $(c_u,)$, each entry at least $1$.
+
+        Raises:
+            ValueError: If neither the hyperparameter nor a resolved budget is available.
+        """
+        stored = self.hparams.get("source_valid_windows")
+        if stored is not None:
+            return torch.as_tensor([int(step) for step in stored], dtype=torch.long).clamp_min(1)
+        budget = self.warmup_budget
+        if budget is None:
+            raise ValueError(
+                "source_valid_tolerance_s is set but the task has no source_valid_windows and no "
+                "resolved warm-up budget to derive them from. Pass source_valid_windows (the "
+                "shards' untrimmed causal_warmup_steps of up_st and up_ph, see "
+                "ua_tolerance.declared_source_windows)."
+            )
+        from hdf5_dataset.hdf5_dataset import decimated_trim_steps
+
+        _, trim_steps = decimated_trim_steps(budget.trim_minutes)
+        trimmed = torch.as_tensor(budget.source.declared_warmup_steps, dtype=torch.long)
+        return (trimmed + int(trim_steps)).clamp_min(1)
 
     def _build_source_valid(self, batch: Any, source: torch.Tensor) -> torch.Tensor:
         r"""Assemble the per-channel source-validity mask in the source stream's channel order.
@@ -455,8 +621,10 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         :meth:`_build_source_stream` concatenates the blocks, so channel $c$ of the mask describes
         channel $c$ of the stream.
 
-        Under ``source_event_mask`` the mask is also ``False`` at every step outside a detected
-        contraction (:meth:`_source_event_steps`).
+        Under ``source_valid_tolerance_s`` the flags are first relaxed by
+        :func:`~teb_vae.lag_attn_cfs.ua_tolerance.tolerant_flags`, with the windows of
+        :meth:`_source_valid_windows`. Under ``source_event_mask`` the mask is also ``False`` at
+        every step outside a detected contraction (:meth:`_source_event_steps`).
 
         Args:
             batch: A batch from the data module.
@@ -490,6 +658,23 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 f"has {tuple(source.shape)}; the two must come from the same blocks."
             )
         valid = valid.to(device=source.device, dtype=torch.bool)
+        # The tolerant flags, after the dataset's flags are assembled and before the ablation
+        # below: a flag turns valid where the channel's causal window holds no long-run sample.
+        tolerance = self.hparams.get("source_valid_tolerance_s")
+        if tolerance is not None:
+            up_valid = getattr(batch, "up_valid", None)
+            if up_valid is None:
+                raise RuntimeError(
+                    "source_valid_tolerance_s is set but the batch has no `up_valid` field. Set "
+                    "dataset_kwargs.emit_quality_mask: true."
+                )
+            valid = ua_tolerance.tolerant_flags(
+                valid,
+                up_valid.to(device=source.device, dtype=torch.bool),
+                self._source_valid_windows().to(source.device),
+                float(tolerance),
+                decimation=int(self.orig_model.geometry.decimation),
+            )
         # The ``source_event_mask`` ablation: a step outside every detected contraction leaves the
         # keys as well. Detected under the unmasked ``weight``, as the contraction weight is.
         weight = getattr(batch, "weight", None)
@@ -641,6 +826,28 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             lambda_boundary=0.0,
         )["metrics"]
         return scored["pred_gap"]
+
+    def _event_ua_valid(self, batch: Any) -> Optional[torch.Tensor]:
+        r"""The UA mask the contraction detector reads, with short runs valid under the tolerance.
+
+        Under ``event_weight_ua_tolerance_s`` the samples of invalid runs of at most
+        $T_{\mathrm{tol}}$ count as valid
+        (:func:`~teb_vae.lag_attn_cfs.ua_tolerance.tolerant_reward_validity`), so a contraction is
+        dropped only when its span touches a long run. Nothing else in the weight changes. The
+        onset cache is keyed per segment and must be fed one validity rule only; the tolerance is
+        a constant of the run, so every detection of one segment reads the same rule.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            The validity $(B, L)$, or ``None`` when ``event_weight_ua_valid`` is off.
+        """
+        valid = super()._event_ua_valid(batch)
+        tolerance = self.hparams.get("event_weight_ua_tolerance_s")
+        if valid is None or tolerance is None:
+            return valid
+        return ua_tolerance.tolerant_reward_validity(valid.to(torch.bool), float(tolerance))
 
     def _event_detector(self) -> Callable[..., Dict[str, Any]]:
         r"""This cell's evaluation detector, so the contraction weight names the table's events.

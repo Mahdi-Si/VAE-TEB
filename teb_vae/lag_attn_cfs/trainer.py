@@ -207,6 +207,52 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
             model_kwargs["target_scored_start"] = start
         return model_kwargs
 
+    def _extra_task_kwargs(self, vae_config: Dict[str, Any]) -> Dict[str, Any]:
+        r"""The UA tolerance keys of the task, and the source windows the flags rule reads.
+
+        Only the keys the config sets are returned, so a run that sets none of them builds its
+        task with the keywords it was built with before the keys existed, and a sibling trainer
+        whose task does not take them is not handed them. Under ``source_valid_tolerance_s`` the
+        untrimmed window $W_c$ of every declared source channel is read off the configured shards
+        (:func:`~teb_vae.lag_attn_cfs.ua_tolerance.declared_source_windows`) and handed to the
+        task as ``source_valid_windows``, which puts it in the checkpoint's hyperparameters.
+
+        Args:
+            vae_config: The ``model_config.VAE_model`` block.
+
+        Returns:
+            The task keywords.
+
+        Raises:
+            ValueError: If a key is set and this trainer's task class does not take it.
+        """
+        from teb_vae.lag_attn_cfs import ua_tolerance
+        from teb_vae.lag_attn_rws.task import task_constructor_names
+
+        extra = {
+            key: vae_config[key]
+            for key in UA_TOLERANCE_TASK_KEYS
+            if vae_config.get(key) is not None
+        }
+        if vae_config.get("source_valid_tolerance_s") is not None:
+            dataset_config = self.config.get("dataset_config") or {}
+            paths = [
+                *(dataset_config.get("vae_train_datasets") or []),
+                *(dataset_config.get("vae_test_datasets") or []),
+            ]
+            extra["source_valid_windows"] = list(
+                ua_tolerance.declared_source_windows(
+                    paths, use_up_st=bool(vae_config.get("use_up_st", True))
+                )
+            )
+        unknown = sorted(set(extra) - task_constructor_names(self.TASK_CLS))
+        if unknown:
+            raise ValueError(
+                f"model_config.VAE_model sets {unknown}, which {self.TASK_CLS.__name__} does not "
+                f"take. Remove the keys from this cell's config."
+            )
+        return extra
+
     def causal_standing_message(self) -> str:
         """Return the one-line statement of this run's causal standing, for the startup log.
 
@@ -536,6 +582,66 @@ def _check_quality_switch_pairing(config: Dict[str, Any]) -> None:
             "model_config.VAE_model.source_event_mask is true but source_mask_mode is 'soft'. "
             "The ablation removes the keys outside a contraction, which only the hard mode does; "
             "set source_mask_mode: hard, or turn source_event_mask off."
+        )
+    _check_ua_tolerance_pairing(vae, kwargs)
+
+
+#: The task keys of the UA tolerance rules, forwarded from ``model_config.VAE_model`` to the task
+#: when set. ``source_valid_windows`` is not among them: the trainer reads it off the shards.
+UA_TOLERANCE_TASK_KEYS: Tuple[str, ...] = (
+    "ua_bridge_guard_s",
+    "source_valid_tolerance_s",
+    "event_weight_ua_tolerance_s",
+)
+
+
+def _check_ua_tolerance_pairing(vae: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
+    """Refuse a UA tolerance or removal key without what it reads or what makes it causal.
+
+    * ``source_running_gap_keys: remove`` builds its mask from ``up_valid`` and applies it to the
+      quality key mask, so it needs ``emit_quality_mask: true`` and ``source_quality_mask``.
+    * ``source_valid_tolerance_s`` turns the flags of the steps inside a short run valid. The
+      bridge across that run reads samples after it, so without the per-anchor key removal an
+      anchor inside the run would read keys that look ahead through the bridge. It therefore
+      needs ``source_running_gap_keys: remove``, and ``emit_quality_mask`` for ``up_valid``.
+    * ``event_weight_ua_tolerance_s`` relaxes the validity ``event_weight_ua_valid`` hands the
+      detector, so it needs that switch.
+
+    Args:
+        vae: The ``model_config.VAE_model`` block.
+        kwargs: The ``dataset_kwargs`` block.
+
+    Raises:
+        ValueError: Naming the keys and their values.
+    """
+    removal = vae.get("source_running_gap_keys", "keep")
+    emits = bool(kwargs.get("emit_quality_mask", False))
+    if removal == "remove" and (not emits or not bool(vae.get("source_quality_mask", False))):
+        raise ValueError(
+            f"model_config.VAE_model.source_running_gap_keys is 'remove' but "
+            f"dataset_kwargs.emit_quality_mask is {kwargs.get('emit_quality_mask')!r} and "
+            f"source_quality_mask is {vae.get('source_quality_mask')!r}. The removal mask is "
+            f"built from up_valid, which only emit_quality_mask emits, and it is applied to the "
+            f"quality key mask."
+        )
+    if vae.get("source_valid_tolerance_s") is not None and (removal != "remove" or not emits):
+        raise ValueError(
+            f"model_config.VAE_model.source_valid_tolerance_s is "
+            f"{vae.get('source_valid_tolerance_s')!r} but source_running_gap_keys is "
+            f"{removal!r} and emit_quality_mask is {kwargs.get('emit_quality_mask')!r}. The "
+            f"tolerant flags turn the steps inside a short UA run valid, and the bridge across "
+            f"the run reads samples after it: only the per-anchor key removal keeps an anchor "
+            f"from reading through the bridge into its own future. Set source_running_gap_keys: "
+            f"remove and emit_quality_mask: true."
+        )
+    if vae.get("event_weight_ua_tolerance_s") is not None and not bool(
+        vae.get("event_weight_ua_valid", False)
+    ):
+        raise ValueError(
+            f"model_config.VAE_model.event_weight_ua_tolerance_s is "
+            f"{vae.get('event_weight_ua_tolerance_s')!r} but event_weight_ua_valid is "
+            f"{vae.get('event_weight_ua_valid')!r}: the tolerance relaxes the UA validity that "
+            f"switch hands the contraction detector, and without it there is none."
         )
 
 

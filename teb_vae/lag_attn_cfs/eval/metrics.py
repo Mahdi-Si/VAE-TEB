@@ -107,6 +107,7 @@ import torch
 from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
 )
+from teb_vae.lag_attn_cfs.ua_tolerance import tolerant_reward_validity
 from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_CAVEAT
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.losses import (
@@ -114,6 +115,8 @@ from teb_vae.lag_attn_rws.nets.losses import (
     ar_innovation,
     masked_raw_block_per_anchor,
     raw_sample_score,
+    student_t_log_normaliser,
+    student_t_nll,
 )
 
 # The two bound-margin conventions, imported rather than restated: "the prior variance is pinned"
@@ -299,12 +302,41 @@ def forward_kwargs(task: Any, batch: Any, u_stream: torch.Tensor) -> Dict[str, A
         batch: The batch the streams came from.
         u_stream: The assembled source stream $(B, T, c_u)$, for the mask's shape check.
 
+    Under ``source_running_gap_keys='remove'`` it carries a second key, the per-anchor removal
+    mask ``source_key_removed`` the task builds from the batch's ``up_valid``. It too is the
+    batch's own and survives an intervention on the values, for the same reason.
+
     Returns:
-        ``{'source_valid': (B, T, c_u) bool}`` under ``source_quality_mask``, ``{}`` otherwise.
+        ``{'source_valid': (B, T, c_u) bool}`` under ``source_quality_mask``, plus
+        ``{'source_key_removed': (B, T, L) bool}`` under running-gap removal, ``{}`` otherwise.
     """
-    if not bool(getattr(task.orig_model, "source_quality_mask", False)):
+    model = task.orig_model
+    if not bool(getattr(model, "source_quality_mask", False)):
         return {}
-    return {"source_valid": task._build_source_valid(batch, u_stream)}
+    kwargs = {"source_valid": task._build_source_valid(batch, u_stream)}
+    if getattr(model, "source_running_gap_keys", "keep") == "remove":
+        kwargs["source_key_removed"] = task._build_source_key_removed(batch, u_stream)
+    return kwargs
+
+
+def decoder_logvar_bound(model: Any) -> Optional[Tuple[float, float]]:
+    r"""The bound the model's decoder applies to the forecast log-variance.
+
+    The decoder's own ``logvar_clamp``, which is the shared ``logvar_clamp`` unless the model was
+    built with ``decoder_logvar_clamp``. Every reader of ``logvar_full`` (the floor and ceiling
+    fractions, the calibration census and its verdict) reads this bound; the prior and posterior
+    readouts keep the model's shared one.
+
+    Args:
+        model: The loaded net.
+
+    Returns:
+        $(\mathrm{lo}_d, \mathrm{hi}_d)$, or ``None`` for a model with no bound at all.
+    """
+    clamp = getattr(getattr(model, "decoder", None), "logvar_clamp", None)
+    if clamp is None:
+        clamp = getattr(model, "logvar_clamp", None)
+    return None if clamp is None else (float(clamp[0]), float(clamp[1]))
 
 
 def batch_field(batch: Any, name: str) -> Any:
@@ -437,8 +469,8 @@ NORMALISED_UNIT = "normalised"
 # =============================================================================
 # The likelihood structure
 # =============================================================================
-def forecast_likelihood_terms(model: Any) -> Dict[str, Optional[torch.Tensor]]:
-    r"""The two terms that define the model's forecast *density*, detached, for every site here.
+def forecast_likelihood_terms(model: Any) -> Dict[str, Any]:
+    r"""The terms that define the model's forecast *density*, detached, for every site here.
 
     ``cell_mask`` is the $(H, C_{\mathrm{keep}})$ scored-cell mask
     $m_{\tau,c} = \mathbb 1[\tau < H_c]$ and ``ar_coef`` the $(C_{\mathrm{keep}},)$ AR(1)
@@ -448,20 +480,150 @@ def forecast_likelihood_terms(model: Any) -> Dict[str, Optional[torch.Tensor]]:
     innovations. ``None`` for a model that built neither, which leaves every score bitwise the
     factorised all-cells one.
 
+    A model built with ``forecast_student_nu`` adds a third term, ``student_nu`` $= \nu$, a
+    Python ``float``: every score that splats this dict then reads each innovation under the
+    scaled Student-$t$ density. The key is absent for a Gaussian model, so this dict is then the
+    two-key one. A site that reads the terms by name must read ``student_nu`` with ``.get``.
+
     Detached because nothing in the evaluation may reach the checkpoint's parameters: $\phi$ is a
     parameter, and the oracle probe's optimiser backpropagates through a block score scored under
-    it.
+    it. $\nu$ is a constant and passes through unchanged.
 
     Args:
         model: The rebuilt net.
 
     Returns:
-        ``{'cell_mask': ..., 'ar_coef': ...}``, each a tensor or ``None``.
+        ``{'cell_mask': ..., 'ar_coef': ...}``, each a tensor or ``None``, plus ``'student_nu'``
+        when the model sets it.
     """
     return {
-        name: None if value is None else value.detach()
+        name: value.detach() if torch.is_tensor(value) else value
         for name, value in model.forecast_likelihood_kwargs().items()
     }
+
+
+def student_t_cdf(standardised: torch.Tensor, student_nu: float) -> torch.Tensor:
+    r"""The CDF $F_\nu(z)$ of the standard Student-$t$ density, elementwise.
+
+    Torch has no regularised incomplete beta function, so the values go through
+    ``scipy.special.stdtr`` on the host in float64 and come back in the input's dtype and device.
+    The evaluation calls this once per batch and only under ``student_nu``, so the copy costs
+    little, and the Gaussian path does not call it at all.
+
+    Args:
+        standardised: $z = \varepsilon / \sigma$.
+        student_nu: $\nu$.
+
+    Returns:
+        $F_\nu(z)$, the shape, dtype and device of ``standardised``.
+    """
+    from scipy import special
+
+    values = special.stdtr(
+        float(student_nu), standardised.detach().to("cpu", torch.float64).numpy()
+    )
+    return torch.as_tensor(values, dtype=standardised.dtype, device=standardised.device)
+
+
+def student_t_pdf(standardised: torch.Tensor, student_nu: float) -> torch.Tensor:
+    r"""The density $f_\nu(z)$ of the standard Student-$t$ distribution, elementwise.
+
+    $$f_\nu(z) = \exp\!\left(-c_\nu - \tfrac{\nu + 1}{2}\operatorname{log1p}(z^2 / \nu)\right),$$
+
+    with $c_\nu$ the log-normaliser of
+    :func:`~teb_vae.lag_attn_rws.nets.losses.student_t_log_normaliser`.
+
+    Args:
+        standardised: $z$.
+        student_nu: $\nu$.
+
+    Returns:
+        $f_\nu(z)$ in the shape of ``standardised``.
+    """
+    nu = float(student_nu)
+    return torch.exp(
+        -student_t_log_normaliser(nu) - 0.5 * (nu + 1.0) * torch.log1p(standardised**2 / nu)
+    )
+
+
+def student_t_crps(standardised: torch.Tensor, student_nu: float) -> torch.Tensor:
+    r"""The CRPS of the standard Student-$t$ forecast at $z$, in units of the scale.
+
+    $$\mathrm{CRPS}(F_\nu, z) = z\,(2F_\nu(z) - 1) + 2 f_\nu(z)\,\frac{\nu + z^2}{\nu - 1}
+    - \frac{2\sqrt{\nu}\, B\!\left(\tfrac12, \nu - \tfrac12\right)}
+           {(\nu - 1)\, B\!\left(\tfrac12, \tfrac{\nu}{2}\right)^2},$$
+
+    the closed form for $\nu > 1$. Multiplied by $\sigma$ it is the CRPS of the scaled density.
+    As $\nu \to \infty$ it tends to the Gaussian
+    $z(2\Phi(z) - 1) + 2\phi(z) - \pi^{-1/2}$.
+
+    Args:
+        standardised: $z$.
+        student_nu: $\nu > 1$.
+
+    Returns:
+        The CRPS in scale units, the shape of ``standardised``.
+    """
+    nu = float(student_nu)
+
+    def _log_beta(a: float, b: float) -> float:
+        return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+
+    constant = (
+        2.0 * math.sqrt(nu) / (nu - 1.0)
+        * math.exp(_log_beta(0.5, nu - 0.5) - 2.0 * _log_beta(0.5, 0.5 * nu))
+    )
+    cdf = student_t_cdf(standardised, nu)
+    pdf = student_t_pdf(standardised, nu)
+    return (
+        standardised * (2.0 * cdf - 1.0)
+        + 2.0 * pdf * (nu + standardised**2) / (nu - 1.0)
+        - constant
+    )
+
+
+def predictive_variance_factor(student_nu: float) -> float:
+    r"""The factor that turns a squared Student-$t$ standardised value into a variance-unit one.
+
+    A scaled Student-$t$ density with scale $\sigma$ has variance $\sigma^2 \nu / (\nu - 2)$, so
+    $z^2 = \varepsilon^2 / \sigma^2$ has mean $\nu / (\nu - 2)$ (about $1.33$ at $\nu = 8$) for a
+    calibrated forecast. Multiplying by $(\nu - 2) / \nu$ divides by the predictive variance
+    instead, which puts a calibrated forecast at $1$ under either density.
+
+    Args:
+        student_nu: $\nu > 2$.
+
+    Returns:
+        $(\nu - 2) / \nu$.
+    """
+    nu = float(student_nu)
+    return (nu - 2.0) / nu
+
+
+def coverage_half_widths(student_nu: Optional[float] = None) -> Tuple[float, ...]:
+    r"""The half-widths, in scale units, of the central intervals the coverage is read at.
+
+    The three nominal masses stay $\operatorname{erf}(k/\sqrt{2})$ for $k = 1, 2, 3$
+    (:data:`COVERAGE_NOMINALS`). Under the Gaussian density the half-widths are $k$ itself. Under
+    a Student-$t$ density they are the quantiles that hold the same mass,
+    $q_k = F_\nu^{-1}\!\left(\tfrac12 + \tfrac{p_k}{2}\right)$; for $\nu = 8$ they are about
+    $1.067$, $2.366$ and $4.277$. So the observed mass inside $|z| \le q_k$ is compared with the same
+    nominal under either density, and the verdict's tolerance keeps its meaning.
+
+    Args:
+        student_nu: $\nu$, or ``None`` for the Gaussian density.
+
+    Returns:
+        One half-width per level of :data:`COVERAGE_LEVELS`.
+    """
+    if student_nu is None:
+        return tuple(float(level) for level in COVERAGE_LEVELS)
+    from scipy import special
+
+    return tuple(
+        float(special.stdtrit(float(student_nu), 0.5 + 0.5 * nominal))
+        for nominal in COVERAGE_NOMINALS
+    )
 
 
 def forecast_innovation(
@@ -551,7 +713,9 @@ def likelihood_structure_record(model: Any) -> Dict[str, Any]:
         over -- and ``block_cells``, $H \cdot C_{\mathrm{keep}}$; plus the two per-channel vectors
         an offline re-run needs to draw either term, positional against the kept channel axis:
         ``scored_horizon_per_channel`` ($H_c = \sum_\tau m_{\tau,c}$, every channel $H$ without a
-        cell mask) and ``ar_coef_per_channel`` ($\phi_c$, ``None`` without the AR term).
+        cell mask) and ``ar_coef_per_channel`` ($\phi_c$, ``None`` without the AR term). Last,
+        ``student_nu``: $\nu$ of the Student-$t$ innovation density, or ``None`` for the
+        Gaussian one, so a reader of any nat in the run knows which density it is a log of.
     """
     terms = forecast_likelihood_terms(model)
     cell_mask, ar_coef = terms["cell_mask"], terms["ar_coef"]
@@ -578,6 +742,7 @@ def likelihood_structure_record(model: Any) -> Dict[str, Any]:
         "ar_coef_per_channel": (
             None if ar_coef is None else [float(value) for value in ar_coef.cpu().tolist()]
         ),
+        "student_nu": terms.get("student_nu"),
     }
 
 
@@ -602,9 +767,12 @@ def describe_likelihood_structure(record: Optional[Mapping[str, Any]]) -> str:
         if record.get("forecast_ar_residual")
         else "AR(1) residual off"
     )
+    # Named only when set, so the line of a Gaussian run reads as it did before the key existed.
+    nu = record.get("student_nu")
+    density = "" if nu is None else f"; Student-t innovations, nu = {float(nu):g}"
     return (
         f"likelihood structure: {ar}; {record.get('scored_cells')} of "
-        f"{record.get('block_cells')} block cells scored per anchor"
+        f"{record.get('block_cells')} block cells scored per anchor{density}"
     )
 
 
@@ -1136,6 +1304,7 @@ def branch_channel_scores(
     likelihood: str,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> torch.Tensor:
     r"""One branch's masked score, summed over the horizon and resolved per channel.
 
@@ -1159,13 +1328,14 @@ def branch_channel_scores(
             :func:`forecast_likelihood_terms`. The identity above holds only when the block score
             it is read beside was scored under the same two terms.
         ar_coef: The model's AR(1) coefficient, or ``None``.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density.
 
     Returns:
         The per-anchor per-channel score $(B, A_{\max}, C_{\mathrm{keep}})$.
     """
     score = raw_sample_score(
         mu, target, likelihood=likelihood, logvar=logvar, cell_mask=cell_mask, ar_coef=ar_coef,
-        step_mask=mask,
+        step_mask=mask, student_nu=student_nu,
     )
     return (score * mask[..., None]).sum(dim=2)
 
@@ -1179,6 +1349,7 @@ def masked_raw_block_per_horizon_step(
     logvar: Optional[torch.Tensor] = None,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> torch.Tensor:
     r"""The per-anchor block score resolved by horizon step: summed over $c$, not over $\tau$.
 
@@ -1199,13 +1370,14 @@ def masked_raw_block_per_horizon_step(
         cell_mask: The model's scored-cell mask, or ``None``; see
             :func:`forecast_likelihood_terms`.
         ar_coef: The model's AR(1) coefficient, or ``None``.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density.
 
     Returns:
         The per-horizon-step block score $(B, A_{\max}, H)$.
     """
     per_sample = raw_sample_score(
         mu, target, likelihood=likelihood, logvar=logvar, cell_mask=cell_mask, ar_coef=ar_coef,
-        step_mask=mask,
+        step_mask=mask, student_nu=student_nu,
     )
     return (per_sample * mask[..., None]).sum(dim=3)
 
@@ -1219,6 +1391,7 @@ def horizon_block_sums(
     likelihood: str,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Accumulate one branch's horizon-resolved block score and its own denominator.
 
@@ -1243,6 +1416,7 @@ def horizon_block_sums(
         cell_mask: The model's scored-cell mask, or ``None``; see
             :func:`forecast_likelihood_terms`.
         ar_coef: The model's AR(1) coefficient, or ``None``.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density.
 
     Returns:
         ``sum_block`` and ``n_anchors``, each $(H,)$ in float64 -- a real split reaches $10^9$
@@ -1250,7 +1424,7 @@ def horizon_block_sums(
     """
     per_tau = masked_raw_block_per_horizon_step(
         mu, target, mask, likelihood=likelihood, logvar=logvar,
-        cell_mask=cell_mask, ar_coef=ar_coef,
+        cell_mask=cell_mask, ar_coef=ar_coef, student_nu=student_nu,
     )
     return {
         "sum_block": per_tau.sum(dim=(0, 1), dtype=torch.float64),
@@ -1266,6 +1440,7 @@ def horizon_residual_sums(
     *,
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Sum the residual and the log-variance over every scored coefficient, per horizon step.
 
@@ -1300,6 +1475,10 @@ def horizon_residual_sums(
         cell_mask: The model's scored-cell mask, or ``None``; see
             :func:`forecast_likelihood_terms`.
         ar_coef: The model's AR(1) coefficient, or ``None``.
+        student_nu: The model's Student-$t$ $\nu$, or ``None``. Under it $S^{z}$ divides by the
+            predictive variance $\sigma^2 \nu / (\nu - 2)$ instead of the squared scale
+            $\sigma^2$ (:func:`predictive_variance_factor`), so $S^{z}_\tau / n_\tau$ is still
+            $1$ for a calibrated forecast.
 
     Returns:
         The four sums, each $(H,)$ in float64.
@@ -1307,6 +1486,9 @@ def horizon_residual_sums(
     residual_sq = (target - mu) ** 2
     innovation, logvar_eff = forecast_innovation_and_logvar(mu, target, logvar, ar_coef, mask)
     innovation_sq = residual_sq if ar_coef is None else innovation**2
+    if student_nu is not None:
+        # Applied only under the Student-t density, so the Gaussian sums keep their bits.
+        innovation_sq = innovation_sq * predictive_variance_factor(student_nu)
     masked = _scored_cells(mask, cell_mask)
     count = (
         mask.sum(dim=(0, 1), dtype=torch.float64) * float(target.shape[-1])
@@ -1763,6 +1945,7 @@ def calibration_sums(
     logvar_clamp: Tuple[float, float],
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
+    student_nu: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Accumulate everything the observation model's calibration is judged from.
 
@@ -1806,6 +1989,15 @@ def calibration_sums(
         ar_coef: The model's AR(1) coefficient, or ``None``. The homoscedastic alternative is then
             fitted to the same innovations, so the gain still compares two variances of one
             residual rather than a variance model against a residual model.
+        student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density. Under
+            it every statistic reads the model's own density, with $z = e / \sigma$ and $\sigma$
+            the scale. The PIT is $u = F_\nu(z)$ (:func:`student_t_cdf`). Coverage counts
+            $|z| \le q_k$ with $q_k$ the Student-$t$ half-width that holds the same nominal mass
+            (:func:`coverage_half_widths`). CRPS takes the Student-$t$ closed form
+            (:func:`student_t_crps`). ``sum_standardised_sq`` divides by the predictive variance
+            (:func:`predictive_variance_factor`). One more sum, ``sum_model_nll``, carries the
+            exact per-cell Student-$t$ NLL, because $\overline{z^2}$ alone no longer gives it.
+            The Gaussian path writes the same keys and the same bits as before the argument.
 
     Returns:
         The sums and the two histograms, each reduced in float64 -- the counts alone reach $10^9$,
@@ -1821,25 +2013,37 @@ def calibration_sums(
     sigma = torch.exp(0.5 * flat_logvar)
     standardised = residual / sigma
 
-    normal_cdf = 0.5 * (1.0 + torch.erf(standardised / math.sqrt(2.0)))
-    normal_pdf = torch.exp(-0.5 * standardised**2) / math.sqrt(2.0 * math.pi)
-    crps = sigma * (
-        standardised * (2.0 * normal_cdf - 1.0) + 2.0 * normal_pdf - 1.0 / math.sqrt(math.pi)
-    )
+    if student_nu is None:
+        cdf = 0.5 * (1.0 + torch.erf(standardised / math.sqrt(2.0)))
+        normal_pdf = torch.exp(-0.5 * standardised**2) / math.sqrt(2.0 * math.pi)
+        crps = sigma * (
+            standardised * (2.0 * cdf - 1.0) + 2.0 * normal_pdf - 1.0 / math.sqrt(math.pi)
+        )
+        standardised_sq = standardised**2
+    else:
+        cdf = student_t_cdf(standardised, student_nu)
+        crps = sigma * student_t_crps(standardised, student_nu)
+        # In variance units, so a calibrated forecast still reads 1 (see the argument's note).
+        standardised_sq = standardised**2 * predictive_variance_factor(student_nu)
 
     lo, hi = float(logvar_clamp[0]), float(logvar_clamp[1])
     sums: Dict[str, torch.Tensor] = {
         "count": weights.sum(dtype=torch.float64),
         "sum_residual_sq": (residual**2 * weights).sum(dtype=torch.float64),
-        "sum_standardised_sq": (standardised**2 * weights).sum(dtype=torch.float64),
+        "sum_standardised_sq": (standardised_sq * weights).sum(dtype=torch.float64),
         "sum_logvar": (flat_logvar * weights).sum(dtype=torch.float64),
         "crps_sum": (crps * weights).sum(dtype=torch.float64),
-        "pit_histogram": _weighted_histogram(normal_cdf, weights, PIT_BINS, 0.0, 1.0),
+        "pit_histogram": _weighted_histogram(cdf, weights, PIT_BINS, 0.0, 1.0),
         "logvar_histogram": _weighted_histogram(flat_logvar, weights, LOGVAR_BINS, lo, hi),
     }
-    for level in COVERAGE_LEVELS:
+    if student_nu is not None:
+        # The scorer's own per-cell term, so this mean is the block NLL per scored coefficient.
+        sums["sum_model_nll"] = (
+            student_t_nll(residual**2, flat_logvar, student_nu) * weights
+        ).sum(dtype=torch.float64)
+    for level, half_width in zip(COVERAGE_LEVELS, coverage_half_widths(student_nu)):
         sums[f"within_{level}_sigma"] = (
-            (standardised.abs() <= float(level)).to(weights.dtype) * weights
+            (standardised.abs() <= half_width).to(weights.dtype) * weights
         ).sum(dtype=torch.float64)
     return sums
 
@@ -1876,7 +2080,10 @@ def _weighted_histogram(
 
 
 def calibration_report(
-    sums: Mapping[str, Any], *, logvar_clamp: Optional[Sequence[float]] = None
+    sums: Mapping[str, Any],
+    *,
+    logvar_clamp: Optional[Sequence[float]] = None,
+    student_nu: Optional[float] = None,
 ) -> Dict[str, Any]:
     r"""Turn the accumulated calibration sums into the statistics they exist for.
 
@@ -1898,15 +2105,26 @@ def calibration_report(
     and the two denominators differ -- so a column carried across under the sibling's name would be
     silently non-comparable with the sibling's number.
 
+    Under a Student-$t$ density ($\nu$ = ``student_nu``) the model's NLL is the accumulated
+    ``sum_model_nll`` per coefficient instead of the Gaussian formula above. The homoscedastic
+    alternative stays the **Gaussian** MLE: a constant-scale Student-$t$ MLE has no closed form
+    over accumulated sums. The gain then also contains what the heavier tails earned, and the
+    record says so under ``homoscedastic_density``.
+
     Args:
         sums: What :func:`calibration_sums` accumulated, as tensors, arrays or plain lists.
         logvar_clamp: The bound the log-variance histogram was laid out over, for its bin edges.
+        student_nu: The $\nu$ the sums were accumulated under, or ``None`` for the Gaussian
+            density. It must be the value :func:`calibration_sums` received, because the sums do
+            not carry it. It is written into the report as ``student_nu`` and ``density``, and
+            each coverage level records its interval ``half_width`` in scale units.
 
     Returns:
         The PIT histogram and its worst departure from uniformity, central coverage against the
-        erf nominals, mean CRPS, the standardised residual variance a calibrated model puts at
-        $1$, the NLL gain per coefficient, and the log-variance histogram. Empty when nothing was
-        scored -- a calibration statement over nothing is a skip, not a number.
+        nominal masses $0.6827, 0.9545, 0.9973$, mean CRPS, the standardised residual variance a
+        calibrated model puts at $1$, the NLL gain per coefficient, and the log-variance
+        histogram. Empty when nothing was scored -- a calibration statement over nothing is a
+        skip, not a number.
     """
     def _scalar(name: str) -> float:
         value = sums.get(name)
@@ -1941,11 +2159,18 @@ def calibration_report(
     mean_standardised_sq = _scalar("sum_standardised_sq") / count
     mean_logvar = _scalar("sum_logvar") / count
     residual_variance = _scalar("sum_residual_sq") / count
-    model_nll = 0.5 * (math.log(2.0 * math.pi) + mean_logvar + mean_standardised_sq)
+    if student_nu is None:
+        model_nll = 0.5 * (math.log(2.0 * math.pi) + mean_logvar + mean_standardised_sq)
+    else:
+        model_nll = _scalar("sum_model_nll") / count
     homoscedastic_nll = 0.5 * (
         math.log(2.0 * math.pi) + math.log(max(residual_variance, np.finfo(np.float64).tiny)) + 1.0
     )
+    half_widths = coverage_half_widths(student_nu)
     return {
+        # Which density every number below describes; None is the Gaussian one.
+        "student_nu": None if student_nu is None else float(student_nu),
+        "density": "gaussian" if student_nu is None else "student_t",
         "n_coefficients": int(count),
         "pit": {
             "n_bins": int(pit_counts.size),
@@ -1962,12 +2187,17 @@ def calibration_report(
             {
                 "level_sigma": int(level),
                 "nominal": float(nominal),
+                # The interval |z| <= half_width the observed mass is counted in: k itself under
+                # the Gaussian density, the Student-t quantile of the same mass otherwise.
+                "half_width": float(half_width),
                 "observed": _scalar(f"within_{level}_sigma") / count,
                 "observed_tail": 1.0 - _scalar(f"within_{level}_sigma") / count,
                 "nominal_tail": 1.0 - float(nominal),
                 "n_coefficients": int(count),
             }
-            for level, nominal in zip(COVERAGE_LEVELS, COVERAGE_NOMINALS)
+            for level, nominal, half_width in zip(
+                COVERAGE_LEVELS, COVERAGE_NOMINALS, half_widths
+            )
         ],
         "crps_normalised": _scalar("crps_sum") / count,
         # One when the learned variance is right on average; above one when it is too small.
@@ -1981,6 +2211,9 @@ def calibration_report(
             "gain_per_coefficient": homoscedastic_nll - model_nll,
             "homoscedastic_sigma": float(np.sqrt(max(residual_variance, 0.0))),
         },
+        # The constant alternative above is always Gaussian; under a Student-t model the gain
+        # also holds what the heavier tails earned.
+        "homoscedastic_density": "gaussian",
         "logvar": {
             "n_bins": int(logvar_counts.size),
             "bin_edges": np.linspace(lo, hi, logvar_counts.size + 1).tolist()
@@ -2697,7 +2930,11 @@ def evaluate_batch(
     # against the same margin rather than restating the rule.
     lo, hi = float(model.logvar_clamp[0]), float(model.logvar_clamp[1])
     floor_threshold = lo + LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
-    ceil_threshold = hi - LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+    # The forecast's two fractions read the decoder's own bound, which is the shared one unless
+    # the model was built with ``decoder_logvar_clamp``; the prior's floor keeps the shared bound.
+    dec_lo, dec_hi = decoder_logvar_bound(model)
+    dec_floor_threshold = dec_lo + LOGVAR_FLOOR_MARGIN_FRAC * (dec_hi - dec_lo)
+    ceil_threshold = dec_hi - LOGVAR_FLOOR_MARGIN_FRAC * (dec_hi - dec_lo)
     dtype = outputs["logvar_prior"].dtype
     columns["mean_logvar_prior"] = _per_sample_mean(
         outputs["logvar_prior"].mean(dim=-1), kl_support
@@ -2717,7 +2954,7 @@ def evaluate_batch(
     # explodes; on the ceiling it has given up and is predicting noise, which reads as a healthy
     # falling NLL while ``pred_gap`` goes to zero.
     columns["logvar_full_floor_frac"] = _per_sample_element_mean(
-        (outputs["logvar_full"] <= floor_threshold).to(dtype), mask, cell_mask
+        (outputs["logvar_full"] <= dec_floor_threshold).to(dtype), mask, cell_mask
     )
     columns["logvar_full_ceil_frac"] = _per_sample_element_mean(
         (outputs["logvar_full"] >= ceil_threshold).to(dtype), mask, cell_mask
@@ -2895,7 +3132,7 @@ def evaluate_batch(
     calibration = (
         calibration_sums(
             outputs["mu_full"], outputs["logvar_full"], target, mask,
-            logvar_clamp=model.logvar_clamp, **density,
+            logvar_clamp=decoder_logvar_bound(model), **density,
         )
         if likelihood == "gaussian_nll"
         else {}
@@ -2929,7 +3166,10 @@ def evaluate_batch(
         if bool(task.hparams.get("event_weight_ua_valid", False)):
             up_valid = batch_field(batch, "up_valid")
             if isinstance(up_valid, torch.Tensor):
-                available["up_valid"] = up_valid
+                # With the training detector's tolerance, when the run set one.
+                available["up_valid"] = tolerant_reward_validity(
+                    up_valid.to(torch.bool), task.hparams.get("event_weight_ua_tolerance_s")
+                )
         up_raw = batch_field(batch, "up")
         if isinstance(up_raw, torch.Tensor):
             available["up_raw"] = up_raw
@@ -4210,6 +4450,11 @@ def _calibration_verdict(
     would accept a fifty-fold error at three, which is the end where an over-confident variance
     shows up first.
 
+    Under a Student-$t$ model the nominal masses stay $\operatorname{erf}(k/\sqrt{2})$ and the
+    report counts the observed mass inside the Student-$t$ interval that holds each of them
+    (:func:`calibration_report`). The verdict therefore reads the same fields, records
+    ``student_nu`` among its values, and names the density in its criterion.
+
     Args:
         calibration: The calibration report, or ``None``/empty when there was none.
         tail_tolerance: Relative tolerance on each level's tail mass.
@@ -4217,12 +4462,20 @@ def _calibration_verdict(
     Returns:
         The verdict, carrying every level's nominal and observed coverage whatever the status.
     """
+    student_nu = (calibration or {}).get("student_nu")
+    density = (
+        "" if student_nu is None
+        else f", read inside the Student-t (nu = {float(student_nu):g}) intervals of those masses"
+    )
     criterion = (
         f"observed central coverage at 1/2/3 sigma within {tail_tolerance:g} relative tail error "
-        f"of erf(k/sqrt(2))"
+        f"of erf(k/sqrt(2)){density}"
     )
     levels = list((calibration or {}).get("coverage") or [])
     values: Dict[str, float] = {"tail_tolerance": float(tail_tolerance)}
+    if student_nu is not None:
+        # Only under the Student-t density, so a Gaussian verdict's values are as before.
+        values["student_nu"] = float(student_nu)
     if not levels:
         return Verdict(
             "calibration_near_nominal", INCONCLUSIVE, criterion,
@@ -4382,10 +4635,12 @@ def evaluate(
                 value if name not in calibration_totals else calibration_totals[name] + value
             )
     model = task.orig_model
-    clamp = getattr(model, "logvar_clamp", None)
+    clamp = decoder_logvar_bound(model)
     calibration = calibration_report(
         {name: value.detach().cpu() for name, value in calibration_totals.items()},
         logvar_clamp=clamp,
+        # The density the per-batch sums were accumulated under; the sums do not carry it.
+        student_nu=forecast_likelihood_terms(model).get("student_nu"),
     )
     verdicts = build_verdicts(
         aggregate,

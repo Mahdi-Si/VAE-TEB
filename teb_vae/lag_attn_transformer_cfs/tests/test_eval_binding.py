@@ -100,6 +100,8 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
         "source_quality_mask",
         "forecast_ar_max",
         "persistence_lags",
+        # The 2026-11-10 Student-t innovation density.
+        "forecast_student_nu",
     }
 
     assert set(GEOMETRY_KEYS) == (

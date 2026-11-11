@@ -102,8 +102,8 @@ class FeatureForecastTarget:
     #: attribute, which is the whole cost of keeping it a buffer.
     target_channel_weight: Optional[torch.Tensor]
 
-    def forecast_likelihood_kwargs(self) -> Dict[str, Optional[torch.Tensor]]:
-        r"""The two terms that define the forecast *density* rather than weight it.
+    def forecast_likelihood_kwargs(self) -> Dict[str, Any]:
+        r"""The terms that define the forecast *density* rather than weight it.
 
         ``cell_mask`` is the per-channel scored horizon $(H, C)$ and ``ar_coef`` the AR(1)
         residual coefficient $\phi_c = \tanh(a_c)$, $(C,)$; see
@@ -116,18 +116,28 @@ class FeatureForecastTarget:
         A cell built with ``forecast_ar_max`` $\phi_{\max} < 1$ gets
         $\phi_c = \phi_{\max}\tanh(a_c)$; at the default $1$ no multiplication is applied.
 
+        A cell built with ``forecast_student_nu`` $= \nu$ adds a third key, ``student_nu``, a
+        Python ``float``: every scorer then reads each innovation under a scaled Student-$t$
+        density with $\nu$ degrees of freedom instead of the Gaussian one. The key is added only
+        when $\nu$ is set, so a Gaussian model's dict is exactly the two-key dict, and a caller
+        that reads the dict by name keeps working for every model that does not use it.
+
         Returns:
-            ``{'cell_mask': ..., 'ar_coef': ...}``.
+            ``{'cell_mask': ..., 'ar_coef': ...}``, plus ``'student_nu'`` when it is set.
         """
         ar_logit = getattr(self, "target_ar_logit", None)
         ar_coef = None if ar_logit is None else torch.tanh(ar_logit)
         ar_max = float(getattr(self, "forecast_ar_max", 1.0))
         if ar_coef is not None and ar_max != 1.0:
             ar_coef = ar_max * ar_coef
-        return {
+        terms: Dict[str, Any] = {
             "cell_mask": getattr(self, "target_cell_mask", None),
             "ar_coef": ar_coef,
         }
+        student_nu = getattr(self, "forecast_student_nu", None)
+        if student_nu is not None:
+            terms["student_nu"] = float(student_nu)
+        return terms
 
     def _default_decoder_out_channels(self) -> int:
         r"""One output per surviving target channel: $C_{\mathrm{keep}}$, or $c_y$ ungated.
@@ -445,6 +455,9 @@ class FeatureForecastTarget:
             block_width=self.decoder_out_channels,
             coverage_floor=self.coverage_floor,
             logvar_clamp=self.logvar_clamp,
+            # The decoder's own bound, under a cell's ``decoder_logvar_clamp``; ``None`` on every
+            # model without one, which reads the forecast fractions against the shared bound.
+            decoder_logvar_clamp=getattr(self, "decoder_logvar_clamp", None),
             beta=beta,
             beta_prior=beta_prior,
             lambda_full=lambda_full,

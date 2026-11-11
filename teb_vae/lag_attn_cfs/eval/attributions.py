@@ -572,6 +572,7 @@ class AnchorReadout(nn.Module):
         columns: torch.Tensor,
         coordinates: torch.Tensor,
         source_valid: Optional[torch.Tensor] = None,
+        source_key_removed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the model and return the readout at each row's anchor.
 
@@ -590,6 +591,10 @@ class AnchorReadout(nn.Module):
                 and never interpolated: it is the third element of the ``extra`` tuple, so Captum
                 expands it with the rows and every point of a path -- the baseline included --
                 attends under the mask of the UA that was recorded. See :func:`readout_args`.
+            source_key_removed: The recording's own running-gap removal mask $(B, T, L)$
+                ``bool``, on a model built with ``source_running_gap_keys='remove'`` and ``None``
+                otherwise. The fourth element of ``extra``, held fixed along the path for the
+                reason ``source_valid`` is.
 
         Returns:
             The readout, $(B,)$.
@@ -599,6 +604,8 @@ class AnchorReadout(nn.Module):
         kwargs: Dict[str, Any] = {} if self.cell.dense_latent else {"return_proposals": True}
         if source_valid is not None:
             kwargs["source_valid"] = source_valid
+        if source_key_removed is not None:
+            kwargs["source_key_removed"] = source_key_removed
         with attributed_forward(model, anchors):
             outputs = model(y_st, y_ph, u_stream, **kwargs)
         rows = torch.arange(columns.shape[0], device=columns.device)
@@ -690,7 +697,8 @@ def readout_args(
     r"""The arguments :meth:`AnchorReadout.forward` takes after the three attributed streams.
 
     ``extra`` is ``(target_features, weight)``, plus the recording's source-validity mask as a
-    third element on a model built with ``source_quality_mask``. The mask goes **last**, after
+    third element on a model built with ``source_quality_mask``, plus its running-gap removal mask
+    as a fourth under ``source_running_gap_keys='remove'``. The mask goes **last**, after
     ``columns`` and ``coordinates``, so the positional order of the four fixed arguments never
     depends on the flag. It travels with the fixed arguments rather than with the attributed
     inputs, so no baseline and no interpolation point $x_0 + \alpha (x - x_0)$ edits it: the

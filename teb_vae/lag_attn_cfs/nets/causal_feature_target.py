@@ -62,7 +62,7 @@ import torch
 import torch.nn.functional as F
 
 from teb_vae.lag_attn_fs.nets.feature_target import FeatureForecastTarget
-from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
+from teb_vae.lag_attn_rws.nets.losses import raw_sample_score, validate_student_nu
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
 
 #: How many contiguous groups the kept target channels are partitioned into by rank -- by warm-up
@@ -519,6 +519,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         forecast_ar_residual: bool,
         forecast_ar_max: float = 1.0,
         target_scored_start: Optional[Sequence[int]] = None,
+        forecast_student_nu: Optional[float] = None,
     ) -> None:
         r"""Stash the forecast density's structural keywords, **before** the base constructor.
 
@@ -545,9 +546,18 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 whose coefficient is almost entirely a function of samples the anchor has already
                 seen carries no forecast information, and scoring it pays the objective for
                 reproducing the past. ``None`` -- the default -- starts every channel at $0$.
+            forecast_student_nu: $\nu > 2$, the degrees of freedom of a scaled Student-$t$
+                density for each innovation, with the decoder's $\sigma = \exp(\log\sigma^2/2)$
+                as its scale. The forecast innovations are heavy-tailed, and under a Gaussian
+                density a few large ones force the variance up everywhere and fail the 3-sigma
+                coverage. ``None`` -- the default -- is the Gaussian density. The value is a
+                plain attribute rather than a parameter or a buffer, so the state dict is the
+                same under either setting and a Gaussian checkpoint loads strictly into a
+                Student-$t$ model.
 
         Raises:
-            ValueError: If ``forecast_ar_max`` is outside $(0, 1]$.
+            ValueError: If ``forecast_ar_max`` is outside $(0, 1]$, or ``forecast_student_nu``
+                is set and not above $2$.
         """
         self.target_scored_horizon = (
             None
@@ -563,6 +573,9 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             if target_scored_start is None
             else tuple(int(step) for step in target_scored_start)
         )
+        # Validated here, at construction, so a bad value fails before any shard is read rather
+        # than at the first scored batch.
+        self.forecast_student_nu = validate_student_nu(forecast_student_nu)
 
     def _register_likelihood_structure(self) -> None:
         r"""Build the scored-cell mask buffer and the AR(1) parameter, after the base.

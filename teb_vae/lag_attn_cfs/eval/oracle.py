@@ -75,6 +75,7 @@ from torch.utils.data import DataLoader, Subset
 from teb_vae.lag_attn.nets.decoders import BaselineFutureDecoder, HorizonDecoderCore
 from teb_vae.lag_attn_cfs.eval._reuse import subsample_indices
 from teb_vae.lag_attn_cfs.eval.metrics import (
+    decoder_logvar_bound,
     DENSE_ANCHOR_GEOMETRY,
     batch_field,
     batch_guids,
@@ -316,7 +317,8 @@ def build_probe(model: Any, *, width_multiplier: int = 1) -> nn.Module:
         # Zero, like the production decoder's: two invocations of one module draw two dropout
         # masks, and every score here is a difference between invocations.
         dropout=0.0,
-        logvar_clamp=(float(model.logvar_clamp[0]), float(model.logvar_clamp[1])),
+        # The production decoder's own bound, so the probe forecasts under the same one.
+        logvar_clamp=decoder_logvar_bound(model),
     )
 
     embed_std = float(getattr(model, "horizon_embed_std", 0.02))
