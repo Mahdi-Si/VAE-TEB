@@ -86,20 +86,22 @@ class MinimalAdaptor:
     ``block_input`` (UP in channel 0, FHR in channel 1), ``domain_start`` and ``sample_weights``.
     """
 
-    #: GUID -> (minimal file, first row, end row); filled by :func:`install_adaptor`.
-    index: Dict[str, Tuple[str, int, int]] = {}
+    #: GUID -> (minimal file, its rows in increasing order); filled by :func:`install_adaptor`.
+    index: Dict[str, Tuple[str, np.ndarray]] = {}
 
     def __init__(self, **_: Any) -> None:
         self.mimo = self
         self._prepared: Any = None
 
     def read_single_input(self, record: str, **_: Any) -> None:
-        path, a, b = self.index[bfd._stem(record)]
+        path, rows = self.index[bfd._stem(record)]
         with h5py.File(path, "r") as f:
+            # One contiguous read, then the rows: a GUID's rows lie in one block of the file.
+            read = lambda k: f[k][rows[0]:rows[-1] + 1][rows - rows[0]]  # noqa: E731
             self._prepared = types.SimpleNamespace(
-                block_input=np.stack([f["up"][a:b], f["fhr"][a:b]], axis=-1),
-                domain_start=[float(x) for x in f["epoch"][a:b]],
-                sample_weights=f["weight"][a:b],
+                block_input=np.stack([read("up"), read("fhr")], axis=-1),
+                domain_start=[float(x) for x in read("epoch")],
+                sample_weights=read("weight"),
             )
 
     def prepare_data(self, **_: Any) -> Tuple[Any, None]:
@@ -128,18 +130,18 @@ cnp = _load_pipeline()
 META_TO_SUBGROUP = {meta: sg for sg, meta in cnp.SUBGROUP_META.items()}
 
 
-def scan_minimal(paths: Sequence[str]) -> Tuple[pd.DataFrame, Dict[str, Tuple[str, int, int]]]:
+def scan_minimal(paths: Sequence[str]) -> Tuple[pd.DataFrame, Dict[str, Tuple[str, np.ndarray]]]:
     """Index every GUID of the minimal files.
 
     Returns:
         ``(guids, index)``: one row per GUID with ``tracing_guid``, ``subgroup``, ``record_path``,
-        ``tlo_hours`` and ``ss_hours``; and GUID -> ``(file, first row, end row)``.
+        ``tlo_hours`` and ``ss_hours``; and GUID -> ``(file, rows)``.
 
     Raises:
         ValueError: If a GUID's rows are not contiguous or a GUID is in two files.
     """
     rows: List[Dict[str, Any]] = []
-    index: Dict[str, Tuple[str, int, int]] = {}
+    index: Dict[str, Tuple[str, np.ndarray]] = {}
     for path in map(os.path.abspath, paths):
         with h5py.File(path, "r") as f:
             guids = f["guid"].asstr()[:]
@@ -150,7 +152,7 @@ def scan_minimal(paths: Sequence[str]) -> Tuple[pd.DataFrame, Dict[str, Tuple[st
             guid = str(guids[a])
             if guid in index:
                 raise ValueError(f"GUID {guid} appears twice ({index[guid][0]} and {path})")
-            index[guid] = (path, int(a), int(b))
+            index[guid] = (path, np.arange(a, b))
             epoch = float(cols["epoch"][a])
             rows.append(dict(
                 tracing_guid=guid,
