@@ -54,6 +54,17 @@ least :attr:`QualityConfig.box_valid_height_units` above the rest and returns to
 ``BOX``: its raw samples stay in the signal. The rule is off by default, and a build with it on
 writes other ``up``, ``up_st`` and ``up_ph`` values, so it needs its own output path.
 
+**Crests and brief runs (version 5).** A contraction crest that the device clamps at the
+ceiling, or that toggles between the ceiling and a lower value, enters and leaves the clamp with
+jumps. The box and ceiling rules then mark the whole crest, and the bridge draws a line under
+the contraction. With :attr:`QualityConfig.crest_valid` (on by default) such a run is a valid
+``CREST`` when it sits on a rising or a falling flank: the level just before or just after it
+stands above the rest. A box that leaves the rest and returns to it has no flank and stays
+invalid. The same switch keeps the fall of a contraction from a flat top back to the rest from
+counting as a ``STEP``. Separately, a run that only the jump and spike rules marked and that is
+shorter than :attr:`QualityConfig.brief_max_s` ($16$ s) is a valid ``BRIEF``: the selected
+scattering channels average over longer spans, so its raw samples stay.
+
 **Level shifts.** A step leaves a new level in valid samples, and a coefficient whose kernel
 spans the step responds to the jump although few of its samples are invalid. Every ``STEP``, and
 every short invalid span between two settled levels that differ by
@@ -87,8 +98,8 @@ is not regular, so it is still marked. A sensor that toggles to the ceiling can 
 wave swings at most :attr:`QualityConfig.osc_max_units`, and a jump to or from a ceiling value is
 marked inside a wave too.
 
-**Causality.** Most rules read only past samples. Twelve read ahead, and each read is bounded by
-:attr:`QualityConfig.lookahead_s`:
+**Causality.** Most rules read only past samples. The rules below read ahead, and each read is
+bounded by :attr:`QualityConfig.lookahead_s`:
 
 * a box is closed by its opposite jump within :attr:`QualityConfig.box_max_s`;
 * a step needs a settled window within :attr:`QualityConfig.step_search_s` and no return to the
@@ -104,6 +115,8 @@ marked inside a wave too.
 * a push is judged by the :attr:`QualityConfig.push_context_s` after it;
 * a valid box (only with :attr:`QualityConfig.box_valid`) is judged by the
   :attr:`QualityConfig.box_valid_context_s` after it;
+* a crest (only with :attr:`QualityConfig.crest_valid`) is judged by the
+  :attr:`QualityConfig.push_context_s` after it, and a brief run once it ends;
 * the transient after a gap ends at the start of a settled window of
   :attr:`QualityConfig.settle_window_s`;
 * a spike is measured over :attr:`QualityConfig.spike_side_s` on both sides;
@@ -132,7 +145,7 @@ import numpy as np
 
 #: Version of the rules and of the stored fields. A builder writes it as a file attribute, and a
 #: file with another version is not complete for a build of this one.
-QUALITY_VERSION = 4
+QUALITY_VERSION = 5
 
 
 class UaBit(enum.IntFlag):
@@ -162,6 +175,12 @@ class UaBit(enum.IntFlag):
         BOX: Only with :attr:`QualityConfig.box_valid`: a run the jump rules marked that stands
             above the rest and returns to it. Valid; its level is a device level, its timing is
             the event's.
+        CREST: Only with :attr:`QualityConfig.crest_valid`: a run the jump, spike or ceiling
+            rules marked that rides on a contraction, in any stage of labour, ceiling values
+            included. Valid. Its ceiling samples also carry ``CENSORED``.
+        BRIEF: A run that only the jump and spike rules marked, shorter than
+            :attr:`QualityConfig.brief_max_s`. Valid: the selected scattering channels average
+            over longer spans, so the raw samples stay.
     """
 
     MISSING = 1
@@ -177,6 +196,8 @@ class UaBit(enum.IntFlag):
     PUSH = 1024
     FLAT = 2048
     BOX = 4096
+    CREST = 8192
+    BRIEF = 16384
 
 
 class FhrBit(enum.IntFlag):
@@ -198,10 +219,10 @@ class FhrBit(enum.IntFlag):
     LINEAR = 64
 
 
-#: Storage type of the UA bits: :class:`UaBit` has thirteen bits.
+#: Storage type of the UA bits: :class:`UaBit` has fifteen bits.
 UA_DTYPE = np.uint16
-#: The UA bits that make a sample invalid. ``CENSORED``, ``OSCILLATION``, ``REST``, ``PUSH`` and
-#: ``BOX`` samples stay valid.
+#: The UA bits that make a sample invalid. ``CENSORED``, ``OSCILLATION``, ``REST``, ``PUSH``,
+#: ``BOX``, ``CREST`` and ``BRIEF`` samples stay valid.
 UA_INVALID = int(
     UaBit.MISSING | UaBit.CODE | UaBit.TRANSIENT | UaBit.STEP | UaBit.HOLD | UaBit.FLOOR
     | UaBit.ISLAND | UaBit.FLAT
@@ -311,6 +332,19 @@ class QualityConfig:
         box_valid_post_s: Start and end, after the run, of the window of the return test.
         box_valid_min_post_s: Fewest seconds of valid samples in that window.
         box_valid_margin_s: A valid box keeps at least this distance from both segment ends.
+        crest_valid: Turn a run that rides on a contraction into a valid ``CREST``, in every
+            stage of labour and with ceiling values, and do not take the fall of a contraction
+            from a flat top for a ``STEP``. A clamped or toggling crest is still a contraction:
+            its timing and its rise are the event's. Off gives the version 4 masks of these runs.
+        crest_max_s: Longest crest run. A contraction lasts about $1$--$3$ minutes.
+        crest_ceiling_share: Smallest share of ceiling values in a toggling crest.
+        crest_body_share: Smallest share of non-ceiling values in a toggling crest; their median
+            must stand :attr:`push_on_units` above the rest.
+        brief_max_s: A run that only the jump and spike rules marked (``TRANSIENT`` and no other
+            invalid bit, no gap or code in it) and that is shorter than this is a valid
+            ``BRIEF``. The selected scattering channels average over at least $16$ s, so such a
+            run moves them little, and a bridge across it would change more samples than it
+            repairs. $0$ turns the rule off.
         shift_span_max_s: Longest invalid span that can carry a level shift.
         shift_search_s: A level shift needs a settled window that starts within this after its
             span.
@@ -380,6 +414,11 @@ class QualityConfig:
     box_valid_post_s: Tuple[float, float] = (5.0, 30.0)
     box_valid_min_post_s: float = 5.0
     box_valid_margin_s: float = 60.0
+    crest_valid: bool = True
+    crest_max_s: float = 180.0
+    crest_ceiling_share: float = 0.1
+    crest_body_share: float = 0.2
+    brief_max_s: float = 16.0
     shift_span_max_s: float = 60.0
     shift_search_s: float = 30.0
     fhr_hold_min_s: float = 15.0
@@ -410,6 +449,10 @@ class QualityConfig:
                          self.push_max_s + self.push_context_s,
                          # Only a build with the valid-box rule reads this far.
                          (self.box_valid_max_s + self.box_valid_context_s) if self.box_valid else 0.0,
+                         # A crest is judged by the push context after it; a brief run once it
+                         # ends.
+                         (self.crest_max_s + self.push_context_s) if self.crest_valid else 0.0,
+                         self.brief_max_s,
                          self.shift_span_max_s + max(self.step_confirm_s,
                                                      self.shift_search_s + self.settle_window_s)))
 
@@ -700,6 +743,9 @@ def ua_quality(
     _mark_floors(x, data, q, kept, cfg)
     if stage2 is not None:
         _mark_pushes(x, data, ceiling, q, np.asarray(stage2, dtype=bool), cfg)
+    if cfg.crest_valid:
+        _mark_crests(x, data, ceiling, q, cfg)
+    _mark_brief(data, q, cfg)
     # Last, because an island is judged by every other invalid bit around it.
     _mark_islands(q, cfg)
     if cfg.box_valid:
@@ -801,6 +847,12 @@ def _step_after(
     :attr:`QualityConfig.return_units` of ``level`` within :attr:`QualityConfig.step_confirm_s`.
     A jump inside a contraction rise fails the first test, and a flat-topped contraction fails
     the third.
+
+    With :attr:`QualityConfig.crest_valid` a fourth test applies to a downward jump. With $r$ the
+    10th percentile of the usable, valid samples in the :attr:`QualityConfig.rest_context_s`
+    before the jump, a level at least :attr:`QualityConfig.step_units` above $r$ that falls to a
+    settled level of at least $r -$ :attr:`QualityConfig.return_units` is the fall of a
+    contraction from a flat top, not a sensor repositioning: the baseline has not moved.
     """
     pre = slice(max(0, start - cfg.samples(cfg.pre_level_s)), start)
     clean = data[pre] & ~ceiling[pre] & ((q[pre] & UA_DTYPE(UaBit.TRANSIENT | UaBit.STEP)) == 0)
@@ -812,6 +864,14 @@ def _step_after(
     found = _settled_window(x, data, ceiling, i + 1, i + 1 + cfg.samples(cfg.step_search_s), cfg)
     if found is None or (found[1] - level) * sign < cfg.step_units:
         return None
+    if cfg.crest_valid and sign < 0:
+        past = slice(max(0, start - cfg.samples(cfg.rest_context_s)), start)
+        ok = data[past] & ~ceiling[past] & ((q[past] & UA_DTYPE(UA_INVALID)) == 0)
+        prior = x[past][ok]
+        if prior.size:
+            rest = float(np.percentile(prior, 10))
+            if level >= rest + cfg.step_units and found[1] >= rest - cfg.return_units:
+                return None
     after = slice(i + 1, min(x.size, i + 1 + cfg.samples(cfg.step_confirm_s)))
     if np.any(np.abs(x[after][data[after]] - level) <= cfg.return_units):
         return None
@@ -1244,6 +1304,115 @@ def _mark_pushes(
             continue
         q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
         q[start:stop] |= UA_DTYPE(UaBit.PUSH)
+
+
+def _mark_crests(
+    x: np.ndarray, data: np.ndarray, ceiling: np.ndarray, q: np.ndarray, cfg: QualityConfig
+) -> None:
+    r"""Turn ``TRANSIENT`` runs that ride on a contraction into valid ``CREST``.
+
+    The push rule (:func:`_mark_pushes`) for every stage of labour, for longer runs, and with
+    ceiling values. A contraction crest that the device clamps at $100$ or $127$, or that toggles
+    between the ceiling and a lower value, passes the jump and ceiling rules as an artifact,
+    and the bridge then draws a line under the contraction. A maximal invalid run $[a, b)$
+    qualifies when:
+
+    * every sample carries ``TRANSIENT`` and no other invalid bit, and is usable data;
+    * it is at most :attr:`QualityConfig.crest_max_s` long, and both neighbours are valid;
+    * it sits on a contraction, by one of two tests. With $r$ the rest level, the 10th
+      percentile of the valid samples in the :attr:`QualityConfig.rest_context_s` before it:
+
+      - *flank*: the median of the valid samples in the :attr:`QualityConfig.push_context_s`
+        before it, or after it, lies at least :attr:`QualityConfig.push_on_units` above $r$:
+        the run sits on a rising or a falling flank;
+      - *toggling crest*: at least :attr:`QualityConfig.crest_ceiling_share` of its samples are
+        ceiling values, at least :attr:`QualityConfig.crest_body_share` are not, and the median
+        of those that are not lies at least :attr:`QualityConfig.push_on_units` above $r$: the
+        device jumps to the clamp and back from both flanks, and the samples between the
+        toggles trace the contraction.
+
+      A box that leaves the rest and returns to it has the rest on both sides, and either no
+      body under the clamp or a body at the rest, so it stays invalid;
+    * no sample falls below $r -$ :attr:`QualityConfig.return_units`: a dropout is not a crest;
+    * no constant run inside it lasts :attr:`QualityConfig.hold_long_s`: a frozen sensor is not
+      a crest.
+
+    "Valid" is read from the bits as they are when the function starts. The ceiling samples of a
+    crest also get ``CENSORED``: the true value is at least the stored one.
+
+    Args:
+        x: UA in TOCO units.
+        data: Usable samples: present and not a code.
+        ceiling: Usable samples at a ceiling value.
+        q: UA bits, changed in place.
+        cfg: The thresholds.
+    """
+    transient = int(UaBit.TRANSIENT)
+    invalid = (q & UA_DTYPE(UA_INVALID)) != 0
+    only = ((q & UA_DTYPE(transient)) != 0) & ((q & UA_DTYPE(UA_INVALID ^ transient)) == 0)
+    clean = data & ~invalid
+    n = x.size
+    longest = cfg.samples(cfg.crest_max_s)
+    context = cfg.samples(cfg.push_context_s)
+    past = cfg.samples(cfg.rest_context_s)
+    frozen = cfg.samples(cfg.hold_long_s)
+    found: List[Tuple[int, int]] = []
+    for start, stop in runs(invalid):
+        if stop - start > longest or start == 0 or stop >= n:
+            continue
+        if not (only[start:stop].all() and data[start:stop].all()):
+            continue
+        if not (clean[start - 1] and clean[stop]):
+            continue
+        prior = x[max(0, start - past):start][clean[max(0, start - past):start]]
+        if prior.size == 0:
+            continue
+        rest = float(np.percentile(prior, 10))
+        sides = [v for v in (_median_in(x, clean, start - context, start),
+                             _median_in(x, clean, stop, stop + context)) if v is not None]
+        inside = x[start:stop]
+        flank = bool(sides) and max(sides) >= rest + cfg.push_on_units
+        touch = ceiling[start:stop]
+        body = inside[~touch]
+        toggling = (touch.mean() >= cfg.crest_ceiling_share
+                    and body.size >= cfg.crest_body_share * inside.size
+                    and float(np.median(body)) >= rest + cfg.push_on_units)
+        if not (flank or toggling):
+            continue
+        if float(inside.min()) < rest - cfg.return_units:
+            continue
+        if constant_runs(inside, np.ones(inside.size, dtype=bool), frozen):
+            continue
+        found.append((start, stop))
+    for start, stop in found:
+        q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
+        q[start:stop] |= UA_DTYPE(UaBit.CREST)
+        q[start:stop][ceiling[start:stop]] |= UA_DTYPE(UaBit.CENSORED)
+
+
+def _mark_brief(data: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:
+    r"""Turn short runs that only the jump and spike rules marked into valid ``BRIEF``.
+
+    A maximal invalid run $[a, b)$ shorter than :attr:`QualityConfig.brief_max_s` whose samples
+    carry ``TRANSIENT`` and no other invalid bit, and are all usable data, becomes valid. A run
+    next to a gap or a code joins it in one invalid run and stays invalid; so does a ``STEP``,
+    whose level shift the contamination still needs.
+
+    Args:
+        data: Usable samples: present and not a code.
+        q: UA bits, changed in place.
+        cfg: The thresholds.
+    """
+    if cfg.brief_max_s <= 0:
+        return
+    transient = int(UaBit.TRANSIENT)
+    invalid = (q & UA_DTYPE(UA_INVALID)) != 0
+    only = ((q & UA_DTYPE(transient)) != 0) & ((q & UA_DTYPE(UA_INVALID ^ transient)) == 0)
+    shortest_invalid = cfg.brief_max_s * cfg.fs
+    for start, stop in runs(invalid):
+        if stop - start < shortest_invalid and only[start:stop].all() and data[start:stop].all():
+            q[start:stop] &= UA_DTYPE(0xFFFF ^ transient)
+            q[start:stop] |= UA_DTYPE(UaBit.BRIEF)
 
 
 def _mark_valid_boxes(x: np.ndarray, q: np.ndarray, cfg: QualityConfig) -> None:

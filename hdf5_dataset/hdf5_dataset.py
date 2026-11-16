@@ -1801,6 +1801,36 @@ class CombinedHDF5Dataset(Dataset):
             attrs=attrs,
         )
 
+    def read_quality_fields(self, idx: int, names: Sequence[str]) -> Dict[str, torch.Tensor]:
+        r"""Read signal-quality fields of one sample, outside ``load_fields``.
+
+        A consumer that needs these fields for a few samples only (for example a
+        diagnostic page that draws the pre-fill signals) uses this method. It then
+        does not add them to every batch of a pass. Each field is trimmed and typed
+        exactly as :meth:`__getitem__` returns it when ``load_fields`` names it.
+
+        Args:
+            idx: The dataset index.
+            names: Members of the quality fields listed in the class docstring,
+                for example ``('fhr_raw', 'up_raw', 'fhr_quality', 'up_quality',
+                'fhr_repair_exact')``.
+
+        Returns:
+            ``{name: tensor}`` for every requested field that the sample's file
+            stores. The result is empty for a dataset built without the
+            signal-quality step.
+
+        Raises:
+            ValueError: If a name is not a signal-quality field.
+        """
+        unknown = sorted(set(names) - _QUALITY_FIELDS)
+        if unknown:
+            raise ValueError(f"{unknown} are not signal-quality fields; valid: {sorted(_QUALITY_FIELDS)}")
+        file_idx, sample_idx = self.index_map[int(idx)]
+        f = self._open_handle(file_idx)
+        stored = self._get_sample_fields(file_idx)
+        return {name: self._load_quality_field(f, name, sample_idx) for name in names if name in stored}
+
     def _raw_window(self) -> slice:
         """The slice of the raw sample grid this dataset serves."""
         if self.trim_minutes is None:

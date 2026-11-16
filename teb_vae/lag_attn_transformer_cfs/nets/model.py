@@ -234,7 +234,10 @@ class SeqVaeLagAttnTrfCfs(
                 gives the UA adapter each channel's validity as an input beside the values, adds
                 a per-head score bias on bad keys, and feeds the gate the attention mass on them.
                 It needs ``source_quality_mask`` and ``posterior_event_gate``, and adds
-                $d_{\mathrm{model}} C_u + 2M$ parameters, all zero at init.
+                $d_{\mathrm{model}} C_u + 2M$ parameters, all zero at init. ``'input'`` keeps
+                every key too, but the validity enters only as the UA adapter's input: no score
+                bias, no gate term, $d_{\mathrm{model}} C_u$ parameters, zero at init. It needs
+                ``source_quality_mask`` only.
             source_running_gap_keys: ``'keep'`` -- the default -- builds the model bitwise as
                 before the keyword existed. ``'remove'`` requires ``source_key_removed`` in every
                 forward and takes, per anchor, every lag key whose value can rest on bridged UA

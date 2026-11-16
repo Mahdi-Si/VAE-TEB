@@ -5,13 +5,17 @@ multi-line overlay -- are the shared ones, bound rather than forked. They alread
 properties that matter for an unattended multi-hour run, and both are asserted against this seam
 rather than taken on trust:
 
-**One thing here is this package's own rather than the sibling's**, and it is stated where it
-is defined: the cohort palette (:data:`CLINICAL_CLASS_COLORS` -- green, amber, red by severity, not
-``utils.style``'s blue-first mapping). The publication style itself -- the open frame, the type
-scale, the borderless legends, the double-column width, the footnote layout -- is the shared layer's
-:data:`~teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT`, bound here as :data:`STYLE_REFINEMENT` so
-the name every analysis reads keeps resolving; the weight and type constants beside it are named
-steps on that scale, kept here because the analyses draw with them by name.
+**Two things here are this package's own rather than the sibling's**, and each is stated where
+it is defined. The first is the cohort palette (:data:`CLINICAL_CLASS_COLORS` -- green, amber, red
+by severity, not ``utils.style``'s blue-first mapping). The second is the paper style
+(:data:`PAPER_STYLE` and :data:`PAPER_PALETTE`), which follows the conventions of the
+``figures4papers`` repository (C. Liu): a sans-serif face, a heavier open frame and heavier data
+lines, frameless legends, almost no grid, and a blue, green, red and neutral palette in which blue
+marks the key result and red the contrast. :func:`configure_figure_style` applies the shared
+layer's :data:`~teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT` first and this style over it, so
+the double-column width, the panel letters and the footnote layout stay the shared ones. The
+weight and type constants below are named steps on the paper scale, kept here because the
+analyses draw with them by name.
 
 The shared panel primitives read their weights and sizes from the **active** ``rcParams`` rather
 than from literals, which is what lets one style reach inside every builder without any package
@@ -60,40 +64,136 @@ EMPTY_NOTE = figures.EMPTY_NOTE
 #: more than a handful of distinct weights reads as accidental: the eye takes a change of weight
 #: as a change of meaning, so every weight has to mean something.
 #:
-#: Calibrated against the refined ``axes.linewidth`` of $0.6$ and ``lines.linewidth`` of $1.1$:
-#: the frame is the lightest structural mark, a hairline sits at it, the regular data weight is
-#: the rcParam default, and the emphasis weight is a step above it. Nothing here is heavier than
-#: :data:`LINE_HEAVY`, which exists for the one mark that is a *bar* rather than a line -- the
-#: inter-quartile span of a per-recording strip.
-LINE_HAIRLINE = 0.6
-LINE_THIN = 0.8
-LINE_REGULAR = 1.1
-LINE_EMPHASIS = 1.4
-LINE_HEAVY = 2.6
+#: Calibrated against the paper style's ``axes.linewidth`` of $1.0$ and ``lines.linewidth`` of
+#: $1.6$: a hairline sits below the frame, the regular data weight is the rcParam default, and the
+#: emphasis weight is a step above it. ``figures4papers`` draws its frame at about one sixth of its
+#: type size and its data lines at about twice the frame; these steps keep both ratios at this
+#: package's smaller type. Nothing here is heavier than :data:`LINE_HEAVY`, which exists for the
+#: one mark that is a *bar* rather than a line -- the inter-quartile span of a per-recording strip.
+LINE_HAIRLINE = 0.7
+LINE_THIN = 1.0
+LINE_REGULAR = 1.6
+LINE_EMPHASIS = 2.1
+LINE_HEAVY = 3.2
 
 #: Marker diameter in points of a point estimate drawn on a curve or a strip: small enough that
 #: a dense trajectory reads as a line with points on it rather than as a string of beads.
-MARKER_SMALL = 3.5
+MARKER_SMALL = 4.0
 
 #: Type sizes for text that is deliberately smaller than the axis labels: four steps, each with a
 #: job. The body size comes from ``rcParams`` and is not restated here. Nothing sits below the
-#: 5.5 pt floor a per-cell count or a band name is still legible at when the figure is read at
+#: 6.5 pt floor a per-cell count or a band name is still legible at when the figure is read at
 #: its designed width.
-FONT_TINY = 5.5
-FONT_SMALL = 6.0
-FONT_LABEL = 6.5
-FONT_NOTE = 7.5
+FONT_TINY = 6.5
+FONT_SMALL = 7.0
+FONT_LABEL = 7.5
+FONT_NOTE = 8.5
 
-#: The publication style, bound from the shared layer rather than owned: one open frame, one type
-#: scale and one legend convention across every evaluation package, so two figures of the same
-#: quantity from two cells are the same figure. See
-#: :data:`teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT` for what it sets and why.
+# =============================================================================
+# The paper style
+# =============================================================================
+#: The palette, after ``figures4papers``. Blue marks the key result, red the contrast, teal and
+#: violet further series, and the neutrals the reference and the background. The gold is that
+#: repository's highlight, darkened so that a line in it still reads on white. Each slot keeps the
+#: name of its job, so an analysis that draws with ``COLOR_BLUE`` draws the key result.
+PAPER_PALETTE: Dict[str, str] = {
+    "COLOR_BLUE": "#0F4D92",
+    "COLOR_VERMILLION": "#B64342",
+    "COLOR_GREEN": "#42949E",
+    "COLOR_ORANGE": "#C8961E",
+    "COLOR_PURPLE": "#9A4D8E",
+    "COLOR_MAGENTA": "#EA84DD",
+    "COLOR_GRAY": "#767676",
+    "COLOR_BLACK": "#272727",
+    "COLOR_LIGHT_GRAY": "#CFCECE",
+    "COLOR_GRID": "#EFEFEF",
+    "COLOR_SPINE": "#272727",
+    "INNER_BOX_COLOR": "#272727",
+}
+
+#: The series order of a multi-line panel: the two strongest hues first, then the accents, then
+#: the neutral reference.
+PAPER_LINE_PALETTE = (
+    PAPER_PALETTE["COLOR_BLUE"], PAPER_PALETTE["COLOR_VERMILLION"], PAPER_PALETTE["COLOR_GREEN"],
+    PAPER_PALETTE["COLOR_ORANGE"], PAPER_PALETTE["COLOR_PURPLE"], "#3775BA",
+    PAPER_PALETTE["COLOR_GRAY"],
+)
+
+#: The rcParams applied over the shared refinement. ``figures4papers`` sets its type at 15-16 pt
+#: and its frame at 2-2.5 pt for a compact panel of about 5 in; this package's panels are about
+#: 3.5 in wide, so the same proportions give 8.5 pt type and a 1 pt frame.
+PAPER_STYLE: Dict[str, Any] = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+    "mathtext.fontset": "dejavusans",
+    "font.size": 8.5,
+    "axes.titlesize": 9.5,
+    "axes.titleweight": "normal",
+    "axes.labelsize": 8.5,
+    "xtick.labelsize": 7.5,
+    "ytick.labelsize": 7.5,
+    "legend.fontsize": 7.5,
+    "legend.title_fontsize": 7.5,
+    "text.color": PAPER_PALETTE["COLOR_BLACK"],
+    "axes.titlecolor": PAPER_PALETTE["COLOR_BLACK"],
+    "axes.labelcolor": PAPER_PALETTE["COLOR_BLACK"],
+    "xtick.labelcolor": PAPER_PALETTE["COLOR_BLACK"],
+    "ytick.labelcolor": PAPER_PALETTE["COLOR_BLACK"],
+    # A heavier open frame in ink rather than in a lighter tone.
+    "axes.linewidth": 1.0,
+    "axes.edgecolor": PAPER_PALETTE["COLOR_SPINE"],
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "xtick.color": PAPER_PALETTE["COLOR_SPINE"],
+    "ytick.color": PAPER_PALETTE["COLOR_SPINE"],
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "xtick.major.size": 3.5,
+    "ytick.major.size": 3.5,
+    "xtick.minor.width": 0.7,
+    "ytick.minor.width": 0.7,
+    # Almost no grid: a faint line where a value has to be read across, nothing more.
+    "grid.color": PAPER_PALETTE["COLOR_GRID"],
+    "grid.linewidth": 0.6,
+    # Frameless legends. The white backing stays, so that a band that crosses a legend corner
+    # does not run through its text.
+    "legend.frameon": True,
+    "legend.framealpha": 0.9,
+    "legend.edgecolor": "none",
+    "lines.linewidth": LINE_REGULAR,
+    "lines.markersize": MARKER_SMALL,
+    "patch.linewidth": 0.8,
+    "hatch.color": PAPER_PALETTE["COLOR_LIGHT_GRAY"],
+    "savefig.dpi": 300,
+    "savefig.facecolor": "white",
+    "figure.facecolor": "white",
+    "svg.fonttype": "none",
+    "pdf.fonttype": 42,
+}
+
+#: The shared layer's publication style, which :func:`configure_figure_style` applies before
+#: :data:`PAPER_STYLE`. See :data:`teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT` for what it sets.
 STYLE_REFINEMENT = figures.STYLE_REFINEMENT
 
-#: Applied once at run start by ``run.py``, and deliberately not an import side effect:
-#: ``rcParams`` are global to the process, so an import-time call would restyle every other figure
-#: drawn in it -- including a test's. The run's figure format rides along for the same reason.
-configure_figure_style = figures.configure_figure_style
+
+def configure_figure_style(figure_format: Optional[str] = None) -> None:
+    """Apply the shared publication style, then this package's paper style and palette.
+
+    Called once at run start by ``run.py``, and deliberately not an import side effect:
+    ``rcParams`` are global to the process, so an import-time call would restyle every other figure
+    drawn in it -- including a test's. The run's figure format rides along for the same reason.
+
+    Args:
+        figure_format: The format every figure of this run is written in, or ``None`` to keep the
+            active one.
+    """
+    import matplotlib.pyplot as plt
+    from cycler import cycler
+
+    figures.configure_figure_style(figure_format)
+    plt.rcParams.update(PAPER_STYLE)
+    plt.rcParams["axes.prop_cycle"] = cycler(color=list(PAPER_LINE_PALETTE))
+    figures.use_palette(PAPER_PALETTE, PAPER_LINE_PALETTE)
 
 #: One axes styled the way every evaluation panel is: an open frame for a value panel, a box for
 #: an image. Bound rather than wrapped, because every weight it draws with is read from the active
@@ -110,7 +210,7 @@ integer_counts = figures.integer_counts
 PANEL_HEIGHT = figures.PANEL_HEIGHT
 FIGURE_WIDTH = figures.FIGURE_WIDTH
 SERIES_STYLES = figures.SERIES_STYLES
-LINE_PALETTE = figures.LINE_PALETTE
+LINE_PALETTE = PAPER_LINE_PALETTE
 BODY_ALPHA = figures.BODY_ALPHA
 render_figure = figures.render_figure
 figure_filename = figures.figure_filename
@@ -172,17 +272,17 @@ violin_panel = figures.violin_panel
 grouped_violin_figure = figures.grouped_violin_figure
 
 #: The palette. Bound here rather than imported per analysis so a quantity keeps one colour across
-#: the run: these are the hues the training figures use, not ``utils.style``'s, two of which
-#: differ.
-COLOR_BLACK = figures.COLOR_BLACK
-COLOR_BLUE = figures.COLOR_BLUE
-COLOR_GRAY = figures.COLOR_GRAY
-COLOR_GREEN = figures.COLOR_GREEN
-COLOR_LIGHT_GRAY = figures.COLOR_LIGHT_GRAY
-COLOR_MAGENTA = figures.COLOR_MAGENTA
-COLOR_ORANGE = figures.COLOR_ORANGE
-COLOR_PURPLE = figures.COLOR_PURPLE
-COLOR_VERMILLION = figures.COLOR_VERMILLION
+#: the run: these are the paper palette's hues (:data:`PAPER_PALETTE`), which
+#: :func:`configure_figure_style` also hands to the shared primitives.
+COLOR_BLACK = PAPER_PALETTE["COLOR_BLACK"]
+COLOR_BLUE = PAPER_PALETTE["COLOR_BLUE"]
+COLOR_GRAY = PAPER_PALETTE["COLOR_GRAY"]
+COLOR_GREEN = PAPER_PALETTE["COLOR_GREEN"]
+COLOR_LIGHT_GRAY = PAPER_PALETTE["COLOR_LIGHT_GRAY"]
+COLOR_MAGENTA = PAPER_PALETTE["COLOR_MAGENTA"]
+COLOR_ORANGE = PAPER_PALETTE["COLOR_ORANGE"]
+COLOR_PURPLE = PAPER_PALETTE["COLOR_PURPLE"]
+COLOR_VERMILLION = PAPER_PALETTE["COLOR_VERMILLION"]
 
 # =============================================================================
 # The cohort palette
@@ -553,6 +653,9 @@ def _draw_effect_heatmap(
 __all__ = [
     "BODY_ALPHA",
     "CLINICAL_CLASS_COLORS",
+    "PAPER_LINE_PALETTE",
+    "PAPER_PALETTE",
+    "PAPER_STYLE",
     "COLOR_MAGENTA",
     "FIGURE_WIDTH",
     "LINE_PALETTE",

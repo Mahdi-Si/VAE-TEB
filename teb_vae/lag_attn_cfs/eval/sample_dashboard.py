@@ -86,6 +86,10 @@ PLOTLY_FILENAME = "plotly.min.js"
 
 _ASSET_DIR = Path(__file__).resolve().parent / "sample_dashboard_assets"
 
+#: The signal-quality fields a page reads from the shard for its one segment. They stay out of
+#: ``load_fields``, so no batch of the collection pass carries them.
+PREFILL_FIELDS: Tuple[str, ...] = ("fhr_raw", "up_raw", "fhr_quality", "up_quality", "fhr_repair_exact")
+
 #: The readouts of the collection pass that the header and the gallery print.
 GALLERY_METRICS: Tuple[Tuple[str, str], ...] = (
     ("nll_base_block", "NLL base"),
@@ -293,6 +297,106 @@ def _heatmap(
 
 
 # =================================================================================================
+# The pre-fill signals and the reason of each invalid span
+# =================================================================================================
+@dataclass(frozen=True)
+class PrefillSignals:
+    r"""One segment's signals before the quality step bridged them, with the step's quality bits.
+
+    A shard built with the signal-quality step stores the bridged signals in ``fhr``/``up`` and the
+    signals before the fill in ``fhr_raw``/``up_raw``. The pre-fill FHR is the record's repaired
+    FHR channel, so it already holds the upstream repair; the ``REPAIRED`` bit marks those samples
+    where the raw channel could be read. A missing FHR sample is stored as 0.
+
+    Attributes:
+        signals: ``'fhr'`` / ``'up'`` -> the pre-fill signal, $(L,)$, in the monitor's units.
+        bits: ``'fhr'`` / ``'up'`` -> the quality bit code of each sample, $(L,)$.
+        invalid: ``'fhr'`` / ``'up'`` -> the bits that make a sample of this segment invalid. For
+            FHR they depend on ``fhr_repair_exact``, as in the loader's ``fhr_valid``.
+        names: ``'fhr'`` / ``'up'`` -> bit name -> bit value.
+    """
+
+    signals: Dict[str, np.ndarray]
+    bits: Dict[str, np.ndarray]
+    invalid: Dict[str, int]
+    names: Dict[str, Dict[str, int]]
+
+
+def read_prefill(dataset: Any, index: int) -> Optional[PrefillSignals]:
+    """Read one segment's pre-fill signals and quality bits from its shard.
+
+    Args:
+        dataset: The evaluation dataset. It needs ``read_quality_fields`` and ``quality_info``.
+        index: The dataset index.
+
+    Returns:
+        The signals, or ``None`` when the dataset cannot give them: a dataset without the reader,
+        or a shard built without the signal-quality step.
+    """
+    reader = getattr(dataset, "read_quality_fields", None)
+    info = getattr(dataset, "quality_info", None)
+    if not callable(reader) or info is None:
+        return None
+    fields = reader(int(index), PREFILL_FIELDS)
+
+    def host(value: Any) -> np.ndarray:
+        """One unbatched field as a flat host array. ``_to_numpy`` would take its first row."""
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value).reshape(-1)
+
+    signals = {
+        name: host(fields[f"{name}_raw"]).astype(np.float64)
+        for name in ("fhr", "up") if f"{name}_raw" in fields
+    }
+    if not signals:
+        return None
+    bits = {
+        name: host(fields[f"{name}_quality"]).astype(np.int64)
+        for name in ("fhr", "up") if f"{name}_quality" in fields
+    }
+    exact = bool(host(fields["fhr_repair_exact"])[0]) if "fhr_repair_exact" in fields else False
+    return PrefillSignals(
+        signals=signals,
+        bits=bits,
+        invalid={
+            "up": int(info.up_invalid_bits),
+            "fhr": int(info.fhr_invalid_bits_exact if exact else info.fhr_invalid_bits_rules),
+        },
+        names={
+            "up": {str(k): int(v) for k, v in info.up_bits.items()},
+            "fhr": {str(k): int(v) for k, v in info.fhr_bits.items()},
+        },
+    )
+
+
+def invalid_spans(bits: np.ndarray, invalid: int, names: Mapping[str, int]) -> List[List[Any]]:
+    r"""The runs of invalid samples, each with the invalid bits found in it.
+
+    A sample is invalid where ``bits & invalid != 0``. A run's reason lists every invalid bit set
+    on at least one of its samples, in bit order, for example ``"TRANSIENT, HOLD"``.
+
+    Args:
+        bits: The quality bit code of each sample, $(L,)$.
+        invalid: The bits that make a sample invalid.
+        names: Bit name -> bit value.
+
+    Returns:
+        ``[[start, end, reason], ...]`` in raw samples, ``end`` exclusive, sorted by ``start``.
+    """
+    codes = np.asarray(bits, dtype=np.int64).reshape(-1)
+    bad = (codes & int(invalid)) != 0
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], bad.astype(np.int8), [0]))))
+    ordered = sorted(((value, name) for name, value in names.items() if value & int(invalid)))
+    spans: List[List[Any]] = []
+    for start, end in zip(edges[0::2], edges[1::2]):
+        seen = int(np.bitwise_or.reduce(codes[start:end]))
+        reason = ", ".join(name for value, name in ordered if seen & value)
+        spans.append([int(start), int(end), reason])
+    return spans
+
+
+# =================================================================================================
 # The payload of one page
 # =================================================================================================
 @dataclass
@@ -438,6 +542,7 @@ def build_payload(
     scales: Mapping[str, Tuple[float, float]],
     row_limits: Optional[Mapping[str, float]] = None,
     run_label: str = "",
+    prefill: Optional[PrefillSignals] = None,
 ) -> Dict[str, Any]:
     r"""Reduce one forward to the arrays and the catalogue of one dashboard.
 
@@ -451,6 +556,9 @@ def build_payload(
             :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`.
         row_limits: The run's shared colour limits, or ``None``.
         run_label: What the header calls this run.
+        prefill: The segment's pre-fill signals and quality bits, from :func:`read_prefill`, or
+            ``None``. With them the page adds a pre-fill trace per signal and the reason of every
+            invalid span.
 
     Returns:
         The JSON-ready payload.
@@ -500,6 +608,28 @@ def build_payload(
         if valid is not None:
             arrays[f"{name}_valid"] = valid.astype(np.float64)
             items.append(_trace(f"{name}_valid", "Data quality", f"{word} sample valid", "0 or 1", "raw", f"{name}_valid"))
+
+    # ---- The pre-fill signals, and why each invalid span is invalid ------------------------------
+    # The pre-fill signal is in the monitor's units already: the loader never normalises it.
+    quality_spans: Dict[str, List[List[Any]]] = {}
+    for name, word in (("fhr", "FHR"), ("up", "UA")):
+        values = None if prefill is None else prefill.signals.get(name)
+        if values is None:
+            continue
+        if name in arrays and arrays[name].size != values.size:
+            logger.warning(f"dashboard: pre-fill {name} has {values.size} samples, the batch has "
+                           f"{arrays[name].size}; the pre-fill trace is left out")
+            continue
+        drawn = np.where(np.isfinite(values), values, np.nan)
+        floor = traces.RAW_GAP_FLOOR.get(name)
+        if floor is not None:
+            # A missing FHR sample is stored as 0; drawn as a gap, not as a drop to the axis floor.
+            drawn[drawn < floor] = np.nan
+        arrays[f"{name}_prefill"] = drawn
+        items.append(_trace(f"{name}_prefill", "Raw signals", f"{word}, as read before repair", traces.RAW_SIGNAL_UNITS[name],
+                            "raw", f"{name}_prefill", extra={"ctg": list(traces.RAW_SIGNAL_LIMITS[name])}))
+        if name in prefill.bits:
+            quality_spans[name] = invalid_spans(prefill.bits[name], prefill.invalid[name], prefill.names[name])
 
     # ---- Contractions and decelerations, on the raw clock -----------------------------------------
     event_spans: Dict[str, List[List[float]]] = {"contractions": [], "decelerations": []}
@@ -766,6 +896,7 @@ def build_payload(
             "source_warmup": source_warmup.tolist(),
         },
         "events": event_spans,
+        "quality_spans": quality_spans,
         "traces": items,
         "heatmaps": maps,
         "params": parameters,
@@ -826,6 +957,8 @@ class DashboardSet:
         delay_steps: The model's causal input delay.
         run_label: What each page's header calls this run.
         cap: How many segments get a page, or ``None`` for every selected segment.
+        dataset: The evaluation dataset. A page reads its segment's pre-fill signals from it, with
+            :func:`read_prefill`. ``None`` draws no pre-fill traces.
         entries: One record per segment with a page, keyed by dataset index.
         failures: One record per page that could not be written.
     """
@@ -836,6 +969,7 @@ class DashboardSet:
     delay_steps: int = 0
     run_label: str = ""
     cap: Optional[int] = None
+    dataset: Any = None
     entries: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     failures: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -865,6 +999,16 @@ class DashboardSet:
             shutil.copy2(entry["path"], target)
             entry["selections"].append(selection)
         return entry["file"]
+
+    def _prefill(self, index: int) -> Optional[PrefillSignals]:
+        """The segment's pre-fill signals, or ``None``. A read failure costs only the pre-fill traces."""
+        if self.dataset is None:
+            return None
+        try:
+            return read_prefill(self.dataset, index)
+        except Exception as error:  # noqa: BLE001 - the page is still useful without them
+            logger.warning(f"dashboard: pre-fill signals of dataset index {index} not read: {error}")
+            return None
 
     def has_room(self) -> bool:
         """Whether the cap leaves room for another segment."""
@@ -905,6 +1049,7 @@ class DashboardSet:
             payload = build_payload(
                 task, inputs, row, index=index, delay_steps=self.delay_steps, scales=self.scales,
                 row_limits=self.row_limits, run_label=self.run_label,
+                prefill=self._prefill(index),
             )
             (directory / name).write_text(render_page(payload), encoding="utf-8")
         except Exception as error:  # noqa: BLE001 - one page is not worth the rest of the run
@@ -976,8 +1121,12 @@ class DashboardSet:
 __all__ = [
     "DASHBOARD_CAP",
     "DashboardSet",
+    "PREFILL_FIELDS",
+    "PrefillSignals",
     "SegmentInputs",
     "build_payload",
     "encode_array",
+    "invalid_spans",
+    "read_prefill",
     "render_page",
 ]

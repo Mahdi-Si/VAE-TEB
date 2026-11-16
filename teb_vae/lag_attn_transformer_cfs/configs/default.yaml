@@ -321,6 +321,13 @@ model_config:
     #     Needs `posterior_event_gate: true`; refuses `source_event_mask`. Adds
     #     d_model * C_u + 2 * num_heads parameters, so a hard-mode checkpoint warm-starts a soft
     #     model only through a seeded copy (`neural_surgery_trf_cfs/surgery/init_s6.py`).
+    #   input: softer still. Every key stays and the UA adapter reads each channel's validity as an
+    #     input beside its value, as in soft, but there is NO score bias on bad keys and NO gate
+    #     term: the mask reaches the model only through the UA representation, and the model
+    #     learns from it alone how far to trust a bad step. Starts at "treat every step as valid".
+    #     Does not need `posterior_event_gate`. Adds d_model * C_u parameters; a soft checkpoint
+    #     loads into it after dropping `source_invalid_key_bias` and `source_invalid_gate.weight`.
+    #     `source_invalid_mass` is still logged, as a readout only.
     source_mask_mode: hard
     # RUNNING-GAP KEYS. The bridge across an invalid UA run [a, b] reads `ua_bridge_guard_s` of
     # samples after b, so a key whose step starts at or after a can rest on UA after the anchor

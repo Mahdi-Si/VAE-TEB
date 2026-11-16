@@ -41,7 +41,7 @@ import string
 import textwrap
 import warnings
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -88,6 +88,7 @@ __all__ = [
     "FIGURE_WIDTH",
     "FOOTNOTE_MAX_CHARS",
     "LINE_PALETTE",
+    "PALETTE_SLOTS",
     "PANEL_HEIGHT",
     "SERIES_STYLES",
     "integer_counts",
@@ -124,6 +125,7 @@ __all__ = [
     "significance_strip",
     "style_axes",
     "to_numpy",
+    "use_palette",
     "violin_panel",
 ]
 
@@ -424,8 +426,60 @@ def configure_figure_style(figure_format: Optional[str] = None) -> None:
     """
     apply_publication_style()
     plt.rcParams.update(STYLE_REFINEMENT)
+    # A package may have swapped the palette earlier in this process; a fresh configuration starts
+    # from this module's own colours.
+    use_palette(None)
     if figure_format is not None:
         set_figure_format(figure_format)
+
+
+#: The colour names :func:`use_palette` may rebind. Each primitive here reads these module names
+#: when it draws, so a swap reaches every panel without a second copy of any builder.
+PALETTE_SLOTS: Tuple[str, ...] = (
+    "COLOR_BLUE", "COLOR_ORANGE", "COLOR_GREEN", "COLOR_PURPLE", "COLOR_VERMILLION",
+    "COLOR_MAGENTA", "COLOR_GRAY", "COLOR_BLACK", "COLOR_LIGHT_GRAY", "COLOR_GRID", "COLOR_SPINE",
+    "INNER_BOX_COLOR",
+)
+
+#: This module's own colours, kept so :func:`use_palette` can restore them.
+_DEFAULT_PALETTE = {name: globals()[name] for name in PALETTE_SLOTS}
+_DEFAULT_LINE_PALETTE = LINE_PALETTE
+
+
+def use_palette(palette: Optional[Dict[str, str]] = None,
+                line_palette: Optional[Sequence[str]] = None) -> None:
+    """Swap the colours every primitive here draws with, for the rest of the process.
+
+    A package that wants its own palette calls this once at run start, after
+    :func:`configure_figure_style`. The swap rebinds the module colour names, rebuilds
+    :data:`LINE_PALETTE` and recolours :data:`SERIES_STYLES` in place, so a module that imported
+    that dictionary sees the new colours too. ``use_palette(None)`` restores this module's own
+    colours, and :func:`configure_figure_style` calls it, so a package that does not ask for a
+    palette never inherits another package's.
+
+    Args:
+        palette: Slot name (a member of :data:`PALETTE_SLOTS`) -> hex colour. A slot not named
+            keeps this module's own colour. ``None`` restores every slot.
+        line_palette: The series order of :func:`series_style`. ``None`` keeps this module's own
+            order, written with the new colours of the same slots.
+
+    Raises:
+        ValueError: If ``palette`` names a slot outside :data:`PALETTE_SLOTS`.
+    """
+    global LINE_PALETTE
+    unknown = sorted(set(palette or {}) - set(PALETTE_SLOTS))
+    if unknown:
+        raise ValueError(f"unknown palette slots {unknown}; valid: {list(PALETTE_SLOTS)}")
+    resolved = dict(_DEFAULT_PALETTE, **(palette or {}))
+    globals().update(resolved)
+    if line_palette is not None:
+        LINE_PALETTE = tuple(str(colour) for colour in line_palette)
+    else:
+        # The default order, slot by slot, so a swapped hue keeps its position in the order.
+        slot_of = {colour: name for name, colour in _DEFAULT_PALETTE.items()}
+        LINE_PALETTE = tuple(resolved[slot_of[colour]] for colour in _DEFAULT_LINE_PALETTE)
+    for key, style in SERIES_STYLES.items():
+        style["color"] = resolved["COLOR_GRAY"] if style.get("linestyle") == "--" else resolved["COLOR_VERMILLION"]
 
 
 def style_axes(ax: Any, *, grid: str = "major") -> None:
@@ -697,7 +751,7 @@ def histogram_panel(
     title: str = "",
     xlabel: str = "",
     bins: int = 40,
-    color: str = COLOR_BLUE,
+    color: Optional[str] = None,
     reference: Optional[float] = None,
     reference_label: str = "",
 ) -> int:
@@ -709,7 +763,7 @@ def histogram_panel(
         title: Panel title.
         xlabel: X-axis label.
         bins: Histogram bin count.
-        color: Bar colour.
+        color: Bar colour. ``None`` uses :data:`COLOR_BLUE` of the active palette.
         reference: Optional vertical reference line -- a threshold, or a null value the
             distribution should sit away from.
         reference_label: Legend label for the reference line.
@@ -718,6 +772,7 @@ def histogram_panel(
         The number of finite values drawn, so a caller can record how much of a capped draw
         actually contributed rather than inferring it from the figure.
     """
+    color = COLOR_BLUE if color is None else color
     finite = _finite(values)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -786,7 +841,7 @@ def ribbon_plot(
     title: str = "",
     xlabel: str = "",
     ylabel: str = "",
-    color: str = COLOR_BLUE,
+    color: Optional[str] = None,
     label: str = "",
 ) -> int:
     r"""Draw a median line with an inter-quartile ribbon over a stack of per-sample curves.
@@ -803,12 +858,13 @@ def ribbon_plot(
         title: Panel title.
         xlabel: X-axis label.
         ylabel: Y-axis label.
-        color: Line and ribbon colour.
+        color: Line and ribbon colour. ``None`` uses :data:`COLOR_BLUE` of the active palette.
         label: Legend label for the median line.
 
     Returns:
         The number of x positions that had at least one finite value.
     """
+    color = COLOR_BLUE if color is None else color
     curves = np.asarray(to_numpy(values), dtype=np.float64)
     if curves.ndim == 1:
         curves = curves[None, :]
@@ -1050,7 +1106,7 @@ def violin_panel(
     *,
     title: str = "",
     ylabel: str = "",
-    color: str = COLOR_BLUE,
+    color: Optional[str] = None,
     colors: Optional[Any] = None,
     reference: Optional[float] = None,
     reference_label: str = "",
@@ -1086,7 +1142,8 @@ def violin_panel(
         samples: Ordered mapping from group label to that group's values.
         title: Panel title.
         ylabel: Y-axis label.
-        color: Body colour, used when ``colors`` is not supplied.
+        color: Body colour, used when ``colors`` is not supplied. ``None`` uses
+            :data:`COLOR_BLUE` of the active palette.
         colors: Optional label-to-colour mapping, for a grouped variant that must match a
             palette used elsewhere in the run.
         reference: Optional horizontal reference line.
@@ -1095,6 +1152,7 @@ def violin_panel(
     Returns:
         The number of groups that had at least one finite value.
     """
+    color = COLOR_BLUE if color is None else color
     groups = dict(samples)
     labels = list(groups)
     finite = [_finite(values) for values in groups.values()]
@@ -1156,7 +1214,7 @@ def binned_violin_panel(
     bin_width: float,
     min_body_size: int,
     colors: Optional[Any] = None,
-    color: str = COLOR_BLUE,
+    color: Optional[str] = None,
     title: str = "",
     xlabel: str = "",
     ylabel: str = "",
@@ -1207,7 +1265,8 @@ def binned_violin_panel(
             from its test at, and a default here would be a second definition of that threshold.
         colors: Optional label-to-colour mapping, so a caller's own cohort palette reaches the
             bodies rather than this module's default.
-        color: Body colour for a label the mapping does not cover.
+        color: Body colour for a label the mapping does not cover. ``None`` uses
+            :data:`COLOR_BLUE` of the active palette.
         title: Panel title.
         xlabel: X-axis label.
         ylabel: Y-axis label.
@@ -1221,6 +1280,7 @@ def binned_violin_panel(
             shorter of the two would silently drop windows off the figure while every axis label
             still said they were there.
     """
+    color = COLOR_BLUE if color is None else color
     windows = list(samples_by_window)
     positions_x = [float(value) for value in centres]
     if len(windows) != len(positions_x):

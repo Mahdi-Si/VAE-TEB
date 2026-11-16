@@ -897,6 +897,8 @@ def run_samples_analysis(
         delay_steps=delay_steps,
         run_label=str(((context.config or {}).get("general_config") or {}).get("tag") or ""),
         cap=None if dashboard_cap is None else int(dashboard_cap),
+        # The pages read their pre-fill signals from the shard, so no batch has to carry them.
+        dataset=getattr(loader, "dataset", None),
     )
 
     manifest: List[Dict[str, Any]] = []

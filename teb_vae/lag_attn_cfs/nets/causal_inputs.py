@@ -122,11 +122,17 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
 #: anchor out of the lag attention. See :meth:`CausalWarmupInputs.attend_lagged_source`.
 SOURCE_RUNNING_GAP_MODES: Tuple[str, ...] = ("keep", "remove")
 
-#: The two ways ``source_quality_mask`` can apply the UA step mask. ``'hard'`` removes the keys of
-#: bad steps and shuts the posterior where none is left; ``'soft'`` keeps every key, tells the model
-#: which ones are bad and lets it learn how far to trust them. See
+#: The three ways ``source_quality_mask`` can apply the UA step mask. ``'hard'`` removes the keys
+#: of bad steps and shuts the posterior where none is left. ``'soft'`` keeps every key, gives the UA
+#: adapter each channel's validity as an input, and adds two learned terms on bad keys: a per-head
+#: score bias and a gate term on the attention mass they get. ``'input'`` keeps every key and gives
+#: the adapter the validity input only: no score bias and no gate term, so whatever the model does
+#: with a bad step it learns through the source representation alone. See
 #: :meth:`CausalWarmupInputs.attend_lagged_source`.
-SOURCE_MASK_MODES: Tuple[str, ...] = ("hard", "soft")
+SOURCE_MASK_MODES: Tuple[str, ...] = ("hard", "soft", "input")
+
+#: The modes that keep every key and feed the validity to the UA adapter.
+SOFT_MASK_MODES: Tuple[str, ...] = ("soft", "input")
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
 #: base. ``__class__`` appears because a method referencing ``super()`` gets an implicit closure
@@ -149,8 +155,8 @@ class LaggedSourceAttention(NamedTuple):
             mode and without a hard mask, where it equals ``event_gate``.
         source_open: $o_t = \exists \ell: K_{t\ell}$ ``(B, T)`` in the hard mode, else ``None``.
             Under running-gap removal $K$ is first reduced to $K \wedge \lnot R$.
-        invalid_mass: The soft mode's attention mass on invalid keys per head ``(B, T, M)``, else
-            ``None``.
+        invalid_mass: The soft or input mode's attention mass on invalid keys per head
+            ``(B, T, M)``, else ``None``.
     """
 
     alpha: torch.Tensor
@@ -268,7 +274,9 @@ class CausalWarmupInputs:
                 ``'hard'`` -- the default -- is the behaviour described above, bitwise.
                 ``'soft'`` keeps the keys of bad steps and gives the model the mask as an input
                 instead; it needs ``source_quality_mask`` and adds three zero-initialised
-                parameters, built by :meth:`_build_soft_source_mask`.
+                parameters, built by :meth:`_build_soft_source_mask`. ``'input'`` keeps the keys
+                too, but the mask enters only as the UA adapter's per-channel input: one
+                zero-initialised parameter, no score bias and no gate term.
             source_running_gap_keys: One of :data:`SOURCE_RUNNING_GAP_MODES`. ``'keep'`` -- the
                 default -- is the model before the keyword existed, bitwise. ``'remove'`` makes
                 every forward require ``source_key_removed``, the per-anchor removal mask
@@ -298,10 +306,11 @@ class CausalWarmupInputs:
             raise ValueError(
                 f"source_mask_mode must be one of {SOURCE_MASK_MODES}, got {source_mask_mode!r}"
             )
-        if source_mask_mode == "soft" and not self.source_quality_mask:
+        if source_mask_mode in SOFT_MASK_MODES and not self.source_quality_mask:
             raise ValueError(
-                "source_mask_mode='soft' needs source_quality_mask=True: the soft mode gives the "
-                "model the UA step mask as an input, so every forward must carry source_valid."
+                f"source_mask_mode={source_mask_mode!r} needs source_quality_mask=True: the mode "
+                f"gives the model the UA step mask as an input, so every forward must carry "
+                f"source_valid."
             )
         self.source_mask_mode = str(source_mask_mode)
         if source_running_gap_keys not in SOURCE_RUNNING_GAP_MODES:
@@ -1007,12 +1016,13 @@ class CausalWarmupInputs:
               it, **only** when ``posterior_event_gate`` and ``source_quality_mask`` are both on.
               It is the one way to tell an anchor the model shut ($o_t = 1$, small $g_t$) from an
               anchor the data shut ($o_t = 0$), because ``event_gate`` is $0$ in both.
-            * Under ``source_mask_mode='soft'`` the three mask keys above change: ``source_open``
-              and ``event_gate_learned`` are absent, because nothing is closed and ``event_gate``
-              is the learned gate itself; ``source_key_mask`` is still returned; and two keys
-              are added: ``source_invalid_mass``, the attention mass each head put on invalid
-              keys, $(B, T, M)$, and ``source_quality``, the adapter's per-channel flags,
-              $(B, T, C_u)$.
+            * Under ``source_mask_mode='soft'`` or ``'input'`` the three mask keys above change:
+              ``source_open`` and ``event_gate_learned`` are absent, because nothing is closed and
+              ``event_gate`` is the learned gate itself; ``source_key_mask`` is still returned;
+              and two keys are added: ``source_invalid_mass``, the attention mass each head put
+              on invalid keys, $(B, T, M)$, and ``source_quality``, the adapter's per-channel
+              flags, $(B, T, C_u)$. In the ``'input'`` mode ``source_invalid_mass`` is a readout
+              only: nothing in the model reads it.
             * ``source_key_removed`` -- the removal mask the forward applied, **only** under
               ``source_running_gap_keys='remove'``. Returned so every control re-attends with the
               same removal. In the hard mode ``source_key_mask`` stays the quality key mask $K$,
@@ -1063,7 +1073,8 @@ class CausalWarmupInputs:
         # Under the soft UA mask the adapter also reads each channel's validity; ``None`` -- every
         # other configuration -- is the plain encode.
         quality: Optional[torch.Tensor] = None
-        if source_valid is not None and getattr(self, "source_mask_mode", "hard") == "soft":
+        mode = getattr(self, "source_mask_mode", "hard")
+        if source_valid is not None and mode in SOFT_MASK_MODES:
             quality = self.source_quality_input(source_valid, source.dtype)
         h_u = self.encode_source_kv(source, quality)
 
@@ -1341,7 +1352,10 @@ class CausalWarmupInputs:
         return int(num_steps) if reach is None else max(1, min(int(reach), int(num_steps)))
 
     def _build_soft_source_mask(self) -> None:
-        r"""Build the soft mask's three parameters, or set them to ``None`` in the hard mode.
+        r"""Build the soft mask's parameters, or set them to ``None`` in the hard mode.
+
+        The ``'input'`` mode builds only the first one below, ``quality_proj``; its key bias and
+        gate term are ``None``, so the validity reaches the model only through the UA adapter.
 
         Called by a composing constructor **after** the base constructor, because the parameters
         need the module machinery, the model width, the head count and the posterior's event gate.
@@ -1366,27 +1380,31 @@ class CausalWarmupInputs:
 
         Raises:
             ValueError: In the soft mode, if the model was built without ``posterior_event_gate``:
-                the gate is the soft mode's only way to shut the posterior.
+                the gate is the soft mode's only way to shut the posterior. In both the soft and
+                the input mode, if the UA adapter cannot take a validity input.
         """
-        if getattr(self, "source_mask_mode", "hard") != "soft":
-            self.source_invalid_key_bias = None
-            self.source_invalid_gate = None
+        mode = getattr(self, "source_mask_mode", "hard")
+        self.source_invalid_key_bias = None
+        self.source_invalid_gate = None
+        if mode not in SOFT_MASK_MODES:
             return
-        if getattr(self.posterior_head, "event_gate_head", None) is None:
+        if mode == "soft" and getattr(self.posterior_head, "event_gate_head", None) is None:
             raise ValueError(
                 "source_mask_mode='soft' needs posterior_event_gate=True: without the hard mask "
                 "the learned event gate is the only way the model can shut its posterior where "
-                "the UA is bad."
+                "the UA is bad. source_mask_mode='input' has no gate term and does not need it."
             )
         if not hasattr(self.source_adapter, "quality_proj"):
             raise ValueError(
-                f"source_mask_mode='soft' needs an availability-aware UA adapter; this model's "
+                f"source_mask_mode={mode!r} needs an availability-aware UA adapter; this model's "
                 f"source_adapter is a {type(self.source_adapter).__name__}."
             )
-        num_heads = int(self.lag_attn.num_heads)
         adapter = self.source_adapter
         adapter.quality_proj = nn.Linear(int(adapter.in_dim), int(self.d_model), bias=False)
         nn.init.zeros_(adapter.quality_proj.weight)
+        if mode == "input":
+            return
+        num_heads = int(self.lag_attn.num_heads)
         self.source_invalid_key_bias = nn.Parameter(torch.zeros(num_heads))
         self.source_invalid_gate = nn.Linear(num_heads, 1, bias=False)
         nn.init.zeros_(self.source_invalid_gate.weight)
@@ -1468,11 +1486,18 @@ class CausalWarmupInputs:
         A key counts as invalid when any UA channel of its step is invalid, which is the hard
         mode's rule; the adapter's input keeps the per-channel detail.
 
+        **Input mode**: every key the lag mask admits stays, the attention has no score bias and
+        the gate has no invalid-mass term: $g_t = \sigma(w^\top \tilde a_t + c)$. The flags enter
+        only through $h^u$, so whatever the model does with a bad step -- trust it, discount it,
+        shut its gate -- it learns from the source representation. $\rho_{t,m}$ is still
+        computed and returned as a readout.
+
         **Running-gap removal** (``removed`` given, ``source_running_gap_keys='remove'``): the
         keys with $R_{t\ell}$ leave the attention mask in both modes, because their value can rest
         on bridged UA after the anchor. In the soft mode the attention runs under
         $\mathrm{lag\_mask} \wedge \lnot R$ while $\bar v$ and the score bias stay as above, and
-        an anchor with no key left gets $g_t \cdot \mathbb 1[\exists \ell: \lnot R_{t\ell}]$. In
+        an anchor with no key left gets $g_t \cdot \mathbb 1[\exists \ell: \lnot R_{t\ell}]$; the
+        input mode does the same without the score bias. In
         the hard mode the attention runs under $K \wedge \lnot R$, and $o_t$ is computed from that
         reduced mask, so the gate closes where no key is left.
 
@@ -1514,6 +1539,20 @@ class CausalWarmupInputs:
                 # An anchor with no key left attends to nothing, but the gate reads a LayerNorm of
                 # a zero summary and stays open; closing it keeps q = p there.
                 gate = gate * kept.any(dim=-1, keepdim=True).to(gate.dtype)
+            return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+
+        if key_mask is not None and getattr(self, "source_mask_mode", "hard") == "input":
+            lag_mask = lag_mask.to(torch.bool)
+            invalid = (lag_mask[None] & ~key_mask.to(torch.bool)).to(h_u.dtype)  # (B, T, L)
+            kept = lag_mask if removed is None else lag_mask[None] & ~removed.to(torch.bool)
+            _, alpha, heads = self.lag_attn(query, h_u, kept)
+            # A readout only: nothing in the model reads it.
+            invalid_mass = (alpha * invalid[:, :, None, :]).sum(dim=-1)  # (B, T, M)
+            gate = self.posterior_head.event_gate_values(heads)
+            if removed is not None:
+                # As in the soft mode: an anchor with no key left keeps q = p. Without a learned
+                # gate, the open indicator itself is the gate.
+                gate, _ = self._close_gate(gate, kept.any(dim=-1), heads.dtype)
             return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
 
         if removed is not None:

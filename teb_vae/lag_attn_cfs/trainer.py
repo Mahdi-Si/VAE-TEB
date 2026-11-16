@@ -534,7 +534,7 @@ def _check_quality_switch_pairing(config: Dict[str, Any]) -> None:
       and an active ``fhr_step_mask`` needs the switch.
     * ``source_event_mask`` narrows the source-quality key mask with the contraction detector, so
       it needs ``source_quality_mask`` and an ``event_weight_floor``, and it refuses
-      ``source_mask_mode: soft``, which removes no key.
+      ``source_mask_mode: soft`` and ``input``, which remove no key.
 
     Args:
         config: The resolved run config.
@@ -577,9 +577,11 @@ def _check_quality_switch_pairing(config: Dict[str, Any]) -> None:
         )
     # The soft mask keeps every key and only flags the bad ones, so the ablation's "outside a
     # contraction" steps would stay readable with a flag, and the arm would not be the ablation.
-    if bool(vae.get("source_event_mask", False)) and vae.get("source_mask_mode") == "soft":
+    mask_mode = vae.get("source_mask_mode")
+    if bool(vae.get("source_event_mask", False)) and mask_mode in ("soft", "input"):
         raise ValueError(
-            "model_config.VAE_model.source_event_mask is true but source_mask_mode is 'soft'. "
+            f"model_config.VAE_model.source_event_mask is true but source_mask_mode is "
+            f"{mask_mode!r}. "
             "The ablation removes the keys outside a contraction, which only the hard mode does; "
             "set source_mask_mode: hard, or turn source_event_mask off."
         )

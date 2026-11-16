@@ -63,6 +63,10 @@
       "gate_open_lags.pdf",
       "gate_open_trajectory.pdf"
     ],
+    "lag_detected": [
+      "lag_detected.pdf",
+      "lag_detected_time.pdf"
+    ],
     "lag_clocks": [
       "lag_second_stage.pdf",
       "lag_second_stage_features.pdf",

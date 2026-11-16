@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import event_gate as event_gate_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import gate_open as gate_open_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import lag_detected as lag_detected_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
@@ -302,6 +303,12 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # delivery, contraction age and the gate value. Reads the per-anchor table and the vector
     # sidecar only.
     "gate_open": gate_open_analysis.run_gate_open_analysis,
+    # Directly after the gate populations, because it narrows them: the active anchors (gate on
+    # and a KL above the objective's activity threshold) whose KL attribution peaks at a lag
+    # beyond lag 0. It lists those anchors and their episodes, places the peaks on the lag axis,
+    # and tests their forecast gain against the immediate anchors of the same recordings. Reads
+    # the per-anchor table and the vector sidecar only.
+    "lag_detected": lag_detected_analysis.run_lag_detected_analysis,
     # Third of the lag-against-the-clocks trio: the same two clocks, read on the ANCHORS that carry
     # the coupling rather than on all of them. It selects anchors by a quantile band of the pooled
     # per-anchor KL and reads the lag structure of the selection off the per-anchor vector sidecar

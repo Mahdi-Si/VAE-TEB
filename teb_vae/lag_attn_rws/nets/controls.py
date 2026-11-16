@@ -348,7 +348,9 @@ def perm_forward_outputs(
             permuted["source_key_removed"] = removed[perm_index]
         # The soft mode closes no anchor, so it has no ``source_open`` to carry. Its flags are
         # already inside the permuted ``source_state``; the donor's copy is carried for readers.
-        if getattr(model, "source_mask_mode", "hard") != "soft":
+        # The soft and the input mode both keep every key ("soft", "input": SOFT_MASK_MODES of
+        # lag_attn_cfs.nets.causal_inputs, which this package does not import).
+        if getattr(model, "source_mask_mode", "hard") not in ("soft", "input"):
             # The keys the arm attended under: the donor's key mask less the donor's removal, the
             # set the forward's own ``source_open`` is computed from.
             open_keys = permuted["source_key_mask"]

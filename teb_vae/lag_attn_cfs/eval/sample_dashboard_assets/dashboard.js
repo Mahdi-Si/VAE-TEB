@@ -107,10 +107,18 @@
     { name: "Forecast error", left: ["mse_base", "mse_full", "mse_persist"], right: ["fhr"] },
     { name: "Forecast and truth", left: ["truth_tau", "fc_mu_full", "fc_mu_base"], right: ["fc_sigma_full"] },
     { name: "Latent shift", left: ["delta_mu_norm", "kld"], right: ["fhr"] },
+    // One axis only: the pre-fill and the bridged signal share the unit and the CTG scale.
+    { name: "FHR before and after repair", left: ["fhr_prefill", "fhr_stored"], right: [] },
+    { name: "UA before and after repair", left: ["up_prefill", "up_stored"], right: [] },
   ];
+  // A preset with an empty right list draws on the left axis only.
+  const presetFits = p => p.left.some(has) && (p.right.length === 0 || p.right.some(has));
   function defaultFig(kind, n) {
     if (kind === "trace") {
-      const p = PRESETS[n === 0 ? 0 : 2];
+      // With the pre-fill signals, the two trace figures open on the raw signal against the repaired
+      // one, FHR on top and UA below; without them, on the coupling presets.
+      const repair = PRESETS.find(q => q.name === (n === 0 ? "FHR before and after repair" : "UA before and after repair"));
+      const p = repair && repair.left.every(has) ? repair : PRESETS[n === 0 ? 0 : 2];
       return { left: p.left.filter(has), right: p.right.filter(has), params: { L: {}, R: {} }, scale: { L: "auto", R: "auto" }, smooth: 0, colors: {} };
     }
     const first = n === 0 ? "attn" : "kl_lag";
@@ -119,7 +127,7 @@
   function freshState() {
     return {
       xMode: "to_delivery", theme: "light",
-      overlays: { contractions: true, decelerations: false, warmup: true, gaps: false, unscored: true },
+      overlays: { contractions: true, decelerations: false, warmup: true, gaps: false, fhr_gaps: false, unscored: true },
       figs: { t1: defaultFig("trace", 0), t2: defaultFig("trace", 1), h1: defaultFig("map", 0), h2: defaultFig("map", 1) },
     };
   }
@@ -130,7 +138,7 @@
       if (hash) saved = JSON.parse(atob(hash));
     } catch (e) { saved = null; }
     if (!saved) {
-      try { saved = JSON.parse(localStorage.getItem("sample-dashboard-view") || "null"); } catch (e) { saved = null; }
+      try { saved = JSON.parse(localStorage.getItem("sample-dashboard-view-v2") || "null"); } catch (e) { saved = null; }
     }
     const fresh = freshState();
     if (!saved || !saved.figs) return fresh;
@@ -149,7 +157,7 @@
   }
   const S = loadState();
   function saveState() {
-    try { localStorage.setItem("sample-dashboard-view", JSON.stringify(S)); } catch (e) { /* no storage */ }
+    try { localStorage.setItem("sample-dashboard-view-v2", JSON.stringify(S)); } catch (e) { /* no storage */ }
   }
   document.documentElement.dataset.theme = S.theme;
 
@@ -426,6 +434,42 @@
   const PLOT_CONFIG = { displaylogo: false, scrollZoom: false, responsive: true, doubleClick: "autosize",
     modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"], toImageButtonOptions: { format: "svg" } };
 
+  // ---- Invalid samples ----------------------------------------------------------------------------
+  // The page builder writes D.quality_spans when it could read the shard's quality bits: one
+  // [start, end, reason] per run of invalid raw samples, end exclusive. Without them, the loader's
+  // own <name>_valid mask gives the spans, with no reason.
+  const spanCache = {};
+  function invalidSpans(name) {
+    if (spanCache[name]) return spanCache[name];
+    const given = (D.quality_spans || {})[name];
+    let out = [];
+    if (given) out = given;
+    else if (D.arrays[name + "_valid"]) {
+      const v = arr(name + "_valid").v;
+      let start = -1;
+      for (let i = 0; i <= v.length; i++) {
+        const bad = i < v.length && v[i] < 0.5;
+        if (bad && start < 0) start = i;
+        if (!bad && start >= 0) { out.push([start, i, ""]); start = -1; }
+      }
+    }
+    spanCache[name] = out;
+    return out;
+  }
+  function spanAt(name, rawIndex) {
+    // The spans are sorted and disjoint, so a binary search finds the one that holds the sample.
+    const spans = invalidSpans(name);
+    let lo = 0, hi = spans.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (rawIndex < spans[mid][0]) hi = mid - 1;
+      else if (rawIndex >= spans[mid][1]) lo = mid + 1;
+      else return spans[mid];
+    }
+    return null;
+  }
+  const SIGNAL_TRACE_IDS = { fhr: ["fhr", "fhr_stored", "fhr_prefill", "fhr_valid"], up: ["up", "up_stored", "up_prefill", "up_valid"] };
+
   function shapes(onMap, yCoord, yFactor) {
     // On a map a tint would change the colour the reader decodes, so an event is an outline there.
     const out = onMap ? gridShapes(yCoord, yFactor) : [];
@@ -436,14 +480,9 @@
     if (S.overlays.warmup) rect(0, G.warmup * G.dt - G.dt / 2, cssVar("--warmup"), onMap);
     if (S.overlays.contractions) for (const [a, p, b] of D.events.contractions) event(rawS(a), rawS(b), "--contraction", "--contraction-line");
     if (S.overlays.decelerations) for (const [a, p, b] of D.events.decelerations) event(rawS(a), rawS(b), "--deceleration", "--deceleration-line");
-    if (S.overlays.gaps && !onMap && D.arrays.up_valid) {
-      const v = arr("up_valid").v;
-      let start = -1;
-      for (let i = 0; i <= v.length; i++) {
-        const bad = i < v.length && v[i] < 0.5;
-        if (bad && start < 0) start = i;
-        if (!bad && start >= 0) { rect(start * G.raw_dt, i * G.raw_dt, cssVar("--gap"), false); start = -1; }
-      }
+    if (!onMap) {
+      if (S.overlays.gaps) invalidSpans("up").forEach(([a, b]) => rect(rawS(a), rawS(b), cssVar("--gap"), false));
+      if (S.overlays.fhr_gaps) invalidSpans("fhr").forEach(([a, b]) => rect(rawS(a), rawS(b), cssVar("--gap-fhr"), false));
     }
     if (S.overlays.unscored) {
       const scored = arr("score_contributing").v;
@@ -534,7 +573,7 @@
     const plot = el.querySelector(".plot");
     const F = { key, type: "trace", el, plot, height: TRACE_PLOT_PX, cache: [] };
     FIGS[key] = F;
-    PRESETS.forEach((p, i) => { if (p.left.some(has) && p.right.some(has)) { const o = document.createElement("option"); o.value = i; o.textContent = p.name; el.querySelector(".preset").appendChild(o); } });
+    PRESETS.forEach((p, i) => { if (presetFits(p)) { const o = document.createElement("option"); o.value = i; o.textContent = p.name; el.querySelector(".preset").appendChild(o); } });
     el.querySelector(".preset").addEventListener("change", ev => {
       const p = PRESETS[+ev.target.value];
       if (!p) return;
@@ -977,6 +1016,17 @@
     F.cache.forEach(item => {
       parts.push('<div class="tt-row"><span>' + '<span style="color:' + item.colour + '">▬</span> ' + escapeHtml(item.name) + "</span><b>" + fmt(valueAt(item, seconds)) + " " + escapeHtml(item.spec.u) + "</b></div>");
     });
+    if (F.type !== "map") {
+      // Why the sample under the pointer is invalid, for a signal the figure draws or shades.
+      const rawIndex = Math.floor(seconds / G.raw_dt);
+      [["fhr", "FHR", "fhr_gaps"], ["up", "UA", "gaps"]].forEach(([name, word, overlay]) => {
+        const shown = S.overlays[overlay] || F.cache.some(item => SIGNAL_TRACE_IDS[name].includes(item.spec.id));
+        const span = shown ? spanAt(name, rawIndex) : null;
+        if (!span) return;
+        const length = ((span[1] - span[0]) * G.raw_dt).toFixed(1) + " s";
+        parts.push('<div class="tt-row"><span>' + word + " invalid (" + length + ")</span><b>" + escapeHtml(span[2] || "invalid") + "</b></div>");
+      });
+    }
     tip.innerHTML = parts.join("");
     tip.hidden = false;
     const w = tip.offsetWidth, h = tip.offsetHeight;

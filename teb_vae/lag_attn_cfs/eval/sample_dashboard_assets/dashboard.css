@@ -15,6 +15,7 @@
   --deceleration: rgba(227, 73, 72, .18);
   --warmup: rgba(120, 118, 110, .18);
   --gap: rgba(235, 104, 52, .22);
+  --gap-fhr: rgba(237, 161, 0, .24);
   --unscored: rgba(98, 80, 214, .13);
   --contraction-line: #128a5f;
   --deceleration-line: #c02f2e;
@@ -38,6 +39,7 @@
   --deceleration: rgba(230, 103, 103, .24);
   --warmup: rgba(195, 194, 183, .14);
   --gap: rgba(217, 89, 38, .26);
+  --gap-fhr: rgba(201, 133, 0, .28);
   --unscored: rgba(144, 133, 233, .17);
   --contraction-line: #2fc08f;
   --deceleration-line: #e66767;
@@ -71,6 +73,7 @@ select:focus-visible, input:focus-visible, button:focus-visible, a:focus-visible
 .sw-deceleration { background: var(--deceleration); }
 .sw-warmup { background: var(--warmup); }
 .sw-gap { background: var(--gap); }
+.sw-gap-fhr { background: var(--gap-fhr); }
 .sw-unscored { background: var(--unscored); }
 
 .identity { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 10px 16px 2px; align-items: baseline; }
