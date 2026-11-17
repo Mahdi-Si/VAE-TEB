@@ -317,6 +317,11 @@ eval_config:
     # recordings that have a non-overlapping second segment is enough for a per-recording mean with
     # a bootstrap interval; absent means the analysis's own default of 512.
     time_shift: 512
+    # NOT a retention cap: how many segments the lag-extent analysis draws (seeded, within
+    # max_hours_before_delivery). Each costs one forward plus about thirty attention-and-decode
+    # arms (both key-truncation families and the contraction knockout); about 0.25 s per segment
+    # on a laptop GPU. Absent means every segment.
+    lag_extent: 2048
 
   # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
   # the prior is credited with carrying the target's predictive state. Explicitly provisional:

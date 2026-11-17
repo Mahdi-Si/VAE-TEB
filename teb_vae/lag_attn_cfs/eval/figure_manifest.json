@@ -67,6 +67,11 @@
       "lag_detected.pdf",
       "lag_detected_time.pdf"
     ],
+    "lag_extent": [
+      "lag_extent_events.pdf",
+      "lag_extent_heads.pdf",
+      "lag_extent_reach.pdf"
+    ],
     "lag_clocks": [
       "lag_second_stage.pdf",
       "lag_second_stage_features.pdf",

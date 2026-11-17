@@ -30,6 +30,7 @@ A suggested reading order is `forecast/baseline_comparison.pdf`, then `coupling/
 - [Source-null figures](#source-null-figures)
 - [Time-shift figure](#time-shift-figure)
 - [Occlusion figures](#occlusion-figures)
+- [Lag-extent figures](#lag-extent-figures)
 - [Band-resolved lag-KL figures](#band-resolved-lag-kl-figures)
 - [Gate figures](#gate-figures)
 - [High-KL anchor figures](#high-kl-anchor-figures)
@@ -800,6 +801,28 @@ The `occlusion` analysis (`analyses/occlusion.py`) zeroes the source values with
 **How to read it.** Nothing on this page is tested. The analysis scores one anchor per segment and is capped in segments, so many (class, window) cells are below the minimum group size. Read `n_recordings` in `occlusion_clocks.csv` before you read a movement. [EVAL.md](EVAL.md) gives the arithmetic behind the cap. The observational counterpart is `lag_kld_scaled`, on the same bands and the same grid.
 
 ---
+
+## Lag-extent figures
+
+The `lag_extent` analysis (`analyses/lag_extent.py`) writes these into `lag_extent/`. [EVAL.md](EVAL.md#lag_extent) defines every readout.
+
+### `lag_extent/lag_extent_heads.pdf`
+
+**What it shows.** One row per head. Left: the mean attention over lags per class on a symmetric-log scale, with the median support shaded, and the head's share of the KL in the title. Right: per class, the median and inter-quartile range over recordings of the support's first lag, the 50 % mass lag and the support's last lag.
+
+**How to read it.** Heads own disjoint latent groups, so read the head with the large KL share first. A support that ends at the last searched lag is edge-censored.
+
+### `lag_extent/lag_extent_reach.pdf`
+
+**What it shows.** (a) The gain share kept when only lags $\le k$ are read, per class; (b) the share kept when only lags $\ge k$ are read; (c) per horizon step, the lag window the forecast uses (solid: 90 % end; dotted: start) beside the dashed $\max(d-\tau,0)$ a fixed data delay $d$ predicts; (d) the source gain per horizon step; (e) the latest lag the forecast needs and (f) the dominant head's last support lag, against hours before delivery, as median and IQR over recordings.
+
+**How to read it.** A flat curve in (c) is a recency filter; a slope of $-1$ toward the dashed line is a learned delay. In (a), the value at $k=0$ is the share of the gain that lag $0$ alone carries. Removal renormalises the attention, so (b) can exceed one.
+
+### `lag_extent/lag_extent_events.pdf`
+
+**What it shows.** Against seconds since contraction onset: (a) the dominant head's attention on the contraction's lags, solid, and the fixed-filter null, dotted; (b) the forecast gain lost when the contraction's keys are removed, with the half-peak window shaded; (c) the total source gain. (d) The data: decelerations per recording at each peak-to-nadir delay, matched minus null.
+
+**How to read it.** Solid on dotted in (a) means the head does not follow the contraction. The shaded window in (b) is when, in the contraction cycle, the forecast reads the contraction's own steps; compare it with the delay in (d).
 
 ## Band-resolved lag-KL figures
 

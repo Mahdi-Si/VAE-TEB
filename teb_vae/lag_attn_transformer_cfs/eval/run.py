@@ -223,7 +223,8 @@ RUN_ARGS: Dict[str, Any] = {
     # the live list if the registry changes):
     #   forecast, coupling, perm_control, latent, lag_kl, attention, calibration, residual,
     #   distributions, trajectory, time_to_delivery, second_stage, events, sufficiency, samples,
-    #   recording_traces, warmup, source_null, time_shift, occlusion, lag_clocks, lag_kld_scaled,
+    #   recording_traces, warmup, source_null, time_shift, occlusion, lag_extent, lag_clocks,
+    #   lag_kld_scaled,
     #   event_gate, gate_open, lag_high_kl, spectral_skill, attribution, cross_subgroup
     # ``event_gate`` and ``gate_open`` read the per-anchor tables only, so
     # "only": "event_gate,gate_open" re-runs them against a finished output_dir with no checkpoint.

@@ -45,9 +45,11 @@ EXPECTED_KEYWORD_ONLY = ("eval_config", "output_dir", "probe")
 #: INTERVENTION on the model's input cannot be served by any table a forward already wrote, because
 #: the forward it needs is one that never happened -- the fourth needs the latent at every
 #: anchor of every segment of a recording, which no durable table carries, and the fifth needs a
-#: GRADIENT of that forward, which no table can hold either.
+#: GRADIENT of that forward, which no table can hold either. ``lag_extent`` is the occlusion case
+#: on the attention's keys: its truncation arms are forwards that never ran.
 MODEL_READING_ANALYSES = frozenset(
-    {"samples", "sufficiency", "occlusion", "recording_traces", "attribution", "time_shift"}
+    {"samples", "sufficiency", "occlusion", "recording_traces", "attribution", "time_shift",
+     "lag_extent"}
 )
 
 

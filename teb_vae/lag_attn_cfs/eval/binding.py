@@ -37,6 +37,7 @@ from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analys
 from teb_vae.lag_attn_cfs.eval.analyses import event_gate as event_gate_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import gate_open as gate_open_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_detected as lag_detected_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import lag_extent as lag_extent_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
@@ -284,6 +285,12 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # package permitted to reach for the model on the context, because an intervention on the
     # model's INPUT cannot be served by any table a forward already wrote.
     "occlusion": occlusion_analysis.run_occlusion_analysis,
+    # The extent of the lag structure rather than its location: each head's support start and end,
+    # the earliest and latest lag the forecast needs (two key-truncation families through the
+    # model's own removal mask, by horizon step), whether the attention follows a contraction as it
+    # ages, and the data's own contraction-to-deceleration delay -- by class and through labour.
+    # It re-attends through the model, so it sits beside the other intervention.
+    "lag_extent": lag_extent_analysis.run_lag_extent_analysis,
     # Reads the collected tables and the vector sidecar only, so its position is a reading order
     # rather than a dependency: the lag structure against time before delivery and against the
     # second-stage onset, beside the two clocks that resolve the coupling magnitude.

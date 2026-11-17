@@ -705,6 +705,29 @@ Use `cost.seconds_per_arm_per_segment` to extrapolate when the band count change
 
 The analysis needs `context.task` and `context.loader` and records a skip without them, because no table can serve an intervention on the model's input.
 
+### lag_extent
+
+This analysis reports the **extent** of the lag structure, not its location: the earliest and the latest lag that carries the coupling, per head, per class and through labour, and whether the attention follows a contraction as it ages. It answers three questions that a peak or a centroid cannot.
+
+**Where each head looks.** `1.5-entmax` gives exact zeros, so each head has a support at each anchor: its first and last lag with weight above `1e-4` (`att_first_h<m>`, `att_last_h<m>`), the lags where its cumulative weight reaches 10, 50 and 90 % (`att_q10_h<m>` …) and its centroid. Heads are never averaged first. The same quantiles are taken on the KL attribution map (`klmap_q10` …).
+
+**Where the forecast needs the source.** Keys are removed through the model's own running-gap removal mask (`_attend_and_pose` with an extended `removed`). The target encoder and the prior are the matched forward's; only the attention, the posterior and the decode run again, at the latent mean. Two families on a log-spaced lag grid:
+
+| Family | Arm | Readout |
+|---|---|---|
+| near | keep lags $\le k$ | `effect_mid_lag`, `effect_end_lag`: the first $k$ whose gain share reaches 50 % and 90 % |
+| far | keep lags $\ge k$ | `effect_start_lag`: the $k$ where the share falls below 90 % |
+
+The share is $(G_k - G_{\mathrm{none}})/(G_{\mathrm{full}} - G_{\mathrm{none}})$ on the mean-decoded gain, where $G_{\mathrm{none}}$ removes every key (the gate closes, $q=p$). A recording whose span is below `0.25` nats per anchor gives `NaN`. **Removal renormalises the entmax**, so an arm is "the model reading only these lags"; the KL is not monotone under it, which is why the shares use the gain. Both families are also resolved by horizon step $\tau$ (`lag_extent_horizon.csv`). One query serves the whole horizon, so a delay $d$ needs lag $\max(d-\tau-1,0)$ at step $\tau$. A model that has learned the delay gives `end_lag_slope_vs_tau` near $-1$, and a recency filter gives one near $0$. The table carries the prediction from the data's own delay beside it.
+
+**Whether the attention follows the contraction.** For each anchor with a detected contraction behind it, the contraction body occupies lags $[t-s_{\mathrm{end}},\,t-s_{\mathrm{on}}]$. `ctr_mass_h<m>` is the head's weight there. The null is the run's pooled per-head profile summed over the same lags, which is what a time-invariant filter would put there; `tracking_index` is the difference. `centroid_slope_vs_age` is the head centroid's slope against contraction age in steps: $1$ is tracking, $0$ is a fixed filter. One more arm removes exactly the contraction's keys. `ctr_loss` is the gain it costs, and `knockout_start_age_s`/`knockout_end_age_s` are the first and last contraction-age bins where that loss is at least half its peak. The keys are causal filter outputs, so a key after the contraction still carries some of it: the knockout measures reading the contraction's own steps.
+
+**The data's delay.** Decelerations on the raw FHR in bpm (`events.detect_decelerations`) are paired with the most recent contraction peak within 120 s, and against a null that pairs them with the previous segment's contractions. `lag_extent_delays.csv` holds both histograms and their excess; `delays.<cohort>.excess_median_s` is the reference delay.
+
+Everything is reduced per recording first (anchor means, or the recording's own truncation curve), then by class and by $0.5$ h window before delivery. `effect_end_lag` and the dominant head's `att_last` are tested per window across classes (Kruskal–Wallis, Holm across windows, pairwise on survivors). The rest is descriptive.
+
+The analysis needs `context.task` and `context.loader` and records a skip without them. It draws its segments from the dataset (seeded, within `max_hours_before_delivery`), capped by `caps.lag_extent`, so it is always `capped`. The outputs are `lag_extent_anchors.parquet` (one row per contributing anchor), `lag_extent_arms.npz` (the per-anchor gain of every arm, the grid and the per-class mean attention), `lag_extent_per_recording.csv` (fanned out by class and subgroup), `lag_extent_heads.csv`, `lag_extent_truncation.csv`, `lag_extent_horizon.csv`, `lag_extent_trajectory.csv`, `lag_extent_trajectory_significance.csv`, `lag_extent_event_locked.csv`, `lag_extent_tracking.csv`, `lag_extent_delays.csv` and three figures. The lag axis is stored-coefficient time.
+
 ### lag_clocks
 
 This analysis follows the lag profile through labour on both clinical clocks. It asks whether the location and shape of the profile change over time or differ by class. Read it with `time_to_delivery` and `second_stage`, which measure the amount of predictive gain and KL in the same windows.
