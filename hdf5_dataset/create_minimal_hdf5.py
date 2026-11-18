@@ -9,6 +9,12 @@ Each record goes through the same reading and segment filtering as ``create_new_
 post-delivery segments dropped; the 12.4 h range). Nothing else is computed: no scattering, no
 phase harmonics, no masks, no signal-quality step.
 
+Each record is also read with the MIMO fill off (``create_new_pipeline.mimo_fill``), and the files
+store what the signal-quality step needs, so ``minimal_to_split_hdf5.py --quality v4|v5`` can run it
+later without the ``.mat`` files: the pre-fill signals and the FHR repair mask from the record's raw
+channel. The builder gates the filled and the pre-fill signals separately, so a row is kept when
+either gate keeps it, and ``kept_filled`` / ``kept_prefill`` say which.
+
 Per segment, each file stores:
     fhr, up                 (N, 5280) float32  -- 4 Hz, 22 min
     weight                  (N, 330)  float32  -- MIMO sample weights (1/16 rate)
@@ -18,6 +24,15 @@ Per segment, each file stores:
     cs_label, bg_label      (N,)      uint8
     time_from_labor_onset   (N,)      float32  -- epoch - labour onset (s); NaN if unknown
     second_stage_onset      (N,)      float32  -- epoch - second-stage onset (s); NaN if unknown
+    fhr_pre, up_pre         (N, 5280) float32  -- MIMO fill off; a gap reads 0
+    kept_filled             (N,)      uint8    -- the gates keep the filled signals (a build
+                                                  without the quality step reads these rows)
+    kept_prefill            (N,)      uint8    -- the gates keep the pre-fill signals (a build
+                                                  with the quality step reads these rows)
+    fhr_repaired            (N, 5280) uint8    -- signal_quality.raw_fhr_repaired over the
+                                                  record's kept_prefill rows; 0 elsewhere
+    fhr_repair_exact        (N,)      uint8    -- 1 when that mask was read from the raw channel
+    fhr_raw_match           (N,)      float32  -- its record-wide match rate; NaN without it
 
 ``minimal_guid_selection.csv`` beside the files lists every GUID read and how many segments it gave.
 
@@ -56,6 +71,12 @@ except ModuleNotFoundError as _exc:
         raise
     from hdf5_dataset.new_pipeline import create_new_pipeline as cnp
 try:
+    import profile_signal_quality as psq
+except ModuleNotFoundError as _exc:
+    if _exc.name != "profile_signal_quality":
+        raise
+    from hdf5_dataset.new_pipeline import profile_signal_quality as psq
+try:
     from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args
 except ModuleNotFoundError as _exc:
     if not str(_exc.name).startswith("teb_vae"):
@@ -80,31 +101,62 @@ FIELDS = {
     "bg_label": ((), "u1"),
     "time_from_labor_onset": ((), "f4"),
     "second_stage_onset": ((), "f4"),
+    "fhr_pre": ((cnp.SIGNAL_LENGTH,), "f4"),
+    "up_pre": ((cnp.SIGNAL_LENGTH,), "f4"),
+    "kept_filled": ((), "u1"),
+    "kept_prefill": ((), "u1"),
+    "fhr_repaired": ((cnp.SIGNAL_LENGTH,), "u1"),
+    "fhr_repair_exact": ((), "u1"),
+    "fhr_raw_match": ((), "f4"),
 }
+#: Per-row fields of :func:`read_record`, in :data:`FIELDS` order.
+SIGNAL_FIELDS = ("fhr", "up", "weight", "fhr_pre", "up_pre", "kept_filled", "kept_prefill",
+                 "fhr_repaired", "fhr_repair_exact", "fhr_raw_match")
 
 
 def read_record(job: Tuple[str, str], verbose: bool = False) -> Dict[str, Any]:
-    """Read one .mat file and keep the segments ``create_new_pipeline`` would keep.
+    """Read one .mat file with and without the MIMO fill; keep what either gate keeps.
+
+    ``profile_signal_quality.load_record`` does both reads, checks they agree on the segments and
+    weights, de-duplicates and gates each. The FHR repair mask is computed as the build's
+    ``_clean_record`` computes it: over the record's pre-fill-kept segments, falling back to none
+    when the raw channel is missing or unreadable.
 
     Args:
         job: ``(record_path, subgroup)``.
-        verbose: Show MIMO output.
+        verbose: Unused; MIMO output stays suppressed.
 
     Returns:
-        Dict with ``path``, ``subgroup``, ``fhr``, ``up``, ``weight``, ``epoch`` (empty arrays when
-        nothing survives) and ``error`` (``""`` on success).
+        Dict with ``path``, ``subgroup``, ``epoch``, one array per :data:`SIGNAL_FIELDS` (empty
+        when nothing survives) and ``error`` (``""`` on success).
     """
     path, subgroup = job
     try:
-        fhr, up, ds, w = cnp._run_mimo_pipeline(path, cnp.MIN_DOMAIN_START_DATASET, verbose)
-        fhr, up = cnp._sanitize_signals(fhr, up)
-        keep, _, _ = cnp.deduplicate_segments(ds, w)
-        fhr, up, w, ds = fhr[keep], up[keep], w[keep], [ds[i] for i in keep]
-        valid, _, _ = cnp._quality_filter_segments(fhr, up, w, ds)
-        valid = [i for i in valid if ds[i] < 0]  # post-delivery segments out, as in the pipeline
-        epoch = np.asarray(ds, dtype=np.float32)[valid]
-        return dict(path=path, subgroup=subgroup, fhr=fhr[valid], up=up[valid], weight=w[valid],
-                    epoch=epoch, error="")
+        r = psq.load_record(path)
+        kept_filled = np.array([g == "kept" for g in r["gate"]], dtype=bool)
+        kept_prefill = np.array([g == "kept" for g in r["gate_prefill"]], dtype=bool)
+        n = len(kept_prefill)
+        repaired = np.zeros((n, cnp.SIGNAL_LENGTH), dtype=np.uint8)
+        exact = np.zeros(n, dtype=np.uint8)
+        match = np.full(n, np.nan, dtype=np.float32)
+        if kept_prefill.any():
+            try:
+                mask, info = psq.sq.raw_fhr_repaired(path, r["domain_start"][kept_prefill],
+                                                     r["fhr_pre"][kept_prefill],
+                                                     r["present"][kept_prefill])
+            except Exception as exc:  # noqa: BLE001 -- the build's rules stand in, as there
+                mask, info = None, {"raw_fhr": repr(exc)}
+            if mask is not None:
+                repaired[kept_prefill] = mask
+                exact[kept_prefill] = 1
+                match[kept_prefill] = info.get("raw_match", np.nan)
+        keep = kept_filled | kept_prefill
+        out = dict(fhr=r["fhr_now"], up=r["up_now"], weight=r["weight"], fhr_pre=r["fhr_pre"],
+                   up_pre=r["up_pre"], kept_filled=kept_filled, kept_prefill=kept_prefill,
+                   fhr_repaired=repaired, fhr_repair_exact=exact, fhr_raw_match=match)
+        out = {k: np.asarray(v)[keep] for k, v in out.items()}
+        return dict(path=path, subgroup=subgroup,
+                    epoch=r["domain_start"][keep].astype(np.float32), error="", **out)
     except Exception as exc:  # noqa: BLE001 -- one bad record must not stop the build
         return dict(path=path, subgroup=subgroup, epoch=np.zeros(0, np.float32), error=str(exc))
 
@@ -139,7 +191,7 @@ def append_record(h5f: h5py.File, rec: Dict[str, Any], labor_map: Dict[str, floa
     target, cs, bg = cnp.SUBGROUP_META[rec["subgroup"]]
     epoch = rec["epoch"]
     rows = {
-        "fhr": rec["fhr"], "up": rec["up"], "weight": rec["weight"], "epoch": epoch,
+        **{k: rec[k] for k in SIGNAL_FIELDS}, "epoch": epoch,
         "guid": [guid] * n,
         "class_label": np.full(n, target, np.uint8),
         "cs_label": np.full(n, cs, np.uint8),
@@ -256,7 +308,7 @@ RUN_ARGS: Dict[str, Any] = {
     "output_dir": r"/data1/fetal-heart-tracing/HDF5_Datasets/minimal_raw_signals",
     # str | None -- CSV with trace_guid, labor_onset_hours, second_stage_onset_hours.
     #        (None -> time_from_labor_onset and second_stage_onset are NaN)
-    "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
+    "tlo_csv_path": r"/data/deid/datafabric/fetal-heart-tracing/processing/labor_onset/labor_onset_by_dataset.csv",
     # int | None -- seed of the healthy draw.  (None -> 42, the pipeline's RANDOM_STATE)
     "seed": None,
     # int | None -- parallel record readers; 1 reads in this process.  (None -> min(cpu_count, 8))

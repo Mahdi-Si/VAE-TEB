@@ -88,6 +88,8 @@ class MinimalAdaptor:
 
     #: GUID -> (minimal file, its rows in increasing order); filled by :func:`install_adaptor`.
     index: Dict[str, Tuple[str, np.ndarray]] = {}
+    #: Serve ``up_pre``/``fhr_pre`` (the signal-quality build) instead of ``up``/``fhr``.
+    prefill: bool = False
 
     def __init__(self, **_: Any) -> None:
         self.mimo = self
@@ -98,14 +100,42 @@ class MinimalAdaptor:
         with h5py.File(path, "r") as f:
             # One contiguous read, then the rows: a GUID's rows lie in one block of the file.
             read = lambda k: f[k][rows[0]:rows[-1] + 1][rows - rows[0]]  # noqa: E731
+            suffix = "_pre" if self.prefill else ""
             self._prepared = types.SimpleNamespace(
-                block_input=np.stack([read("up"), read("fhr")], axis=-1),
+                block_input=np.stack([read("up" + suffix), read("fhr" + suffix)], axis=-1),
                 domain_start=[float(x) for x in read("epoch")],
                 sample_weights=read("weight"),
             )
 
     def prepare_data(self, **_: Any) -> Tuple[Any, None]:
         return self._prepared, None
+
+
+class MimoSequence:
+    """What ``create_new_pipeline.mimo_fill(False)`` patches: it looks the class up in the module
+    of the adaptor in use, this one. The minimal files have no fill to turn off;
+    :attr:`MinimalAdaptor.prefill` picks the stored pre-fill signals instead."""
+
+    def interpolate_input(self) -> "MimoSequence":
+        return self
+
+
+def stored_fhr_repaired(record_path: str, domain_start: np.ndarray, fhr_pre: np.ndarray,
+                        present: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """``signal_quality.raw_fhr_repaired`` from the mask ``create_minimal_hdf5.py`` stored.
+
+    The record's raw channel was read on the server, over the same segments the build keeps, so
+    the mask and the match rate are the ones a build from the ``.mat`` file computes.
+    """
+    path, rows = MinimalAdaptor.index[bfd._stem(record_path)]
+    with h5py.File(path, "r") as f:
+        epoch = f["epoch"][rows[0]:rows[-1] + 1][rows - rows[0]]
+        pos = {float(e): i for i, e in enumerate(epoch)}
+        sel = rows[[pos[float(t)] for t in domain_start]]
+        if not f["fhr_repair_exact"][sel].all():
+            return None, {"raw_fhr": "no exact repair mask stored"}
+        mask = f["fhr_repaired"][sel[0]:sel[-1] + 1][sel - sel[0]].astype(bool)
+        return mask, {"raw_match": float(f["fhr_raw_match"][sel[0]])}
 
 
 def _load_pipeline() -> Any:

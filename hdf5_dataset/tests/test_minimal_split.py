@@ -22,3 +22,23 @@ def test_round_mantissa_bounds_error_and_keeps_specials():
     finite = [0, 1, 7, 8]
     err = np.abs(y[finite].astype(float) - x[finite].astype(float))
     assert (err <= np.abs(x[finite].astype(float)) * 2.0 ** -6).all()
+
+
+def test_stored_fhr_repaired_follows_the_segments_the_build_asks_for(tmp_path):
+    import h5py
+    from hdf5_dataset import minimal_to_full_hdf5 as m2f
+
+    path = str(tmp_path / "m.hdf5")
+    mask = np.zeros((4, 8), np.uint8)
+    mask[np.arange(4), np.arange(4)] = 1          # row r is marked at sample r
+    with h5py.File(path, "w") as f:
+        f["epoch"] = np.array([-900.0, -600.0, -300.0, -100.0], np.float32)
+        f["fhr_repaired"] = mask
+        f["fhr_repair_exact"] = np.array([1, 1, 1, 0], np.uint8)
+        f["fhr_raw_match"] = np.full(4, 0.9, np.float32)
+    m2f.MinimalAdaptor.index = {"g1": (path, np.arange(4))}
+    got, info = m2f.stored_fhr_repaired("/x/g1.mat", np.array([-600.0, -300.0]), None, None)
+    assert got.dtype == bool and np.flatnonzero(got[0]) == [1] and np.flatnonzero(got[1]) == [2]
+    assert info["raw_match"] == np.float32(0.9)
+    # A record without an exact mask falls back to the rules, as a build from the .mat does.
+    assert m2f.stored_fhr_repaired("/x/g1.mat", np.array([-100.0]), None, None)[0] is None

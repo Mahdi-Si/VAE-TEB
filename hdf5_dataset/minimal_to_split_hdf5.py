@@ -31,14 +31,24 @@ Output, in ``output_dir``::
     split_guids.csv             one row per GUID: subgroup, split, segments kept
     segments.csv                one row per segment in the window: gap fractions, kept or not
 
-Not supported, as in ``minimal_to_full_hdf5.py``: the signal-quality step (it needs the signals
-before the MIMO fill). Use a configuration with every quality switch off, as ``tiny.yaml`` does.
+* **Signal quality** (``quality``: ``"v4"`` or ``"v5"``). The pipeline's own quality step, as a
+  production build with ``signal_quality`` runs it: the minimal files serve the pre-fill signals
+  and the FHR repair mask that ``create_minimal_hdf5.py`` stored (a file without ``fhr_pre`` is
+  refused), the gates and the gap measure above read the pre-fill signals, and every file gets the
+  quality datasets, ``<block>_rho`` and the root ``quality_*`` attributes. ``"v5"`` is the current
+  rules, the build of ``build_fold_datasets.py`` (``signal_quality`` on, ``quality_valid_boxes``
+  off). ``"v4"`` turns off the two rules version 5 added (``crest_valid``, ``brief_max_s``), which
+  gives the version 4 masks bit for bit, for checkpoints trained on a version 4 build; the files
+  still record ``quality_version`` 5, and ``quality_crest_valid`` / ``quality_brief_max_s`` tell
+  the two apart. Each needs its own ``output_dir`` and statistics. ``None`` builds without it; the
+  configuration then needs every quality switch off, as ``tiny.yaml`` does.
 
 Run: edit :data:`RUN_ARGS` at the bottom and press Run, or override a key on the command line.
 A rerun into the same directory skips every complete file.
 """
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -81,6 +91,8 @@ COEFFICIENT_BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
 GAP_MIN_RUN = 40
 #: Rows per read while compacting and while measuring the gaps.
 BATCH_ROWS = 2048
+#: ``quality`` -> the ``signal_quality.QualityConfig`` changes from the default (version 5) rules.
+QUALITY_RULES = {"v5": {}, "v4": {"crest_valid": False, "brief_max_s": 0.0}}
 
 
 def gap_fraction(x: np.ndarray, min_run: int = GAP_MIN_RUN, tol: float = 1e-3) -> np.ndarray:
@@ -97,9 +109,13 @@ def gap_fraction(x: np.ndarray, min_run: int = GAP_MIN_RUN, tol: float = 1e-3) -
     return out / lin.shape[1]
 
 
-def select_segments(paths: Sequence[str], last_hours: float,
-                    max_gap_fraction: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def select_segments(paths: Sequence[str], last_hours: float, max_gap_fraction: float,
+                    prefill: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Measure every segment in the window and keep the good ones.
+
+    With *prefill* the rows the gates keep on the pre-fill signals (``kept_prefill``) are read and
+    the gaps are measured on ``fhr_pre``/``up_pre``, where a gap is a run of zeros; otherwise the
+    ``kept_filled`` rows (every row of an older file) and ``fhr``/``up``.
 
     Returns:
         ``(guids, segments)``: :func:`minimal_to_full_hdf5.scan_minimal`'s GUID table with the
@@ -111,15 +127,20 @@ def select_segments(paths: Sequence[str], last_hours: float,
     tables = []
     for path in map(os.path.abspath, paths):
         with h5py.File(path, "r") as f:
+            if prefill and "fhr_pre" not in f:
+                raise ValueError(f"{path} has no pre-fill signals; rebuild it with the current "
+                                 f"create_minimal_hdf5.py to run the quality step")
+            flag = "kept_prefill" if prefill else "kept_filled"
             epoch = f["epoch"][:]
-            rows = np.flatnonzero(epoch >= epoch_min)
+            ok = f[flag][:].astype(bool) if flag in f else np.ones(len(epoch), dtype=bool)
+            rows = np.flatnonzero((epoch >= epoch_min) & ok)
             names = f["guid"].asstr()[:][rows]
             gaps = {"fhr": np.zeros(len(rows)), "up": np.zeros(len(rows))}
             fhr_zero = np.zeros(len(rows), dtype=bool)
             for a in range(0, len(rows), BATCH_ROWS):
                 sel = rows[a:a + BATCH_ROWS]
                 for name in gaps:
-                    x = f[name][sel[0]:sel[-1] + 1][sel - sel[0]]
+                    x = f[name + ("_pre" if prefill else "")][sel[0]:sel[-1] + 1][sel - sel[0]]
                     gaps[name][a:a + len(sel)] = gap_fraction(x)
                     if name == "fhr":
                         fhr_zero[a:a + len(sel)] = (x == 0).any(axis=1)
@@ -221,8 +242,12 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
          leg_alignment: Optional[str] = None,
          phase_operator: Optional[str] = None, device: Optional[str] = None,
          scatter_batch_size: Optional[int] = None, trim_minutes: Optional[float] = None,
-         compute_stats: Optional[bool] = None, verbose: Optional[bool] = None) -> int:
+         compute_stats: Optional[bool] = None, verbose: Optional[bool] = None,
+         quality: Optional[str] = None) -> int:
     """Apply the defaults, select, split, transform, compact and compute the statistics."""
+    quality = None if quality == "off" else quality
+    if quality is not None and quality not in QUALITY_RULES:
+        raise ValueError(f"quality={quality!r}; valid: None, {sorted(QUALITY_RULES)}")
     last_hours = 4.0 if last_hours is None else float(last_hours)
     max_gap_fraction = 0.10 if max_gap_fraction is None else float(max_gap_fraction)
     test_fraction = 0.2 if test_fraction is None else float(test_fraction)
@@ -238,7 +263,7 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
     paths = [os.path.abspath(p) for p in minimal_paths]
     os.makedirs(output_dir, exist_ok=True)
 
-    guids, segments = select_segments(paths, last_hours, max_gap_fraction)
+    guids, segments = select_segments(paths, last_hours, max_gap_fraction, quality is not None)
     segments.to_csv(os.path.join(output_dir, "segments.csv"), index=False)
     guids = split_guids(guids, test_fraction, seed, max_guids_per_subgroup)
     guids.drop(columns="rows").to_csv(os.path.join(output_dir, "split_guids.csv"), index=False)
@@ -251,12 +276,21 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
     m2f.MinimalAdaptor.index = {g: (f, r) for g, f, r in zip(
         guids["tracing_guid"], guids["record_path"].map(os.path.dirname), guids["rows"])}
     cnp.EarlyMaestraMimoAdaptor = m2f.MinimalAdaptor
+    m2f.MinimalAdaptor.prefill = quality is not None
+    if quality is not None:
+        cnp.sq.raw_fhr_repaired = m2f.stored_fhr_repaired
     keys = guids["tracing_guid"].map(cnp._normalize_guid)
     labor_map = dict(zip(keys, guids["tlo_hours"] * 3600.0))
     ss_map = dict(zip(keys, guids["ss_hours"] * 3600.0))
     masks = cnp.compute_scattering_masks(
         cnp.SIGNAL_LENGTH, scattering_T=16, device=torch.device("cpu"), transform=cnp.CAUSAL,
         leg_alignment=leg_alignment, phase_operator=phase_operator)
+    cfg = dataclasses.replace(cnp.sq.DEFAULT_CONFIG, **QUALITY_RULES.get(quality, {}))
+    # Every switch any rule set changes, with this build's value: a complete file must agree.
+    rules = {k: getattr(cfg, k) for r in QUALITY_RULES.values() for k in r} if quality else {}
+    if quality is not None:
+        cnp.attach_signal_quality(masks, cfg)
+    quality_version = cnp.sq.QUALITY_VERSION if quality is not None else None
     source = os.path.join(os.path.abspath(output_dir), "split_guids.csv")
     torch_device = torch.device(device) if device else None
 
@@ -265,7 +299,12 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
         final = os.path.join(output_dir, split, f"{sg}.hdf5")
         files[split].append(os.path.abspath(final))
         records = grp["record_path"].tolist()
-        if bfd.is_complete(final, cnp.guid_set_digest(records), source):
+        if bfd.is_complete(final, cnp.guid_set_digest(records), source, quality_version):
+            with h5py.File(final, "r") as f:
+                other = {k: f.attrs.get(f"quality_{k}") for k in rules}
+            if any(other[k] != v for k, v in rules.items()):
+                raise ValueError(f"{final} was built with other quality rules ({other}); use "
+                                 f"another output_dir")
             logger.info(f"complete, skipped: {final}")
             continue
         os.makedirs(os.path.dirname(final), exist_ok=True)
@@ -290,7 +329,8 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
         compute_statistics(files["train"] + files["test"], stat_path, trim_minutes, device or "cpu")
     with open(os.path.join(output_dir, "dataset_files.yaml"), "w", encoding="utf-8") as f:
         f.write(f"# Built by hdf5_dataset/minimal_to_split_hdf5.py: last {last_hours:g} h, "
-                f"gaps <= {max_gap_fraction:.0%}, trim_minutes {trim_minutes:g}.\n")
+                f"gaps <= {max_gap_fraction:.0%}, trim_minutes {trim_minutes:g}, "
+                f"quality {quality or 'off'}.\n")
         for key, split in (("vae_train_datasets", "train"), ("vae_test_datasets", "test")):
             f.write(f"{key}:\n")
             f.writelines(f"  - {p}\n" for p in files[split])
@@ -325,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
                    action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--verbose", dest="verbose", action=argparse.BooleanOptionalAction,
                    default=None)
+    p.add_argument("--quality", dest="quality", choices=[*sorted(QUALITY_RULES), "off"])
     return p
 
 
@@ -347,12 +388,18 @@ RUN_ARGS: Dict[str, Any] = {
     "minimal_paths": [os.path.join(_MINIMAL_DIR, f"{c}.hdf5")
                       for c in ("acidosis", "hie", "healthy")],
     # str -- the output directory. Required. A rerun into it skips complete files.
-    "output_dir": os.path.join(_MINIMAL_DIR, "split_last4h_gap10"),
+    "output_dir": os.path.join(_MINIMAL_DIR, "split_last4h_gap10_qv5"),
+    # "v4" | "v5" | "off" | None -- the signal-quality step and its rules; see the module docstring. Needs
+    #        minimal files with pre-fill signals. "v5" is what build_fold_datasets.py builds
+    #        (signal_quality on, quality_valid_boxes off); "v4" only to evaluate a checkpoint
+    #        trained on a version 4 build.  ("off" or None -> no quality step)
+    "quality": "v5",
 
     # ================================ Selection ================================
     # float | None -- keep segments wholly inside the last N hours before delivery.  (None -> 4)
     "last_hours": 4.0,
-    # float | None -- most of FHR, and of UP, in filled gaps (straight runs >= 10 s). (None -> 0.10)
+    # float | None -- most of FHR, and of UP, in gaps (straight runs >= 10 s; filled, or zeros
+    #        with the quality step).  (None -> 0.10)
     "max_gap_fraction": 0.10,
     # float | None -- test share of each subgroup's GUIDs.  (None -> 0.2)
     "test_fraction": 0.2,

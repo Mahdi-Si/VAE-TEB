@@ -4504,7 +4504,7 @@ RUN_ARGS: Dict[str, Any] = {
     "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_int",
 
     # str -- CSV carrying the labour-onset and second-stage columns. Required.
-    "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
+    "tlo_csv_path": r"/data/deid/datafabric/fetal-heart-tracing/processing/labor_onset/labor_onset_by_dataset.csv",
 
     # str | None -- the two-sided run's classification_dataset_records.pickle. Skips steps 1-3 and
     #        pins the SAME GUIDs, folds, partitions and segments, which is what makes this build
