@@ -26,7 +26,7 @@ from teb_vae.lag_attn_rws.eval.launch import (  # noqa: E402
     missing_required,
     resolve_launch_args,
 )
-from hdf5_dataset import (  # noqa: E402
+from hdf5_dataset.hdf5_dataset import (  # noqa: E402
     LEG_ALIGNMENT_NONE,
     PHASE_OPERATOR_LEGACY,
     TWO_SIDED,

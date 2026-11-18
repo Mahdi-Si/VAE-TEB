@@ -12,9 +12,13 @@ start is the rung-7 network exactly: same forecast, same NLL, same KL at step 0.
 and no data is read. The optimizer state is dropped (one tensor changed shape); the config's
 ``core_model_checkpoint`` loads weights only.
 
-Run from an IDE by editing :data:`RUN_ARGS`, or::
+From the repo root::
 
-    python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s8init --source A.ckpt --output B.ckpt
+    python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s8init --source <run>/lag-attn-trf-cfs-epoch=443.ckpt
+
+``--output`` is optional and defaults to ``<source stem>-s8init.ckpt`` beside the source. From an
+IDE's Run button, with no command line, :data:`RUN_ARGS` is used instead; a flag given on the
+command line overrides its entry.
 """
 from __future__ import annotations
 
@@ -33,9 +37,10 @@ from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs  # n
 from train.graph_models_utils import check_model_class, load_checkpoint_strict  # noqa: E402
 
 KEY = "decoder.persistence_lag_weight"
+#: The IDE entry: set ``source`` and press Run. ``output`` None writes ``<source stem>-s8init.ckpt``.
 RUN_ARGS: Dict[str, Any] = dict(
     source="SET_ME/lag-attn-trf-cfs-epoch=443.ckpt",
-    output="SET_ME/lag-attn-trf-cfs-epoch=443-s8init.ckpt",
+    output=None,
     lags=38,
 )
 
@@ -82,16 +87,21 @@ def build(source: Path, output: Path, lags: int) -> Path:
 
 
 def main(args: Dict[str, Any]) -> Path:
-    unset = [n for n in ("source", "output") if str(args[n]).startswith("SET_ME")]
-    if unset:
-        raise ValueError(f"set {', '.join(unset)} in RUN_ARGS or on the command line")
-    path = build(Path(args["source"]), Path(args["output"]), int(args["lags"]))
+    if str(args["source"]).startswith("SET_ME"):
+        raise ValueError("set --source on the command line, or source in RUN_ARGS")
+    source = Path(args["source"])
+    output = Path(args["output"]) if args["output"] else source.with_name(f"{source.stem}-s8init.ckpt")
+    path = build(source, output, int(args["lags"]))
     print(f"wrote {path}; strict load passed; decoder output unchanged by the {args['lags']}-lag padding")
     return path
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    for k, v in RUN_ARGS.items():
-        p.add_argument(f"--{k}", type=type(v), default=v)
+    p.add_argument("--source", default=RUN_ARGS["source"],
+                   help="the trained rung-7 checkpoint to widen (e.g. lag-attn-trf-cfs-epoch=443.ckpt)")
+    p.add_argument("--output", default=RUN_ARGS["output"],
+                   help="where to write the warm start [default: <source stem>-s8init.ckpt beside the source]")
+    p.add_argument("--lags", type=int, default=RUN_ARGS["lags"],
+                   help="persistence lags of the warm start; must match persistence_lags in the s8 config [38]")
     main(vars(p.parse_args()))

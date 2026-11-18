@@ -39,6 +39,10 @@ general_config:
   lr: 0.0003
   lr_milestone: [150, 300]
   epochs: 400
+  # The rung-7 run's own batch (its resolved_config.yaml), so the gradient noise matches. [128]
+  batch_size:
+    train: 228
+    test: 228
 
 model_config:
   # SET THIS PATH to the file make_s8init.py wrote. [rung 7: the s7init file]
