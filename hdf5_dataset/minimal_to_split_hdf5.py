@@ -59,7 +59,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: Repository root: ``hdf5_dataset/minimal_to_split_hdf5.py`` -> up two.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if not __package__ and _REPO_ROOT not in sys.path:
+if not __package__:
+    # The root must come first, even when an IDE has added it already. Otherwise this
+    # folder's hdf5_dataset.py shadows the hdf5_dataset package.
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _REPO_ROOT]
     sys.path.insert(0, _REPO_ROOT)
 
 import h5py

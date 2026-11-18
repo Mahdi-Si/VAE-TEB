@@ -51,8 +51,10 @@ def _import_pipeline() -> Any:
         The imported ``create_new_pipeline`` module.
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    # The root must come first, even when an IDE has added it already. Otherwise this
+    # folder's hdf5_dataset.py shadows the hdf5_dataset package.
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != repo_root]
+    sys.path.insert(0, repo_root)
 
     # Stub the prod-only adaptor: the pipeline imports the symbol but the
     # selection code path never constructs one.

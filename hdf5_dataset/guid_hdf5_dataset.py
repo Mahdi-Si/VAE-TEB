@@ -111,7 +111,10 @@ from torch.utils.data import Dataset, DataLoader
 # that contains it. Putting the repository root first is what lets the self-test below run from
 # the Run button with no PYTHONPATH set.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if not __package__ and _REPO_ROOT not in sys.path:
+if not __package__:
+    # The root must come first, even when an IDE has added it already. Otherwise this
+    # folder's hdf5_dataset.py shadows the hdf5_dataset package.
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _REPO_ROOT]
     sys.path.insert(0, _REPO_ROOT)
 
 from hdf5_dataset.hdf5_dataset import (

@@ -32,7 +32,10 @@ import torch
 # intra-package imports precisely to stay importable under the production package name; this one is
 # an entry point, is not on the pipeline's import path, and takes the repo-root guard instead.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if not __package__ and _REPO_ROOT not in sys.path:
+if not __package__:
+    # The root must come first, even when an IDE has added it already. Otherwise this
+    # folder's hdf5_dataset.py shadows the hdf5_dataset package.
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _REPO_ROOT]
     sys.path.insert(0, _REPO_ROOT)
 
 from hdf5_dataset.causal_scattering import (  # noqa: E402

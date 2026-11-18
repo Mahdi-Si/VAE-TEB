@@ -137,8 +137,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Launched as a script (an IDE's Run button), this file's own directory is on
 # sys.path but the repository root is not; the launch helpers below need it.
-if not __package__ and _REPO_ROOT not in sys.path:
-    sys.path.append(_REPO_ROOT)
+if not __package__:
+    # The root must come first, even when an IDE has added it already. Otherwise this
+    # folder's hdf5_dataset.py shadows the hdf5_dataset package.
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _REPO_ROOT]
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
