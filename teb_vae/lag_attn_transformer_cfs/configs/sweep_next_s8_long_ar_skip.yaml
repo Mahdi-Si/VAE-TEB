@@ -1,0 +1,61 @@
+# Next-step ladder, rung 8: rung 7 with the decoder's AR skip widened from 6 lags (20 s) to 38
+# lags (148 s), continued from a trained rung-7 checkpoint. Every other key is rung 7's.
+#
+# WHY. The s7 audit (tmp/audit_s7/REPORT.md, epoch 443, test split of split_last4h_gap10) found the
+# scattering MEAN forecast is the model's weak point: a ridge on longer FHR history beats it by
+# ~9%, and removing the 6-lag skip helps at 24-80 s horizons. An own-channel direct AR fitted on
+# the train split, scored on the same cells: scattering MSE 0.604 (6 lags), 0.575 (16), 0.547
+# (38), against 0.567 for the VAE. The phase block does not move (0.664 -> 0.663), and the VAE
+# already wins there. The skip is target-only, so pred_gap stays a pure source readout.
+#
+# WARM START. `make_s8init.py` zero-pads `decoder.persistence_lag_weight` from (30, 5, 76) to
+# (30, 37, 76) and checks that the decoder output is unchanged, so step 0 is the rung-7 network
+# exactly. Build it on the training machine, then set the path below:
+#   python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s8init \
+#       --source <run>/model_checkpoints/lag-attn-trf-cfs-epoch=443.ckpt \
+#       --output <run>/model_checkpoints/lag-attn-trf-cfs-epoch=443-s8init.ckpt
+# The rung-7 keys the strict loader depends on (forecast_ar_max, source_mask_mode soft,
+# decoder_logvar_clamp, posterior_event_gate) are inherited unchanged; do not move them here.
+#
+# READ THIS RUN AGAINST THE RUNG-7 RUN, epoch for epoch from the warm start:
+#   * scattering MSE against own-channel AR(6) (eval/linear_baselines.py): 0.93 at epoch 443,
+#     expected 0.85-0.90; the mid-horizon hump (tau ~ 56 s) should flatten;
+#   * `val/nll_full_block`: expected to fall; it must not rise above the epoch-443 value after
+#     the first ~5 epochs (the start is exact, so an early rise means the LR is too high);
+#   * `val/pred_gap_mean`: may fall a little, because the base branch gets better on its own.
+#     Judge the source by the gain after contraction onset, not by this number alone;
+#   * phase MSE: unchanged.
+# REFUTED if after ~100 epochs scattering MSE/AR(6) is still above 0.92: then the transformer
+# already carried what the long lags add, and the next step is the frozen-target-path stage.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s8_long_ar_skip.yaml
+base: sweep_next_s7_tolerant_ua_tails.yaml
+
+general_config:
+  # The rung-7 run ended at 0.003 * 0.1 = 0.0003 after its epoch-400 milestone; continue there,
+  # with the default 2000-step ramp from zero, and drop x0.1 at epoch 150 of this run.
+  lr: 0.0003
+  lr_milestone: [150, 300]
+  epochs: 400
+
+model_config:
+  # SET THIS PATH to the file make_s8init.py wrote. [rung 7: the s7init file]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=443-s8init.ckpt
+
+  VAE_model:
+    # Rung 8: 38 lags = 148 s, the full lag window of the source attention. [6]
+    persistence_lags: 38
+    # The warm start was trained at beta = 1, and the skip change does not touch the latent, so
+    # the KL warm-up from 0 is not restarted. [linear_warmup 0 -> 1 over 50 epochs]
+    beta_schedule:
+      kind: constant
+      value: 1.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s8_long_ar_skip
+      tags:
+        variant: lag_attn_trf_cfs_next_s8_long_ar_skip
