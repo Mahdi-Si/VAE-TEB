@@ -94,6 +94,7 @@ from teb_vae.lag_attn_rws.eval._reuse import configure_numerics, subsample_indic
 from teb_vae.lag_attn_rws.eval import launch  # noqa: E402
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding  # noqa: E402
 from teb_vae.lag_attn_rws.task import checkpoint_task_kwargs  # noqa: E402
+from teb_vae.lag_attn_rws.eval.send_pack import pack_for_sending  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
     AnalysisContext,
@@ -1324,6 +1325,10 @@ def main(
         for record in report.failed_steps:
             logger.error(f"[{record.name}] {record.error}")
             logger.error(f"{record.traceback}")
+        try:
+            logger.info(f"data without figures copied to {pack_for_sending(results_dir)}")
+        except OSError as error:
+            logger.warning(f"could not copy the data to a _send folder: {error}")
         return report.exit_code()
     finally:
         logger.remove(sink_id)

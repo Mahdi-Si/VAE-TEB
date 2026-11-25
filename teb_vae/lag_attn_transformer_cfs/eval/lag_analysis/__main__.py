@@ -12,12 +12,21 @@ import sys
 import time
 from pathlib import Path
 
-import h5py
-import numpy as np
-import torch
+# An IDE Run button runs this file as a script: put the repository root on sys.path (it is four levels
+# up) so the absolute imports below resolve.
+_REPO_ROOT = str(Path(__file__).resolve().parents[4])
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from . import core, report
-from .steps import DONOR_STEPS, LAG_STEPS, SLOW_DELAY_S, SPLIT_BY, STEPS, Acc
+import h5py  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from teb_vae.lag_attn_rws.eval.send_pack import pack_for_sending  # noqa: E402
+from teb_vae.lag_attn_transformer_cfs.eval.lag_analysis import core, report  # noqa: E402
+from teb_vae.lag_attn_transformer_cfs.eval.lag_analysis.steps import (  # noqa: E402
+    DONOR_STEPS, LAG_STEPS, SLOW_DELAY_S, SPLIT_BY, STEPS, Acc,
+)
 
 
 def parse(argv=None):
@@ -284,8 +293,56 @@ def main(argv=None):
     info_path.write_text(json.dumps(info, indent=1, default=str))
     rows_out = report.build(out, info)
     print(f"{len(rows_out)} statistics written to {out}")
+    print(f"data without figures copied to {pack_for_sending(out)}")
     return 0
 
 
+#: Arguments for a run without command-line arguments (an IDE Run button). Any argument given on the
+#: command line replaces all of these. Keys are the command-line options with "_" for "-"; None leaves
+#: an option at its default. Paths are the production server's.
+RUN_ARGS = {
+    # The checkpoint to analyse. Run once for the new run's best checkpoint and once for the
+    # checkpoint it started from (epoch 369 or 400), with the same shards and stats.
+    "checkpoint": "/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-11-18--[12-40]-lag_attn_trf_cfs_revised/model_checkpoints/lag-attn-trf-cfs-epoch=369.ckpt",
+    # Shard files or globs, evaluated together as one set. These are the training run's validation
+    # shards (healthy only). Add acidosis and HIE shards to fill the "adverse" block of the report.
+    "shards": ["/data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/*/shard_*.hdf5"],
+    # The normalisation statistics the checkpoint was trained with.
+    "stats": "/data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/stats.hdf5",
+    # Output folder. None = <run folder>/lag_analysis/<checkpoint name>, beside model_checkpoints;
+    # the copy without figures goes to the same path + "_send".
+    "out": None,
+    # Resolved training config; None = the resolved_config.yaml beside the checkpoint.
+    "config": None,
+    "steps": None,        # None = all steps; or e.g. "gain,shift,events"
+    "max_guids": None,    # None = every recording; a small number for a quick try
+    "batch_size": None,   # None = 16
+    "num_workers": None,  # None = 2
+    "k_samples": None,    # None = 8 latent samples
+    "device": None,       # None = cuda if available
+    "force": False,       # True = redo steps whose result file exists
+}
+
+
+def run_args_argv(run_args):
+    """The command-line arguments that ``run_args`` stands for (see :data:`RUN_ARGS`)."""
+    args = dict(run_args)
+    if args.get("out") is None:
+        checkpoint = Path(args["checkpoint"])
+        args["out"] = str(checkpoint.parent.parent / "lag_analysis" / checkpoint.stem)
+    argv = []
+    for key, value in args.items():
+        flag = "--" + key.replace("_", "-")
+        if value is None or value is False:
+            continue
+        if value is True:
+            argv.append(flag)
+        elif isinstance(value, (list, tuple)):
+            argv += [flag, *map(str, value)]
+        else:
+            argv += [flag, str(value)]
+    return argv
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:] or run_args_argv(RUN_ARGS)))

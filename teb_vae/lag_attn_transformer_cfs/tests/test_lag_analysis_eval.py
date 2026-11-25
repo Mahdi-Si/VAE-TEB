@@ -83,3 +83,16 @@ def test_the_pipeline_writes_a_self_describing_folder_and_resumes(tmp_path, caps
     assert "resuming after batch 1/2" in capsys.readouterr().out and not progress.exists()
     again = json.loads((tmp_path / "resumed" / "lag_analysis.json").read_text())
     assert again["statistics"] == stats and again["curves"] == result["curves"]
+
+
+def test_run_args_become_the_command_line_the_parser_reads():
+    """The Run-button dict: lists expand, flags appear only when True, out defaults beside the run."""
+    from teb_vae.lag_attn_transformer_cfs.eval.lag_analysis import __main__ as cli
+
+    run_args = dict(cli.RUN_ARGS, checkpoint="/runs/r1/model_checkpoints/m-epoch=3.ckpt",
+                    shards=["/a/*.hdf5", "/b.hdf5"], max_guids=5, force=True)
+    args = cli.parse(cli.run_args_argv(run_args))
+
+    assert args.out == "/runs/r1/lag_analysis/m-epoch=3"
+    assert args.shards == ["/a/*.hdf5", "/b.hdf5"] and args.max_guids == 5 and args.force
+    assert args.batch_size == 16 and args.config is None
