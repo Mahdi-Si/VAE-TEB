@@ -250,6 +250,8 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         # The IRF head's learning-rate multiplier; forwarded only when it is not the inert 1.0.
         if float(vae_config.get("irf_lr_scale") or 1.0) != 1.0:
             extra["irf_lr_scale"] = float(vae_config["irf_lr_scale"])
+        if vae_config.get("freeze_target_path"):
+            extra["freeze_target_path"] = True
         if vae_config.get("source_valid_tolerance_s") is not None:
             dataset_config = self.config.get("dataset_config") or {}
             paths = [

@@ -118,6 +118,8 @@ TASK_LEVEL_KEYS = (
     "lambda_full_wrong",
     # The learning-rate multiplier of the IRF head's optimizer group, read by the task.
     "irf_lr_scale",
+    # Train the UA path only, read by the task.
+    "freeze_target_path",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -239,6 +241,7 @@ IRF_SOURCE_PATHS = (
     f"{_VAE}.lambda_full_wrong",
     f"{_VAE}.lambda_source_expl",
     f"{_VAE}.lambda_source_wrong",
+    f"{_VAE}.freeze_target_path",
 )
 
 #: The two divergences the 2026-10-29 headline-run decision added to BOTH edges: this cell trains on

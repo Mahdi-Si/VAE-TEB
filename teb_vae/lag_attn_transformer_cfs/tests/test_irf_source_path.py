@@ -237,6 +237,38 @@ def test_the_wrong_ua_full_term_sends_its_gradient_where_the_full_term_does(pert
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.target_encoder.parameters())
 
 
+def test_freeze_target_path_keeps_the_base_forecast_and_trains_the_ua_path(perturb_posterior):
+    """``freeze_target_path``: a large step on the objective with the wrong-UA term moves the full
+    forecast and leaves the base forecast bit-identical, prior clock included."""
+    module = make_task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, prior_availability_input=True),
+        hparams=dict(lambda_full_wrong=1.0),
+        freeze_target_path=True,
+    )
+    model, batch = module.orig_model, _batch()
+    perturb_posterior(model)
+    with torch.no_grad():  # the clock projection starts at zero; a trained one reads the clock
+        model.prior_head.clock_proj.weight.normal_(0.0, 0.1)
+
+    def forecast():
+        torch.manual_seed(0)
+        with torch.no_grad():
+            out = model.eval()(*module._build_forward_inputs(batch))
+        model.train()
+        return out["mu_base"], out["mu_full"]
+
+    base_before, full_before = forecast()
+    loss, metrics = module.compute_loss_and_metrics(batch, 0, "train")
+    loss.backward()
+    torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1.0).step()
+    base_after, full_after = forecast()
+
+    assert "pred_gap_full_wrong" in metrics
+    assert model.get_parameter("lag_attn.W_k.weight").grad.abs().sum() > 0
+    assert torch.equal(base_before, base_after)
+    assert not torch.equal(full_before, full_after)
+
+
 def test_with_the_option_off_the_model_is_the_one_before_the_option_existed():
     """Same state-dict keys and same forward as the code before ``source_path`` existed."""
     kwargs = tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, posterior_event_gate=True, persistence_residual=True)

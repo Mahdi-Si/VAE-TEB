@@ -10,7 +10,7 @@ This reference summarizes the verified architecture, dataset layout, clocks, HDF
 
 | Topic / Need | Exact File(s) & Line Range(s) | What You Get There |
 | :--- | :--- | :--- |
-| **Current training run and next architecture** | `teb_vae/lag_attn_transformer_cfs/IMPLEMENTATION_PLAN.md` | No-IRF S8 continuation, evaluation protocol, and the frozen FHR base with a learned UA residual |
+| **Current training run and next architecture** | `teb_vae/lag_attn_transformer_cfs/IMPLEMENTATION_PLAN.md` | UA-path-only S8 continuation (`run_s8_source_only.yaml`), evaluation protocol, and the frozen FHR base with a learned UA residual |
 | **Model Class & Keyword Schema** | `teb_vae/lag_attn_transformer_cfs/nets/model.py:1-162` | MRO, `SeqVaeLagAttnTrfCfs.__init__`, `IRF_KEYWORDS`, why mixin order is load-bearing |
 | **Causal Inputs & IRF Wiring** | `teb_vae/lag_attn_cfs/nets/causal_inputs.py:771-960`, `1825-1875` | `_build_irf_source_path`, `_irf_outputs`, `irf_source`, `irf_evidence_for`, `attend_lagged_source` |
 | **IRF Head Math** | `teb_vae/lag_attn_cfs/nets/irf_source.py:1-157` | `ua_step_level`, `context_irf`, `IrfSourceHead.forward`, causal tone/high-pass/prequential gate |
@@ -46,11 +46,11 @@ This reference summarizes the verified architecture, dataset layout, clocks, HDF
   ```bash
   .venv/bin/python -m pytest teb_vae/lag_attn_transformer_cfs/tests -q -m "not slow"
   ```
-- **Training (7-GPU DDP, S8 continuation with onset weighting disabled)**:
+- **Training (7-GPU DDP, S8 continuation: onset weighting off, `freeze_target_path: true`)**:
   ```bash
   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
       -m teb_vae.lag_attn_transformer_cfs.trainer \
-      --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_no_irf.yaml
+      --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_source_only.yaml
   ```
 - **Single-GPU smoke**:
   ```bash
@@ -192,7 +192,7 @@ Built as a clean baseline/replacement for UA→FHR coupling & delay (`teb_vae/co
 - **`epoch=369` (`s8`)**: Lag attention does **not** measure physical delay (`kappa = 0.06–0.33`, 95–100% of gain retained by a UA-blind fixed lag profile, `2/64` latent dims and head 3 carry `99.4%` of gain, `logvar_prior` collapses onto floor under `base_decode: sample`).
 - **6 concrete implementation bugs found in `s9`/`s10` & IRF**:
   1. `IrfSourceHead` multiplies regression weights `beta` fitted on mean-subtracted `Zc` against uncentered `Z` / `Xf` (causing `-0.22 -> +0.29 SD` drift, `pred_gap_irf = -0.21`) and counts zeroed `PREQ_GAP` startup steps in `resid`.
-  2. The legacy IRF and full wrong-UA losses roll the input by one row and drop most rows when GUIDs are contiguous. The validation shuffle for the no-IRF path now uses a cross-GUID derangement when all ranks can supply one.
+  2. The legacy IRF losses roll the input by one row and drop most rows when GUIDs are contiguous. The validation shuffle and the full wrong-UA term (`_full_wrong_term`, now centred on the base NLL) use a cross-GUID derangement when all ranks can supply one.
   3. `lambda_full_wrong` backpropagates >99% of its squared gradient norm into FHR encoders and shared decoder weights (worsening `nll_base_block` by `+8.3` nats in 30 steps).
   4. `_irf_source_terms` and `_full_wrong_term` fold 4–7 copies of uncentered `~ -1465` nat NLLs directly into `main_loss` & `val/total_loss`, distorting `spike_breaker` (`additive_margin: 6600`) and checkpoint selection.
   5. `irf_gate_evidence` learns a negative weight gradient under `kl_own`, drifts with step index (`irf_context_steps = 0`), and `occluded_forward_outputs` does not recompute/zero `irf_evidence`.

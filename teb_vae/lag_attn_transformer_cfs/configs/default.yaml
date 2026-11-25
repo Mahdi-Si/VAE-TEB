@@ -397,6 +397,10 @@ model_config:
     # `source_path: irf` only (task-level). Multiplier on the learning rate of the head's three
     # parameter tensors, which form their own optimizer group. 1.0 = one group, as before the key.
     irf_lr_scale: 1.0
+    # Task-level. Train the UA path only (source adapter, lag attention, posterior head, gates);
+    # the target encoder, prior, decoder and AR(1) coefficient keep their loaded weights. For
+    # continuing a converged warm start. false = every parameter trains, as before the key.
+    freeze_target_path: false
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256

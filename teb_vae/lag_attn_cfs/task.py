@@ -85,6 +85,48 @@ _KEY_SEPARATOR = b"\x1f"
 #: argument that motivates the tiling applies.
 DENSE_STAGES: Tuple[str, ...] = ("val", "test")
 
+#: The net's UA path: the modules that read the source or turn it into the posterior. Under
+#: ``freeze_target_path`` these are the only parameters that train. ``irf_*`` exist only on nets
+#: built with the IRF head. ``source_adapter`` is NOT here: under ``prior_availability_input`` the
+#: prior reads the adapter's encode of a zero source (``_prior_clock``), so training the adapter
+#: would move the base branch (4 nats per anchor after 20 steps at 1e-4 on checkpoint 369).
+SOURCE_PATH_MODULES: Tuple[str, ...] = (
+    "source_invalid_key_bias",
+    "source_invalid_gate",
+    "query_proj",
+    "lag_attn",
+    "posterior_head",
+    "irf_head",
+    "irf_evidence_gate",
+)
+
+
+def freeze_all_but_source_path(model: torch.nn.Module) -> None:
+    """Set ``requires_grad=False`` on every parameter outside :data:`SOURCE_PATH_MODULES`.
+
+    Parameters already frozen by the net (the attention output projection) stay frozen.
+
+    Raises:
+        ValueError: If the net has none of the UA-path modules, so nothing would train.
+    """
+    source = {
+        id(p)
+        for name in SOURCE_PATH_MODULES
+        if getattr(model, name, None) is not None
+        for p in (
+            getattr(model, name).parameters()
+            if isinstance(getattr(model, name), torch.nn.Module)
+            else [getattr(model, name)]
+        )
+    }
+    if not source:
+        raise ValueError(
+            f"freeze_target_path: {type(model).__name__} has none of {SOURCE_PATH_MODULES}"
+        )
+    for parameter in model.parameters():
+        if id(parameter) not in source:
+            parameter.requires_grad_(False)
+
 
 class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
     r"""Lightning task for :class:`~teb_vae.lag_attn_cfs.nets.model.SeqVaeLagAttnCfs`.
@@ -107,6 +149,7 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         event_weight_ua_tolerance_s: Optional[float] = None,
         source_valid_windows: Optional[Sequence[int]] = None,
         irf_lr_scale: float = 1.0,
+        freeze_target_path: bool = False,
         **kwargs: Any,
     ) -> None:
         r"""Initialize the task.
@@ -140,6 +183,11 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             irf_lr_scale: Multiplier on the learning rate of the IRF head's parameters, under a
                 net built with ``source_path='irf'`` (:meth:`configure_param_groups`). ``1.0`` --
                 the default -- builds the optimizer as before the key existed.
+            freeze_target_path: Train the UA path only (:data:`SOURCE_PATH_MODULES`). Every
+                other parameter -- target encoder, prior, decoder, AR(1) coefficient, and the
+                source adapter the prior's clock runs through -- gets
+                ``requires_grad=False``, so the base branch of a warm start stays exactly as
+                loaded and the joint objective cannot absorb the source gain into it.
             **kwargs: Every other keyword, forwarded to the inherited constructor unchanged. A
                 second keyword schema for the same objective could only drift from the first.
 
@@ -159,6 +207,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 f"built with source_path='irf': it scales the learning rate of the IRF head."
             )
         self.save_hyperparameters({"irf_lr_scale": float(irf_lr_scale)})
+        self.save_hyperparameters({"freeze_target_path": bool(freeze_target_path)})
+        if freeze_target_path:
+            freeze_all_but_source_path(self.orig_model)
         # Saved as plain floats and ints, so the checkpoint's hyperparameters stay YAML-safe.
         self.save_hyperparameters(
             {
@@ -1141,37 +1192,43 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         likelihood: str,
         stage: str,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        r"""The full branch's block likelihood with another row's UA, for ``lambda_full_wrong``.
+        r"""The full branch's harm under another recording's UA, for ``lambda_full_wrong``.
 
-        The batch is rolled by one and the posterior branch is rebuilt by the permutation
-        control's own path (:func:`~teb_vae.lag_attn_rws.nets.controls.perm_forward_outputs`,
-        without its no-grad guard): the source state the lag attention reads, its key and removal
-        masks and, under ``irf_gate_evidence``, the head's evidence re-run on the donor's UA all
-        come from the donor. A row whose donor is the same recording is dropped; with fewer than
-        two rows left the term is skipped. Nothing is detached, as in the objective's own full
-        term: the gradient reaches the lag-attention path and, through the posterior head's
-        target inputs and the shared decoder, the FHR path.
+        Each row's donor is drawn by a derangement across recordings (the validation shuffle's
+        :func:`~teb_vae.lag_attn.nets.controls.make_derangement` with GUID groups), so every row
+        is scored also on an unshuffled loader, where neighbours share a recording. The posterior
+        branch is rebuilt by the permutation control's own path
+        (:func:`~teb_vae.lag_attn_rws.nets.controls.perm_forward_outputs`, without its no-grad
+        guard): the source state, its key and removal masks and, under ``irf_gate_evidence``, the
+        head's evidence all come from the donor. Without a GUID-level derangement (a recording
+        holding more than half the batch, on any rank at validation) the term is skipped.
+
+        The term is centred on the base branch, which carries no gradient here: it is
+        $D_1(\pi U) - D_0$, the nats the wrong UA costs against no UA. The gradient is that of
+        $D_1(\pi U)$, and the total stays on the scale of the objective without it.
 
         Returns:
-            ``(nll, metrics)``: the unweighted block NLL in nats per anchor (zero when skipped),
-            and ``pred_gap_full_wrong``, the base NLL minus it over the same rows.
+            ``(harm, metrics)``: the harm in nats per anchor (zero when skipped), and
+            ``pred_gap_full_wrong``, its negative.
         """
         target, mask = self._scored_block(forward_outputs, target_features, weight)
-        usable = self._other_recording_rows(batch, mask.device)
-        if not self._agreed(int(usable.sum()) >= 2, stage, mask.device):
+        guids = [_as_key(guid) for guid in self._phase_field(batch, "guid")]
+        if not self._agreed(controls.groups_can_derange(guids), stage, mask.device):
             return mask.new_zeros(()), {}
-        donor = torch.arange(len(usable), device=mask.device).roll(1)
+        donor = controls.make_derangement(
+            len(guids), generator=self._perm_generator, device=mask.device, groups=guids
+        )
         wrong = controls.perm_forward_outputs.__wrapped__(
             self.orig_model, forward_outputs, perm_index=donor,
             anchors=forward_outputs.get("anchor_index"),
         )
-        rows = mask * usable[:, None, None]
-        nll = self._block_nll(wrong["mu_full"], wrong["logvar_full"], target, rows, likelihood)
+        nll = self._block_nll(wrong["mu_full"], wrong["logvar_full"], target, mask, likelihood)
         with torch.no_grad():
             base = self._block_nll(
-                forward_outputs["mu_base"], forward_outputs["logvar_base"], target, rows, likelihood
+                forward_outputs["mu_base"], forward_outputs["logvar_base"], target, mask, likelihood
             )
-        return nll, {"pred_gap_full_wrong": base - nll.detach()}
+        harm = nll - base
+        return harm, {"pred_gap_full_wrong": -harm.detach()}
 
     def _scored_block(
         self, forward_outputs: Dict[str, torch.Tensor], target_features: torch.Tensor, weight: torch.Tensor
