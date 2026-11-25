@@ -167,6 +167,7 @@ FINAL_REVISION_KEYS = (
 #: the model flag and the loader's three-key rule. Shipped ON here; `tiny.yaml` and `smoke_hie.yaml`
 #: turn it off because their shards predate the signal-quality step.
 QUALITY_PATHS = (
+    f"{_VAE}.source_mask_mode",
     f"{_VAE}.source_quality_mask",
     # The task's three quality switches: the detector's `up_valid` rule, the target's step mask and
     # the source event-mask ablation. Neither sibling has them.
@@ -254,6 +255,11 @@ Q4_DATASET_PATHS: Dict[str, str] = {
     "dataset_config.vae_test_datasets": "the 2026-10-27 quality-version-4 build",
     "dataset_config.stat_path": "the statistics of the 2026-10-27 quality-version-4 build",
 }
+PRODUCTION_RUNTIME_PATHS: Dict[str, str] = {
+    "general_config.cuda_devices": "this cell's production GPU allocation",
+    "general_config.accumulate_grad_batches": "this cell's production effective batch size",
+    "dataset_config.dataloader_config.dataset_kwargs.cache_size": "this cell's production loader cache",
+}
 
 #: The ENCODER edge: what may differ from the conv-LSTM causal cell, and why. Anything not here must
 #: be identical, because a difference outside this list would be attributed to the encoder by every
@@ -276,6 +282,10 @@ ENCODER_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     **FINAL_REVISION_PATHS,
     **Q4_HEADLINE_PATHS,
     **Q4_DATASET_PATHS,
+    **PRODUCTION_RUNTIME_PATHS,
+    "advanced_config.callbacks.early_stopping.enabled": (
+        "the Transformer production run uses a fixed epoch budget"
+    ),
 }
 
 #: The TARGET edge: what may differ from the conv-Transformer two-sided cell.
@@ -316,16 +326,12 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     # `secondary_monitor` key at all and the six architecture switches are absent from it too, and
     # this edge compares the paths the two files SHARE -- so a key one side does not have is not a
     # divergence it could declare.
-    "advanced_config.callbacks.early_stopping.enabled": (
-        "stops on val/total_loss where the comparison model runs its epoch budget out; enabled "
-        "because a run of this cell reaches its composite optimum well before its budget ends"
-    ),
     "advanced_config.callbacks.early_stopping.patience": (
-        "the second half of the control above, in validation epochs; inheriting the comparison "
-        "model's value would make the flag above inert rather than merely different"
+        "the saved patience settings differ even though both production runs disable early stopping"
     ),
     # The dataset paths are already declared above, as causal shards.
     **Q4_HEADLINE_PATHS,
+    **PRODUCTION_RUNTIME_PATHS,
 }
 
 #: Surviving target channels at the shipped warm-up budget, on the committed integer-operator

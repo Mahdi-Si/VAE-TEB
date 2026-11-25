@@ -182,13 +182,17 @@ def test_the_task_hands_the_control_the_matched_forwards_anchors(task, perturb_p
 
     def _record(model, forward_outputs, **kwargs):
         seen["anchors"] = kwargs.get("anchors")
-        return original(model, forward_outputs, **kwargs)
+        result = original(model, forward_outputs, **kwargs)
+        seen["donors"] = result["perm_index"].tolist()
+        return result
 
     module = task()
     perturb_posterior(module.orig_model)
+    batch = make_stub_batch(4)
+    batch.guid = ["recording-a", "recording-a", "recording-b", "recording-b"]
     controls.perm_forward_outputs = _record
     try:
-        module.compute_loss_and_metrics(make_stub_batch(_BATCH), 0, "val")
+        module.compute_loss_and_metrics(batch, 0, "val")
     finally:
         controls.perm_forward_outputs = original
 
@@ -197,6 +201,11 @@ def test_the_task_hands_the_control_the_matched_forwards_anchors(task, perturb_p
     # explicit one, and still not the contiguous prefix the argument's absence would mean.
     model = module.orig_model
     assert seen["anchors"].shape[1] == model.geometry.t_valid - model.warmup_period
+    assert all(batch.guid[row] != batch.guid[donor] for row, donor in enumerate(seen["donors"]))
+
+    batch.guid = ["recording-a", "recording-a", "recording-a", "recording-b"]
+    _, metrics = module.compute_loss_and_metrics(batch, 0, "val")
+    assert "shuffle_penalty" not in metrics
 
 
 def test_the_control_is_skipped_on_a_degenerate_validation_batch(task, perturb_posterior):

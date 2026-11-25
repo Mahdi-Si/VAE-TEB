@@ -9,16 +9,16 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
     python -m teb_vae.lag_attn_transformer_cfs.trainer \
         --config teb_vae/lag_attn_transformer_cfs/configs/tiny.yaml
 
-    # Prod box. The rank count must equal len(general_config.cuda_devices) -- default.yaml ships
+    # Prod box. The rank count must equal len(general_config.cuda_devices) -- the S8 run uses
     # 7 -- or Lightning rejects the device/world-size mismatch at Trainer construction. Export
     # the stamp so ranks 1..N-1 share rank 0's run directory.
     TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
         -m teb_vae.lag_attn_transformer_cfs.trainer \
-        --config teb_vae/lag_attn_transformer_cfs/configs/default.yaml
+        --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_no_irf.yaml
 
 From an IDE's Run button, with no command line: ``RUN_CONFIG`` at the bottom of this file names the
-config to use -- ``configs/default.yaml``, which since 2026-09-05 carries the corrected representation
-(integer phase operator, unaligned inputs, stored clock) and needs the integer-operator shards. Note a
+config to use -- ``configs/run_s8_no_irf.yaml``, the continuation from the trained epoch-369 S8
+weights on the original production shards. Note a
 Run-button launch of a production config is a *single* process whose seven ``cuda_devices`` make
 Lightning spawn DDP workers underneath it; for a single-device smoke run point ``RUN_CONFIG`` at
 ``configs/tiny.yaml``.
@@ -144,9 +144,7 @@ def _resolve_cli_config_path(config_path: str) -> str:
 #: ``--config`` on the command line always wins over this value. A relative path is resolved against
 #: the repository root, not the working directory.
 #:
-#: default.yaml is the headline run on the 2026-10-27 build, quality masks on. The two-arm
-#: quality-mask experiment that chose it is configs/prod_q4_*.yaml.
-RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s6_soft_ua_mask.yaml"
+RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/run_s8_no_irf.yaml"
 
 
 if __name__ == "__main__":

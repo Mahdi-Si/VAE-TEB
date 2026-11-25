@@ -124,6 +124,9 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     "pred_gap_novel_lo",
     "pred_gap_novel_mid",
     "pred_gap_novel_hi",
+)
+
+OPTIONAL_CAUSAL_SUFFIXES: Tuple[str, ...] = (
     # The source-null KL the objective charges under `lambda_source_null`; logged on both stages
     # when the weight is set and absent (an empty column) when it is not.
     "source_null_kl_penalty",
@@ -142,7 +145,7 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
 #: The two readouts that run on validation batches only, beside the permutation control's three:
 #: the source-null KL and the forecast gap with both branches decoded at their latent means.
 #:
-#: Each costs an extra pass per step (a source encode, a decode), and -- more importantly -- each is
+#: Each costs extra work per step (a source encode, or latent-mean decoding), and each is
 #: a *readout* that never enters the objective. Tracking a ``train/`` variant would produce a column
 #: that is NaN in every row of every run.
 #: ``coupling_minus_clock`` is derived from the first and the objective's KL, so it shares their stage.
@@ -174,7 +177,7 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         + tuple(
             f"{stage}/{name}"
             for stage in ("train", "val")
-            for name in _FORECAST_GAP_SUFFIXES + _CAUSAL_SUFFIXES
+            for name in _FORECAST_GAP_SUFFIXES + _CAUSAL_SUFFIXES + OPTIONAL_CAUSAL_SUFFIXES
         )
         + tuple(f"val/{name}" for name in _CAUSAL_VAL_ONLY_SUFFIXES)
     )

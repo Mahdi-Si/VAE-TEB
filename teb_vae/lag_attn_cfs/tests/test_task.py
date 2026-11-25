@@ -361,6 +361,22 @@ def test_the_mean_decoded_gap_is_the_objectives_gap_when_the_posterior_draw_is_i
     torch.testing.assert_close(val_metrics["pred_gap_mean"], val_metrics["pred_gap"])
 
 
+def test_mean_decoded_gap_is_independent_of_both_latent_draws(
+    task, stub_batch, perturb_posterior, monkeypatch
+):
+    module = task(model_kwargs=tiny_warmup_kwargs(base_decode="sample"))
+    perturb_posterior(module.orig_model)
+    module.eval()
+
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    _, at_mean = module.compute_loss_and_metrics(stub_batch, 0, "val")
+    monkeypatch.setattr(torch, "randn_like", torch.ones_like)
+    _, sampled = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert not torch.isclose(sampled["nll_base_block"], at_mean["nll_base_block"])
+    torch.testing.assert_close(sampled["pred_gap_mean"], at_mean["pred_gap"])
+
+
 def test_a_readout_reusing_an_objective_metric_name_is_refused(
     task, stub_batch, monkeypatch
 ):

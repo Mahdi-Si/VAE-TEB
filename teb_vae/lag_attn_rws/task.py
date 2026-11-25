@@ -42,7 +42,7 @@ exists to check.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Hashable, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -724,6 +724,10 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         return stage != "train" and batch_size >= 2
 
+    def _perm_control_groups(self, batch: Any) -> Optional[Sequence[Hashable]]:
+        """Grouping for the validation shuffle, if the task supplies recording IDs."""
+        return None
+
     def _sync_perm_decision(self, do_perm: bool, device: torch.device) -> bool:
         """MIN-reduce ``do_perm`` so no rank runs the control alone.
 
@@ -1147,9 +1151,14 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # the collective in lockstep -- while calling ``_sync_perm_decision`` here would cost an
         # ``all_reduce`` plus a ``.item()`` GPU sync on EVERY training step to confirm a
         # constant False, stalling the CPU behind the forward each time.
-        do_perm = stage != "train" and self._sync_perm_decision(
-            self._should_run_perm(inputs[0].size(0), stage), inputs[0].device
-        )
+        groups = None
+        do_perm = False
+        if stage != "train":
+            local_perm = self._should_run_perm(inputs[0].size(0), stage)
+            if local_perm:
+                groups = self._perm_control_groups(batch)
+                local_perm = groups is None or controls.groups_can_derange(groups)
+            do_perm = self._sync_perm_decision(local_perm, inputs[0].device)
         if do_perm:
             # Readout only, under no_grad: the shuffled branch re-scores the forecast under a
             # stranger's source and never touches the objective.
@@ -1158,6 +1167,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                     self.orig_model,
                     forward_outputs,
                     generator=self._perm_generator,
+                    groups=groups,
                     # The matched forward's own anchors, read from its dict exactly as
                     # ``compute_loss`` reads them: absent on a model that decodes every anchor, so
                     # this is bitwise the previous call there. On a model that decodes a tile it is

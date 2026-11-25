@@ -125,6 +125,7 @@ def test_the_tables_carry_this_cells_one_axis_and_the_cross_cell_comparison(tmp_
         "## Arm inventory",
         "## Anchor tiling sweep (`anchor_stride`)",
         "## Arm leaves",
+        "## Coupling",
         "## Cross-cell comparison",
     ], headings
     # Both cells' rows in the cross-cell table, keyed on the class each run recorded.

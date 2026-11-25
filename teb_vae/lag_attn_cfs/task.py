@@ -849,7 +849,7 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         forward_outputs: Dict[str, torch.Tensor],
         weight: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Re-decode the full branch at $\mu^q$ and return the matched forecast gap.
+        r"""Score the matched forecast gap with both branches decoded at their latent means.
 
         Args:
             inputs: The forward's positional arguments; ``inputs[0]`` and ``inputs[1]`` are the two
@@ -861,12 +861,19 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             The scalar $D_0(\mu^p) - D_1(\mu^q)$ in nats per anchor.
         """
         model = self.orig_model
-        mu_post = forward_outputs["mu_post"]
         anchors = forward_outputs["anchor_index"].to(torch.long)
-        z_mean = mu_post.gather(1, anchors[:, :, None].expand(-1, -1, mu_post.shape[-1]))
-        mu_full, logvar_full = model.decoder(z_mean, persistence=forward_outputs.get("persistence"))
+        mu_post = forward_outputs["mu_post"]
+        index = anchors[:, :, None].expand(-1, -1, mu_post.shape[-1])
+        persistence = forward_outputs.get("persistence")
+        mu_full, logvar_full = model.decoder(mu_post.gather(1, index), persistence=persistence)
+        decoded = {**forward_outputs, "mu_full": mu_full, "logvar_full": logvar_full}
+        if model.base_decode == "sample":
+            z_prior_mean = forward_outputs["mu_prior"].gather(1, index)
+            decoded["mu_base"], decoded["logvar_base"] = model.decoder(
+                z_prior_mean, persistence=persistence
+            )
         scored = model.compute_loss(
-            {**forward_outputs, "mu_full": mu_full, "logvar_full": logvar_full},
+            decoded,
             torch.cat([inputs[0], inputs[1]], dim=-1),
             weight=weight,
             beta=0.0,
@@ -1014,6 +1021,11 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         if getattr(self.orig_model, "source_path", "lag_attn") == "irf":
             return False
         return super()._should_run_perm(batch_size, stage)
+
+    def _perm_control_groups(self, batch: Any) -> Optional[Sequence[bytes]]:
+        """Keep the validation shuffle between recordings when GUIDs are available."""
+        guids = getattr(batch, "guid", None)
+        return None if guids is None else [_as_key(guid) for guid in guids]
 
     def _irf_source_terms(
         self,

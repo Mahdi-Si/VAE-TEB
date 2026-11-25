@@ -32,6 +32,7 @@ _DEFAULT = _CONFIG_DIR / "default.yaml"
 #: on, and a run whose two disagree is the drift this guard exists to make visible.
 _RUN_NAME = "advanced_config.tracking.mlflow.run_name"
 _VARIANT = "advanced_config.tracking.mlflow.tags.variant"
+_CONSTANT_BETA_VALUE = "model_config.VAE_model.beta_schedule.value"
 
 _ARMS = sorted(path.name for path in _CONFIG_DIR.glob("sweep_*.yaml"))
 
@@ -66,7 +67,12 @@ def test_an_arm_is_a_well_formed_variant_of_the_default(name):
     default = _flatten(load_config(str(_DEFAULT)))
     arm = _flatten(load_config(str(_CONFIG_DIR / name)))
 
-    assert set(arm) == set(default)
+    extra = set(arm) - set(default)
+    if arm["model_config.VAE_model.beta_schedule.kind"] == "constant":
+        assert extra == {_CONSTANT_BETA_VALUE}
+    else:
+        assert not extra
+    assert set(default) <= set(arm)
     moved = {path for path in default if arm[path] != default[path]} - {_RUN_NAME, _VARIANT}
     assert moved, f"{name} moves nothing but its identity"
     if arm[_RUN_NAME] != default[_RUN_NAME] or arm[_VARIANT] != default[_VARIANT]:
@@ -82,12 +88,10 @@ def test_an_arm_can_be_trained_and_judged(name):
       that phase contributes no forecast at all and its share of the epoch is silently dropped.
     * $F \ge B - 1$ over the survivors: an arm that lowered the floor would score assumed
       pre-recording history as signal with every shape correct.
-    * $\beta$ ramps from exactly zero: $z$ is the only route to the decoder, so an arm that lost the
-      warm-up would collapse for a reason that has nothing to do with its own axis.
+    * From scratch, $\beta$ ramps from zero and the run outlasts the warm-up. The warm-start arms
+      can keep the trained checkpoint's full KL weight.
     * The step-granular learning-rate ramp stays on; zeroed, the arm would fall back to the
       framework's epoch-granularity path and change the optimisation alongside its own axis.
-    * The run outlasts the $\beta$ warm-up by the collapse criterion's window, which reads the tail:
-      a run shorter than that cannot be judged at all.
     """
     config = load_config(str(_CONFIG_DIR / name))
     vae = config["model_config"]["VAE_model"]
@@ -99,7 +103,12 @@ def test_an_arm_can_be_trained_and_judged(name):
     assert 1 <= stride
     assert floor + stride <= t_valid
     assert floor >= vae["causal_warmup_budget_steps"] - 1
-    assert schedule["kind"] == "linear_warmup"
-    assert schedule["start"] == 0.0
     assert config["general_config"]["lr_warmup_steps"] > 0
-    assert epochs > schedule["warmup_epochs"] + KL_COLLAPSE_PATIENCE_EPOCHS
+    if schedule["kind"] == "constant":
+        assert config["model_config"]["core_model_checkpoint"]
+        assert schedule["value"] == 1.0
+        assert epochs > KL_COLLAPSE_PATIENCE_EPOCHS
+    else:
+        assert schedule["kind"] == "linear_warmup"
+        assert schedule["start"] == 0.0
+        assert epochs > schedule["warmup_epochs"] + KL_COLLAPSE_PATIENCE_EPOCHS

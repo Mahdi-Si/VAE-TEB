@@ -19,6 +19,7 @@ values -- tiled on training, dense on validation.
 from __future__ import annotations
 
 from teb_vae.lag_attn_cfs.task import SeqVaeLagAttnCfsTask
+from teb_vae.lag_attn_cfs.trainer import OPTIONAL_CAUSAL_SUFFIXES
 from teb_vae.lag_attn_fs.task import SeqVaeLagAttnFsTask
 from teb_vae.lag_attn_transformer_cfs.task import SeqVaeLagAttnTrfCfsTask
 from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
@@ -111,8 +112,9 @@ def test_every_tracked_metric_is_emitted_on_its_stage_and_nowhere_else(task, per
     }
 
     for stage in ("train", "val"):
-        missing = sorted(tracked[stage] - emitted[stage])
+        missing = sorted(tracked[stage] - emitted[stage] - set(OPTIONAL_CAUSAL_SUFFIXES))
         assert missing == [], (stage, missing)
+        assert emitted[stage].isdisjoint(OPTIONAL_CAUSAL_SUFFIXES)
     validation_only = tracked["val"] - tracked["train"]
     assert validation_only, "no validation-only readout is tracked; the check below is vacuous"
     assert validation_only.isdisjoint(emitted["train"]), sorted(validation_only & emitted["train"])

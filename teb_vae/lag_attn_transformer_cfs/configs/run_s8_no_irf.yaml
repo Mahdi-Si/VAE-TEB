@@ -1,0 +1,60 @@
+# Production S8 continuation from the trained epoch-369 weights on the 2026-11-18 split.
+# The checkpoint path comes from its saved ModelCheckpoint state.
+# This ablation removes contraction-onset weighting and keeps the other S8 objective settings.
+# The optimizer starts fresh at the checkpoint's final LR after a 500-step ramp.
+# Run trainer.py in the IDE, or use the torchrun command in IMPLEMENTATION_PLAN.md.
+
+base: sweep_next_s8_long_ar_skip.yaml
+general_config:
+  tag: lag_attn_trf_cfs_s8_no_event_weight
+  lr: 3.0e-05
+  lr_milestone: []
+  lr_warmup_steps: 500
+  epochs: 20
+model_config:
+  core_model_checkpoint: /data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-11-18--[12-40]-lag_attn_trf_cfs_revised/model_checkpoints/lag-attn-trf-cfs-epoch=369.ckpt
+  VAE_model:
+    source_path: lag_attn
+    irf_readout: false
+    irf_gate_evidence: false
+    lambda_source_irf: 0.0
+    lambda_source_expl: 0.0
+    lambda_source_wrong: 0.0
+    lambda_full_wrong: 0.0
+    event_weight_floor: null
+    event_weight_ua_valid: false
+dataset_config:
+  vae_train_datasets:
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5
+  vae_test_datasets:
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5
+  - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/stats.hdf5
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_s8_no_event_weight
+      tags:
+        variant: lag_attn_trf_cfs_s8_no_event_weight
