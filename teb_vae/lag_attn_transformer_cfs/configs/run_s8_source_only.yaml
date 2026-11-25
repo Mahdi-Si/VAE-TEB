@@ -1,0 +1,66 @@
+# Production S8 continuation that trains the UA path only, from the trained epoch-369 weights.
+# This is the run trainer.py launches (RUN_CONFIG). Its base, run_s8_no_irf.yaml, stays the
+# joint-training ablation arm.
+#
+# Two changes from S8 (epoch 369), and one held back. Each is one key here.
+#   1. No contraction-onset weighting (from the base file). S8 scored the full branch only in the
+#      60 s after a detected onset (event_weight_floor 0.0), so outside that window the posterior
+#      was trained by the KL alone. Here the full branch is scored at every anchor.
+#   2. freeze_target_path: true. The target encoder, prior, decoder, AR(1) coefficients and the
+#      UA adapter keep their epoch-369 values, so the base forecast is S8's exactly; the lag
+#      attention, its query, the posterior head and the gates train (0.18 M of 4.2 M parameters).
+#      The adapter stays frozen because the prior reads its encode of a zero UA (the prior clock).
+#      Why: in S7 and in S8, joint training let the FHR path absorb the source gain
+#      (val/pred_gap_mean peaked at epoch 197 of S7 and at epoch 13 of S8, then fell).
+#      Undo: false (then use the base file's lr 3e-5).
+#   3. lambda_full_wrong stays 0.0 here. At 1.0 it adds the nats another recording's UA costs the
+#      full branch against the base branch (donors from other recordings in the batch; with the
+#      target path frozen its gradient reaches only the UA path). It is the next switch to try,
+#      not part of this run, because it trades own-UA gain for specificity (pilot below).
+#
+# LOCAL PILOT (2026-11-25; epoch 369, local healthy train shards, 400 steps at batch 16, scored
+# on every 6th batch of the local test split with the server stats; nats per anchor; read as
+# direction only):
+#                                        own gain  pred_gap_mean  full NLL   base NLL   wrong-UA harm
+#   epoch 369                              4.24       3.92        -1341.42   -1337.18     1.42
+#   this file (freeze, no onset weight)    4.48       4.16        -1341.71   -1337.23     1.51
+#   + lambda_full_wrong 1.0                3.82       3.47        -1341.04   -1337.22     0.33
+#   run_s8_no_irf.yaml (joint, lr 3e-5)    4.84       4.56        -1341.75   -1336.91     1.16
+# Scoring noise is about 0.04 nats. The joint arm reaches the same full NLL as this file, but its
+# base gets worse by 0.30, so part of its larger gain is a worse base; this file keeps the base
+# exact and has the lower total loss (-2666.07 against -2665.86).
+#
+# LR. With only the UA path trainable, the base cannot drift, so the rate is above S8's final
+# 3e-5: 1e-4 after a 500-step ramp, x0.1 at epoch 25, 40 epochs. A fresh optimizer starts from
+# the saved weights.
+#
+# READ THE RUN AGAINST EPOCH 369 (its metrics_history.csv):
+#   * val/nll_base_block should match S8's last value to sampling noise from the first epoch. If
+#     it moves, the freeze did not apply.
+#   * val/nll_full_block and val/pred_gap_mean should improve over epoch 369. pred_gap_mean is
+#     the clean source readout now, because the base cannot move.
+#   * val/shuffle_penalty (wrong-UA cost) is expected to stay where epoch 369 left it.
+#   * Then run the lag-analysis evaluator on the candidate and on epoch 369 with the same shards
+#     and stats (IMPLEMENTATION_PLAN.md, "Read the run against S8").
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_source_only.yaml
+
+base: run_s8_no_irf.yaml
+general_config:
+  tag: lag_attn_trf_cfs_s8_source_only
+  lr: 1.0e-04
+  lr_milestone: [25]
+  lr_warmup_steps: 500
+  epochs: 40
+model_config:
+  VAE_model:
+    freeze_target_path: true
+    lambda_full_wrong: 0.0
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_s8_source_only
+      tags:
+        variant: lag_attn_trf_cfs_s8_source_only
