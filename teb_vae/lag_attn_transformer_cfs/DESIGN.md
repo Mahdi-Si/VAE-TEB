@@ -354,6 +354,144 @@ $(H, C_{\mathrm{keep}})$ parameter seeded at $2^{-\tau/5}$. The gather is masked
 own warm-up. Both decoder invocations receive the same persistence tensor, and the tensor holds
 target values only.
 
+### 6.5 The IRF head (`source_path: irf`, `irf_readout`)
+
+The head described here is used in two ways. As a **replacement** of the lag attention
+(`source_path: irf`) it loses the forecast gain: on checkpoint 369 its `pred_gap` was $-0.10$
+nats per anchor at the warm start and $+0.08$ after a head-only fit, against $+4.96$ for the lag
+attention on the same batches. So the ladder uses it as a **readout beside** the lag attention
+(`irf_readout`, at the end of this section), and the replacement stays as the instrument-only
+variant `sweep_alt_irf_source_only.yaml`.
+
+**What it replaces, and why.** `source_path: lag_attn` (the default) is §6.2 and §6.3: the lag
+attention, the event gate and the posterior shift. The lag study of checkpoint 369
+(`tmp/lag_analysis_369/REPORT.md`) found that this path does not measure a lag. A UA-blind
+attention profile keeps 95–100 % of the gain. The gate, the KL and the expected lag follow any UA
+that is fed, also another recording's. The timing of the gain cannot be separated from the 60-s
+reward window after contraction onset. `source_path: irf` builds none of that path. It puts the
+UA path of `teb_vae/coupling_irf` under this model's forecast. `teb_vae/coupling_irf/DESIGN.md`
+gives the method (§3) and its acceptance results as a standalone model (§7).
+
+**Formula.** For anchor $t$, horizon step $\tau$ (target step $t + \tau$, $\tau = 1 \dots H$) and
+kept target channel $c$:
+
+$$\mu^{\mathrm{full}}_{t,\tau,c} = \mathrm{sg}\bigl(\mu^{\mathrm{base}}_{t,\tau,c}\bigr)
++ a_{t,c} \sum_{j} h_{t,j,c} \bigl(\eta_{\tau,c}\, X^{f}_{t,\tau,j} - \rho_{\tau,c}\, Z_{t,j}\bigr),
+\qquad \log\sigma^{2,\mathrm{full}} = \mathrm{sg}\bigl(\log\sigma^{2,\mathrm{base}}\bigr).$$
+
+- $u$ is the UA level per step above its trailing 10th percentile of 75 steps, floored at 0. The
+  level is the mean of the batch's raw `up` over the 16 raw samples of the step; a step is valid
+  where at least half of them are valid in `up_valid`. The UA coefficients are not read.
+- $Z_t$ is $u$ convolved with $J = 29$ hat functions over delays 0–120 s; the IRF is zero at
+  both ends. $X^f_{t,\tau}$ is the same at step $t + \tau$ with UA up to the anchor only.
+- $h_t$ is the ridge IRF of each channel, fitted on the past of the same segment after the same
+  causal high-pass (minus a trailing 75-step mean) on the target and on $Z$:
+  $h_t = (S^{zz}_t + n_t(\lambda_r I + \lambda_s S))^{-1} S^{zr}_t$. The target is the normalised
+  kept feature vector the likelihood scores. A row counts where UA covers the last 120 s and the
+  FHR step is valid (the objective's `weight`); a channel's rows also need its own warm-up.
+- $a_t \in [0, 1]$ is the gate, per channel. The IRF fitted up to step $s - 15$ predicts the
+  target at $s$; $a_t$ is the slope of the target on these predictions minus `irf_gate_k`
+  standard errors. It is 0 where UA does not cover the anchor.
+- $\mathrm{sg}$ is stop-gradient. The FHR path is trained by the base term only, and `pred_gap`
+  is a pure mean shift from UA.
+
+The FHR path is unchanged: same modules, same weights, same draw of $z^p$. The trained parameters
+of the head are `irf_head.log_lambda` $(2,)$ for $\lambda_r, \lambda_s$, and `irf_head.rho_logit`
+and `irf_head.eta_logit` $(H, C_{\mathrm{keep}})$. The source gate and the source adapter stay,
+frozen: the prior's clock (§6.3) encodes a zero stream through them. `query_proj`, `lag_attn`,
+`posterior_head` and the soft-mask parameters do not exist.
+
+**Keys.**
+
+| Key | Where | Meaning |
+| --- | --- | --- |
+| `source_path` | constructor | `lag_attn` (default) or `irf` |
+| `irf_gate_k` | constructor | standard errors the gate subtracts; fixed, shipped $4.4$ |
+| `irf_context_steps` | constructor | steps of past the IRF is fitted on; $0$ = the whole segment |
+| `irf_channels` | constructor | kept target channels the head acts on (indices into the kept axis); `null` = all. The other channels get no shift, and `rho_logit` / `eta_logit` have one column per listed channel |
+| `irf_lr_scale` | task | multiplier on the learning rate of the head's parameters, which then form their own optimizer group; $1.0$ = one group |
+| `lambda_source_expl` | task | weight of the likelihood at $\mathrm{sg}(\mu^{\mathrm{base}})$ plus the explain-mode shift ($Z_{t+\tau}$ in place of $\eta X^f$: UA up to the target) |
+| `lambda_source_wrong` | task | weight of both likelihoods with the head re-run on another row's UA (batch rolled by one; rows whose donor is the same recording are dropped) |
+
+`eval/calibrate_irf_gate.py` gives `irf_gate_k`: it runs the head with the own UA and with another
+row's UA and prints the $k$ at which the wrong UA opens the gate at a chosen share of the cells
+(default $0.05$). The gate is open where $z = \text{slope}/\text{se} > k$, and the head returns
+$z$ for this. The rung sets `irf_channels` to kept channels $0 \dots 20$ (the FHR level and the
+fast scattering channels), $k = 4.45$ and `irf_lr_scale: 30`. On the slower scattering channels and
+on the phase channels the untrained head opened its gate as often for a wrong UA as for the own
+one and added error.
+
+`irf` needs `posterior_event_gate: false`, `source_quality_mask: false`, `lambda_event_gate: 0.0`,
+`lambda_source_null: 0.0`, the stored forecast clock and `emit_quality_mask: true`; the
+constructor and the task refuse the other values. `sweep_alt_irf_source_only.yaml` is its config
+(base: `sweep_next_s8_long_ar_skip.yaml`), and
+`teb_vae/neural_surgery_trf_cfs/surgery/make_s9init.py --mode source` turns a `lag_attn`
+checkpoint into its warm start.
+
+**Forward and metrics.** The forward takes three more inputs, `ua_level`, `ua_valid` and
+`target_step_valid`, each $(B, T)$. It returns the keys of §7 with the posterior equal to the
+prior (`mu_post`, `logvar_post`, `z_post` are the prior's tensors and `kld_per_t` is 0), and adds
+`irf_h` $(B, A, J, C)$, `irf_gate` $(B, A, C)$, `irf_delta_expl` $(B, A, H, C)$ and `irf_ua_ok`
+$(B, A)$. $C$ is the full kept width; under `irf_channels` the unlisted channels hold zeros. `source_state`, `attended_source_heads`, `attn_weights`, `kld_per_t_per_head`,
+`source_kl_lag_map` and `event_gate` are absent.
+
+| Metric | Stages | Definition |
+| --- | --- | --- |
+| `pred_gap` | train, val | unchanged: base block NLL minus full block NLL |
+| `pred_gap_expl` | train, val | the same with the explain-mode shift |
+| `pred_gap_wrong`, `pred_gap_expl_wrong` | train, val | the same two with another row's UA |
+| `irf_gate_open`, `irf_gate_open_wrong` | train, val | share of cells with $a > 0$ among scored anchors with UA cover × the head's scored channels |
+| `irf_level_delay_s` | train, val | median over the anchors with $a > 0$ on target channel 0 (the FHR level) of the delay of that channel's IRF minimum, in seconds |
+
+The four gaps are in the unit of `nll_base_block`: horizon-weighted nats per anchor, summed over
+the anchor's scored cells (about $1300$ at the rung's settings, about $559$ of them on the head's
+$21$ channels) and averaged over the scored anchors. A metric with nothing to average is absent
+for that step. `source_lag_warmth_frac_*`,
+`kld_source_null`, `pred_gap_mean`, `coupling_minus_clock` and the permutation control's three
+columns are not emitted, the diagnostic page is not drawn, and `eval/run.py` refuses the
+checkpoint: each reads a posterior or an attention map.
+
+**The head as a readout (`irf_readout: true`, with `source_path: lag_attn`).** The model is the
+lag-attention model with the head beside it. Every output of the forward is unchanged; the head's
+outputs are added (`irf_h`, `irf_gate`, `irf_z`, `irf_ua_ok`, `irf_delta`, `irf_delta_expl`), and
+its shift enters no forecast. The head is trained by three terms, each scored at
+$\mathrm{sg}(\mu^{\mathrm{base}})$ plus a shift with $\mathrm{sg}(\log\sigma^{2,\mathrm{base}})$:
+`lambda_source_irf` (the forecast-mode shift), `lambda_source_expl` and `lambda_source_wrong`. None
+sends a gradient into the FHR path or the lag attention. `pred_gap` stays the lag attention's gap;
+`pred_gap_irf` is the head's (base NLL minus the NLL at base plus the forecast-mode shift), and
+the other metrics of the table above are the head's. The diagnostic page and `eval/` work as for
+the plain model. Rung `sweep_next_s9_irf_readout.yaml`; warm start `make_s9init.py --mode readout`.
+
+**Making the lag attention specific (`sweep_next_s10_specific_source.yaml`).** Two more options,
+both off by default:
+
+- `irf_gate_evidence` (constructor; needs `irf_readout` and `source_mask_mode: soft`). The event
+  gate's logit gets $w_e^\top e_t$, with $e_t = \bigl(\mathrm{clamp}(z_{t,0} / k, 0, 3),\ \text{share
+  of the head's channels with } a_t > 0\bigr)$ from the head at every step, zero without UA cover,
+  detached. `irf_evidence_gate.weight` $(1, 2)$ starts at zero, so the forward starts unchanged.
+  A control that swaps the UA gets the evidence of the head re-run on that UA; the source-null
+  control gets zero evidence.
+- `lambda_full_wrong` (task). A training term: the full branch's block likelihood with another
+  row's UA. The batch is rolled by one through `controls.perm_forward_outputs`, here with
+  gradient: the source state, its key and removal masks and the evidence all come from the
+  donor row; rows whose donor is the same recording are dropped. As in the full term itself
+  nothing is detached, so the gradient reaches the lag attention, the posterior head and,
+  through the shared decoder and the target state, the FHR path. `pred_gap_full_wrong` is the
+  base NLL minus this NLL.
+
+The rung also sets `event_weight_floor: null`, so no reward window is tied to contraction onset.
+Warm start `make_s9init.py --mode s10`.
+
+**Limits.**
+
+- The context is one 20-minute segment. The standalone model fitted the IRF on 60 minutes of the
+  stitched recording, so the gate opens less often here.
+- The delay is read on the level channel only, on the stored clock (UA is stored 20 s early), and
+  it includes that channel's 12–13 s filter latency.
+- All channels share one normal matrix. A channel's own invalid rows only zero its residual, so
+  the IRF of a slow channel with a long warm-up is shrunk towards zero.
+- The linear solves run on the CPU where the GPU has no batched solver.
+
 ## 7. Forward return dict
 
 `SeqVaeLagAttnTrfCfs.forward(y_st, y_ph, u_stream, anchor_phase=None, anchor_stride=None,

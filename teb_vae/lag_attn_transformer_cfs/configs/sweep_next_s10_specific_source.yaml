@@ -1,0 +1,73 @@
+# Next-step ladder, rung 10: make the lag-attention path specific to the recording's own UA.
+# Rung 9 (the IRF head as a readout) with three changes to the objective and the gate. The
+# forecast path is still the lag attention. Every key not set here is rung 9's.
+#
+# WHY. On checkpoint 369 (12 local train batches of 16, validation step, nats per anchor) the
+# lag attention gains `pred_gap` = +4.96 over the base forecast, and with another recording's UA
+# the full forecast is 2.50 WORSE than the base (`nll_shuffled_block - nll_base_block`): a wrong
+# UA harms it by half its gain. The lag study (tmp/lag_analysis_369/REPORT.md) found the cause:
+# the gate, the KL and the expected lag follow any UA that is fed, and the gain's timing cannot
+# be separated from the 60-s reward window after contraction onset. Nothing in the rung-8
+# objective tells the posterior that a UA may not belong to the FHR.
+#
+# THE THREE CHANGES, and the single key that removes each:
+#   1. `lambda_full_wrong: 1.0`. A training term: the full branch's block likelihood with another
+#      row's UA (the batch rolled by one through the permutation control's path, with gradient;
+#      rows whose donor is the same recording are dropped). The posterior is charged for moving
+#      the forecast on a UA that is not its own. Remove with `lambda_full_wrong: 0.0`.
+#   2. `irf_gate_evidence: true`. The event gate's logit gets a linear term in the IRF head's
+#      evidence per step: the level channel's gate statistic over `irf_gate_k`, cut to [0, 3],
+#      and the share of the head's channels whose gate is open. The head opens for the own UA
+#      (15 % of the cells) and rarely for a wrong one (5 %), so this is the signal the gate
+#      needs to tell the two apart. Detached; the two weights start at zero. Remove with
+#      `irf_gate_evidence: false` (and warm-start from the rung-9 init).
+#   3. No reward window: `event_weight_floor: null` weighs every scored anchor of the full
+#      branch the same, so the gain is no longer tied to the 60 s after a contraction onset.
+#      Remove by deleting the two event-weighting keys below (rung 9's values: 0.0 and true).
+#
+# WARM START. `make_s9init.py --mode s10` adds the head's parameters and the two zero evidence
+# weights to a rung-8 checkpoint and checks that `mu_base` and `mu_full` are unchanged:
+#   python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s9init --mode s10 \
+#       --source <run>/model_checkpoints/lag-attn-trf-cfs-epoch=<N>.ckpt
+#
+# WHAT TO READ, against the rung-9 run:
+#   * `val/pred_gap_full_wrong` (base NLL minus the full NLL with another row's UA): -2.8 at the
+#     warm start. It should rise towards 0: a wrong UA must not move the forecast.
+#   * `val/pred_gap`: +4.96 at the warm start. It should stay near its rung-8 value. Part of it
+#     may be gain that any UA gives (a contraction clock), and that part is expected to go.
+#   A smoke test of the training signal, not a result: 300 steps of batch 16 from the warm start
+#   at a flat rate of 0.0001 moved `pred_gap_full_wrong` from -2.79 to -0.45 and `pred_gap` from
+#   4.96 to 4.65 on 12 held-out local batches; the base NLL rose by 1.0 nat.
+#   * `val/shuffle_penalty` (`nll_shuffled_block - nll_full_block`): the same question with a
+#     random other recording. With `pred_gap_full_wrong` near 0 it approaches `pred_gap`.
+#   * `val/event_gate_mean`, and the head's columns of rung 9 (`irf_gate_open*`,
+#     `irf_level_delay_s`, `pred_gap_irf`), which this rung does not change.
+# REFUTED if `val/pred_gap` falls by more than a third while `val/pred_gap_full_wrong` is still
+# below -1: then the gain was mostly not specific to the own UA, and the objective removes it
+# faster than it makes the rest specific.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s10_specific_source.yaml
+base: sweep_next_s9_irf_readout.yaml
+
+model_config:
+  # SET THIS PATH to the file `make_s9init.py --mode s10` wrote. [rung 9: the s9readout-init file]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=N-s10init.ckpt
+
+  VAE_model:
+    # Change 1: the full branch is also scored with another row's UA. [0.0]
+    lambda_full_wrong: 1.0
+    # Change 2: the IRF head's evidence feeds the event gate. [false]
+    irf_gate_evidence: true
+    # Change 3: every scored anchor weighs the same; with no weight there is no detector, so its
+    # validity switch goes off too. `event_weight_reach_steps` is then not read. [0.0, true]
+    event_weight_floor: null
+    event_weight_ua_valid: false
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s10_specific_source
+      tags:
+        variant: lag_attn_trf_cfs_next_s10_specific_source

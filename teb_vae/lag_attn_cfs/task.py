@@ -57,12 +57,20 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from teb_vae.coupling_irf.model import STEP_S, irf_delay
 from teb_vae.lag_attn_cfs import ua_tolerance
 from teb_vae.lag_attn_cfs.causal_warmup import WarmupBudget
 from teb_vae.lag_attn_cfs.eval import events as cfs_events
+from teb_vae.lag_attn_cfs.nets.irf_source import ua_step_level
 from teb_vae.lag_attn_fs.task import SeqVaeLagAttnFsTask
 from teb_vae.lag_attn_rws.nets import controls
-from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
+from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+from teb_vae.lag_attn_rws.nets.raw_masks import (
+    VALID_THRESHOLD,
+    contributing_anchors,
+    forecast_mask,
+    kl_mask,
+)
 from teb_vae.lag_attn_rws.sample_page import ForecastRowInputs, InputStreamPanel
 
 #: Field separator inside the tile-phase hash key. A byte that cannot occur in a GUID or in a
@@ -98,6 +106,7 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         source_valid_tolerance_s: Optional[float] = None,
         event_weight_ua_tolerance_s: Optional[float] = None,
         source_valid_windows: Optional[Sequence[int]] = None,
+        irf_lr_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
         r"""Initialize the task.
@@ -128,16 +137,28 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 untrimmed grid, the windows of ``source_valid_tolerance_s``. The trainer reads them
                 off the shards; they are a hyperparameter so a task rebuilt from a checkpoint gets
                 them too. ``None`` falls back to :meth:`_source_valid_windows`.
+            irf_lr_scale: Multiplier on the learning rate of the IRF head's parameters, under a
+                net built with ``source_path='irf'`` (:meth:`configure_param_groups`). ``1.0`` --
+                the default -- builds the optimizer as before the key existed.
             **kwargs: Every other keyword, forwarded to the inherited constructor unchanged. A
                 second keyword schema for the same objective could only drift from the first.
 
         Raises:
             ValueError: If a tolerance is not positive or the guard is negative, if
-                ``source_valid_tolerance_s`` is set on a net without running-gap removal, or if
-                ``event_weight_ua_tolerance_s`` is set without ``event_weight_ua_valid``.
+                ``source_valid_tolerance_s`` is set on a net without running-gap removal, if
+                ``event_weight_ua_tolerance_s`` is set without ``event_weight_ua_valid``, or if
+                ``irf_lr_scale`` is not positive or is set on a net without the IRF head.
         """
         super().__init__(base_model, **kwargs)
         self.save_hyperparameters("seed")
+        if not float(irf_lr_scale) > 0 or (
+            float(irf_lr_scale) != 1.0 and getattr(self.orig_model, "irf_head", None) is None
+        ):
+            raise ValueError(
+                f"irf_lr_scale={irf_lr_scale!r} must be > 0, and other than 1.0 only on a net "
+                f"built with source_path='irf': it scales the learning rate of the IRF head."
+            )
+        self.save_hyperparameters({"irf_lr_scale": float(irf_lr_scale)})
         # Saved as plain floats and ints, so the checkpoint's hyperparameters stay YAML-safe.
         self.save_hyperparameters(
             {
@@ -533,13 +554,45 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         # be the ``self.training`` mistake in another spelling, so the stage travels on the
         # instance for exactly the length of one step; see ``compute_loss_and_metrics``'s caller.
         phase, stride = self.resolve_anchor_geometry(self._stage, batch)
+        inputs: Tuple[Any, ...] = (y_st, y_ph, source, phase, stride)
         if bool(getattr(self.orig_model, "source_quality_mask", False)):
-            valid = self._build_source_valid(batch, source)
+            inputs += (self._build_source_valid(batch, source),)
             if getattr(self.orig_model, "source_running_gap_keys", "keep") == "remove":
-                removed = self._build_source_key_removed(batch, source)
-                return y_st, y_ph, source, phase, stride, valid, removed
-            return y_st, y_ph, source, phase, stride, valid
-        return y_st, y_ph, source, phase, stride
+                inputs += (self._build_source_key_removed(batch, source),)
+        if getattr(self.orig_model, "irf_head", None) is not None:
+            # The IRF head's three inputs, last, after the two mask slots (None where unused).
+            inputs += (None,) * (7 - len(inputs)) + self._build_irf_inputs(batch)
+        return inputs
+
+    def _build_irf_inputs(self, batch: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""The IRF head's inputs (``source_path='irf'`` or ``irf_readout``): UA level, its validity, FHR validity.
+
+        The UA level is the mean of the batch's raw ``up`` over the raw samples of each step, and
+        a step is valid where at least half of its samples are valid in ``up_valid``
+        (:func:`~teb_vae.lag_attn_cfs.nets.irf_source.ua_step_level`). The FHR step validity is
+        the objective's own: ``weight`` at threshold, after ``target_quality_mask``.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            ``(ua_level, ua_valid, target_step_valid)``, each $(B, T)$.
+
+        Raises:
+            RuntimeError: If the batch carries no ``up``, ``up_valid`` or ``weight``.
+        """
+        up, up_valid, weight = (getattr(batch, name, None) for name in ("up", "up_valid", "weight"))
+        if up is None or up_valid is None or weight is None:
+            raise RuntimeError(
+                "the model was built with the IRF head but the batch lacks `up`, `up_valid` "
+                "or `weight`. Add 'up' and 'weight' to dataset_kwargs.load_fields and set "
+                "dataset_kwargs.emit_quality_mask: true."
+            )
+        model = self.orig_model
+        ua_level, ua_valid = ua_step_level(
+            up, up_valid, int(model.geometry.decimation), int(weight.shape[1])
+        )
+        return ua_level, ua_valid, self._target_quality_weight(batch, weight) >= VALID_THRESHOLD
 
     def _build_source_key_removed(self, batch: Any, source: torch.Tensor) -> torch.Tensor:
         r"""The per-anchor running-gap removal mask $R_{t\ell}$ of this batch.
@@ -779,7 +832,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             ``{'kld_source_null': ..., 'pred_gap_mean': ...}`` on the evaluation stages, empty on
             ``train``.
         """
-        if stage == "train":
+        # Both readouts re-pose a posterior, and ``source_path='irf'`` has none.
+        if stage == "train" or getattr(self.orig_model, "source_path", "lag_attn") == "irf":
             return {}
         return {
             "kld_source_null": controls.source_null_kld(
@@ -926,6 +980,230 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         return controls.source_null_kld_with_grad(
             self.orig_model, forward_outputs, inputs[2], weight
         )
+
+    def configure_param_groups(self) -> Any:
+        r"""The optimizer's parameters, with the IRF head in its own group under ``irf_lr_scale``.
+
+        The head has three small parameter tensors, and Adam moves an entry by about the learning
+        rate per step, so at the rate the warm-started FHR path needs they barely move. With
+        ``irf_lr_scale`` $s \ne 1$ the head's parameters form a second group at $s$ times the
+        base rate; the run's schedule multiplies both groups alike. At $1.0$, or on a net without
+        the head, this is the inherited flat list.
+
+        Returns:
+            The flat parameter list, or two AdamW param-group dicts.
+        """
+        scale = float(self.hparams.get("irf_lr_scale", 1.0))
+        head = getattr(self.orig_model, "irf_head", None)
+        if scale == 1.0 or head is None:
+            return super().configure_param_groups()
+        head_ids = {id(parameter) for parameter in head.parameters()}
+        trainable = list(self._trainable_parameters())
+        return [
+            {"params": [p for p in trainable if id(p) not in head_ids]},
+            {"params": [p for p in trainable if id(p) in head_ids],
+             "lr": scale * float(self.hparams.lr)},
+        ]
+
+    def _should_run_perm(self, batch_size: int, stage: str) -> bool:
+        """The inherited decision, and never under ``source_path='irf'``.
+
+        The control re-poses the posterior under another row's source. That path has no posterior;
+        its wrong-UA terms (:meth:`_irf_source_terms`) are its control.
+        """
+        if getattr(self.orig_model, "source_path", "lag_attn") == "irf":
+            return False
+        return super()._should_run_perm(batch_size, stage)
+
+    def _irf_source_terms(
+        self,
+        batch: Any,
+        inputs: Tuple[Any, ...],
+        forward_outputs: Dict[str, torch.Tensor],
+        target_features: torch.Tensor,
+        weight: torch.Tensor,
+        likelihood: str,
+        stage: str,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        r"""The IRF head's loss terms and readouts (``source_path='irf'`` or ``irf_readout``).
+
+        Every term is the full branch's block likelihood, scored at the detached base forecast
+        plus a mean shift of the head, under the objective's own target, mask, channel and horizon
+        weights and density, so no term sends a gradient into the FHR path or the lag attention.
+        Under ``source_path='irf'`` the objective's full term already scores the forecast-mode
+        shift. Under ``irf_readout`` that shift is in no forecast: ``lambda_source_irf`` times its
+        likelihood is added here, with the readout ``pred_gap_irf``. Added in both:
+
+        * ``lambda_source_expl`` times the likelihood of the explain-mode shift, which reads UA
+          up to the target step;
+        * ``lambda_source_wrong`` times the likelihoods of both shifts with the head re-run on
+          another row's UA. The batch is rolled by one. A row whose donor is the same recording
+          is dropped, and the term is skipped when fewer than two rows are left.
+
+        The readouts are unweighted, like ``pred_gap``. ``pred_gap_expl``, ``pred_gap_wrong`` and
+        ``pred_gap_expl_wrong`` are the base block NLL minus the shifted one, in nats per anchor.
+        ``irf_gate_open`` and ``irf_gate_open_wrong`` are the share of cells with $a > 0$ among
+        scored anchors with UA cover times the head's scored channels. ``irf_level_delay_s`` is the median
+        delay of the IRF minimum of target channel 0, the FHR level channel, over the anchors
+        whose gate is open on it, in seconds on the stored clock. It includes that channel's
+        filter latency. A readout with nothing to average is absent, not zero. On the evaluation
+        stages that decision is reduced over the ranks, as the permutation control's is.
+
+        Args:
+            batch: A batch from the data module, read for ``guid``.
+            inputs: The forward's positional arguments; the last three are the head's inputs.
+            forward_outputs: That forward's dict.
+            target_features: The target stream $(B, T, c_y)$.
+            weight: The validity signal $(B, T)$ the objective scored under.
+            likelihood: The objective's likelihood.
+            stage: ``'train'``, ``'val'`` or ``'test'``.
+
+        Returns:
+            ``(loss, metrics)``: the weighted sum of the added terms, and the readouts.
+        """
+        model = self.orig_model
+        anchors = forward_outputs["anchor_index"]
+        target, mask = self._scored_block(forward_outputs, target_features, weight)
+        mu_base = forward_outputs["mu_base"].detach()
+        logvar_base = forward_outputs["logvar_base"].detach()
+        # The channels the gate is counted on: the head's own, where they are scored at all.
+        cell_mask = model.forecast_likelihood_kwargs()["cell_mask"]
+        scored = torch.zeros(target.shape[-1], dtype=torch.bool, device=target.device)
+        scored[model.irf_channel_index] = True
+        if cell_mask is not None:
+            scored = scored & (cell_mask.sum(dim=0) > 0)
+
+        def nll(delta: Any, rows: torch.Tensor) -> torch.Tensor:
+            return self._block_nll(mu_base + delta, logvar_base, target, rows, likelihood)
+
+        def gate_open(gate: torch.Tensor, ua_ok: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+            cells = (contributing_anchors(rows).to(gate.dtype) * ua_ok)[..., None] * scored
+            return ((gate > 0) * cells).sum() / cells.sum().clamp_min(1.0)
+
+        gate, ua_ok = forward_outputs["irf_gate"], forward_outputs["irf_ua_ok"]
+        nll_expl = nll(forward_outputs["irf_delta_expl"], mask)
+        loss = float(self.hparams.get("lambda_source_expl", 0.0)) * nll_expl
+        with torch.no_grad():
+            base = nll(0.0, mask)
+            metrics = {
+                "pred_gap_expl": base - nll_expl,
+                "irf_gate_open": gate_open(gate, ua_ok, mask),
+            }
+            delay, _depth = irf_delay(forward_outputs["irf_h"][..., 0])
+            delay = delay[
+                (gate[..., 0] > 0) & ua_ok & (contributing_anchors(mask) > 0) & torch.isfinite(delay)
+            ]
+            if self._agreed(delay.numel() > 0, stage, mask.device):
+                metrics["irf_level_delay_s"] = STEP_S * delay.median()
+        if "irf_delta" in forward_outputs:
+            # The head as a readout beside the lag attention: its forecast-mode shift is in no
+            # forecast, so it is scored here.
+            nll_irf = nll(forward_outputs["irf_delta"], mask)
+            loss = loss + float(self.hparams.get("lambda_source_irf", 0.0)) * nll_irf
+            metrics["pred_gap_irf"] = (base - nll_irf).detach()
+
+        usable = self._other_recording_rows(batch, mask.device)
+        if self._agreed(int(usable.sum()) >= 2, stage, mask.device):
+            ua_level, ua_valid, step_valid = inputs[-3:]
+            wrong = model.irf_source(
+                target_features, ua_level.roll(1, 0), ua_valid.roll(1, 0), step_valid, anchors
+            )
+            rows = mask * usable[:, None, None]
+            nll_wrong, nll_expl_wrong = nll(wrong["delta"], rows), nll(wrong["delta_expl"], rows)
+            loss = loss + float(self.hparams.get("lambda_source_wrong", 0.0)) * (
+                nll_wrong + nll_expl_wrong
+            )
+            with torch.no_grad():
+                base = nll(0.0, rows)
+                metrics["pred_gap_wrong"] = base - nll_wrong
+                metrics["pred_gap_expl_wrong"] = base - nll_expl_wrong
+                metrics["irf_gate_open_wrong"] = gate_open(wrong["a"], wrong["ua_ok"], rows)
+        return loss, metrics
+
+    def _full_wrong_term(
+        self,
+        batch: Any,
+        forward_outputs: Dict[str, torch.Tensor],
+        target_features: torch.Tensor,
+        weight: torch.Tensor,
+        likelihood: str,
+        stage: str,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        r"""The full branch's block likelihood with another row's UA, for ``lambda_full_wrong``.
+
+        The batch is rolled by one and the posterior branch is rebuilt by the permutation
+        control's own path (:func:`~teb_vae.lag_attn_rws.nets.controls.perm_forward_outputs`,
+        without its no-grad guard): the source state the lag attention reads, its key and removal
+        masks and, under ``irf_gate_evidence``, the head's evidence re-run on the donor's UA all
+        come from the donor. A row whose donor is the same recording is dropped; with fewer than
+        two rows left the term is skipped. Nothing is detached, as in the objective's own full
+        term: the gradient reaches the lag-attention path and, through the posterior head's
+        target inputs and the shared decoder, the FHR path.
+
+        Returns:
+            ``(nll, metrics)``: the unweighted block NLL in nats per anchor (zero when skipped),
+            and ``pred_gap_full_wrong``, the base NLL minus it over the same rows.
+        """
+        target, mask = self._scored_block(forward_outputs, target_features, weight)
+        usable = self._other_recording_rows(batch, mask.device)
+        if not self._agreed(int(usable.sum()) >= 2, stage, mask.device):
+            return mask.new_zeros(()), {}
+        donor = torch.arange(len(usable), device=mask.device).roll(1)
+        wrong = controls.perm_forward_outputs.__wrapped__(
+            self.orig_model, forward_outputs, perm_index=donor,
+            anchors=forward_outputs.get("anchor_index"),
+        )
+        rows = mask * usable[:, None, None]
+        nll = self._block_nll(wrong["mu_full"], wrong["logvar_full"], target, rows, likelihood)
+        with torch.no_grad():
+            base = self._block_nll(
+                forward_outputs["mu_base"], forward_outputs["logvar_base"], target, rows, likelihood
+            )
+        return nll, {"pred_gap_full_wrong": base - nll.detach()}
+
+    def _scored_block(
+        self, forward_outputs: Dict[str, torch.Tensor], target_features: torch.Tensor, weight: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The objective's forecast target $(B, A, H, C)$ and forecast mask $(B, A, H)$ of this step."""
+        model = self.orig_model
+        anchors = forward_outputs.get("anchor_index")
+        mask, _coverage = forecast_mask(
+            model.scored_weight(weight),
+            model.geometry,
+            coverage_floor=model.coverage_floor,
+            anchors=anchors,
+            anchor_valid=forward_outputs.get("anchor_valid"),
+            validate=False,
+        )
+        return model._build_forecast_target(target_features, anchors), mask
+
+    def _block_nll(
+        self, mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, rows: torch.Tensor, likelihood: str
+    ) -> torch.Tensor:
+        """A forecast's block NLL in nats per anchor under the objective's weights and density, as
+        ``nll_full_block`` is reduced, over the anchors of the mask ``rows``."""
+        model = self.orig_model
+        block, contributing = masked_raw_block_per_anchor(
+            mu,
+            target,
+            rows,
+            likelihood=likelihood,
+            logvar=logvar,
+            channel_weight=getattr(model, "target_channel_weight", None),
+            horizon_weight=getattr(model, "horizon_weight", None),
+            **model.forecast_likelihood_kwargs(),
+        )
+        return block.sum() / contributing.sum().clamp_min(1.0)
+
+    def _other_recording_rows(self, batch: Any, device: torch.device) -> torch.Tensor:
+        """Which rows get another recording's UA when the batch is rolled by one, $(B,)$ boolean."""
+        guids = [str(guid) for guid in self._phase_field(batch, "guid")]
+        return torch.tensor([guids[row] != guids[row - 1] for row in range(len(guids))], device=device)
+
+    def _agreed(self, local: bool, stage: str, device: torch.device) -> bool:
+        """A skip decision all ranks share: validation metrics are synchronised over the ranks, so
+        no rank may report alone. Training steps decide locally."""
+        return local if stage == "train" else self._sync_perm_decision(local, device)
 
     #: The stage the next :meth:`_build_forward_inputs` resolves its anchor geometry from. A class
     #: attribute so it exists before the first step and on a task nothing has stepped, and one of

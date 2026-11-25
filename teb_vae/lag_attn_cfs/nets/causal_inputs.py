@@ -81,6 +81,7 @@ from torch import nn
 
 from teb_vae.lag_attn.nets.delays import ChannelGate
 from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter
+from teb_vae.lag_attn_cfs.nets.irf_source import IrfSourceHead
 from teb_vae.lag_attn_rws.nets.model import SATURATION_FRAC
 
 #: The constructor keywords this mixin owns, i.e. the ones a composing model must **not** forward to
@@ -133,6 +134,12 @@ SOURCE_MASK_MODES: Tuple[str, ...] = ("hard", "soft", "input")
 
 #: The modes that keep every key and feed the validity to the UA adapter.
 SOFT_MASK_MODES: Tuple[str, ...] = ("soft", "input")
+
+#: The two UA paths. ``'lag_attn'`` is the lag attention, the event gate and the posterior shift.
+#: ``'irf'`` builds none of them: an impulse response fitted on the segment's own past shifts the
+#: detached base forecast (:mod:`~teb_vae.lag_attn_cfs.nets.irf_source`). See
+#: :meth:`CausalWarmupInputs._build_irf_source_path`.
+SOURCE_PATHS: Tuple[str, ...] = ("lag_attn", "irf")
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
 #: base. ``__class__`` appears because a method referencing ``super()`` gets an implicit closure
@@ -761,6 +768,287 @@ class CausalWarmupInputs:
                 persistent=False,
             )
 
+    def _build_irf_source_path(
+        self,
+        source_path: str = "lag_attn",
+        irf_gate_k: float = 4.4,
+        irf_context_steps: int = 0,
+        irf_channels: Optional[Sequence[int]] = None,
+        irf_readout: bool = False,
+        irf_gate_evidence: bool = False,
+    ) -> None:
+        r"""Set ``source_path`` and build the IRF head where a keyword asks for it.
+
+        Called by a composing constructor **after** everything else. ``'lag_attn'`` with
+        ``irf_readout=False`` -- the defaults -- changes nothing.
+
+        Under ``'lag_attn'`` with ``irf_readout`` the model is the lag-attention model with
+        ``irf_head`` beside it. The forward is unchanged in every output it had and adds the
+        head's (:meth:`_irf_outputs`); the head's shift is not added to any forecast.
+        ``irf_gate_evidence`` also builds ``irf_evidence_gate``, a bias-free linear map from the
+        head's two evidence numbers per step to the event gate's logit, zero-initialised, so the
+        forward starts unchanged (:meth:`attend_lagged_source`).
+
+        Under ``'irf'``:
+
+        * ``query_proj``, ``lag_attn``, ``posterior_head`` and ``te_analysis`` are removed. The
+          base constructor built them and nothing reads them, and a parameter without a gradient
+          stops a DDP run under ``find_unused_parameters=False``. They are built and then removed,
+          not skipped, so the base constructor is untouched and the initial weights of the FHR
+          path under a given seed are the lag-attention model's.
+        * The source gate and the source key/value modules stay, because the prior's clock
+          (:meth:`_prior_clock`) and the input rows of the sample page read them. The clock runs
+          under no-grad, so their parameters are frozen.
+        * ``irf_head`` is built, an
+          :class:`~teb_vae.lag_attn_cfs.nets.irf_source.IrfSourceHead` over the kept target
+          channels, or over ``irf_channels`` of them. Its three parameters are the only ones this
+          path adds. ``irf_channel_index`` is the non-persistent buffer of those channels.
+
+        Args:
+            source_path: One of :data:`SOURCE_PATHS`.
+            irf_gate_k: $k$, the standard errors the gate subtracts from its calibration slope.
+                A fixed number, not trained.
+            irf_context_steps: Steps of past the IRF is fitted on; $0$ is all past steps of the
+                segment.
+            irf_channels: The kept target channels the head acts on, as indices into the kept
+                channel axis, strictly ascending. ``None`` is all of them. The shift of every
+                other channel is zero.
+            irf_readout: Build the head beside the lag attention, as a readout. With
+                ``source_path='lag_attn'`` only.
+            irf_gate_evidence: Feed the head's evidence to the event gate. It needs
+                ``irf_readout`` and ``source_mask_mode='soft'``, the one mode whose gate logit
+                takes added terms.
+
+        Raises:
+            ValueError: On an unknown ``source_path``; under ``'irf'`` with ``irf_readout`` or a
+                key of the path it replaces (``source_quality_mask``, ``posterior_event_gate``);
+                with a head and a forecast clock shift; with ``irf_channels`` empty, not
+                ascending or out of range; or with ``irf_gate_evidence`` without ``irf_readout``
+                or outside the soft mask mode.
+        """
+        if source_path not in SOURCE_PATHS:
+            raise ValueError(f"source_path must be one of {SOURCE_PATHS}, got {source_path!r}")
+        self.source_path = str(source_path)
+        self.irf_readout, self.irf_gate_evidence = bool(irf_readout), bool(irf_gate_evidence)
+        if self.irf_gate_evidence and not (
+            self.irf_readout and getattr(self, "source_mask_mode", "hard") == "soft"
+        ):
+            raise ValueError(
+                "irf_gate_evidence needs irf_readout=True and source_mask_mode='soft': the "
+                "evidence is added to the event gate's logit, which only the soft mode builds "
+                "from added terms."
+            )
+        if self.source_path != "irf" and not self.irf_readout:
+            return
+        if self.target_forecast_shift and any(self.target_forecast_shift):
+            raise ValueError(
+                "the IRF head fits its impulse response on the stored target steps and needs "
+                "the stored forecast clock; got a target_forecast_shift."
+            )
+        if self.source_path == "irf":
+            if self.irf_readout or self.source_quality_mask or getattr(self, "posterior_event_gate", False):
+                raise ValueError(
+                    "source_path='irf' reads the raw UA level and builds no lag attention and no "
+                    "posterior, so the keys of that path must be off: source_quality_mask=False "
+                    "(with it source_mask_mode='hard' and source_running_gap_keys='keep'), "
+                    "posterior_event_gate=False and irf_readout=False (the head is the path)."
+                )
+            del self.query_proj, self.lag_attn, self.posterior_head, self.te_analysis
+            for module in self.source_kv_modules():
+                module.requires_grad_(False)
+        width = int(self.decoder_out_channels)
+        channels = list(range(width)) if irf_channels is None else [int(c) for c in irf_channels]
+        if not channels or channels != sorted(set(channels)) or not 0 <= channels[0] <= channels[-1] < width:
+            raise ValueError(
+                f"irf_channels must be strictly ascending indices into the {width} kept target "
+                f"channels, got {irf_channels!r}"
+            )
+        self.register_buffer("irf_channel_index", torch.tensor(channels), persistent=False)
+        self.irf_head = IrfSourceHead(
+            self.horizon, len(channels), gate_k=irf_gate_k, context_steps=irf_context_steps
+        )
+        if self.irf_gate_evidence:
+            self.irf_evidence_gate = nn.Linear(2, 1, bias=False)
+            nn.init.zeros_(self.irf_evidence_gate.weight)
+
+    def _irf_outputs(
+        self,
+        target_features: torch.Tensor,
+        ua_level: Optional[torch.Tensor],
+        ua_valid: Optional[torch.Tensor],
+        target_step_valid: Optional[torch.Tensor],
+        anchors: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        r"""Run the head on the batch's own UA and name its outputs for the forward dict.
+
+        Returns:
+            ``irf_h`` $(B, A, J, C)$, ``irf_gate`` and ``irf_z`` $(B, A, C)$, ``irf_ua_ok``
+            $(B, A)$, ``irf_delta`` and ``irf_delta_expl`` $(B, A, H, C)$. Under
+            ``irf_gate_evidence`` also ``irf_evidence`` $(B, T, 2)$, detached, and the head's four
+            inputs (``irf_target``, ``irf_ua_level``, ``irf_ua_valid``, ``irf_step_valid``), so a
+            control that swaps the UA can recompute the evidence (:meth:`irf_evidence_for`).
+
+        Raises:
+            ValueError: If one of the three head inputs is missing.
+        """
+        if ua_level is None or ua_valid is None or target_step_valid is None:
+            raise ValueError(
+                "a model with the IRF head needs ua_level, ua_valid and target_step_valid in "
+                "every forward (task._build_forward_inputs builds them from the batch's up, "
+                "up_valid and weight)."
+            )
+        head = self.irf_source(target_features, ua_level, ua_valid, target_step_valid, anchors)
+        outputs = {
+            "irf_h": head["h"],
+            "irf_gate": head["a"],
+            "irf_z": head["z"],
+            "irf_ua_ok": head["ua_ok"],
+            "irf_delta": head["delta"],
+            "irf_delta_expl": head["delta_expl"],
+        }
+        if getattr(self, "irf_gate_evidence", False):
+            outputs.update(
+                irf_evidence=head["evidence"].detach(),
+                irf_target=target_features,
+                irf_ua_level=ua_level,
+                irf_ua_valid=ua_valid,
+                irf_step_valid=target_step_valid,
+            )
+        return outputs
+
+    def irf_evidence_for(
+        self, forward_outputs: Dict[str, torch.Tensor], perm_index: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        r"""The event gate's evidence with the UA of other rows: the head re-run on ``ua[perm_index]``.
+
+        The evidence depends on the target and on the UA together, so it cannot be permuted; a
+        control that gives a row another row's UA calls this.
+
+        Returns:
+            The evidence $(B, T, 2)$, detached.
+        """
+        ua, valid = forward_outputs["irf_ua_level"], forward_outputs["irf_ua_valid"]
+        if perm_index is not None:
+            ua, valid = ua[perm_index], valid[perm_index]
+        return self.irf_source(
+            forward_outputs["irf_target"], ua, valid, forward_outputs["irf_step_valid"],
+            forward_outputs["anchor_index"],
+        )["evidence"].detach()
+
+    def irf_source(
+        self,
+        target_features: torch.Tensor,
+        ua_level: torch.Tensor,
+        ua_valid: torch.Tensor,
+        target_step_valid: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        r"""Run the IRF head for one UA signal against this batch's target features.
+
+        The forward calls it with the batch's own UA. The task calls it again with another
+        row's UA for the wrong-UA terms, so only the head is re-run and not the FHR path.
+
+        Args:
+            target_features: The target stream $(B, T, c_y)$ in declared channel order, the
+                tensor the forecast target is gathered from.
+            ua_level: UA level per step $(B, T)$.
+            ua_valid: Its validity $(B, T)$, boolean.
+            target_step_valid: FHR step validity $(B, T)$, boolean: the objective's weight at
+                threshold. A kept channel is valid where the step is and the channel is past
+                its own warm-up.
+            anchors: The decoded anchors $(B, A)$.
+
+        Returns:
+            The head's dict: ``delta``, ``delta_expl``, ``h``, ``a``, ``z``, ``ua_ok``,
+            ``evidence``. Under
+            ``irf_channels`` the head runs on those channels only, and every tensor with a channel
+            axis is returned at the full kept width with zeros on the other channels.
+        """
+        y = (
+            target_features
+            if self.target_gate is None
+            else torch.index_select(target_features, -1, self.target_gate.keep_index)
+        )
+        step_ok = target_step_valid.to(torch.bool)
+        steps = torch.arange(y.shape[1], device=y.device)[:, None]
+        y_ok = step_ok[..., None] & (steps >= self.target_warm_steps)
+        index, width = self.irf_channel_index, y.shape[-1]
+        if index.numel() == width:
+            return self.irf_head(y, y_ok, step_ok, ua_level, ua_valid.to(torch.bool), anchors)
+        out = self.irf_head(
+            y[..., index], y_ok[..., index], step_ok, ua_level, ua_valid.to(torch.bool), anchors
+        )
+        return {
+            key: value if key in ("ua_ok", "evidence")
+            else value.new_zeros(*value.shape[:-1], width).index_copy(-1, index, value)
+            for key, value in out.items()
+        }
+
+    def _forward_irf(
+        self,
+        target_features: torch.Tensor,
+        u_stream: torch.Tensor,
+        h_y: torch.Tensor,
+        persistence: Optional[torch.Tensor],
+        anchor_index: torch.Tensor,
+        anchor_valid: torch.Tensor,
+        ua_level: Optional[torch.Tensor],
+        ua_valid: Optional[torch.Tensor],
+        target_step_valid: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        r"""The rest of the forward under ``source_path='irf'``, from the target state on.
+
+        The prior, the draw of $z^p$ and the base decode are the lag-attention forward's. The
+        full forecast is the detached base forecast plus the head's mean shift, so the FHR path
+        is trained by the base term only and the gain is a pure mean shift.
+
+        Returns:
+            The keys the objective reads, with the posterior equal to the prior (``mu_post``,
+            ``logvar_post`` and ``z_post`` are the prior's tensors, ``kld_per_t`` is zero), and
+            the keys of :meth:`_irf_outputs` but ``irf_delta``, which is in ``mu_full``. There is no attention,
+            so ``source_state``, ``attended_source_heads``, ``attn_weights``,
+            ``kld_per_t_per_head``, ``source_kl_lag_map`` and ``event_gate`` are absent.
+
+        Raises:
+            ValueError: If one of the three head inputs is missing.
+        """
+        irf = self._irf_outputs(target_features, ua_level, ua_valid, target_step_valid, anchor_index)
+        mu_prior, logvar_prior, raw_logvar_prior = self.prior_head(
+            h_y,
+            clock=self._prior_clock(u_stream) if self.prior_availability_input else None,
+        )
+        # The posterior is the prior, so this is the lag-attention forward's draw of z^p.
+        z_prior, _ = self._reparameterize_shared(mu_prior, logvar_prior, mu_prior, logvar_prior)
+        with torch.no_grad():
+            mu_prior_sat_frac = (mu_prior.abs() >= (SATURATION_FRAC * self.mu_scale)).float().mean()
+        mu_base, logvar_base = self.decoder(
+            z_prior.gather(1, anchor_index[:, :, None].expand(-1, -1, self.d_z)),
+            persistence=persistence,
+        )
+        outputs = {
+            "mu_prior": mu_prior,
+            "logvar_prior": logvar_prior,
+            "raw_logvar_prior": raw_logvar_prior,
+            "mu_post": mu_prior,
+            "logvar_post": logvar_prior,
+            "z_prior": z_prior,
+            "z_post": z_prior,
+            "target_state": h_y,
+            "mu_base": mu_base,
+            "logvar_base": logvar_base,
+            "mu_full": mu_base.detach() + irf.pop("irf_delta"),
+            "logvar_full": logvar_base.detach(),
+            "kld_per_t": mu_prior.new_zeros(mu_prior.shape[:2]),
+            "mu_prior_sat_frac": mu_prior_sat_frac,
+            "delta_mu_sat_frac": torch.zeros_like(mu_prior_sat_frac),
+            "anchor_index": anchor_index,
+            "anchor_valid": anchor_valid,
+            **irf,
+        }
+        if persistence is not None:
+            outputs["persistence"] = persistence
+        return outputs
+
     # ------------------------------------------------------------------
     # The two overridden construction hooks
     # ------------------------------------------------------------------
@@ -961,6 +1249,9 @@ class CausalWarmupInputs:
         anchor_stride: Optional[int] = None,
         source_valid: Optional[torch.Tensor] = None,
         source_key_removed: Optional[torch.Tensor] = None,
+        ua_level: Optional[torch.Tensor] = None,
+        ua_valid: Optional[torch.Tensor] = None,
+        target_step_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         r"""Run the full pipeline, decoding a tiled anchor set.
 
@@ -993,6 +1284,13 @@ class CausalWarmupInputs:
             source_key_removed: Under ``source_running_gap_keys='remove'`` only, and required
                 there: the per-anchor removal mask $R_{t\ell}$, ``(B, T, L)`` boolean in lag
                 order, ``True`` = removed. See :meth:`attend_lagged_source`.
+            ua_level: Under ``source_path='irf'`` only, and required there: the UA level per
+                step $(B, T)$.
+            ua_valid: Its validity $(B, T)$, boolean.
+            target_step_valid: Under ``source_path='irf'`` only, and required there: the FHR step
+                validity $(B, T)$, boolean. See :meth:`irf_source`.
+
+        Under ``source_path='irf'`` the return is :meth:`_forward_irf`'s instead of the one below.
 
         Returns:
             The base's twenty keys, with ``mu_base``, ``logvar_base``, ``mu_full`` and
@@ -1066,6 +1364,12 @@ class CausalWarmupInputs:
         source = u_stream if self.source_gate is None else self.source_gate(u_stream)
 
         h_y = self.target_encoder(self.target_adapter(target))
+        if getattr(self, "source_path", "lag_attn") == "irf":
+            # No lag attention and no posterior: the IRF head shifts the detached base forecast.
+            return self._forward_irf(
+                torch.cat([y_st, y_ph], dim=-1), u_stream, h_y, persistence,
+                anchor_index, anchor_valid, ua_level, ua_valid, target_step_valid,
+            )
         # Keys AND values for the lag attention, from whichever source representation
         # ``lag_kv_source`` selects. Localising the keys alone would leave the lag-0 value
         # informationally dominant and the degeneracy standing under a better-looking map, so the
@@ -1107,11 +1411,19 @@ class CausalWarmupInputs:
             key_mask = self.source_key_mask(
                 source_valid, self.build_lag_mask(h_u.shape[1], h_u.device), u_stream.dtype
             )
+        # The IRF head as a readout beside the lag attention (``irf_readout``), and its evidence
+        # for the event gate (``irf_gate_evidence``). Neither exists on any other model.
+        irf: Dict[str, torch.Tensor] = {}
+        if getattr(self, "irf_readout", False):
+            irf = self._irf_outputs(
+                torch.cat([y_st, y_ph], dim=-1), ua_level, ua_valid, target_step_valid, anchor_index
+            )
+        evidence = irf.get("irf_evidence")
         attended = (
             self.attend_lagged_source(self.query_proj(query), h_u, key_mask)
-            if source_key_removed is None
+            if source_key_removed is None and evidence is None
             else self.attend_lagged_source(
-                self.query_proj(query), h_u, key_mask, removed=source_key_removed
+                self.query_proj(query), h_u, key_mask, removed=source_key_removed, evidence=evidence
             )
         )
         alpha, attended_heads = attended.alpha, attended.heads
@@ -1212,6 +1524,7 @@ class CausalWarmupInputs:
             # Under ``source_running_gap_keys='remove'`` only, so every control that re-attends
             # this forward's source removes the same keys.
             outputs["source_key_removed"] = source_key_removed.to(torch.bool)
+        outputs.update(irf)
         return outputs
 
     # ------------------------------------------------------------------
@@ -1462,6 +1775,7 @@ class CausalWarmupInputs:
         h_u: torch.Tensor,
         key_mask: Optional[torch.Tensor] = None,
         removed: Optional[torch.Tensor] = None,
+        evidence: Optional[torch.Tensor] = None,
     ) -> LaggedSourceAttention:
         r"""Run the lag attention and the event gate under the configured UA mask mode.
 
@@ -1509,6 +1823,10 @@ class CausalWarmupInputs:
                 for a model without ``source_quality_mask``.
             removed: The running-gap removal mask $R$ ``(B, T, L)`` in lag order, ``True`` =
                 removed, or ``None`` -- every model without ``source_running_gap_keys='remove'``.
+            evidence: Under ``irf_gate_evidence`` only (soft mode): the IRF head's two evidence
+                numbers per step ``(B, T, 2)``, detached. ``irf_evidence_gate`` maps them to a
+                term of the gate's logit, $g_t = \sigma(\dots + w_e^\top e_t)$, with $w_e$
+                zero at the start. ``None`` adds nothing.
 
         Returns:
             A :class:`LaggedSourceAttention`.
@@ -1533,8 +1851,10 @@ class CausalWarmupInputs:
             kept = lag_mask if removed is None else lag_mask[None] & ~removed.to(torch.bool)
             _, alpha, heads = self.lag_attn(query, h_u, kept, score_bias=bias)
             invalid_mass = (alpha * invalid[:, :, None, :]).sum(dim=-1)  # (B, T, M)
-            logits = self.posterior_head.event_gate_logits(heads)
-            gate = torch.sigmoid(logits + self.source_invalid_gate(invalid_mass))
+            logits = self.posterior_head.event_gate_logits(heads) + self.source_invalid_gate(invalid_mass)
+            if evidence is not None:
+                logits = logits + self.irf_evidence_gate(evidence)
+            gate = torch.sigmoid(logits)
             if removed is not None:
                 # An anchor with no key left attends to nothing, but the gate reads a LayerNorm of
                 # a zero summary and stays open; closing it keeps q = p there.
@@ -1604,6 +1924,7 @@ class CausalWarmupInputs:
 __all__ = [
     "CAUSAL_ONLY_KEYWORDS",
     "FORWARDED_EXCLUSIONS",
+    "SOURCE_PATHS",
     "SOURCE_RUNNING_GAP_MODES",
     "CausalWarmupInputs",
 ]

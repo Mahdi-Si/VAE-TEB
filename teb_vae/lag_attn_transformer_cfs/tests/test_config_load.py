@@ -110,6 +110,14 @@ TASK_LEVEL_KEYS = (
     "ua_bridge_guard_s",
     "source_valid_tolerance_s",
     "event_weight_ua_tolerance_s",
+    # The two extra likelihood terms of `source_path: irf`, read by the task's objective.
+    "lambda_source_expl",
+    "lambda_source_wrong",
+    # The head's forecast-mode term under `irf_readout`, and the full branch under a wrong UA.
+    "lambda_source_irf",
+    "lambda_full_wrong",
+    # The learning-rate multiplier of the IRF head's optimizer group, read by the task.
+    "irf_lr_scale",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -215,6 +223,22 @@ UA_TOLERANCE_PATHS = (
 #: The leaf the 2026-11-10 Student-t density added, present in this config and in neither
 #: sibling's, at its inert value: null is the Gaussian innovation density.
 STUDENT_T_PATHS = (f"{_VAE}.forecast_student_nu",)
+
+#: The leaves the 2026-11-24 IRF source path added, present in this config and in neither
+#: sibling's, every one at its inert value: `source_path: lag_attn` is the model before the key.
+IRF_SOURCE_PATHS = (
+    f"{_VAE}.source_path",
+    f"{_VAE}.irf_gate_k",
+    f"{_VAE}.irf_context_steps",
+    f"{_VAE}.irf_channels",
+    f"{_VAE}.irf_lr_scale",
+    f"{_VAE}.irf_readout",
+    f"{_VAE}.irf_gate_evidence",
+    f"{_VAE}.lambda_source_irf",
+    f"{_VAE}.lambda_full_wrong",
+    f"{_VAE}.lambda_source_expl",
+    f"{_VAE}.lambda_source_wrong",
+)
 
 #: The two divergences the 2026-10-29 headline-run decision added to BOTH edges: this cell trains on
 #: the quality-version-4 build, and its decoder log-variance floor moved from -5 to -6 because the
@@ -499,6 +523,7 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         *NEXT_STEP_PATHS,
         *UA_TOLERANCE_PATHS,
         *STUDENT_T_PATHS,
+        *IRF_SOURCE_PATHS,
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -581,6 +606,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         *UA_TOLERANCE_PATHS,
         # The Student-t innovation density, carried here alone at its inert (Gaussian) value.
         *STUDENT_T_PATHS,
+        # The IRF source path's keys, carried here alone at their inert values.
+        *IRF_SOURCE_PATHS,
     }
     assert set(theirs) - set(mine) == set()
 

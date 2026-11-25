@@ -127,6 +127,16 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     # The source-null KL the objective charges under `lambda_source_null`; logged on both stages
     # when the weight is set and absent (an empty column) when it is not.
     "source_null_kl_penalty",
+    # The IRF source path's readouts (`source_path: irf`); absent, so empty columns, otherwise.
+    "pred_gap_expl",
+    "pred_gap_wrong",
+    "pred_gap_expl_wrong",
+    "irf_gate_open",
+    "irf_gate_open_wrong",
+    "irf_level_delay_s",
+    # The hybrid's head gap (`irf_readout`) and the full branch under a wrong UA (`lambda_full_wrong`).
+    "pred_gap_irf",
+    "pred_gap_full_wrong",
 )
 
 #: The two readouts that run on validation batches only, beside the permutation control's three:
@@ -234,6 +244,9 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
             for key in UA_TOLERANCE_TASK_KEYS
             if vae_config.get(key) is not None
         }
+        # The IRF head's learning-rate multiplier; forwarded only when it is not the inert 1.0.
+        if float(vae_config.get("irf_lr_scale") or 1.0) != 1.0:
+            extra["irf_lr_scale"] = float(vae_config["irf_lr_scale"])
         if vae_config.get("source_valid_tolerance_s") is not None:
             dataset_config = self.config.get("dataset_config") or {}
             paths = [

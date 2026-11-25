@@ -1,0 +1,73 @@
+# Next-step ladder, rung 9: rung 8 with the IRF head added BESIDE the lag attention, as a readout.
+# This rung cannot change the forecast: every forward output of rung 8 is unchanged, the head's
+# shift enters no forecast, and the head's loss terms are scored on the detached base forecast,
+# so they send no gradient into the FHR path or the lag attention. Every key not set here is
+# rung 8's, including the contraction weighting, the event gate and the source-null penalty.
+#
+# WHY. The lag study of checkpoint 369 (tmp/lag_analysis_369/REPORT.md) found that the lag
+# attention does not measure a lag, and that its gate, KL and expected lag follow any UA that is
+# fed. Replacing it by the IRF head was tried and loses the forecast gain: `pred_gap` -0.10
+# (+0.08 after a head-only fit) against +4.96 for the lag attention on the same 12 batches
+# (sweep_alt_irf_source_only.yaml). So the lag attention stays the forecast path, and the head
+# adds what it cannot give: a delay in seconds and a UA-specific evidence signal. The head
+# (DESIGN.md §6.5; method in teb_vae/coupling_irf/DESIGN.md) fits an impulse response on the
+# segment's own past and opens its gate only if that response predicted the past out of sample.
+#
+# WARM START. `make_s9init.py --mode readout` adds the three head parameters to a rung-8
+# checkpoint and checks that `mu_base` and `mu_full` are unchanged:
+#   python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s9init --mode readout \
+#       --source <run>/model_checkpoints/lag-attn-trf-cfs-epoch=<N>.ckpt
+#
+# WHAT TO READ:
+#   * `val/pred_gap`, `val/nll_full_block`, `val/shuffle_penalty` and every other rung-8 column:
+#     rung 8's values, as if the head were not there. A difference is a bug.
+#   * `val/irf_gate_open` against `val/irf_gate_open_wrong`: the share of scored anchor x channel
+#     cells whose gate is open with the own UA and with another row's. 15 % against 5 % at the
+#     warm start (by calibration of `irf_gate_k`). The gap between the two is the evidence that
+#     this recording's UA explains its FHR.
+#   * `val/irf_level_delay_s`: median delay of the IRF minimum on target channel 0 over the
+#     anchors whose gate is open, stored clock, including that channel's 12-13 s filter latency.
+#   * `val/pred_gap_irf` (UA up to the anchor) and `val/pred_gap_expl` (UA up to the target):
+#     the head's own gain on the base forecast, against `val/pred_gap_wrong` and
+#     `val/pred_gap_expl_wrong` with another row's UA. All in nats per anchor like `pred_gap`,
+#     summed over about 1300 scored cells, 559 of them on the head's 21 channels. Small:
+#     -0.10 / +0.81 / -0.08 / -0.37 at the warm start.
+# REFUTED as a readout if, after training, `irf_gate_open` is not above `irf_gate_open_wrong`.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_next_s9_irf_readout.yaml
+base: sweep_next_s8_long_ar_skip.yaml
+
+model_config:
+  # SET THIS PATH to the file `make_s9init.py --mode readout` wrote. [rung 8: the s8init file]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=N-s9readout-init.ckpt
+
+  VAE_model:
+    # Rung 9: the IRF head beside the lag attention. [false]
+    irf_readout: true
+    # Standard errors the gate subtracts. Calibrated with eval/calibrate_irf_gate.py on checkpoint
+    # 369 (30 local train batches of 16, the 21 channels below): another row's UA opens the gate
+    # at 5 % of the cells, the own UA at 15.0 %. Recalibrate after training. [4.4]
+    irf_gate_k: 4.45
+    # The head acts on the FHR level and the fast scattering channels only. [null = all 76]
+    # With the untrained head on checkpoint 369: channel 0 opens its gate at 35 % of the anchors
+    # with the own UA and 7 % with another row's; channels 2-20 at 9-18 % against 3-7 %. On
+    # scattering channels 22-31 and on all 44 phase channels the gate opens as often with a wrong
+    # UA as with the own (6 % both) and the shift adds error.
+    irf_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    # The head's three loss terms, each at the detached base forecast plus a shift of the head:
+    # UA up to the anchor, UA up to the target, and both with another row's UA. [0.0 each]
+    lambda_source_irf: 1.0
+    lambda_source_expl: 1.0
+    lambda_source_wrong: 1.0
+    # The head's parameters train at 30 x the run's rate. A head-only fit (400 Adam steps of
+    # batch 16 at 0.01) moved the ridge penalty from 0.3 to 2.8 and was still moving. [1.0]
+    irf_lr_scale: 30.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_next_s9_irf_readout
+      tags:
+        variant: lag_attn_trf_cfs_next_s9_irf_readout

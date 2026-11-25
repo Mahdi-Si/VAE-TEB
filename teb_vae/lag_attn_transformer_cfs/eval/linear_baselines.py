@@ -196,7 +196,9 @@ def collect(
 
         y = torch.index_select(raw_target, -1, target_keep)
         source = inputs[2]
-        source_valid = inputs[5] if len(inputs) > 5 else torch.ones_like(source, dtype=torch.bool)
+        # The slot is None on a model with the IRF head and no source-quality mask.
+        masked = len(inputs) > 5 and inputs[5] is not None
+        source_valid = inputs[5] if masked else torch.ones_like(source, dtype=torch.bool)
         if source_keep is not None:
             source = torch.index_select(source, -1, source_keep)
             source_valid = torch.index_select(source_valid, -1, source_keep)

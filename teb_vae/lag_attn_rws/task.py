@@ -151,6 +151,10 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_boundary: float = 0.0,
         lambda_event_gate: float = 0.0,
         lambda_source_null: float = 0.0,
+        lambda_source_expl: float = 0.0,
+        lambda_source_wrong: float = 0.0,
+        lambda_source_irf: float = 0.0,
+        lambda_full_wrong: float = 0.0,
         event_weight_floor: Optional[float] = None,
         event_weight_reach_steps: Optional[int] = None,
         event_weight_ua_valid: bool = False,
@@ -208,6 +212,24 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                 whose forward inputs carry the source stream (:meth:`_source_null_penalty`);
                 refused otherwise. ``0.0`` -- the default -- adds nothing. Rides the $\beta$
                 schedule.
+            lambda_source_irf: Under a net built with ``irf_readout`` only, and refused otherwise.
+                Weight of the likelihood at the detached base forecast plus the IRF head's
+                forecast-mode shift, which trains the head beside the lag attention. ``0.0`` --
+                the default -- adds nothing.
+            lambda_full_wrong: Weight of the full branch's block likelihood with another row's
+                UA (the batch rolled by one), a training term that charges the lag-attention path
+                for a gain it also takes from a UA that is not its own. Logged as
+                ``pred_gap_full_wrong``. Refused on a net built with ``source_path='irf'``.
+                ``0.0`` -- the default -- adds nothing and computes nothing.
+            lambda_source_expl: Under a net built with the IRF head only (``source_path='irf'``
+                or ``irf_readout``), and refused otherwise. Weight of the full-branch likelihood scored at the detached base
+                forecast plus the IRF head's explain-mode shift, which reads UA up to the target
+                step. ``0.0`` -- the default -- adds nothing.
+            lambda_source_wrong: Under a net built with the IRF head only, and refused otherwise. Weight
+                of the same two likelihoods (forecast mode and explain mode) with the head re-run
+                on another row's UA, so any response the head adds for a UA that does not belong
+                to the FHR raises the loss. ``0.0`` -- the default -- adds nothing. See
+                :meth:`~teb_vae.lag_attn_cfs.task.SeqVaeLagAttnCfsTask._irf_source_terms`.
             event_weight_floor: $w_{\min} \in [0, 1)$, the weight the **full** branch's
                 reconstruction carries at anchors no recent contraction informs; anchors within
                 ``event_weight_reach_steps`` after a contraction onset weigh $1$. ``None`` -- the
@@ -269,6 +291,10 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             "lambda_boundary",
             "lambda_event_gate",
             "lambda_source_null",
+            "lambda_source_expl",
+            "lambda_source_wrong",
+            "lambda_source_irf",
+            "lambda_full_wrong",
             "event_weight_floor",
             "event_weight_reach_steps",
             "event_weight_ua_valid",
@@ -314,6 +340,31 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                 "source_event_mask is set, but the net was not built with source_quality_mask, "
                 "so there is no source mask to narrow. Set model_config.VAE_model."
                 "source_quality_mask: true (and dataset_kwargs.ua_step_mask), or turn it off."
+            )
+        # The IRF head has its own terms, and ``source_path='irf'`` has no posterior, so a weight
+        # of one mechanism reaches nothing on a net without it.
+        irf = getattr(self.orig_model, "source_path", "lag_attn") == "irf"
+        head = getattr(self.orig_model, "irf_head", None) is not None
+        weights = {
+            key: float(self.hparams.get(key) or 0.0)
+            for key in ("lambda_source_expl", "lambda_source_wrong", "lambda_source_irf",
+                        "lambda_source_null", "lambda_full_wrong")
+        }
+        if not head and (weights["lambda_source_expl"] or weights["lambda_source_wrong"]):
+            raise ValueError(
+                "lambda_source_expl / lambda_source_wrong are set, but the net was built without "
+                "the IRF head, so the terms would reach nothing. Set both to 0.0, or set "
+                "model_config.VAE_model.source_path: irf or irf_readout: true."
+            )
+        if weights["lambda_source_irf"] and not getattr(self.orig_model, "irf_readout", False):
+            raise ValueError(
+                "lambda_source_irf is set, but the net was not built with irf_readout. Under "
+                "source_path='irf' the full term already scores that shift; set it to 0.0."
+            )
+        if irf and (weights["lambda_source_null"] or weights["lambda_full_wrong"]):
+            raise ValueError(
+                "lambda_source_null / lambda_full_wrong are set, but the net was built with "
+                "source_path='irf' and has no posterior to rebuild. Set both to 0.0."
             )
 
     def setup(self, stage: str) -> None:
@@ -787,6 +838,12 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             f"declare which forward input is the source stream. Set lambda_source_null to 0.0."
         )
 
+    def _full_wrong_term(self, *args: Any, **kwargs: Any) -> Any:
+        """Refused here: the causal-feature task builds the term from its own target and mask."""
+        raise ValueError(
+            f"lambda_full_wrong > 0 is not supported by {type(self).__name__}. Set it to 0.0."
+        )
+
     def _event_detector(self) -> Callable[..., Dict[str, Any]]:
         r"""The contraction detector the contraction weight runs: this cell's own evaluation's.
 
@@ -1056,6 +1113,24 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             main_loss = main_loss + lambda_source_null * beta * kl_null
             metrics["total_loss"] = main_loss
             metrics["source_null_kl_penalty"] = kl_null.detach()
+        # The IRF head's own terms and readouts, where the forward carries its gate
+        # (``source_path: irf`` or ``irf_readout``).
+        if "irf_gate" in forward_outputs:
+            irf_loss, irf_metrics = self._irf_source_terms(
+                batch, inputs, forward_outputs, fhr_raw, weight, likelihood, stage
+            )
+            main_loss = main_loss + irf_loss
+            metrics["total_loss"] = main_loss
+            metrics.update(irf_metrics)
+        # The full branch under another row's UA, as a loss term on every stage.
+        lambda_full_wrong = float(self.hparams.get("lambda_full_wrong", 0.0))
+        if lambda_full_wrong > 0.0:
+            nll_full_wrong, wrong_metrics = self._full_wrong_term(
+                batch, forward_outputs, fhr_raw, weight, likelihood, stage
+            )
+            main_loss = main_loss + lambda_full_wrong * nll_full_wrong
+            metrics["total_loss"] = main_loss
+            metrics.update(wrong_metrics)
         # Unprefixed and detached: the breaker watches metrics['main_loss'] by exact name and
         # falls back to the returned loss, silently, if it is missing.
         metrics["main_loss"] = main_loss.detach()

@@ -311,6 +311,10 @@ class LagAttnRwsPlotCallback(Callback):
         epoch = int(getattr(trainer, "current_epoch", 0))
         if (epoch + 1) % self.plot_frequency != 0:
             return
+        # The page's latent and lag rows read the posterior and the attention maps. A model built
+        # with source_path='irf' has neither, so it gets no page.
+        if getattr(pl_module.orig_model, "source_path", "lag_attn") == "irf":
+            return
         # The fetch is inside the guard, not before it: it builds a fresh iterator over the
         # validation loader, whose worker processes and HDF5 handles can raise anything at all,
         # and an exception escaping here would abort a multi-day fit for the sake of a figure.

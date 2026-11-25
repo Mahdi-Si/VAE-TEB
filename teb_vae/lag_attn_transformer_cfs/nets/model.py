@@ -55,6 +55,11 @@ from teb_vae.lag_attn_cfs.nets.causal_inputs import (
 )
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
+#: The keywords of ``source_path``, which this constructor hands to the mixin and not to the base.
+IRF_KEYWORDS: Tuple[str, ...] = (
+    "source_path", "irf_gate_k", "irf_context_steps", "irf_channels", "irf_readout", "irf_gate_evidence",
+)
+
 
 class SeqVaeLagAttnTrfCfs(
     CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLagAttnTrfRws
@@ -146,6 +151,12 @@ class SeqVaeLagAttnTrfCfs(
         source_mask_mode: str = "hard",
         source_running_gap_keys: str = "keep",
         decoder_logvar_clamp: Optional[Tuple[float, float]] = None,
+        source_path: str = "lag_attn",
+        irf_gate_k: float = 4.4,
+        irf_context_steps: int = 0,
+        irf_channels: Optional[Sequence[int]] = None,
+        irf_readout: bool = False,
+        irf_gate_evidence: bool = False,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -246,6 +257,35 @@ class SeqVaeLagAttnTrfCfs(
             decoder_logvar_clamp: $(\mathrm{lo}_d, \mathrm{hi}_d)$, the decoder's own bound on the
                 forecast log-variance; the prior and posterior heads keep ``logvar_clamp``.
                 ``None`` -- the default -- is the shared bound, bitwise. It adds no parameter.
+            source_path: How UA reaches the forecast. ``'lag_attn'`` -- the default -- is the lag
+                attention, the event gate and the posterior shift, bitwise as before the keyword
+                existed. ``'irf'`` builds none of them. An impulse response is fitted by ridge
+                regression on the segment's own past and shifts the detached base forecast,
+                behind a gate that opens only if that response has predicted the past out of
+                sample (``teb_vae/coupling_irf/DESIGN.md``). Every forward then needs
+                ``ua_level``, ``ua_valid`` and ``target_step_valid``. It needs
+                ``source_quality_mask=False``, ``posterior_event_gate=False`` and the stored
+                forecast clock. It adds three parameters: ``irf_head.log_lambda`` $(2,)$,
+                ``irf_head.rho_logit`` and ``irf_head.eta_logit`` $(H, C_{\mathrm{keep}})$.
+            irf_gate_k: $k$, the standard errors the IRF gate subtracts from its calibration
+                slope. Fixed, not trained. Read under ``source_path='irf'`` only.
+            irf_context_steps: Steps of past the IRF is fitted on. ``0`` -- the default -- is all
+                past steps of the segment. Read under ``source_path='irf'`` only.
+            irf_channels: The kept target channels the IRF head acts on, as indices into the kept
+                channel axis. ``None`` -- the default -- is all of them. The forecast of every
+                other channel gets no shift, and ``irf_head.rho_logit`` and ``eta_logit`` have one
+                column per listed channel. Read under ``source_path='irf'`` or ``irf_readout``.
+            irf_readout: With ``source_path='lag_attn'`` only. Build the IRF head beside the lag
+                attention as a readout: every output of the forward is unchanged, the head's
+                outputs are added, and its shift enters no forecast. The head is trained by its
+                own loss terms on the detached base forecast. ``False`` -- the default -- builds
+                no head. It adds the head's three parameters.
+            irf_gate_evidence: With ``irf_readout`` and ``source_mask_mode='soft'`` only. The
+                event gate's logit gets a linear term in the head's evidence per step: the level
+                channel's gate statistic over ``irf_gate_k``, cut to $[0, 3]$, and the share of
+                the head's channels whose gate is open. The evidence is detached. It adds
+                ``irf_evidence_gate.weight`` $(1, 2)$, zero at init, so the forward starts
+                unchanged.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -263,7 +303,7 @@ class SeqVaeLagAttnTrfCfs(
         forwarded = {
             name: value
             for name, value in locals().items()
-            if name not in FORWARDED_EXCLUSIONS
+            if name not in FORWARDED_EXCLUSIONS + IRF_KEYWORDS
         }
 
         # Before the base constructor, which builds the input adapters that read the two vectors.
@@ -322,3 +362,7 @@ class SeqVaeLagAttnTrfCfs(
         self._build_soft_source_mask()
         # After the base, which builds the decoder with the shared bound. Inert at None.
         self._set_decoder_logvar_clamp(decoder_logvar_clamp)
+        # Last: under 'irf' it removes the lag attention and the posterior the base built.
+        self._build_irf_source_path(
+            source_path, irf_gate_k, irf_context_steps, irf_channels, irf_readout, irf_gate_evidence
+        )

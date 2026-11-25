@@ -1271,6 +1271,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             The parent's four gap splits, plus ``pred_gap_warm_lo`` / ``_mid`` / ``_hi``,
             ``pred_gap_novel_lo`` / ``_mid`` / ``_hi``, ``target_warm_frac``,
             ``anchors_per_sample``, ``source_lag_warmth_frac_st`` and ``source_lag_warmth_frac_ph``.
+            The last two are absent when the forward carries no ``attn_weights``.
         """
         anchors: Optional[torch.Tensor] = forward_outputs.get("anchor_index")
         anchor_valid: Optional[torch.Tensor] = forward_outputs.get("anchor_valid")
@@ -1309,5 +1310,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             (), float(self.target_warm_frac), device=target.device, dtype=target.dtype
         )
         metrics["anchors_per_sample"] = self._anchors_per_sample(forward_outputs, target)
-        metrics.update(self._source_lag_warmth(forward_outputs, target))
+        # Absent, not zero, on a forward with no attention map (``source_path='irf'``).
+        if "attn_weights" in forward_outputs:
+            metrics.update(self._source_lag_warmth(forward_outputs, target))
         return metrics

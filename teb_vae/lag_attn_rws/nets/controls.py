@@ -179,10 +179,13 @@ def _attend_and_pose(
         # the same one, so this arm cannot apply the mask differently from the matched forward.
         # The removal is passed only when there is one, so a model without the keyword is called
         # with the three arguments it has always taken.
+        # The IRF evidence of the event gate, where the forward returned one: an arm that swaps
+        # the UA puts its own evidence under this key before it calls.
+        evidence = forward_outputs.get("irf_evidence")
         attended = (
             attend(model.query_proj(query), h_u, key_mask)
-            if removed is None
-            else attend(model.query_proj(query), h_u, key_mask, removed=removed)
+            if removed is None and evidence is None
+            else attend(model.query_proj(query), h_u, key_mask, removed=removed, evidence=evidence)
         )
         alpha, attended_heads = attended.alpha, attended.heads
         applied, gate = attended.gate, attended.event_gate
@@ -301,6 +304,12 @@ def perm_forward_outputs(
     # The donor's source arrives with the donor's quality mask: a key is judged by the recording
     # it came from.
     key_mask = forward_outputs.get("source_key_mask")
+    # The event gate's IRF evidence is the head re-run on the donor's UA, not a permutation: it
+    # depends on the target and the UA together.
+    if "irf_evidence" in forward_outputs:
+        forward_outputs = dict(
+            forward_outputs, irf_evidence=model.irf_evidence_for(forward_outputs, perm_index)
+        )
     # The running-gap removal travels with the donor too: it is a function of the donor's raw UA
     # validity, which is what decides whether the donor's key at a lag can read past the anchor.
     removed = forward_outputs.get("source_key_removed")
@@ -472,6 +481,11 @@ def source_null_posterior(
         # missingness pattern alone buys.
         h_u_null = model.encode_source_kv(gated.expand(u_stream.shape[0], -1, -1), quality)
 
+    # A source that says nothing gives the IRF head no evidence either.
+    if "irf_evidence" in forward_outputs:
+        forward_outputs = dict(
+            forward_outputs, irf_evidence=torch.zeros_like(forward_outputs["irf_evidence"])
+        )
     alpha_null, mu_post_null, logvar_post_null, gate_null = _attend_and_pose(
         model, forward_outputs, h_u_null
     )

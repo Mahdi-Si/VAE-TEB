@@ -1,0 +1,119 @@
+# Alternative to the ladder, NOT a rung: rung 8's FHR path with the UA path REPLACED by the IRF
+# head (`source_path: irf`). Kept as the instrument-only variant. It is not a forecast path.
+#
+# WHAT WAS MEASURED (checkpoint 369, 12 local train batches of 16, validation step, shuffle seed
+# 123, horizon-weighted nats per anchor summed over about 1300 scored cells):
+#   * lag attention (rung 8):                 pred_gap +4.96 (scattering 3.12, phase 1.84);
+#   * this replacement at the warm start:     pred_gap -0.10, with another row's UA -0.08;
+#   * after a head-only fit (400 Adam steps): pred_gap +0.08, with another row's UA -0.03.
+# So replacing the lag attention loses about 98 % of the forecast gain. With all 76 channels and
+# the untrained head it was -37: the slower scattering channels and the phase channels open the
+# gate as often for a wrong UA as for the own one, hence `irf_channels` below.
+# What the replacement keeps is specificity and a delay: the gate opens at 15 % of the cells with
+# the own UA against 5 % with another row's, and a planted delay is read back within 4 s
+# (teb_vae/coupling_irf/DESIGN.md §7). The ladder therefore keeps the lag attention as the
+# forecast path and puts this head beside it: sweep_next_s9_irf_readout.yaml, then
+# sweep_next_s10_specific_source.yaml. Use this file only to study the head with no posterior.
+#
+#   full(t, tau, c) = base.detach() + a[t, c] * sum_j h[t, j, c] * (eta * Xf[t, tau, j] - rho * Z[t, j])
+# (DESIGN.md §6.5). The FHR path is trained by the base term alone.
+#
+# WHAT GOES OFF, because the path it belongs to is not built (the constructor and the task refuse
+# the on values): posterior_event_gate, lambda_event_gate, lambda_source_null, source_quality_mask
+# with its mask mode, running-gap rule, tolerance and loader rule, and the contraction weighting
+# (`event_weight_floor: null` is the unweighted full branch; the weight function refuses 1.0).
+# Inert under this path, left at rung 8's values: max_lag, num_heads, d_head, use_entmax,
+# lag_kv_source, lag_bias_init, alibi_slope_scale, query_uses_logvar, source_dropout, a_head_gain,
+# delta_mu_scale, delta_logvar_scale, posterior_logvar_mode, ua_bridge_guard_s. The UA
+# coefficients (`up_st`, `up_ph`) are still loaded: the prior's clock needs their shape.
+#
+# WARM START: python -m teb_vae.neural_surgery_trf_cfs.surgery.make_s9init --mode source \
+#       --source <run>/model_checkpoints/lag-attn-trf-cfs-epoch=<N>.ckpt
+# It drops the keys of query_proj, lag_attn, posterior_head and the soft mask, adds the three head
+# parameters, and checks that the base forecast is unchanged. The source adapter stays, frozen.
+#
+# WHAT A RUN SHOWS: `val/pred_gap` (own UA) against `val/pred_gap_wrong`, `val/pred_gap_expl`,
+# `val/irf_gate_open` against `val/irf_gate_open_wrong`, `val/irf_level_delay_s` (stored clock,
+# including the level channel's 12-13 s filter latency). `source_conditioned_kl_raw` is 0 and the
+# lag-warmth, source-null, permutation and mean-decoded columns are empty; the diagnostic page and
+# `eval/run.py` do not serve this model. Watch `val/logvar_prior_floor_frac`: with no posterior,
+# only `beta_prior` holds the prior's scale up against the sampled base decode.
+#
+# The file name keeps the `sweep_` prefix so that the config lints still read it.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_alt_irf_source_only.yaml
+base: sweep_next_s8_long_ar_skip.yaml
+
+# The learning-rate schedule is rung 8's, unchanged: the FHR path continues from a trained
+# checkpoint and its only loss term, the base term, is rung 8's. The head gets `irf_lr_scale`
+# times that rate (below): Adam moves an entry by about lr per step, and the head's three small
+# parameter tensors need to move by about 1 to 3.
+
+model_config:
+  # SET THIS PATH to the file `make_s9init.py --mode source` wrote. [rung 8: the s8init file]
+  core_model_checkpoint: SET_ME/lag-attn-trf-cfs-epoch=N-s9init.ckpt
+
+  VAE_model:
+    # The IRF head in place of the lag attention. [lag_attn]
+    source_path: irf
+    # Standard errors the gate subtracts. Calibrated with eval/calibrate_irf_gate.py on the s9init
+    # of checkpoint 369 (30 local train batches of 16, the 21 channels below): another row's UA
+    # opens the gate at 5 % of the cells, the own UA at 15.0 %. Recalibrate after training, when
+    # the two penalties have moved. [4.4, the standalone model's value: 5.2 % against 15.3 %]
+    irf_gate_k: 4.45
+    # The IRF is fitted on all past steps of the segment. [0]
+    irf_context_steps: 0
+    # The head acts on the FHR level and the fast scattering channels only. [null = all 76]
+    # Measured on checkpoint 369 with the untrained head, 12 local train batches of 16: on channel
+    # 0 the gate opens at 35 % of the anchors with the own UA and 7 % with another row's, and the
+    # shift removes 2.8 % of the base squared error (8.4 % in explain mode). Channels 2-20 gain
+    # 0-1 %, gate 9-18 % against 3-7 %. On scattering channels 22-31 and on all 44 phase channels
+    # the gate opens as often with a wrong UA as with the own (6 % both) and the shift adds error
+    # (0.9-1.9 % on the phase block): with all 76 channels `pred_gap` was -37 nats per anchor.
+    irf_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    # The head's parameters train at 30 x the rate above: 0.009, and 0.0009 after epoch 150. [1.0]
+    # A head-only fit on the s9init of checkpoint 369 (400 Adam steps of batch 16 at 0.01, FHR path
+    # frozen) moved the ridge penalty from 0.3 to 2.8 and was still moving, and turned `pred_gap`
+    # on 12 held-out batches from -0.10 to +0.08 nats per anchor (wrong UA: -0.08 to -0.03). At
+    # 0.0003 the same move would take about 13,000 optimizer steps.
+    irf_lr_scale: 30.0
+    # The two extra likelihood terms of this path, at the standalone model's weights. [0.0, 0.0]
+    lambda_source_expl: 1.0
+    lambda_source_wrong: 1.0
+    # No posterior: no gate to charge and no source-null posterior to rebuild. [true, 0.05, 1.0]
+    posterior_event_gate: false
+    lambda_event_gate: 0.0
+    lambda_source_null: 0.0
+    # The head reads the raw UA level and `up_valid`, not the UA coefficients, so the
+    # coefficient-level mask and its rules are off. [true, soft, remove, 16.0]
+    source_quality_mask: false
+    source_mask_mode: hard
+    source_running_gap_keys: keep
+    source_valid_tolerance_s: null
+    # No reward window after contraction onset: every scored anchor weighs the same. With no
+    # weight there is no detector, so its validity switch goes off too. [0.0, true]
+    event_weight_floor: null
+    event_weight_ua_valid: false
+
+dataset_config:
+  dataloader_config:
+    dataset_kwargs:
+      # Leaf by leaf, as sweep_no_quality_mask.yaml does: no rule = no coefficient-level UA mask.
+      # `emit_quality_mask` stays true: the head's UA validity is `up_valid`.
+      ua_step_mask:
+        bits: null
+        rho_epsilon: null
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_alt_irf_source_only
+      tags:
+        variant: lag_attn_trf_cfs_alt_irf_source_only
+  callbacks:
+    model_checkpoint:
+      # The second checkpoint follows the gain from UA. [val/pred_gap_mean, which this path lacks]
+      secondary_monitor: "val/pred_gap"
+      secondary_mode: "max"

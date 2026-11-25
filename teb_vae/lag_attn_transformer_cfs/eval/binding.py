@@ -205,7 +205,15 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
         AttributeError: If the model does not expose one of the attributes read, naming it and the
             class -- through the same reader the conv-LSTM cell's disclosure uses, so the two cannot
             come to word the refusal differently.
+        ValueError: If the model was built with ``source_path='irf'``.
     """
+    # Every analysis of this evaluation reads the posterior, its KL or the attention maps.
+    if getattr(model, "source_path", "lag_attn") == "irf":
+        raise ValueError(
+            "this evaluation does not serve a checkpoint built with source_path='irf': it has no "
+            "posterior, no KL and no attention map to analyse. Read the run's irf_* and pred_gap_* "
+            "metrics; the method's acceptance tests are teb_vae/coupling_irf/evaluate.py."
+        )
     target_encoder = disclosed_attribute(model, "target_encoder")
     # The source half is read off whatever the K/V arm actually built, because that is what the lag
     # attention scores. Under a local arm there is no source encoder to read and reporting its

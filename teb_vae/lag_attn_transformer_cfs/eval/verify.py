@@ -108,6 +108,12 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         "base_decode",
         "event_weight_reach_steps",
         "target_weight_ph",
+        # The IRF head: in place of the lag attention, beside it as a readout, feeding the event
+        # gate, and the full branch's wrong-UA term (rungs 9 and 10, `sweep_alt_irf_source_only`).
+        "source_path",
+        "irf_readout",
+        "irf_gate_evidence",
+        "lambda_full_wrong",
     )
 )
 
