@@ -844,6 +844,88 @@ Tests:
 .venv/Scripts/python.exe -m pytest teb_vae/lag_attn_transformer_cfs/tests -q -m slow
 ```
 
+### 17.1 Lag analysis of a checkpoint (`eval/lag_analysis`)
+
+One command repeats the essential measurements of the lag study of checkpoint 369
+(`tmp/lag_analysis_369/REPORT.md`) on any checkpoint of this family and writes a small results
+folder. The folder can be read without the machine, the data or a cache.
+
+```bash
+python -m teb_vae.lag_attn_transformer_cfs.eval.lag_analysis \
+    --checkpoint <ckpt> --shards <glob or files ...> --stats <stats.hdf5> --out <dir> \
+    [--config <resolved_config.yaml>] [--steps gain,shift,...] [--max-guids N] [--batch-size 16] \
+    [--num-workers 2] [--k-samples 8] [--device cuda] [--seed 0] [--force]
+```
+
+**It has no notion of data splits.** Every shard it is given is evaluated, all of them as one set.
+All numbers describe that set. Nothing is fitted on one part and applied to another, and no number
+is selected on one part and confirmed on another. The report states how each choice that could leak
+is made (the static attention profile is cross-fitted over two seeded halves of the recordings; the
+position-only profile, the gate midpoint 0.5, the short-lag range and the slow-channel set need no
+data).
+
+**What must be on the machine.**
+
+| Input | What is needed |
+| --- | --- |
+| Checkpoint | Written by this package's trainer: `model_class`, `model_kwargs`, `hyper_parameters`, `state_dict`. The variant (lag attention, hybrid, IRF only) is read from it. |
+| Resolved config | `--config`, or `resolved_config.yaml` beside the checkpoint. Only `dataset_config.dataloader_config.normalize_fields` and `.dataset_kwargs` are read (`load_fields`, `trim_minutes`, `ua_step_mask`, `fhr_step_mask`, `emit_quality_mask`, filters). The checkpoint does not store them. |
+| Shards | The fields the model reads (`fhr_st`, `fhr_ph`, `up_st`, `up_ph`, `weight`), the raw `fhr` and `up`, `guid`, `epoch`, and the quality fields if the model uses a quality mask. Optional: `up_valid_frac` (donor matching) and the attribute `causal_delay_s` on `up_st` (slow-channel swap). |
+| Stats file | The normalisation statistics the model was fitted with. |
+
+The subgroup of a recording is its shard file stem, or the shard's folder name when the stem is not
+one of the eight names `{acidosis,hie,healthy_bg,healthy_no_bg}_{cs,no_cs}`. Class and delivery mode
+are parsed from it. With other names the class rows are left out and every row is on the block `all`.
+The block `adverse` is the classes acidosis and HIE.
+
+**Steps.** A step whose file `<out>/steps/<step>.npz` exists is skipped unless `--force`. All
+pending steps share one pass over the data; an arm is computed once per batch.
+
+| Step | What it measures | Needs |
+| --- | --- | --- |
+| `gain` | Forecast gain with own UA, another recording's UA (surA), the same recording's UA 40 min away (surB) and zeroed UA; the specific gain (own minus surrogate); KL per anchor by arm; by channel block and horizon | any variant |
+| `shift` | Share of the gain kept when the own UA is moved by 4 to 32 s; half-loss shift W50, centre delta0; tracking index per head | any variant (index: lag attention) |
+| `heads` | KL share and Shapley gain share per head; expected lag per head; loss when lags 0-14 or 15+ are removed | lag attention |
+| `clamp` | Share of the gain kept with the attention replaced by the position-only, the static and the reversed profile | lag attention |
+| `clock` | How much of the course of gate, KL and lag follows a donor's UA; gain dip after the donor's contractions | lag attention |
+| `events` | Gain, gate and KL locked on contraction onset, with the donor's clock as the null; gain peak time; first opening of the gate | any variant |
+| `groups` | Specific gain, KL, gate open share and expected lag by class, delivery mode and time to delivery; class differences; slow-channel swap | any variant (class names) |
+| `irf` | Gate-open share with own and wrong UA, forecast gaps of the head's shift, level-channel delay and its reliability, planted delays, link to the lag-attention path | IRF head |
+| `raw` | Model-free: FHR level around the UA peak of a contraction, nadir delay and depth | no model output |
+
+Definitions follow `tmp/lag_analysis_369/design/PREREG.md`; each statistic carries its one-sentence
+definition and, where it departs from the study, says so. The main departures: percentile bootstrap
+intervals (the study: BCa and a two-way bootstrap for donor rows); surA matched on time to delivery
+and UA valid fraction only; the Shapley values use the gain at the latent means; the gate counts as
+open at 0.5; class differences are unadjusted.
+
+**Outputs** in `<out>/`: `LAG_ANALYSIS.md` (starts with "How to read this folder"),
+`lag_analysis.json` (every statistic under `<id>@<block>` with estimate, interval, n, unit, step,
+arm, definition and the reference value of checkpoint 369), `guid_table.csv` (one row per
+recording), `figures/*.png`, `run_info.json`, `steps/*.npz`. Seconds are on the stored clock: UA is
+stored 20 s earlier than recorded, so recorded = stored - 20 s.
+
+**Run time.** Measured on a GTX 1660 Ti (6 GB) at batch 16, K = 8, two workers: 0.51 s per segment,
+4 min per 100 recordings, 47 min for 1,186 recordings (5,538 segments). Per 100 recordings: `gain`
+115 s, `heads` 65 s, `clamp` 28 s, `shift` 13 s, `clock` 9 s, `groups` 9 s, `events` and `raw` under
+1 s; `irf` adds about 20 s. Peak GPU memory 1.2 GB (1.6 GB with the IRF head). Host memory stays
+under 7 GB. `--max-guids N` takes N recordings in turn from each subgroup, in a seeded order.
+
+**Resuming.** Every `--save-every` batches (default 100, about 14 min on the card above) the pass
+writes `<out>/steps/progress.state`: the per-segment sums and counts of every pending step for the
+segments done so far (about 6 KB per segment), written under a temporary name and renamed. After a
+crash or a kill, run the same command again: it continues after the last saved batch and gives the
+same numbers as an uninterrupted run, because the batch order, the donors and the latent noise depend
+only on the seed and the segment. The file is ignored, with the reason printed, if the checkpoint,
+the shard set, `--max-guids`, `--k-samples`, `--seed`, `--batch-size`, the step list or the code of
+`core.py` / `steps.py` differs, and it is removed when the step files are written.
+
+**What to send back.** The whole `<out>` folder: 9 MB for 1,186 recordings (`steps/` 6.8 MB,
+`guid_table.csv` 1.5 MB, `figures/` 0.7 MB, `lag_analysis.json`, `LAG_ANALYSIS.md` and
+`run_info.json` 0.3 MB). If size matters, leave out `steps/` (2.5 MB remain): every statistic,
+curve and per-recording scalar is in the other files. `steps/` is needed only to redraw curves per
+recording or to rebuild the report with `--out` on another machine.
+
 ## 18. Limitations of the design
 
 - **The nats depend on the block.** A block score sums $\sum_c \min(H_c, H)$ cells, and its scale
