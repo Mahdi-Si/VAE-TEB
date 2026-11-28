@@ -1,8 +1,9 @@
-r"""Calibrate ``irf_gate_k`` of a ``source_path: irf`` checkpoint against another recording's UA.
+r"""Calibrate ``irf_gate_k`` of an IRF checkpoint against another recording's UA.
 
 The IRF gate of a channel is open where $z = \text{slope} / \text{se} > k$ (DESIGN.md §6.5). This
-tool runs the head on shuffled batches twice, with the own UA and with the UA of the previous row
-of the batch (rows whose donor is the same recording are dropped), and prints the $k$ at which
+tool runs the head on shuffled batches twice, with the own UA and with the UA of another recording
+of the batch (a derangement across GUIDs, so no row reads its own recording's UA; a batch of one
+recording is skipped), and prints the $k$ at which
 the wrong UA opens the gate at a chosen share of the cells. A cell is a scored anchor with UA
 cover on one of the head's scored channels, as in ``irf_gate_open``. Only the head runs; the FHR
 path is not needed. ``irf_gate_k`` stays a fixed hyperparameter: put the printed value in the
@@ -34,6 +35,7 @@ import torch  # noqa: E402
 from teb_vae.lag_attn.config import load_config  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.probe import load_task, resolve_device, resolved_config_for  # noqa: E402
 from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
+from teb_vae.lag_attn_rws.nets.controls import groups_can_derange, make_derangement  # noqa: E402
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask  # noqa: E402
 from teb_vae.lag_attn_transformer_cfs.eval.binding import TRF_CFS_BINDING  # noqa: E402
 
@@ -46,6 +48,7 @@ def collect(task: Any, loader: Any, device: torch.device, batches: int) -> Tuple
         ``(z_own, z_wrong)``, 1-D arrays over cells.
     """
     model = task.orig_model
+    generator = torch.Generator().manual_seed(0)
     channels = model.irf_channel_index
     cell_mask = model.forecast_likelihood_kwargs()["cell_mask"]
     if cell_mask is not None:
@@ -64,11 +67,15 @@ def collect(task: Any, loader: Any, device: torch.device, batches: int) -> Tuple
         )
         scored = contributing_anchors(mask) > 0
         guids = [str(guid) for guid in batch.guid]
-        other = torch.tensor([guids[row] != guids[row - 1] for row in range(len(guids))], device=ua.device)
         own = model.irf_source(features, ua, ua_ok, step_ok, anchors)
-        wrong = model.irf_source(features, ua.roll(1, 0), ua_ok.roll(1, 0), step_ok, anchors)
         z_own.append(own["z"][..., channels][scored & own["ua_ok"]].flatten().cpu())
-        z_wrong.append(wrong["z"][..., channels][scored & wrong["ua_ok"] & other[:, None]].flatten().cpu())
+        if not groups_can_derange(guids):
+            continue  # one recording: there is no other recording's UA to hand any row
+        donor = make_derangement(len(guids), generator=generator, device=ua.device, groups=guids)
+        wrong = model.irf_source(features, ua[donor], ua_ok[donor], step_ok, anchors)
+        z_wrong.append(wrong["z"][..., channels][scored & wrong["ua_ok"]].flatten().cpu())
+    if not z_wrong:
+        raise ValueError("no batch held two recordings, so no wrong-UA cell was drawn; raise batch_size")
     return torch.cat(z_own).numpy(), torch.cat(z_wrong).numpy()
 
 
@@ -78,7 +85,7 @@ def main(checkpoint: str, config: Optional[str] = None, shards: Optional[Sequenc
     """Print and return the calibrated ``irf_gate_k``.
 
     Args:
-        checkpoint: A checkpoint built with ``source_path='irf'``.
+        checkpoint: A checkpoint with an IRF head (``source_path='irf'`` or ``irf_readout``).
         config: The run's resolved config, read for the loader settings. ``None`` finds it beside
             the checkpoint.
         shards: The shards to read. ``None`` means the config's training shards.
@@ -95,14 +102,14 @@ def main(checkpoint: str, config: Optional[str] = None, shards: Optional[Sequenc
     torch_device = resolve_device(device)
     task = load_task(Path(checkpoint), torch_device, binding=TRF_CFS_BINDING)
     model = task.orig_model
-    if getattr(model, "source_path", "lag_attn") != "irf":
-        raise ValueError(f"{checkpoint} was not built with source_path='irf'; it has no IRF gate")
+    if getattr(model, "irf_head", None) is None:
+        raise ValueError(f"{checkpoint} has no IRF head (neither source_path='irf' nor irf_readout)")
     dataset = load_config(str(resolved_config_for(Path(checkpoint)) if config is None else config))["dataset_config"]
     kwargs = copy.deepcopy(dataset["dataloader_config"]["dataset_kwargs"])
     kwargs["cache_size"] = 0
     torch.manual_seed(0)  # shuffled, so that the rows of a batch are different recordings
     loader = create_optimized_dataloader(
-        hdf5_files=list(shards or dataset["vae_train_datasets"]), batch_size=batch_size, num_workers=2,
+        hdf5_files=list(shards or dataset["vae_train_datasets"]), batch_size=batch_size, num_workers=0,
         shuffle=True, stats_path=str(stats or dataset["stat_path"]),
         normalize_fields=dataset["dataloader_config"]["normalize_fields"], prefetch_factor=2, **kwargs,
     )

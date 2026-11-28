@@ -3,10 +3,11 @@ r"""The UA tolerance port: running-gap key removal, tolerant flags, tolerant rew
 Four mechanisms, each behind a key that is inert at its default:
 
 * ``source_running_gap_keys`` (model): with ``'remove'``, the key at lag $\ell$ of anchor $t$
-  leaves the lag attention when an invalid UA run $[a, b]$ satisfies $a < D(t - \ell + 1)$ and
-  $b + g + 1 \ge D(t + 1)$, because the bridge across the run reads samples after the anchor;
+  leaves the lag attention when an invalid UA run $[a, b]$ satisfies $a \le D(t - \ell)$ and
+  $b + g + 1 > Dt$, because step $s$ ends at raw sample $Ds$ and the bridge across the run
+  reads samples after the anchor;
 * ``source_valid_tolerance_s`` (task): a flag turns valid where the channel's untrimmed causal
-  window holds no sample of a long run;
+  window $[D(s - W_c), Ds]$ lies inside the trimmed grid and holds no sample of a long run;
 * ``event_weight_ua_tolerance_s`` (task): the contraction detector counts short runs as valid;
 * ``decoder_logvar_clamp`` (model): the decoder's own log-variance bound.
 
@@ -71,7 +72,7 @@ def _brute_removed(up_valid, steps, lags, decimation, guard):
     for row, a, b in zip(rows.tolist(), starts.tolist(), ends.tolist()):
         for t in range(steps):
             for lag in range(min(lags, t + 1)):
-                if a < decimation * (t - lag + 1) and b + guard + 1 >= decimation * (t + 1):
+                if a <= decimation * (t - lag) and b + guard + 1 > decimation * t:
                     removed[row, t, lag] = True
     return torch.from_numpy(removed)
 
@@ -98,15 +99,60 @@ def test_a_run_at_most_the_tolerance_is_short_and_a_longer_one_is_long():
 
 
 def test_tolerant_flags_clear_a_step_only_when_its_window_holds_no_long_run_sample():
-    # T = 6 steps of D = 4 samples; one long run over samples 8..15, i.e. steps 2 and 3.
+    # T = 6 steps of D = 4 samples, step s ending at sample 4s; one long run over samples 8..15.
     valid = _valid_from_runs(6 * D, [(0, 8, 15)])
     flags = torch.zeros(1, 6, 2, dtype=torch.bool)
     windows = torch.tensor([1, 3])
     out = U.tolerant_flags(flags, valid, windows, tolerance_s=1.0, decimation=D)
-    # W = 1 reads its own step: steps 2 and 3 stay invalid.
-    assert out[0, :, 0].tolist() == [True, True, False, False, True, True]
-    # W = 3 reads [D(s - 2), D(s + 1)): every step from 2 to 5 sees the run.
-    assert out[0, :, 1].tolist() == [True, True, False, False, False, False]
+    # W = 1 reads [D(s - 1), Ds]: step 0 reaches into the lead-in, steps 2..4 see the run.
+    assert out[0, :, 0].tolist() == [False, True, False, False, False, True]
+    # W = 3 reads [D(s - 3), Ds]: steps 0..2 reach into the lead-in, steps 3..5 see the run.
+    assert out[0, :, 1].tolist() == [False] * 6
+
+
+def test_tolerant_flags_read_no_raw_sample_after_the_step_endpoint():
+    # A long run that starts one sample after the endpoint 4s of step s = 2. A window that ended
+    # at D(s + 1) would read it; the causal window ends at Ds and must not.
+    valid = _valid_from_runs(6 * D, [(0, 2 * D + 1, 6 * D - 2)])
+    flags = torch.zeros(1, 6, 1, dtype=torch.bool)
+    out = U.tolerant_flags(flags, valid, torch.tensor([1]), tolerance_s=1.0, decimation=D)
+    assert out[0, :, 0].tolist() == [False, True, True, False, False, False]
+    # Brute force: with sample Ds + 1 valid, every run inside the window has ended, so redrawing
+    # the samples after Ds + 1 must not move the flags of steps 0..s.
+    generator = torch.Generator().manual_seed(3)
+    flags = torch.zeros(2, 10, 3, dtype=torch.bool)
+    windows = torch.tensor([1, 2, 4])
+    for step in range(10):
+        base = torch.rand(2, 10 * D, generator=generator) > 0.1
+        base[:, step * D + 1] = True
+        changed = base.clone()
+        changed[:, step * D + 2:] = torch.rand(2, 10 * D - step * D - 2, generator=generator) > 0.5
+        one = U.tolerant_flags(flags, base, windows, 0.5, decimation=D)
+        two = U.tolerant_flags(flags, changed, windows, 0.5, decimation=D)
+        assert torch.equal(one[:, :step + 1], two[:, :step + 1]), step
+
+
+def test_tolerant_flags_never_turn_valid_where_the_window_reaches_the_trimmed_lead_in():
+    # All UA valid on the trimmed grid; a long run may still sit in the lead-in before sample 0.
+    valid = torch.ones(1, 6 * D, dtype=torch.bool)
+    flags = torch.zeros(1, 6, 2, dtype=torch.bool)
+    out = U.tolerant_flags(flags, valid, torch.tensor([1, 3]), tolerance_s=1.0, decimation=D)
+    assert out[0, :, 0].tolist() == [False] + [True] * 5
+    assert out[0, :, 1].tolist() == [False] * 3 + [True] * 3
+
+
+def test_a_run_touching_either_end_of_the_trimmed_grid_counts_as_long():
+    # Two samples each: short by length, but either may continue outside the trimmed grid.
+    flags = torch.zeros(1, 6, 1, dtype=torch.bool)
+    head = U.tolerant_flags(flags, _valid_from_runs(6 * D, [(0, 0, 1)]), torch.tensor([1]), 1.0, D)
+    assert head[0, :, 0].tolist() == [False, False, True, True, True, True]
+    tail = U.tolerant_flags(flags, _valid_from_runs(6 * D, [(0, 20, 23)]), torch.tensor([1]), 1.0, D)
+    assert tail[0, :, 0].tolist() == [False, True, True, True, True, False]
+    # The same runs inside the grid are short and change nothing.
+    inner = U.tolerant_flags(flags, _valid_from_runs(6 * D, [(0, 9, 10)]), torch.tensor([1]), 1.0, D)
+    assert inner[0, :, 0].tolist() == [False] + [True] * 5
+    # The detector's tolerant reward keeps its own rule: length alone decides.
+    assert bool(U.tolerant_reward_validity(_valid_from_runs(6 * D, [(0, 0, 1)]), 1.0).all())
 
 
 def test_tolerant_flags_only_ever_turn_a_flag_valid():
@@ -118,10 +164,13 @@ def test_tolerant_flags_only_ever_turn_a_flag_valid():
     assert bool(out[flags].all())
 
 
-def test_a_short_run_alone_turns_every_flag_valid_and_no_tolerance_changes_nothing():
+def test_a_short_run_alone_turns_every_flag_inside_the_grid_valid_and_no_tolerance_changes_nothing():
     valid = _valid_from_runs(6 * D, [(0, 9, 10)])
     flags = torch.zeros(1, 6, 3, dtype=torch.bool)
-    assert bool(U.tolerant_flags(flags, valid, torch.tensor([1, 4, 9]), 1.0, decimation=D).all())
+    out = U.tolerant_flags(flags, valid, torch.tensor([1, 4, 9]), 1.0, decimation=D)
+    # Every step whose window $[D(s - W), Ds]$ starts at or after sample 0 turns valid.
+    inside = torch.arange(6)[:, None] >= torch.tensor([1, 4, 9])[None, :]
+    assert torch.equal(out[0], inside)
     assert U.tolerant_flags(flags, valid, torch.tensor([1, 4, 9]), None, decimation=D) is flags
     assert U.tolerant_flags(flags, valid, torch.tensor([1, 4, 9]), 0.0, decimation=D) is flags
 
@@ -129,12 +178,13 @@ def test_a_short_run_alone_turns_every_flag_valid_and_no_tolerance_changes_nothi
 def test_the_trimmed_window_is_the_trap_the_untrimmed_window_avoids():
     """On the trimmed grid a fast channel reads 0 steps, clamped to 1: it then turns valid at a
     step whose untrimmed window still holds a long-run sample."""
-    valid = _valid_from_runs(8 * D, [(0, 0, 7)])      # a long run over steps 0 and 1
+    valid = _valid_from_runs(8 * D, [(0, 0, 7)])      # a long run over samples 0..7
     flags = torch.zeros(1, 8, 1, dtype=torch.bool)
     trimmed = U.tolerant_flags(flags, valid, torch.tensor([0]), 1.0, decimation=D)
     untrimmed = U.tolerant_flags(flags, valid, torch.tensor([5]), 1.0, decimation=D)
-    assert bool(trimmed[0, 2, 0]) and not bool(untrimmed[0, 2, 0])
-    assert untrimmed[0, :, 0].tolist() == [False] * 6 + [True, True]
+    assert bool(trimmed[0, 3, 0]) and not bool(untrimmed[0, 3, 0])
+    # Steps 0..4 reach into the lead-in; steps 5 and 6 read the run; step 7 reads [8, 28].
+    assert untrimmed[0, :, 0].tolist() == [False] * 7 + [True]
 
 
 def test_the_declared_windows_are_the_shards_untrimmed_warmup_not_the_trimmed_one():
@@ -173,18 +223,55 @@ def test_removed_keys_match_the_definition_on_random_masks():
 
 
 def test_the_guard_keeps_a_run_running_past_its_last_sample():
-    # A one-sample run at sample 11, the last of step 2. Without a guard the bridge still reads
-    # sample 12, after anchor 2, so the run is running at anchor 2 alone; a guard of 4 samples
-    # makes it read up to sample 16, so it is running at anchor 3 (samples 12..15) too.
-    valid = _valid_from_runs(8 * D, [(0, 11, 11)])
+    # A one-sample run at sample 12, the endpoint of step 3. Without a guard the bridge still
+    # reads sample 13, after anchor 3, so the run is running at anchor 3 alone; a guard of 4
+    # samples makes it read up to sample 17, after anchor 4 (endpoint 16), too.
+    valid = _valid_from_runs(8 * D, [(0, 12, 12)])
     bare = U.removed_keys(valid, num_steps=8, num_lags=4, decimation=D, guard_s=0.0)
     guarded = U.removed_keys(valid, num_steps=8, num_lags=4, decimation=D, guard_s=1.0)
-    assert bare[0].nonzero().tolist() == [[2, 0]]
-    assert guarded[0].nonzero().tolist() == [[2, 0], [3, 0], [3, 1]]
+    assert bare[0].nonzero().tolist() == [[3, 0]]
+    assert guarded[0].nonzero().tolist() == [[3, 0], [4, 0], [4, 1]]
+
+
+@pytest.mark.parametrize("step", [3, 7])
+def test_removed_keys_place_runs_against_the_step_endpoint_ds(step):
+    """The four boundary cases at the model's own $D = 16$, no guard."""
+    d, steps = 16, 12
+    removed = lambda a, b: U.removed_keys(                                  # noqa: E731
+        _valid_from_runs(steps * d, [(0, a, b)]), num_steps=steps, num_lags=steps, decimation=d,
+        guard_s=0.0,
+    )[0]
+    s = step
+    # a = Ds: step s reads sample Ds, so the key of step s is removed.
+    assert removed(d * s, d * (s + 1)).nonzero().tolist() == [[s, 0], [s + 1, 0], [s + 1, 1]]
+    # a = Ds + 1: step s ends before the run, so step s + 1 is the first key the run reaches.
+    assert removed(d * s + 1, d * (s + 1)).nonzero().tolist() == [[s + 1, 0]]
+    # b + 1 + g = Dt: the bridge reads anchor t's own endpoint, not past it; t is not covered.
+    t = s + 2
+    assert int(removed(d * s, d * t - 1).nonzero()[:, 0].max()) == t - 1
+    # b + 1 + g = Dt + 1: the bridge reads one sample past anchor t; t is covered.
+    assert int(removed(d * s, d * t).nonzero()[:, 0].max()) == t
+
+
+def test_no_kept_key_reads_a_raw_sample_after_its_anchor():
+    """Zero look-ahead, written as the samples each key's value reads, and tightness."""
+    generator = torch.Generator().manual_seed(2)
+    valid = torch.rand(3, 12 * D, generator=generator) > 0.15
+    for guard_s in (0.0, 1.0, 2.0):
+        guard = U.seconds_to_samples(guard_s)
+        removed = U.removed_keys(valid, num_steps=12, num_lags=6, decimation=D, guard_s=guard_s)
+        rows, starts, ends = U.run_table(~valid.numpy())
+        for row in range(3):
+            for t in range(12):
+                for lag in range(min(6, t + 1)):
+                    s = t - lag
+                    last_read = max([D * s] + [b + 1 + guard for r, a, b in zip(rows, starts, ends)
+                                               if r == row and a <= D * s])
+                    assert bool(removed[row, t, lag]) == (last_read > D * t), (guard_s, row, t, lag)
 
 
 def test_a_run_reaching_the_segment_end_removes_keys_up_to_the_last_anchor():
-    valid = _valid_from_runs(8 * D, [(0, 22, 8 * D - 1)])     # steps 5..7, to the end
+    valid = _valid_from_runs(8 * D, [(0, 20, 8 * D - 1)])     # from step 5's endpoint to the end
     removed = U.removed_keys(valid, num_steps=8, num_lags=4, decimation=D, guard_s=4.0)
     assert not bool(removed[0, :5].any())
     for t in (5, 6, 7):

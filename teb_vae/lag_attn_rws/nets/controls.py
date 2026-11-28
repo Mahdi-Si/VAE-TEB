@@ -37,7 +37,8 @@ one *does to* a model, not something a model *is*.
 """
 from __future__ import annotations
 
-from typing import Dict, Hashable, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Dict, Hashable, Iterator, Optional, Sequence, Tuple
 
 import torch
 
@@ -78,12 +79,16 @@ __all__ = [
 #: On a model built with the posterior event gate, ``event_gate`` is recomputed too, by every arm:
 #: it is read off the substituted source summary exactly as the posterior it multiplies is. It is
 #: absent from this tuple and the two below because a model without the gate has no such key to
-#: replace, and these tuples describe what is replaced on every model.
+#: replace, and these tuples describe what is replaced on every model. The same holds for the
+#: source-mask readouts ``source_invalid_mass``, ``source_open`` and ``event_gate_learned``: every
+#: arm recomputes them from the attention it ran (:func:`_attend_and_pose`), or drops them where
+#: that attention returned none, so no arm carries the matched forward's copy.
 RECOMPUTED_KEYS: Tuple[str, ...] = (
     "mu_post",
     "logvar_post",
     "z_post",
     "attn_weights",
+    "attended_source_heads",
     "mu_full",
     "logvar_full",
     "perm_index",
@@ -102,8 +107,34 @@ RECOMPUTED_KEYS: Tuple[str, ...] = (
 #: three keys are still present in the returned dict, holding the **matched** forward's values.
 #: Scoring this dict through ``compute_loss`` would therefore return the null KL beside a
 #: reconstruction term computed from the matched forecast. Read :func:`source_null_kld`, not the
-#: dict, unless you want one of the three keys named here.
-SOURCE_NULL_KEYS: Tuple[str, ...] = ("mu_post", "logvar_post", "attn_weights")
+#: dict, unless you want one of the keys named here.
+SOURCE_NULL_KEYS: Tuple[str, ...] = (
+    "mu_post", "logvar_post", "attn_weights", "attended_source_heads",
+)
+
+
+@contextmanager
+def _eval_mode(model) -> Iterator[None]:
+    r"""Run the model's source key/value modules in eval mode, restoring each module's own mode.
+
+    The same switch ``_prior_clock`` makes, so the source-null encode and the prior's clock are
+    one deterministic computation. Gradient still flows; only dropout is off.
+
+    Args:
+        model: The model. One without ``source_kv_modules`` is left as it is.
+
+    Yields:
+        ``None``, with the modules in eval mode.
+    """
+    modules = tuple(getattr(model, "source_kv_modules", lambda: ())())
+    was_training = [module.training for module in modules]
+    for module in modules:
+        module.eval()
+    try:
+        yield
+    finally:
+        for module, flag in zip(modules, was_training):
+            module.train(flag)
 
 
 def _attend_and_pose(
@@ -112,7 +143,8 @@ def _attend_and_pose(
     h_u: torch.Tensor,
     key_mask: Optional[torch.Tensor] = None,
     removed: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    into: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     r"""Run the query, the lag attention and the posterior head against a substituted source state.
 
     The tail both controls share, factored out so the two arms differ in **how the source state was
@@ -157,6 +189,11 @@ def _attend_and_pose(
         removed: The running-gap removal mask ``(B, T, L)`` to attend under. ``None`` takes the
             matched forward's ``source_key_removed`` when it returned one, and removes nothing
             otherwise.
+        into: The arm's output dict, or ``None``. When given, the arm's own source-side
+            readouts are written into it: ``attended_source_heads``, and ``source_invalid_mass``,
+            ``source_open`` and ``event_gate_learned`` where this attention produced them. A
+            readout this attention did not produce is removed, so the dict never holds the
+            matched forward's copy.
 
     Returns:
         ``(alpha, mu_post, logvar_post, gate)``: the attention weights, the posterior's two
@@ -189,6 +226,11 @@ def _attend_and_pose(
         )
         alpha, attended_heads = attended.alpha, attended.heads
         applied, gate = attended.gate, attended.event_gate
+        readouts = {
+            "source_invalid_mass": attended.invalid_mass,
+            "source_open": attended.source_open,
+            "event_gate_learned": attended.event_gate_learned,
+        }
     else:
         _, alpha, attended_heads = model.lag_attn(
             model.query_proj(query),
@@ -197,8 +239,18 @@ def _attend_and_pose(
         )
         gate = model.posterior_head.event_gate_values(attended_heads)
         applied = gate
+        readouts = {}
         if key_mask is not None:
-            applied, gate = model._close_gate(gate, key_mask.any(dim=-1), attended_heads.dtype)
+            source_open = key_mask.any(dim=-1)
+            readouts = {"source_open": source_open, "event_gate_learned": gate}
+            applied, gate = model._close_gate(gate, source_open, attended_heads.dtype)
+    if into is not None:
+        into["attended_source_heads"] = attended_heads
+        for name, value in readouts.items():
+            if value is None:
+                into.pop(name, None)
+            else:
+                into[name] = value
     mu_post, logvar_post = model.posterior_head(
         forward_outputs["target_state"],
         attended_heads,
@@ -279,8 +331,8 @@ def perm_forward_outputs(
 
     Returns:
         A shallow copy of ``forward_outputs`` with exactly :data:`RECOMPUTED_KEYS` replaced --
-        ``mu_post``, ``logvar_post``, ``z_post``, ``attn_weights``, ``mu_full`` and
-        ``logvar_full`` recomputed under $\pi(U)$, plus the ``perm_index`` used. Anything not on
+        ``mu_post``, ``logvar_post``, ``z_post``, ``attn_weights``, ``attended_source_heads``,
+        ``mu_full`` and ``logvar_full`` recomputed under $\pi(U)$, plus the ``perm_index`` used. Anything not on
         that list is the matched forward's own tensor and must not be read as the control's; see
         the constant. The base branch (``mu_base``, ``logvar_base``) and the prior are the
         *same tensors* as the input's -- source-free quantities are untouched by construction.
@@ -313,12 +365,14 @@ def perm_forward_outputs(
     # The running-gap removal travels with the donor too: it is a function of the donor's raw UA
     # validity, which is what decides whether the donor's key at a lag can read past the anchor.
     removed = forward_outputs.get("source_key_removed")
+    permuted = dict(forward_outputs)
     alpha_perm, mu_post_perm, logvar_post_perm, gate_perm = _attend_and_pose(
         model,
         forward_outputs,
         h_u[perm_index],
         key_mask=None if key_mask is None else key_mask[perm_index],
         removed=None if removed is None else removed[perm_index],
+        into=permuted,
     )
     z_post_perm = mu_post_perm + torch.randn_like(mu_post_perm) * torch.exp(
         0.5 * logvar_post_perm
@@ -338,7 +392,6 @@ def perm_forward_outputs(
         decoded, persistence=forward_outputs.get("persistence")
     )
 
-    permuted = dict(forward_outputs)
     permuted.update(
         mu_post=mu_post_perm,
         logvar_post=logvar_post_perm,
@@ -355,18 +408,10 @@ def perm_forward_outputs(
         permuted["source_key_mask"] = key_mask[perm_index]
         if removed is not None:
             permuted["source_key_removed"] = removed[perm_index]
-        # The soft mode closes no anchor, so it has no ``source_open`` to carry. Its flags are
-        # already inside the permuted ``source_state``; the donor's copy is carried for readers.
-        # The soft and the input mode both keep every key ("soft", "input": SOFT_MASK_MODES of
-        # lag_attn_cfs.nets.causal_inputs, which this package does not import).
-        if getattr(model, "source_mask_mode", "hard") not in ("soft", "input"):
-            # The keys the arm attended under: the donor's key mask less the donor's removal, the
-            # set the forward's own ``source_open`` is computed from.
-            open_keys = permuted["source_key_mask"]
-            if removed is not None:
-                open_keys = open_keys & ~permuted["source_key_removed"]
-            permuted["source_open"] = open_keys.any(dim=-1)
-        elif forward_outputs.get("source_quality") is not None:
+        # ``source_open`` is the donor's, as the attention above computed it. The soft and input
+        # modes' flags are already inside the permuted ``source_state``; the donor's copy is
+        # carried for readers.
+        if forward_outputs.get("source_quality") is not None:
             permuted["source_quality"] = forward_outputs["source_quality"][perm_index]
     return permuted
 
@@ -469,28 +514,30 @@ def source_null_posterior(
     zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
     gated = zeros if model.source_gate is None else model.source_gate(zeros)
     quality = forward_outputs.get("source_quality")
-    if quality is None:
-        encoded = model.encode_source_kv(gated)  # (1, T, d_model)
-        # expand, not repeat: the attention's projections materialise their own tensors anyway,
-        # and what this arm saves is the encode -- the gate, the adapter and whichever key/value
-        # body the model built -- not the attention.
-        h_u_null = encoded.expand(u_stream.shape[0], -1, -1)
-    else:
-        # The soft UA mask: the adapter reads each recording's own flags, so the encode is per
-        # sample. The values are zeroed and the flags are kept, so this arm's KL is what the
-        # missingness pattern alone buys.
-        h_u_null = model.encode_source_kv(gated.expand(u_stream.shape[0], -1, -1), quality)
+    # The null encode is deterministic, as the prior's clock (``_prior_clock``) is: with dropout
+    # live it would differ from that clock and from every eval readout by a fresh mask each step.
+    with _eval_mode(model):
+        if quality is None:
+            encoded = model.encode_source_kv(gated)  # (1, T, d_model)
+            # expand, not repeat: the attention's projections materialise their own tensors
+            # anyway, and what this arm saves is the encode -- the gate, the adapter and whichever
+            # key/value body the model built -- not the attention.
+            h_u_null = encoded.expand(u_stream.shape[0], -1, -1)
+        else:
+            # The soft UA mask: the adapter reads each recording's own flags, so the encode is
+            # per sample. The values are zeroed and the flags are kept, so this arm's KL is what
+            # the missingness pattern alone buys.
+            h_u_null = model.encode_source_kv(gated.expand(u_stream.shape[0], -1, -1), quality)
 
     # A source that says nothing gives the IRF head no evidence either.
     if "irf_evidence" in forward_outputs:
         forward_outputs = dict(
             forward_outputs, irf_evidence=torch.zeros_like(forward_outputs["irf_evidence"])
         )
-    alpha_null, mu_post_null, logvar_post_null, gate_null = _attend_and_pose(
-        model, forward_outputs, h_u_null
-    )
-
     nulled = dict(forward_outputs)
+    alpha_null, mu_post_null, logvar_post_null, gate_null = _attend_and_pose(
+        model, forward_outputs, h_u_null, into=nulled
+    )
     nulled.update(
         mu_post=mu_post_null,
         logvar_post=logvar_post_null,
@@ -504,11 +551,12 @@ def source_null_posterior(
 #: The keys :func:`occluded_forward_outputs` rebuilds, and the only ones that describe the
 #: occluded arm.
 #:
-#: One longer than :data:`SOURCE_NULL_KEYS` and one shorter than :data:`RECOMPUTED_KEYS`, and both
-#: differences are the readout this arm exists for. It **does** decode -- the quantity is a
-#: forecast score resolved by horizon step, which needs the decoder's two heads -- so ``z_post``,
-#: ``mu_full`` and ``logvar_full`` are rebuilt. It carries no ``perm_index``, because nothing was
-#: permuted: what moved is a band of the source's own values.
+#: Four longer than :data:`SOURCE_NULL_KEYS`, and :data:`RECOMPUTED_KEYS` with ``source_state`` in
+#: place of ``perm_index``; both differences are the readout this arm exists for. It **does**
+#: decode -- the quantity is a forecast score resolved by horizon step, which needs the decoder's
+#: two heads -- so ``z_post``, ``mu_full`` and ``logvar_full`` are rebuilt, and it re-encodes the
+#: occluded source, so ``source_state`` is its own. It carries no ``perm_index``, because nothing
+#: was permuted: what moved is a band of the source's own values.
 #:
 #: The same warning applies as to the other two arms. Every key not named here is the matched
 #: forward's own tensor in the returned shallow copy, so a reader reaching for ``kld_per_t`` or
@@ -518,6 +566,7 @@ OCCLUSION_KEYS: Tuple[str, ...] = (
     "logvar_post",
     "z_post",
     "attn_weights",
+    "attended_source_heads",
     "mu_full",
     "logvar_full",
     "source_state",
@@ -603,7 +652,20 @@ def occluded_forward_outputs(
         if quality is None
         else model.encode_source_kv(occluded, quality)
     )
-    alpha, mu_post, logvar_post, gate = _attend_and_pose(model, forward_outputs, h_u)
+    # The event gate's IRF evidence for the occluded UA: an occluded step carries no UA, so the
+    # head reads it as invalid there. Without this the gate would read the matched evidence.
+    if "irf_evidence" in forward_outputs and occlusion is not None:
+        band = occlusion.to(torch.bool).expand_as(forward_outputs["irf_ua_valid"])
+        evidence = model.irf_evidence_for({
+            **forward_outputs,
+            "irf_ua_level": forward_outputs["irf_ua_level"].masked_fill(band, 0.0),
+            "irf_ua_valid": forward_outputs["irf_ua_valid"].to(torch.bool) & ~band,
+        })
+        forward_outputs = dict(forward_outputs, irf_evidence=evidence)
+    occluded_outputs = dict(forward_outputs)
+    alpha, mu_post, logvar_post, gate = _attend_and_pose(
+        model, forward_outputs, h_u, into=occluded_outputs
+    )
 
     # Drawn rather than reused from the matched forward: the posterior moved, so its own
     # reparameterisation has to be re-run against the moved parameters. What is held fixed across
@@ -629,7 +691,6 @@ def occluded_forward_outputs(
         decoded, persistence=forward_outputs.get("persistence")
     )
 
-    occluded_outputs = dict(forward_outputs)
     occluded_outputs.update(
         mu_post=mu_post,
         logvar_post=logvar_post,
@@ -705,6 +766,10 @@ def source_null_kld_with_grad(
     nulled = source_null_posterior(model, forward_outputs, u_stream)
     anchors = forward_outputs.get("anchor_index")
     anchor_valid = forward_outputs.get("anchor_valid")
+    # The validity the objective's own masks read: pooled over the forecast clock's shift span on
+    # a model that has one, so this support is the KL support ``compute_loss`` builds.
+    if hasattr(model, "scored_weight"):
+        weight = model.scored_weight(weight)
     # The forward's own index, validated by the objective's mask build this step.
     forecast, _coverage = forecast_mask(
         weight,

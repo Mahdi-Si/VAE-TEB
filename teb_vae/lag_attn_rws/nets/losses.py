@@ -207,6 +207,7 @@ def ar_innovation(
     ar_coef: torch.Tensor,
     step_mask: Optional[torch.Tensor] = None,
     logvar: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""The AR(1) innovation along the horizon, and its log-variance, across masked steps.
 
@@ -234,6 +235,13 @@ def ar_innovation(
     so a step whose predecessor is valid keeps its log-variance bitwise, and a horizon with no
     masked step is bitwise the plain innovation $r_\tau - \phi_c r_{\tau-1}$.
 
+    A ``cell_mask`` whose channel $c$ starts scoring at $\tau_c^0 > 0$ restarts the chain there.
+    With $s_{\tau,c} = \mathbb 1[\tau \ge \tau_c^0]$, both predecessor terms of step $\tau$ are
+    multiplied by $s_{\tau-1,c}$, so $e_{\tau_c^0,c} = r_{\tau_c^0,c}$ under $s^2_{\tau_c^0,c}$
+    alone. Without the restart, the first scored cell conditions on the unscored residual
+    $r_{\tau_c^0-1,c}$: it reads an unscored target and sends gradient into the unscored $\mu$ and
+    $\log\sigma^2$. A ``cell_mask`` that scores every channel from $\tau = 0$ is bitwise ``None``.
+
     Args:
         residual: $r$, $(\ldots, H, C)$.
         ar_coef: $\phi_c$, $(C,)$.
@@ -241,14 +249,24 @@ def ar_innovation(
             its channel axis; ``None`` treats every step as valid.
         logvar: $\log s^2$, broadcastable to ``residual``; ``None`` returns no variance (the
             ``'mse'`` score).
+        cell_mask: Optional $(H, C)$ $0/1$ mask of the scored cells, a scored suffix per channel
+            (:func:`raw_sample_score`); its first scored step per channel restarts the chain.
+            ``None`` restarts nothing.
 
     Returns:
         ``(innovation, logvar_eff)``: $e$ in the shape of ``residual``, and $\log V$ in that shape
         (``logvar`` itself when ``step_mask`` is ``None``), or ``None`` without ``logvar``.
     """
+    started = None
+    if cell_mask is not None and not bool(cell_mask[0].all()):
+        # 1 from each channel's first scored step on: a predecessor before it is never read.
+        started = (cell_mask.cumsum(dim=-2) > 0).to(residual.dtype)
     if step_mask is None:
         previous = F.pad(residual[..., :-1, :], (0, 0, 1, 0))
-        return residual - ar_coef * previous, logvar
+        if started is None:
+            return residual - ar_coef * previous, logvar
+        had_prev = F.pad(started[:-1, :], (0, 0, 1, 0))
+        return residual - ar_coef * previous * had_prev, logvar
     mask = torch.broadcast_to(step_mask[..., None], residual.shape[:-1] + (1,)).to(residual.dtype)
     log_s2 = None if logvar is None else torch.broadcast_to(logvar, residual.shape)
     phi_sq = ar_coef * ar_coef
@@ -258,6 +276,9 @@ def ar_innovation(
     for tau in range(1, residual.shape[-2]):
         valid_prev = mask[..., tau - 1, :]
         gap_prev = 1.0 - valid_prev
+        if started is not None:
+            valid_prev = valid_prev * started[tau - 1, :]
+            gap_prev = gap_prev * started[tau - 1, :]
         prediction = ar_coef * (valid_prev * residual[..., tau - 1, :] + gap_prev * prediction)
         innovations.append(residual[..., tau, :] - prediction)
         if log_s2 is not None:
@@ -387,7 +408,7 @@ def raw_sample_score(
             )
         # A masked step (a gap inside the window) is marginalised: the next valid step is scored
         # on its conditional density given the last valid residual, so no gap target is read.
-        residual, logvar = ar_innovation(residual, ar_coef, step_mask, logvar)
+        residual, logvar = ar_innovation(residual, ar_coef, step_mask, logvar, cell_mask)
     diff2 = residual**2
     if likelihood == "mse":
         score = diff2

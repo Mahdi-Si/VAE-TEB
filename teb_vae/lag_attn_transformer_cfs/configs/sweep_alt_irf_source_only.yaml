@@ -96,6 +96,8 @@ model_config:
     # weight there is no detector, so its validity switch goes off too. [0.0, true]
     event_weight_floor: null
     event_weight_ua_valid: false
+    # The tolerance widens the detector's UA validity, which is off; stated so no rung's value leaks in.
+    event_weight_ua_tolerance_s: null
 
 dataset_config:
   dataloader_config:

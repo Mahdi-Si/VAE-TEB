@@ -31,6 +31,8 @@ distinguishes a rounding difference from a real one.
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import pytest
 import torch
@@ -65,6 +67,9 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 
 from .conftest import (
     BATCH,
+    CAUSAL_C_U,
+    CAUSAL_C_Y,
+    SHIPPED_PHASE_OPERATOR,
     TINY_STRIDE,
     build,
     make_stub_batch,
@@ -391,7 +396,16 @@ def test_zero_is_the_channel_mean_over_the_region_the_model_reads(
     """
     from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 
-    budget = resolve_warmup_budget(cohort_config)
+    # The budget of the shards the loader reads. The fixture repoints only the test split, and
+    # the generated cohort shards carry the legacy operator and widths rather than the tiny
+    # config's, so the resolver reads them under their own declaration.
+    config = copy.deepcopy(cohort_config)
+    dataset = config["dataset_config"]
+    dataset["vae_train_datasets"] = list(dataset["vae_test_datasets"])
+    config["model_config"]["VAE_model"].update(
+        c_y=CAUSAL_C_Y, c_u=CAUSAL_C_U, causal_phase_operator=SHIPPED_PHASE_OPERATOR
+    )
+    budget = resolve_warmup_budget(config)
     assert budget is not None
     keep = np.asarray(budget.target.keep_index, dtype=np.int64)
     waits = np.asarray(budget.target.warmup_steps, dtype=np.int64)
@@ -452,6 +466,35 @@ def test_the_retained_forecast_pair_is_the_mean_decoded_one(trained_task, stub_b
             )
             assert torch.allclose(readout.retained[f"mu_{branch}"], mu, atol=1e-6), branch
             assert torch.allclose(readout.retained[f"logvar_{branch}"], logvar, atol=1e-6), branch
+
+
+def test_the_point_calibration_and_horizon_readouts_carry_no_draw_noise(
+    trained_task, stub_batch
+) -> None:
+    """The point errors, the calibration census and the horizon sums read the mean-decoded pair,
+    so two passes under different global draws agree bitwise while the training-path block, which
+    scores the forward's own posterior draw, moves."""
+    readouts = []
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        readouts.append(
+            evaluate_batch(
+                trained_task, stub_batch, num_samples=1,
+                mc_generator=torch.Generator().manual_seed(seed),
+            )
+        )
+    first, second = readouts
+
+    for name in ("sq_error_full", "abs_error_full", "signed_error_full", "sq_error_base"):
+        assert torch.equal(first.columns[name], second.columns[name]), name
+    assert torch.equal(first.sq_error_per_channel_full, second.sq_error_per_channel_full)
+    assert first.calibration_sums, "a gaussian_nll model must produce a census"
+    for name, value in first.calibration_sums.items():
+        assert torch.equal(value, second.calibration_sums[name]), name
+    for name, value in first.horizon_sums.items():
+        assert torch.equal(value, second.horizon_sums[name]), name
+    # Non-vacuity: the forward really draws, so a draw-routed readout would have moved.
+    assert not torch.equal(first.columns["nll_full_block"], second.columns["nll_full_block"])
 
 
 def test_the_baselines_read_nothing_past_the_persistence_step() -> None:

@@ -519,3 +519,116 @@ def test_a_masked_step_is_neither_read_nor_trained_through() -> None:
         mu.detach(), perturbed, mask, likelihood="gaussian_nll", logvar=logvar, ar_coef=ar_coef
     )
     assert torch.equal(moved, block.detach())
+
+
+# =================================================================================================
+# A scored start: the AR(1) chain restarts at each channel's first scored step
+# =================================================================================================
+def _start_cell_mask(horizon: int, starts) -> torch.Tensor:
+    r"""$m_{\tau,c} = \mathbb 1[\tau \ge \tau^0_c]$, the ``target_scored_start`` mask."""
+    taus = torch.arange(horizon)[:, None]
+    return (taus >= torch.as_tensor(starts)[None, :]).to(torch.float32)
+
+
+@pytest.mark.parametrize("gap_before_start", [False, True], ids=["clean", "gap_at_start_minus_1"])
+def test_a_scored_start_reads_and_trains_no_unscored_cell(gap_before_start: bool) -> None:
+    r"""Under ``target_scored_start`` with $\phi_c \ne 0$, the first scored cell of channel $c$
+    is scored on $e_{\tau^0_c} = r_{\tau^0_c}$, never on $r_{\tau^0_c} - \phi_c r_{\tau^0_c - 1}$.
+
+    So perturbing ``target``, ``mu`` and ``logvar`` at every $\tau < \tau^0_c$ moves the block by
+    exactly zero, and ``mu`` / ``logvar`` there receive exactly zero gradient. Run on a clean
+    horizon and with the step $\tau^0_c - 1$ of every started channel masked, where the
+    marginalised gap would otherwise carry the unscored variance forward.
+    """
+    torch.manual_seed(0)
+    horizon, starts = 6, [0, 2, 3, 5]
+    channels = len(starts)
+    cell_mask = _start_cell_mask(horizon, starts)
+    unscored = cell_mask == 0
+    target = torch.randn(2, 3, horizon, channels)
+    mu = torch.randn(2, 3, horizon, channels, requires_grad=True)
+    logvar = (0.3 * torch.randn(2, 3, horizon, channels)).requires_grad_(True)
+    mask = torch.ones(2, 3, horizon)
+    if gap_before_start:
+        mask[..., 1] = 0.0  # tau^0 - 1 of the channel starting at 2
+        mask[..., 4] = 0.0  # tau^0 - 1 of the channel starting at 5
+    ar_coef = torch.tensor([0.7, -0.6, 0.9, 0.5])
+
+    def _block(mu_, target_, logvar_):
+        block, _ = masked_raw_block_per_anchor(
+            mu_, target_, mask, likelihood="gaussian_nll", logvar=logvar_,
+            cell_mask=cell_mask, ar_coef=ar_coef,
+        )
+        return block
+
+    block = _block(mu, target, logvar)
+    block.sum().backward()
+    assert torch.count_nonzero(mu.grad[..., unscored]) == 0
+    assert torch.count_nonzero(logvar.grad[..., unscored]) == 0
+    assert torch.count_nonzero(mu.grad[..., ~unscored]) > 0
+
+    shift = 5.0 * unscored.to(target.dtype)
+    with torch.no_grad():
+        moved = _block(mu + shift, target - 2.0 * shift, logvar + shift)
+    assert torch.equal(moved, block.detach())
+
+    # Non-vacuity: without the restart, the first scored cell lags the unscored residual.
+    with torch.no_grad():
+        leaky = raw_sample_score(
+            mu + shift, target, likelihood="gaussian_nll", logvar=logvar, ar_coef=ar_coef,
+            step_mask=mask,
+        ) * cell_mask
+        clean = raw_sample_score(
+            mu, target, likelihood="gaussian_nll", logvar=logvar, ar_coef=ar_coef,
+            step_mask=mask,
+        ) * cell_mask
+    assert not torch.equal(leaky, clean)
+
+
+@pytest.mark.parametrize("with_step_mask", [False, True])
+def test_a_suffix_only_cell_mask_leaves_the_innovation_bitwise_unchanged(with_step_mask) -> None:
+    r"""Every channel scored from $\tau = 0$ (an $H_c$ suffix mask, or all ones) takes the
+    historical recursion bitwise, with or without a forecast mask."""
+    from teb_vae.lag_attn_rws.nets.losses import ar_innovation
+
+    torch.manual_seed(1)
+    horizon, channels = 5, 3
+    residual = torch.randn(2, horizon, channels)
+    logvar = 0.2 * torch.randn(2, horizon, channels)
+    ar_coef = torch.tensor([0.4, -0.8, 0.1])
+    step_mask = torch.tensor([[1.0, 0.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0, 1.0]])
+    suffix = (torch.arange(horizon)[:, None] < torch.tensor([5, 3, 1])[None, :]).float()
+    step = step_mask if with_step_mask else None
+
+    plain = ar_innovation(residual, ar_coef, step, logvar)
+    masked = ar_innovation(residual, ar_coef, step, logvar, suffix)
+    assert torch.equal(plain[0], masked[0])
+    assert torch.equal(plain[1], masked[1])
+
+
+def test_the_model_with_a_scored_start_moves_no_loss_under_unscored_perturbation(
+    perturb_posterior,
+) -> None:
+    r"""The same claim end to end through ``compute_loss``, under ``target_scored_start > 0`` and
+    ``forecast_ar_residual``: moving both branches' ``mu`` and ``logvar`` at every unscored prefix
+    cell leaves every reported loss bitwise unchanged."""
+    starts = [0 if index < CAUSAL_ST_WIDTH else 1 + index % (TINY_HORIZON - 1)
+              for index in range(CAUSAL_C_Y)]
+    kwargs = _kwargs(target_scored_start=starts, forecast_ar_residual=True)
+    model = build(kwargs)
+    perturb_posterior(model)
+    _set_ar_logit(model)
+    out, features, weight = _run(model, kwargs)
+    unscored = model.target_cell_mask == 0
+    assert bool(unscored.any()) and not bool(model.target_cell_mask[0].all())
+
+    def _loss(outputs):
+        with torch.no_grad():
+            return model.compute_loss(outputs, features, weight=weight)["metrics"]
+
+    moved = dict(out)
+    for name in ("mu_full", "mu_base", "logvar_full", "logvar_base"):
+        moved[name] = out[name] + 3.0 * unscored.to(out[name].dtype)
+    reference, shifted = _loss(out), _loss(moved)
+    for name in _LOSS_METRICS:
+        assert torch.equal(reference[name], shifted[name]), name

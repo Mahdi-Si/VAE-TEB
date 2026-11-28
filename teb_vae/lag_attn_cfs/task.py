@@ -128,6 +128,29 @@ def freeze_all_but_source_path(model: torch.nn.Module) -> None:
             parameter.requires_grad_(False)
 
 
+def eval_frozen_modules(model: torch.nn.Module) -> None:
+    r"""Put every submodule outside :data:`SOURCE_PATH_MODULES` in evaluation mode.
+
+    ``requires_grad=False`` stops the frozen weights from moving, but not their dropout: Lightning
+    calls ``train(True)`` before every training epoch, and a frozen prior head with live dropout
+    gives a different $\mu^p$ on every forward. The posterior head would then learn to undo those
+    masks. A module is left in its current mode when it is a UA-path module, lies inside one, or
+    holds one; only its frozen leaves and siblings are switched.
+
+    Args:
+        model: The net, after :func:`freeze_all_but_source_path`.
+    """
+    source = {
+        id(module)
+        for name in SOURCE_PATH_MODULES
+        if isinstance(getattr(model, name, None), torch.nn.Module)
+        for module in getattr(model, name).modules()
+    }
+    for module in model.modules():
+        if not any(id(inner) in source for inner in module.modules()):
+            module.training = False
+
+
 class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
     r"""Lightning task for :class:`~teb_vae.lag_attn_cfs.nets.model.SeqVaeLagAttnCfs`.
 
@@ -210,6 +233,7 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         self.save_hyperparameters({"freeze_target_path": bool(freeze_target_path)})
         if freeze_target_path:
             freeze_all_but_source_path(self.orig_model)
+            eval_frozen_modules(self.orig_model)
         # Saved as plain floats and ints, so the checkpoint's hyperparameters stay YAML-safe.
         self.save_hyperparameters(
             {
@@ -230,6 +254,20 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             }
         )
         self._check_ua_tolerance_switches()
+
+    def train(self, mode: bool = True) -> "SeqVaeLagAttnCfsTask":
+        """Set the training mode, keeping the frozen modules in evaluation mode under ``freeze_target_path``.
+
+        Args:
+            mode: ``True`` for training mode, ``False`` for evaluation mode.
+
+        Returns:
+            This task.
+        """
+        super().train(mode)
+        if mode and self.hparams.get("freeze_target_path", False):
+            eval_frozen_modules(self.orig_model)
+        return self
 
     def _check_ua_tolerance_switches(self) -> None:
         r"""Refuse a UA tolerance key that the net or the objective cannot serve.
@@ -331,6 +369,15 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 ("up_st", "up_ph") if bool(getattr(model, "use_up_st", False)) else ("up_ph",)
             ),
             target_quality_mask=bool(self.hparams.get("target_quality_mask", False)),
+            # The objective's two weights, so a window's score row sums the weighted term the
+            # logged block scores sum; detached for the same reason as the density terms.
+            **{
+                name: None if value is None else value.detach()
+                for name, value in (
+                    ("channel_weight", getattr(model, "target_channel_weight", None)),
+                    ("horizon_weight", getattr(model, "horizon_weight", None)),
+                )
+            },
         )
 
     @property
@@ -881,17 +928,20 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
 
         Returns:
             ``{'kld_source_null': ..., 'pred_gap_mean': ...}`` on the evaluation stages, empty on
-            ``train``.
+            ``train``. ``kld_source_null`` is left out when ``lambda_source_null > 0``: it is then
+            ``source_null_kl_penalty``, copied in by :meth:`compute_loss_and_metrics`.
         """
         # Both readouts re-pose a posterior, and ``source_path='irf'`` has none.
         if stage == "train" or getattr(self.orig_model, "source_path", "lag_attn") == "irf":
             return {}
-        return {
-            "kld_source_null": controls.source_null_kld(
+        added = {"pred_gap_mean": self._mean_decoded_pred_gap(inputs, forward_outputs, weight)}
+        # Under ``lambda_source_null`` the objective already computed this KL on the same inputs
+        # and weight as ``source_null_kl_penalty``; :meth:`compute_loss_and_metrics` reuses it.
+        if not float(self.hparams.get("lambda_source_null", 0.0)) > 0.0:
+            added["kld_source_null"] = controls.source_null_kld(
                 self.orig_model, forward_outputs, inputs[2], weight
-            ),
-            "pred_gap_mean": self._mean_decoded_pred_gap(inputs, forward_outputs, weight),
-        }
+            )
+        return added
 
     @torch.no_grad()
     def _mean_decoded_pred_gap(
@@ -974,13 +1024,28 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         """
         return cfs_events.detect_contractions
 
+    def _event_step_align(self) -> str:
+        r"""Raw-to-step rounding convention for causal-feature cells: ``'ceil'``.
+
+        Stored causal step $t$ is decimated at trimmed raw sample $Dt$ and reads only raw samples
+        $\le Dt$, so a contraction onset at raw index $i$ is first visible at step
+        $o = \lceil i / D \rceil$. Using ``'ceil'`` avoids weighting the pre-onset step
+        $\lfloor i / D \rfloor$ up to $(D - 1) / f_s = 3.75\,\text{s}$ before the contraction
+        actually begins, while keeping the derived evaluation window
+        $w = \Delta (R + 1) - \delta / 2$ exact against ``Collector._contraction_ages``.
+
+        Returns:
+            ``'ceil'`` for causal-feature cells.
+        """
+        return "ceil"
+
     # ------------------------------------------------------------------
     # Loss + metrics
     # ------------------------------------------------------------------
     def compute_loss_and_metrics(
         self, batch: Any, batch_idx: int, stage: str
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Run the inherited step, with the stage reachable from the input builder.
+        r"""Run the inherited step, with the stage reachable from the input builder.
 
         The one thing this adds is the stage, and it is added *here* rather than threaded through
         :meth:`_build_forward_inputs`'s signature because that signature is the family's shared seam
@@ -1010,6 +1075,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             loss, metrics = super().compute_loss_and_metrics(batch, batch_idx, stage)
         finally:
             self._stage = DENSE_STAGES[0]
+        if stage != "train" and "pred_gap_mean" in metrics and "source_null_kl_penalty" in metrics:
+            # The same KL as the readout's, already computed by the objective on this step.
+            metrics["kld_source_null"] = metrics["source_null_kl_penalty"]
         if "kld_source_null" in metrics and "source_conditioned_kl_raw" in metrics:
             metrics["coupling_minus_clock"] = (
                 metrics["source_conditioned_kl_raw"].detach() - metrics["kld_source_null"]
@@ -1100,8 +1168,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         * ``lambda_source_expl`` times the likelihood of the explain-mode shift, which reads UA
           up to the target step;
         * ``lambda_source_wrong`` times the likelihoods of both shifts with the head re-run on
-          another row's UA. The batch is rolled by one. A row whose donor is the same recording
-          is dropped, and the term is skipped when fewer than two rows are left.
+          another recording's UA, each row's donor drawn by a derangement across GUIDs (as in
+          :meth:`_full_wrong_term`). The term is skipped when no such derangement exists.
 
         The readouts are unweighted, like ``pred_gap``. ``pred_gap_expl``, ``pred_gap_wrong`` and
         ``pred_gap_expl_wrong`` are the base block NLL minus the shifted one, in nats per anchor.
@@ -1109,8 +1177,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         scored anchors with UA cover times the head's scored channels. ``irf_level_delay_s`` is the median
         delay of the IRF minimum of target channel 0, the FHR level channel, over the anchors
         whose gate is open on it, in seconds on the stored clock. It includes that channel's
-        filter latency. A readout with nothing to average is absent, not zero. On the evaluation
-        stages that decision is reduced over the ranks, as the permutation control's is.
+        filter latency, and is absent when the head does not run channel 0 or $k \le 0$. A
+        readout with nothing to average is absent, not zero. On the evaluation stages that decision is reduced over the ranks, as the permutation control's is.
 
         Args:
             batch: A batch from the data module, read for ``guid``.
@@ -1152,11 +1220,18 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
                 "pred_gap_expl": base - nll_expl,
                 "irf_gate_open": gate_open(gate, ua_ok, mask),
             }
-            delay, _depth = irf_delay(forward_outputs["irf_h"][..., 0])
-            delay = delay[
-                (gate[..., 0] > 0) & ua_ok & (contributing_anchors(mask) > 0) & torch.isfinite(delay)
-            ]
-            if self._agreed(delay.numel() > 0, stage, mask.device):
+            # Channel 0 is the FHR level channel; the head returns zeros on channels it does not
+            # run, and with ``gate_k <= 0`` the gate is open on noise, so the readout is absent.
+            level_run = bool((model.irf_channel_index == 0).any()) and model.irf_head.gate_k > 0
+            if level_run:
+                delay, _depth = irf_delay(forward_outputs["irf_h"][..., 0])
+                delay = delay[
+                    (gate[..., 0] > 0)
+                    & ua_ok
+                    & (contributing_anchors(mask) > 0)
+                    & torch.isfinite(delay)
+                ]
+            if self._agreed(level_run and delay.numel() > 0, stage, mask.device):
                 metrics["irf_level_delay_s"] = STEP_S * delay.median()
         if "irf_delta" in forward_outputs:
             # The head as a readout beside the lag attention: its forecast-mode shift is in no
@@ -1165,22 +1240,25 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             loss = loss + float(self.hparams.get("lambda_source_irf", 0.0)) * nll_irf
             metrics["pred_gap_irf"] = (base - nll_irf).detach()
 
-        usable = self._other_recording_rows(batch, mask.device)
-        if self._agreed(int(usable.sum()) >= 2, stage, mask.device):
+        guids = [_as_key(guid) for guid in self._phase_field(batch, "guid")]
+        if self._agreed(controls.groups_can_derange(guids), stage, mask.device):
+            # A derangement across recordings, as ``_full_wrong_term`` draws: on an unshuffled
+            # loader a roll by one hands most rows their own recording's UA.
+            donor = controls.make_derangement(
+                len(guids), generator=self._perm_generator, device=mask.device, groups=guids
+            )
             ua_level, ua_valid, step_valid = inputs[-3:]
             wrong = model.irf_source(
-                target_features, ua_level.roll(1, 0), ua_valid.roll(1, 0), step_valid, anchors
+                target_features, ua_level[donor], ua_valid[donor], step_valid, anchors
             )
-            rows = mask * usable[:, None, None]
-            nll_wrong, nll_expl_wrong = nll(wrong["delta"], rows), nll(wrong["delta_expl"], rows)
+            nll_wrong, nll_expl_wrong = nll(wrong["delta"], mask), nll(wrong["delta_expl"], mask)
             loss = loss + float(self.hparams.get("lambda_source_wrong", 0.0)) * (
                 nll_wrong + nll_expl_wrong
             )
             with torch.no_grad():
-                base = nll(0.0, rows)
                 metrics["pred_gap_wrong"] = base - nll_wrong
                 metrics["pred_gap_expl_wrong"] = base - nll_expl_wrong
-                metrics["irf_gate_open_wrong"] = gate_open(wrong["a"], wrong["ua_ok"], rows)
+                metrics["irf_gate_open_wrong"] = gate_open(wrong["a"], wrong["ua_ok"], mask)
         return loss, metrics
 
     def _full_wrong_term(
@@ -1263,11 +1341,6 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             **model.forecast_likelihood_kwargs(),
         )
         return block.sum() / contributing.sum().clamp_min(1.0)
-
-    def _other_recording_rows(self, batch: Any, device: torch.device) -> torch.Tensor:
-        """Which rows get another recording's UA when the batch is rolled by one, $(B,)$ boolean."""
-        guids = [str(guid) for guid in self._phase_field(batch, "guid")]
-        return torch.tensor([guids[row] != guids[row - 1] for row in range(len(guids))], device=device)
 
     def _agreed(self, local: bool, stage: str, device: torch.device) -> bool:
         """A skip decision all ranks share: validation metrics are synchronised over the ranks, so

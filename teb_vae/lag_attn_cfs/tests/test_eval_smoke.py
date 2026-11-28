@@ -94,6 +94,10 @@ def test_the_complete_artifact_layout_is_present(collected_run) -> None:
 
     for name in DURABLE_ARTIFACTS:
         assert (results_dir / name).is_file(), f"the run left no {name}"
+    # The figure-free copy to hand over, beside the results.
+    send_dir = results_dir.with_name(results_dir.name + "_send")
+    assert (send_dir / run_module.SUMMARY_FILENAME).is_file(), "the run left no _send copy"
+    assert not list(send_dir.rglob("*.png")) and not list(send_dir.rglob("*.html"))
 
     subdirectories = {path.name for path in results_dir.iterdir() if path.is_dir()}
     silent: Set[str] = {

@@ -323,8 +323,12 @@ def test_the_figure_records_the_objective_the_task_is_actually_training(
     module = task(hparams=dict(_NON_DEFAULT_WEIGHTS))
     module.eval()  # the callback evaluates and restores; matching it keeps the two comparable
 
+    # On the one sample the callback draws: it cuts the batch to ``num_examples`` before the
+    # forward, so its objective is the task's on that cut batch.
     torch.manual_seed(0)
-    _, task_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+    _, task_metrics = module.compute_loss_and_metrics(
+        plotting._leading_samples(stub_batch, 1), 0, "val"
+    )
 
     torch.manual_seed(0)
     LagAttnRwsPlotCallback(tmp_path, num_examples=1).on_validation_epoch_end(
@@ -494,7 +498,8 @@ def test_the_callback_hands_the_page_the_tasks_rows_and_the_batch(tmp_path, task
     marker = object()
     module.forecast_rows = marker
 
-    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1)
+    # Every sample drawn, so the callback has nothing to cut and must pass the batch itself.
+    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=int(stub_batch.weight.shape[0]))
     trainer = _trainer_with_batch(stub_batch)
     original = plotting.build_diagnostic_figure
     plotting.build_diagnostic_figure = _fake_builder
@@ -580,3 +585,26 @@ def test_a_supplied_builder_replaces_it_and_its_failures_still_cost_only_the_row
         raise RuntimeError("no bank for this model")
 
     assert plotting.input_stream_panels(module.orig_model, inputs, 0, _explode) == ()
+
+
+def test_the_callback_runs_its_forward_on_the_drawn_samples_only(tmp_path, task, stub_batch):
+    """A dense forward over a whole production batch to draw two of its samples stalls rank 0
+    while every other rank waits; the batch is cut to ``num_examples`` before the forward."""
+    captured = {}
+
+    def _fake_builder(**kwargs):
+        captured.update(kwargs)
+        return plt.figure()
+
+    original = plotting.build_diagnostic_figure
+    plotting.build_diagnostic_figure = _fake_builder
+    try:
+        LagAttnRwsPlotCallback(tmp_path, num_examples=1)._generate_plots(
+            _trainer_with_batch(stub_batch), stub_batch, task(), epoch=0
+        )
+    finally:
+        plotting.build_diagnostic_figure = original
+
+    assert stub_batch.weight.shape[0] > 1
+    assert captured["outs"]["mu_full"].shape[0] == 1
+    assert torch.equal(captured["batch"].weight, stub_batch.weight[:1])

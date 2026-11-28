@@ -330,6 +330,55 @@ def test_the_per_anchor_table_carries_the_anchor_level_columns(trained_task):
     assert frame["coverage"].max() <= 1.0
 
 
+def _contraction_batch(guids: List[str]):
+    """A labelled batch whose raw ``up`` carries one planted contraction mid-segment, and an
+    ``up_valid`` mask that marks the contraction's rising flank invalid."""
+    batch = _labelled_batch(guids)
+    # Every step observed, so the FHR gap of the stub cannot be what hides the contraction.
+    batch.weight = torch.ones_like(batch.weight)
+    raw = batch.up.shape[1]
+    seconds = torch.arange(raw, dtype=torch.float32) / 4.0
+    centre = 0.45 * float(raw) / 4.0
+    trace = 50.0 * torch.exp(-0.5 * ((seconds - centre) / 12.0) ** 2)
+    batch.up = trace.expand(batch.up.shape[0], raw).clone().reshape(batch.up.shape)
+    batch.up_valid = torch.ones(batch.up.shape[0], raw, dtype=torch.bool)
+    batch.up_valid[:, int(4 * (centre - 12.0)) : int(4 * (centre + 4.0))] = False
+    return batch
+
+
+def test_the_contraction_population_does_not_follow_the_training_ua_switch(trained_task):
+    r"""Two checkpoints differing only in ``event_weight_ua_valid`` are stratified on one
+    contraction population: the batch's ``up_valid`` is read wherever it is present, and the
+    retained mask is kept for both."""
+    hparams = trained_task.hparams
+    saved = {name: hparams.get(name) for name in ("event_weight_ua_valid",)}
+    columns = {}
+    try:
+        for switch in (True, False):
+            hparams["event_weight_ua_valid"] = switch
+            collection = _collect(
+                trained_task, [_contraction_batch(["a", "b"])], caps={"waveforms": 2}, n_total=2
+            )
+            columns[switch] = collection.per_anchor["seconds_since_contraction"].to_numpy()
+            assert "up_valid" in collection.retained, switch
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                hparams.pop(name, None)
+            else:
+                hparams[name] = value
+
+    np.testing.assert_array_equal(columns[True], columns[False])
+
+    # Non-vacuity: without the mask the contraction is found, so reading the mask is what decided
+    # the population -- and the old rule read it for one switch only.
+    plain = _contraction_batch(["a", "b"])
+    del plain.up_valid
+    unmasked = _collect(trained_task, [plain]).per_anchor["seconds_since_contraction"].to_numpy()
+    assert np.isfinite(unmasked).any(), "no contraction found; the test is vacuous"
+    assert not np.array_equal(unmasked, columns[True], equal_nan=True)
+
+
 def test_the_anchor_column_is_the_decimated_step_not_the_row_position(trained_task):
     r"""The correctness risk this cell's gathered anchor set creates.
 
@@ -500,8 +549,8 @@ def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
     model = trained_task.orig_model
     streamed = {}
     kept = {"target": [], "mu_full": [], "logvar_full": [], "mask": []}
-    # The pass's own forward, captured as it runs: the accumulator sums the TRAINING-PATH
-    # forecast, while the retained pair is the mean-decoded one a figure draws.
+    # The pass's own forward, captured as it runs for its anchor set. The accumulator sums the
+    # MEAN-DECODED forecast, which is also the retained pair a figure draws.
     forwards = []
     handle = model.register_forward_hook(lambda _module, _inputs, output: forwards.append(output))
 
@@ -510,8 +559,8 @@ def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
         for name, value in readout.horizon_sums.items():
             streamed[name] = streamed.get(name, 0.0) + value.to(torch.float64)
         kept["target"].append(readout.retained["target"])
-        kept["mu_full"].append(outputs["mu_full"])
-        kept["logvar_full"].append(outputs["logvar_full"])
+        kept["mu_full"].append(readout.retained["mu_full"])
+        kept["logvar_full"].append(readout.retained["logvar_full"])
         _y_st, _y_ph, _u_stream, _target_features, weight = model_inputs(trained_task, batch)
         mask, _coverage = forecast_mask(
             weight, model.geometry, coverage_floor=model.coverage_floor,
@@ -527,7 +576,7 @@ def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
             num_samples=1,
             perm_generator=torch.Generator().manual_seed(_SEED),
             mc_generator=torch.Generator().manual_seed(_SEED),
-            retain=("target",),
+            retain=("target", "mu_full", "logvar_full"),
             on_batch=_sink,
         )
     finally:
@@ -923,3 +972,41 @@ def test_a_real_loader_s_per_block_statistics_are_recorded(cohort_loader):
         assert record[name]["n_channels"] == mean.size
         assert record[name]["mean"] == pytest.approx(mean.tolist())
         assert record[name]["std"] == pytest.approx(std.tolist())
+
+
+def test_changed_shards_stats_or_masks_refuse_the_cached_tables() -> None:
+    """A finished directory's tables describe one ``dataset_config``: other shards, statistics,
+    quality masks or epoch bounds are refused, while a loader setting that changes no number
+    (the worker count) and a record written before the digest existed are not."""
+    from teb_vae.lag_attn_cfs.eval.collect import check_provenance, provenance
+
+    dataset = {
+        "vae_test_datasets": ["a.hdf5"],
+        "stat_path": "stats.hdf5",
+        "dataloader_config": {
+            "num_workers": 4,
+            "dataset_kwargs": {"ua_step_mask": "v1", "trim_minutes": 1.0, "epoch_min": -48000},
+        },
+    }
+    kwargs = {"checkpoint_path": None, "eval_config": {"seed": 1}, "num_samples": 2}
+    recorded = {"provenance": provenance(dataset_config=dataset, **kwargs)}
+
+    same = json.loads(json.dumps(dataset))
+    same["dataloader_config"]["num_workers"] = 0
+    check_provenance(recorded, provenance(dataset_config=same, **kwargs))
+    check_provenance({"provenance": provenance(**kwargs)}, provenance(dataset_config=dataset, **kwargs))
+
+    for path, value in (
+        (("vae_test_datasets",), ["b.hdf5"]),
+        (("stat_path",), "other_stats.hdf5"),
+        (("dataloader_config", "dataset_kwargs", "ua_step_mask"), None),
+        (("dataloader_config", "dataset_kwargs", "emit_quality_mask"), True),
+        (("dataloader_config", "dataset_kwargs", "epoch_min"), -36000),
+    ):
+        moved = json.loads(json.dumps(dataset))
+        node = moved
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        with pytest.raises(TablesProvenanceMismatch, match="dataset_config"):
+            check_provenance(recorded, provenance(dataset_config=moved, **kwargs))

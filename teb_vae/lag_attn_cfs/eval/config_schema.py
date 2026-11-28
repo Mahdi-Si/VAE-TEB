@@ -309,10 +309,12 @@ def resolve_event_lag_window_s(window: Any, vae: Mapping[str, Any]) -> float:
     r"""Return the event window, derived from the run's training contraction reach when unset.
 
     Training weights the full branch at $1$ on the anchors $t \in [o, o + R]$ after each contraction
-    onset step $o$, with $R$ = ``event_weight_reach_steps``, or ``max_lag`` when the reach is
-    ``null`` and ``event_weight_floor`` is set. The evaluation splits anchors by
-    ``seconds_since_contraction`` instead: the age $a$ from the raw onset sample to the anchor's last
-    raw sample. An anchor $j = t - o$ steps after its onset step therefore has
+    onset step $o = \lceil i_{\mathrm{on}} / D \rceil$ (the first decimated step $t$ whose causal
+    sample $Dt$ reaches the raw onset $i_{\mathrm{on}}$), with $R$ = ``event_weight_reach_steps``,
+    or ``max_lag`` when the reach is ``null`` and ``event_weight_floor`` is set. The evaluation
+    splits anchors by ``seconds_since_contraction`` instead: the age
+    $a = (Dt - i_{\mathrm{on}}) / f_s$ from the raw onset sample to the anchor's causal raw sample.
+    An anchor $j = t - o$ steps after its onset step therefore has
     $a \in [\Delta j,\ \Delta (j + 1) - \delta]$, with $\Delta$ the step length and $\delta$ one raw
     sample. The derived window
 

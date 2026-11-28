@@ -43,6 +43,14 @@
 #   * Then run the lag-analysis evaluator on the candidate and on epoch 369 with the same shards
 #     and stats (IMPLEMENTATION_PLAN.md, "Read the run against S8").
 #
+# CHECKPOINT SELECTION. base_decode stays `sample` (inherited from S7/S8; epoch 369 was trained
+# with it), so val/nll_base_block and val/total_loss stay comparable to epoch 369's CSV. The cost:
+# both carry the base branch's sampling noise, so the primary criterion (val/total_loss, min)
+# ranks epochs partly by noise. Select on the secondary criterion instead, val/pred_gap_mean
+# (max, inherited from S7): it is invariant to base_decode. The trainer also keeps the final
+# epoch (`<stem>-epoch=NN-last.ckpt`). gradient_clip_val stays 10500.0 (default.yaml): no grad-norm
+# record of the frozen run exists yet to size a tighter bound from.
+#
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_transformer_cfs.trainer \
 #       --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_source_only.yaml

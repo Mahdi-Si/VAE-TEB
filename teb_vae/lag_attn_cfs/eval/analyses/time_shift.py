@@ -168,25 +168,37 @@ def score_pairs(task: Any, own: Any, partner: Any) -> Dict[str, np.ndarray]:
     # recording stretch it was read from. The partner is a whole stored segment substituted step for
     # step -- step $s$ of the shifted arm is step $s$ of the partner -- so its mask is taken at the
     # same steps with no offset; nothing inside the stream moves, only which segment fills it.
+    # ``source_open`` is not set here: the shifted arm recomputes it from the attention it runs.
     posed = outputs
     if own_kwargs:
         partner_kwargs = forward_kwargs(task, partner, partner_source)
-        partner_valid = partner_kwargs["source_valid"]
-        key_mask = model.source_key_mask(
-            partner_valid,
-            model.build_lag_mask(int(partner_source.shape[1]), partner_source.device),
-            partner_source.dtype,
-        )
-        posed = {**outputs, "source_key_mask": key_mask, "source_open": key_mask.any(dim=-1)}
+        posed = dict(outputs)
+        # Absent on a model without ``source_quality_mask`` whose kwargs are the IRF inputs only.
+        partner_valid = partner_kwargs.get("source_valid")
+        if partner_valid is not None:
+            posed["source_key_mask"] = model.source_key_mask(
+                partner_valid,
+                model.build_lag_mask(int(partner_source.shape[1]), partner_source.device),
+                partner_source.dtype,
+            )
+            if outputs.get("source_quality") is not None:
+                # The soft UA mask also feeds the adapter the per-channel flags; the partner's.
+                posed["source_quality"] = model.source_quality_input(
+                    partner_valid, partner_source.dtype
+                )
         # Under running-gap removal the partner's keys are removed by the PARTNER's raw UA
-        # validity, as its key mask is, and the open anchors are those with a key left.
+        # validity, as its key mask is.
         partner_removed = partner_kwargs.get("source_key_removed")
         if partner_removed is not None:
             posed["source_key_removed"] = partner_removed
-            posed["source_open"] = (key_mask & ~partner_removed).any(dim=-1)
-        if outputs.get("source_quality") is not None:
-            # The soft UA mask also feeds the adapter the per-channel flags; the partner's.
-            posed["source_quality"] = model.source_quality_input(partner_valid, partner_source.dtype)
+        if "irf_evidence" in outputs:
+            # The event gate's IRF evidence is the head re-run on the PARTNER's UA against this
+            # segment's target, as the permutation control re-runs it on the donor's.
+            posed["irf_evidence"] = model.irf_evidence_for({
+                **outputs,
+                "irf_ua_level": partner_kwargs["ua_level"],
+                "irf_ua_valid": partner_kwargs["ua_valid"],
+            })
     # A seeded generator only because the helper also decodes one draw, which nothing here reads;
     # it keeps the global stream untouched.
     generator = torch.Generator(device=gated.device).manual_seed(0)

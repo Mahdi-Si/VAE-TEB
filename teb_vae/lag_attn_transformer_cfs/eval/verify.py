@@ -114,6 +114,18 @@ SWEPT_ARM_LEAVES: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple(
         "irf_readout",
         "irf_gate_evidence",
         "lambda_full_wrong",
+        # S6 to S8 and their continuations: the soft UA mask and running-gap removal, the UA
+        # tolerances, the log-variance clamp, the Student-t density, the horizon weighting, and
+        # the frozen target path of `run_s8_source_only`.
+        "source_mask_mode",
+        "source_running_gap_keys",
+        "source_valid_tolerance_s",
+        "event_weight_ua_tolerance_s",
+        "ua_bridge_guard_s",
+        "decoder_logvar_clamp",
+        "forecast_student_nu",
+        "freeze_target_path",
+        "horizon_weight_halflife_steps",
     )
 )
 

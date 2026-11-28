@@ -252,3 +252,28 @@ def test_the_configured_warmup_reaches_the_task_through_the_driver(tmp_path):
     configured = config["general_config"]["lr_warmup_steps"]
     assert configured > 0
     assert int(driver.pl_model.hparams["lr_warmup_steps"]) == configured
+
+
+def test_a_ramp_that_outlasts_the_first_milestone_or_the_run_is_warned_about(task):
+    """A ramp still rising when the first decay lands never reaches the base rate, and the
+    schedule raises nothing; the warning is the only place a reader learns of it."""
+    from loguru import logger
+
+    messages: List[str] = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        _attach(task(lr_milestones=MILESTONES), 4).build_lr_scheduler(
+            torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))])
+        )
+        assert not messages, messages
+        _attach(task(lr_milestones=MILESTONES), MILESTONES[0] * STEPS_PER_EPOCH).build_lr_scheduler(
+            torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))])
+        )
+        assert any("first milestone" in message for message in messages), messages
+        messages.clear()
+        _attach(task(), TOTAL_STEPS).build_lr_scheduler(
+            torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))])
+        )
+        assert any("never reaches" in message for message in messages), messages
+    finally:
+        logger.remove(sink)

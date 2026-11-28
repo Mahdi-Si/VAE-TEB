@@ -98,14 +98,20 @@ def load_progress(path, meta, accs):
                 acc.c.update({k: None for k in acc.s if k not in acc.c})
     except (OSError, ValueError, KeyError) as err:
         print(f"progress file ignored: it cannot be read ({err})", flush=True)
+        for acc in accs.values():                 # a partial read must not be counted again by the fresh pass
+            acc.s.clear()
+            acc.c.clear()
+            acc.binned = set()
         return None
     return state
 
 
 def code_version():
-    """Hash of the two modules that define the numbers, so progress of other code is never continued."""
+    """Hash of the modules that define the numbers, so progress and step files of other code are never
+    continued. This file counts up to its `RUN_ARGS` block: editing the Run-button values is not a code change."""
     here = Path(__file__).parent
-    return hashlib.sha256((here / "core.py").read_bytes() + (here / "steps.py").read_bytes()).hexdigest()[:12]
+    cli = (here / "__main__.py").read_bytes().split(b"\nRUN_ARGS = {")[0]
+    return hashlib.sha256((here / "core.py").read_bytes() + (here / "steps.py").read_bytes() + cli).hexdigest()[:12]
 
 
 def slow_channels(model, shard, device):
@@ -155,7 +161,8 @@ def main(argv=None):
     task = core.load_task(args.checkpoint, device)
     model = task.orig_model
     var = core.variant(model)
-    ds = core.open_dataset(core.loader_config(args.config, args.checkpoint), shards, args.stats)
+    loader_cfg = core.loader_config(args.config, args.checkpoint)
+    ds = core.open_dataset(loader_cfg, shards, args.stats)
     ix = core.build_index(ds)
     rows = core.select_rows(ix, args.max_guids, args.seed)
     guids, gidx = np.unique(ix["guid"][rows], return_inverse=True)
@@ -177,11 +184,24 @@ def main(argv=None):
     ghalf = np.array([core._rank(g, args.seed) % 2 for g in guids])[gidx]     # seeded half of the recording
 
     ck = Path(args.checkpoint)
-    key = hashlib.sha256(f"{sha256(ck)}|{','.join(map(str, rows))}|{sorted(shards)}|{args.k_samples}|{args.seed}".encode()).hexdigest()[:16]
+    # Everything that changes a number: checkpoint, rows, shards, stats, loader settings, K, seed and code.
+    loader_key = json.dumps(loader_cfg, sort_keys=True, default=str)
+    key = hashlib.sha256(f"{sha256(ck)}|{','.join(map(str, rows))}|{sorted(shards)}|{sha256(args.stats)}|{loader_key}|"
+                         f"{args.k_samples}|{args.seed}|{code_version()}".encode()).hexdigest()[:16]
     want = [s for s in STEPS if s in args.steps.split(",")]
     unknown = set(args.steps.split(",")) - set(STEPS)
     if unknown:
         raise SystemExit(f"unknown step(s) {sorted(unknown)}; steps: {', '.join(STEPS)}")
+    # Every step file in the folder, requested or not, goes into one report: all must be of this run.
+    for f in sorted((out / "steps").glob("*.npz")):
+        with np.load(f) as z:
+            same = "key" in z.files and str(z["key"]) == key
+        if not same:
+            if not args.force:
+                raise SystemExit(f"{f} was written for another checkpoint, shard set, stats, loader setting, code or "
+                                 "setting; one report cannot mix them. Use --force (deletes it) or another --out.")
+            print(f"{f.name}: written by another run, deleted (--force)", flush=True)
+            f.unlink()
     skipped, pending = {}, []
     for s in STEPS:
         f = out / "steps" / f"{s}.npz"
@@ -193,8 +213,6 @@ def main(argv=None):
         elif s == "irf" and not var["irf"]:
             skipped[s] = "needs the IRF head; this checkpoint has none"
         elif f.exists() and not args.force:
-            if str(np.load(f)["key"]) != key:
-                raise SystemExit(f"{f} was written for another checkpoint, shard set or setting. Use --force or another --out.")
             print(f"[{s}] done before, skipped (use --force to redo)")
         else:
             pending.append(s)
@@ -212,7 +230,8 @@ def main(argv=None):
         run["donor_a"], run["donor_b"] = core.assign_donors(ix, rows, args.seed) if donors else (np.full(len(rows), -1),) * 2
         with h5py.File(args.stats, "r") as h:
             for f in ("fhr", "up"):
-                norm = f in (ds.normalize_fields or ())
+                # normalize_fields None: every field with statistics is normalised (CombinedHDF5Dataset).
+                norm = f in h and (ds.normalize_fields is None or f in ds.normalize_fields)
                 run["scale"][f] = (float(h[f]["mean"][()]), float(h[f]["std"][()])) if norm else (0.0, 1.0)
         if var["lag"]:
             run["slow"] = slow_channels(model, shards[0], device)
@@ -225,7 +244,7 @@ def main(argv=None):
         # Crash-safe progress. The batch order is the row order, the donors depend on the seed and the
         # rows, and the latent noise on the seed and the segment, so a resumed pass repeats nothing random.
         progress = out / "steps" / "progress.state"
-        meta = {"checkpoint, shard set, --max-guids, --k-samples or --seed": key, "--batch-size": args.batch_size,
+        meta = {"checkpoint, shard set, stats, loader settings, --max-guids, --k-samples or --seed": key, "--batch-size": args.batch_size,
                 "step list": pending, "code version": code_version()}
         if args.force and progress.exists():
             progress.unlink()
@@ -277,7 +296,13 @@ def main(argv=None):
         "variant": var["name"], "run_key": key,
         "model_kwargs": {k: mk.get(k) for k in ("sequence_length", "horizon", "d_z", "max_lag", "num_heads", "source_path", "irf_readout",
                                                  "irf_gate_evidence", "irf_gate_k", "irf_channels", "source_mask_mode", "source_running_gap_keys",
-                                                 "posterior_event_gate", "lag_kv_source", "use_entmax", "forecast_student_nu", "persistence_lags")},
+                                                 "posterior_event_gate", "lag_kv_source", "use_entmax", "forecast_student_nu", "persistence_lags",
+                                                 "base_decode", "forecast_ar_residual", "forecast_ar_max", "decoder_logvar_clamp", "coverage_floor")},
+        # The objective's settings that tell two checkpoints apart, from the model kwargs or else the task's hparams.
+        "task_settings": {k: mk[k] if k in mk else task.hparams.get(k) for k in (
+            "base_decode", "forecast_ar_residual", "forecast_ar_max", "decoder_logvar_clamp", "coverage_floor", "event_weight_floor",
+            "event_weight_ua_valid", "source_valid_tolerance_s", "target_quality_mask", "freeze_target_path", "lambda_full_wrong")},
+        "stats_sha256": sha256(args.stats), "code_version": code_version(),
         "git_commit": commit,
         "versions": {"python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__, "platform": platform.platform()},
         "shards": [{"path": str(p), "subgroup": core.subgroup_of(p), "rows": int(c)} for p, c in zip(ds.paths, counts)],

@@ -7,6 +7,12 @@
 # k_fold_cross_validation_dataset/test/ directory; use one fold's test split, never several folds'
 # together, because every fold's test split holds the same extra test GUIDs.
 #
+# LEAKAGE CAVEAT. The acidosis and HIE files below also come from fold 1's `train/` and `val/`
+# splits. They are leak-free ONLY for a checkpoint pretrained on healthy recordings alone (the
+# `pre_training_dataset/*` tree), which never saw an adverse GUID. A checkpoint fine-tuned on
+# fold 1's adverse `train/` or `val/` files has trained on these recordings; evaluate it on fold
+# 1's `test/` files only. For the 2026-11-18 build, use eval_overrides_prod_2026_11_18.yaml.
+#
 # This is not a config: it has no `base:` key and it does not stand alone. A training run writes
 # its fully resolved configuration beside its checkpoints, and that file is the record of what
 # the model was trained on — the geometry, the warm-up budget it resolved to, the normalisation

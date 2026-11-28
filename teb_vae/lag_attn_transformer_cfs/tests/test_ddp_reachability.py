@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import List
 
 import pytest
+import torch
 
 from .conftest import (
     TINY_KWARGS,
@@ -26,10 +27,11 @@ from .conftest import (
 )
 
 
-def _starved_parameters(module, batch_idx: int) -> List[str]:
+def _starved_parameters(module, batch_idx: int, batch=None) -> List[str]:
     """Backward one training step and name the trainable parameters left without a gradient."""
     module.zero_grad(set_to_none=True)
-    loss, _metrics = module.compute_loss_and_metrics(make_stub_batch(4), batch_idx, "train")
+    batch = make_stub_batch(4) if batch is None else batch
+    loss, _metrics = module.compute_loss_and_metrics(batch, batch_idx, "train")
     loss.backward()
     return [
         name
@@ -162,6 +164,43 @@ def test_no_parameter_the_revision_added_is_left_without_a_gradient(
         assert expected in names, expected
 
     starved = _starved_parameters(module, 0)
+
+    assert not starved, (
+        f"parameters expecting a gradient but not receiving one: {starved}. Under "
+        f"find_unused_parameters=False the reducer raises on exactly these."
+    )
+
+
+def test_the_source_only_continuation_leaves_no_trainable_parameter_without_a_gradient(
+    task, perturb_posterior
+):
+    """The production continuation's arm: ``freeze_target_path`` with the soft UA mask and
+    running-gap key removal, on a batch whose UA is valid everywhere. The freeze takes most of the
+    model out of the reducer's set, and what is left -- the lag attention, its query, the
+    posterior head and the gates -- must every one still be reached, or the first production step
+    raises under ``find_unused_parameters=False``."""
+    module = task(
+        model_kwargs=tiny_warmup_kwargs(
+            anchor_stride=TINY_STRIDE,
+            source_quality_mask=True,
+            source_mask_mode="soft",
+            source_running_gap_keys="remove",
+            **_SHIPPED_SWITCHES,
+        ),
+        hparams={"likelihood": "gaussian_nll"},
+        freeze_target_path=True,
+    )
+    perturb_posterior(module.orig_model)
+    batch = make_stub_batch(4)
+    batch.up_st_step_valid = torch.ones(batch.up_st.shape, dtype=torch.bool)
+    batch.up_ph_step_valid = torch.ones(batch.up_ph.shape, dtype=torch.bool)
+    batch.up_valid = torch.ones(batch.up.shape, dtype=torch.bool)
+    trainable = [
+        name for name, parameter in module.orig_model.named_parameters() if parameter.requires_grad
+    ]
+    assert trainable, "the freeze left nothing to train"
+
+    starved = _starved_parameters(module, 0, batch)
 
     assert not starved, (
         f"parameters expecting a gradient but not receiving one: {starved}. Under "

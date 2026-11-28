@@ -265,6 +265,43 @@ def test_the_task_builds_the_weight_from_the_batch_only_when_a_floor_is_set(task
 
     assert on._event_detector() is cfs_events.detect_contractions
     assert on._event_detector() is not rws_events.detect_contractions
+    assert on._event_step_align() == "ceil"
+
+
+def test_causal_ceil_alignment_never_weights_a_pre_onset_step():
+    r"""Under ``step_align='ceil'``, an onset at raw index $i$ with $i \bmod D > 0$ activates step
+    $\lceil i / D \rceil$ rather than $\lfloor i / D \rfloor$, preventing up to $3.75\,\text{s}$
+    of pre-onset activation on the causal step grid while leaving ``'floor'`` unchanged."""
+    weight = np.ones(40, dtype=np.float64)
+    up = np.zeros(40 * DECIMATION, dtype=np.float64)
+    stub = lambda trace, fs, valid=None: {  # noqa: E731
+        "onset_raw": np.array([160, 161, 175], dtype=np.int64),
+        "end_raw": np.array([200, 208, 225], dtype=np.int64),
+    }
+    floor_onsets = contraction_onset_steps(up, weight, decimation=DECIMATION, detector=stub, step_align="floor")
+    ceil_onsets = contraction_onset_steps(up, weight, decimation=DECIMATION, detector=stub, step_align="ceil")
+    assert floor_onsets.tolist() == [10, 10, 10]
+    assert ceil_onsets.tolist() == [10, 11, 11]
+
+    ceil_spans = contraction_span_steps(up, weight, decimation=DECIMATION, detector=stub, step_align="ceil")
+    assert ceil_spans.tolist() == [[10, 13], [11, 13], [11, 15]]
+
+    # Anchor weight with a single interior onset at raw 161 must stay at floor on step 10 (raw 160)
+    # and turn on at step 11 (raw 176).
+    single = lambda trace, fs, valid=None: {  # noqa: E731
+        "onset_raw": np.array([161], dtype=np.int64),
+        "end_raw": np.array([200], dtype=np.int64),
+    }
+    w_ceil = contraction_anchor_weight(
+        torch.from_numpy(up[None]), torch.from_numpy(weight[None]),
+        decimation=DECIMATION, reach_steps=3, floor=0.1, detector=single, step_align="ceil",
+    )
+    assert float(w_ceil[0, 10]) == pytest.approx(0.1)
+    assert torch.allclose(w_ceil[0, 11:15], torch.ones(4, dtype=w_ceil.dtype))
+    assert float(w_ceil[0, 15]) == pytest.approx(0.1)
+
+    with pytest.raises(ValueError, match="step_align"):
+        contraction_onset_steps(up, weight, decimation=DECIMATION, detector=stub, step_align="round")
 
 
 # ---------------------------------------------------------------------------------------

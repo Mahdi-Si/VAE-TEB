@@ -342,6 +342,30 @@ def test_the_source_null_floor_is_the_controls_own_function_at_the_forwards_anch
     assert torch.equal(added["kld_source_null"], expected)
 
 
+def test_under_lambda_source_null_the_floor_is_the_objectives_penalty_computed_once(
+    task, stub_batch, perturb_posterior, monkeypatch
+):
+    """With the penalty on, the objective has already computed the same KL on the same inputs and
+    weight; validation reuses it rather than running the source-null forward a second time."""
+    module = task(hparams=dict(lambda_source_null=1.0))
+    perturb_posterior(module.orig_model)
+    calls = []
+    original = controls.source_null_kld_with_grad
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(controls, "source_null_kld_with_grad", counting)
+    module.eval()
+    with torch.no_grad():
+        _, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert len(calls) == 1
+    assert torch.equal(val_metrics["kld_source_null"], val_metrics["source_null_kl_penalty"])
+    assert "coupling_minus_clock" in val_metrics
+
+
 def test_the_mean_decoded_gap_is_the_objectives_gap_when_the_posterior_draw_is_its_mean(
     task, stub_batch, perturb_posterior, monkeypatch
 ):

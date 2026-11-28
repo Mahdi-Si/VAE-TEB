@@ -405,15 +405,18 @@ def collect_batch(
         )
 
     reference = _arm(None)
+    # What the adapter actually reads: the gated stream times its warm-up availability
+    # $m_{t,c} = \mathbb 1[t \ge \delta_c]$. ``source_gate`` does not zero cold steps; the adapter
+    # does, inside its forward, so occupancy measured on ``gated`` alone counts cold steps as live.
+    held = gated if before is None else gated * before[: gated.shape[1]].to(gated.dtype)
     deltas: Dict[str, torch.Tensor] = {}
     live: Dict[str, float] = {}
     for name, band in bands.items():
         mask = band_mask(anchors[:, 0], band, int(gated.shape[1]))
-        # How much of the band actually held a value. Measured on the gated stream the intervention
-        # edits, so a band inside the warm-up -- where the availability mechanism has already
-        # zeroed every channel -- reports a live fraction near zero and its delta is read as the
-        # absence of a source rather than as the source not mattering.
-        occupied = (gated != 0).to(torch.float64) * mask[:, :, None].to(torch.float64)
+        # How much of the band actually held a value the adapter reads, so a band inside the
+        # warm-up reports a live fraction near zero and its delta is read as the absence of a
+        # source rather than as the source not mattering.
+        occupied = (held != 0).to(torch.float64) * mask[:, :, None].to(torch.float64)
         denominator = float(mask.sum().item()) * float(gated.shape[2])
         live[name] = (
             float("nan") if denominator == 0.0 else float(occupied.sum().item()) / denominator

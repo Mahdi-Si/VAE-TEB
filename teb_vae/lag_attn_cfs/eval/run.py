@@ -174,6 +174,7 @@ from teb_vae.lag_attn_cfs.eval.report_seam import (  # noqa: E402,F401
     write_steps,
 )
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_attn_rws.eval.send_pack import pack_for_sending  # noqa: E402
 from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME  # noqa: E402
 from train.data_module import GraphDataModule  # noqa: E402
 
@@ -1639,6 +1640,12 @@ def main(
         for record in report.failed_steps:
             logger.error(f"[{record.name}] {record.error}")
             logger.error(f"{record.traceback}")
+        # The tables without the figures, in a sibling ``<results>_send`` folder to zip and hand
+        # over. A failure here costs the copy and nothing else.
+        try:
+            logger.info(f"data without figures copied to {pack_for_sending(results_dir)}")
+        except (OSError, ValueError) as error:
+            logger.warning(f"could not copy the data to a _send folder: {error}")
         return report.exit_code()
     finally:
         logger.remove(sink_id)
@@ -1759,6 +1766,8 @@ def load_or_collect_tables(
             eval_config=eval_config,
             num_samples=draws,
             max_batches=max_batches,
+            # Compared only when this pass could re-collect: a pass with no model reads no shard.
+            dataset_config=None if task is None else config.get("dataset_config"),
         )
         # Unshuffled, unlike the collection pass's: nothing here is batched through the model, and
         # the per-sample pages build their own strictly sequential loader over a Subset of this
@@ -1838,6 +1847,7 @@ def load_or_collect_tables(
         eval_config=eval_config,
         num_samples=draws,
         max_batches=max_batches,
+        dataset_config=config.get("dataset_config"),
     )
     return collection, probe_record, loader
 

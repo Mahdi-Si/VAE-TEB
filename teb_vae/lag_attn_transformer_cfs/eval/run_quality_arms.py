@@ -14,8 +14,9 @@ order:
 
 No step relies on a directory name to tell the arms apart. Before anything runs, the module reads
 the resolved config that each checkpoint's training run wrote, and refuses unless the masked
-checkpoint trained with ``source_quality_mask``, ``event_weight_ua_valid`` and
-``target_quality_mask`` all on, and the control with all three off. It also refuses one directory
+checkpoint trained with ``source_quality_mask`` and ``target_quality_mask`` both on, and the control
+with both off. ``event_weight_ua_valid`` is read and returned but not enforced: a source-only run
+such as ``run_s8_source_only`` keeps the masks while training with that switch off. It also refuses one directory
 for two roles, and one checkpoint for both arms.
 
 Run it from the PyCharm Run button after filling in :data:`RUN_ARGS`, or:
@@ -46,7 +47,8 @@ if not __package__ and str(_REPO_ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args  # noqa: E402
-from teb_vae.lag_attn_rws.eval.run import RESULTS_DIRNAME, resolved_config_for  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.probe import resolved_config_for  # noqa: E402
+from teb_vae.lag_attn_rws.eval.run import RESULTS_DIRNAME  # noqa: E402
 from teb_vae.lag_attn_transformer_cfs.eval import compare_quality_arms  # noqa: E402
 
 EVAL_MODULE = "teb_vae.lag_attn_transformer_cfs.eval.run"
@@ -57,7 +59,9 @@ VERIFY_LOG = "run_quality_arms_verify.txt"
 STAGES = ("eval", "verify", "compare")
 ARMS = ("masked", "control")
 #: The switches that identify an arm, and the value each arm trained with.
-ARM_SWITCHES = ("source_quality_mask", "event_weight_ua_valid", "target_quality_mask")
+ARM_SWITCHES = ("source_quality_mask", "target_quality_mask")
+#: Read off each arm and returned beside :data:`ARM_SWITCHES`, but not checked against the arm.
+REPORTED_SWITCHES = ("event_weight_ua_valid",)
 EXPECTED = {"masked": True, "control": False}
 
 
@@ -75,7 +79,7 @@ def check_arm(arm: str, checkpoint: Path) -> Dict[str, Any]:
         checkpoint: The checkpoint given for that arm.
 
     Returns:
-        ``{switch: value}`` for every name in :data:`ARM_SWITCHES`.
+        ``{switch: value}`` for every name in :data:`ARM_SWITCHES` and :data:`REPORTED_SWITCHES`.
 
     Raises:
         SystemExit: If the checkpoint is absent, or any switch differs from the arm's value.
@@ -85,8 +89,8 @@ def check_arm(arm: str, checkpoint: Path) -> Dict[str, Any]:
     with open(resolved_config_for(checkpoint), encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
     vae = (config.get("model_config") or {}).get("VAE_model") or {}
-    switches = {name: vae.get(name) for name in ARM_SWITCHES}
-    wrong = {name: value for name, value in switches.items() if bool(value) != EXPECTED[arm]}
+    switches = {name: vae.get(name) for name in ARM_SWITCHES + REPORTED_SWITCHES}
+    wrong = {name: switches[name] for name in ARM_SWITCHES if bool(switches[name]) != EXPECTED[arm]}
     if wrong:
         raise SystemExit(
             f"{arm}_checkpoint {checkpoint} did not train as the {arm} arm: {wrong}, expected "
@@ -262,7 +266,7 @@ RUN_ARGS: Dict[str, Any] = {
 
     # ============================== The output folders ==============================
     # str -- one folder per arm and one for the comparison; three different paths.
-    "masked_output_dir": r"//data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_masked",
+    "masked_output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_masked",
     "control_output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/2026-10-28--[17-14]-lag_attn_trf_cfs_q4_no_quality_mask",
     "comparison_output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/comparison",
 

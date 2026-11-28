@@ -1,0 +1,145 @@
+# Revised production S8 run: fresh from-scratch training on the current SeqVaeLagAttnTrfCfs
+# architecture over the 2026-11-18 healthy-only shards.
+#
+# Inherits directly from `default.yaml` (no nested rung/continuation chain) and states every
+# active architecture, objective, quality, schedule, dataset, and checkpoint setting in one place.
+# This is the config `trainer.py` launches by default (`RUN_CONFIG`) from PyCharm's Run button.
+#
+# Launch via PyCharm Run on `teb_vae/lag_attn_transformer_cfs/trainer.py`, or via torchrun:
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_revised.yaml
+
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_cfs_s8_revised
+  seed: 42
+  cuda_devices: [1, 2, 3, 4, 5, 6, 7]
+  # Stable from-scratch Transformer peak LR (avoiding S8's 3e-3 gradient spikes), with 2000-step
+  # warmup, 150 epochs at peak after the 50-epoch beta ramp, then x0.1 drops at epochs 200 & 320.
+  lr: 5.0e-04
+  lr_milestone: [200, 320]
+  lr_warmup_steps: 2000
+  epochs: 400
+  # 128 x 7 GPUs x 8 grad-accum = 7,168 segments/update (~21.5 GB/GPU peak fp32, safer than S8's
+  # ~24.0 GB/GPU at batch 228 while closely matching its 7,980 effective batch size).
+  accumulate_grad_batches: 8
+  batch_size:
+    train: 128
+    test: 128
+
+model_config:
+  # Fresh from scratch: do not warm-start from the onset-weighted S8 checkpoint.
+  core_model_checkpoint: null
+
+  VAE_model:
+    # --- Capacity & architecture (8.13 M total; 4.95 M / 60.9% in FHR target encoder) ----------
+    d_model: 192
+    d_z: 96
+    encoder_num_heads: 6
+    encoder_d_ff: 768
+    target_attention_blocks: 8
+    num_heads: 4
+    d_head: 48
+    decoder_hidden: 256
+    horizon_depth: 4
+    horizon_attention_blocks: 2
+    # S8 long own-channel persistence skip (38 lags = 148 s, matching max_lag = 37).
+    persistence_residual: true
+    persistence_lags: 38
+    max_lag: 37
+
+    # --- Source path & training mode -----------------------------------------------------------
+    source_path: lag_attn
+    irf_readout: false
+    irf_gate_evidence: false
+    freeze_target_path: false
+
+    # --- Objective, likelihood, and KL / specificity schedules ---------------------------------
+    # Linear beta warmup 0 -> 1 over 50 epochs (shared by KL, event gate, source-null, and
+    # lambda_full_wrong so from-scratch training discovers own-UA coupling before penalties ramp).
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 50
+    beta_prior: 0.1
+    posterior_event_gate: true
+    lambda_event_gate: 0.05
+    lambda_source_null: 1.0
+    # Calibrated cross-GUID wrong-UA specificity penalty (rides beta warmup).
+    lambda_full_wrong: 0.25
+    lambda_source_irf: 0.0
+    lambda_source_expl: 0.0
+    lambda_source_wrong: 0.0
+    # No contraction-onset reward window: every scored anchor supervises the full branch equally.
+    event_weight_floor: null
+    event_weight_ua_valid: false
+    event_weight_ua_tolerance_s: null
+
+    # --- Forecast density & scored support (matches S8 cell-for-cell) --------------------------
+    base_decode: sample
+    forecast_ar_residual: true
+    forecast_ar_max: 0.95
+    forecast_student_nu: 8.0
+    decoder_logvar_clamp: [-9.0, 3.0]
+    target_weight_st: 1.0
+    target_weight_ph: 1.0
+    target_min_novelty:
+      fhr_st: 0.05
+      fhr_ph: null
+
+    # --- Causal signal-quality handling (proven S7/S8 settings) --------------------------------
+    target_quality_mask: true
+    source_quality_mask: true
+    source_mask_mode: soft
+    source_running_gap_keys: remove
+    ua_bridge_guard_s: 4.0
+    source_valid_tolerance_s: 16.0
+
+dataset_config:
+  # 2026-11-18 production healthy-only build (20 train shards, 5 validation shards, server stats).
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_001.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_002.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_003.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_004.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_005.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_006.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_007.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_008.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_009.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_010.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_011.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/train/healthy_no_bg_no_cs/shard_012.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_no_cs/shard_000.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/pre_training_dataset/test/healthy_no_bg_no_cs/shard_001.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/2026-11-18/stats.hdf5
+
+advanced_config:
+  tracking:
+    mlflow:
+      run_name: lag_attn_trf_cfs_s8_revised
+      tags:
+        variant: lag_attn_trf_cfs_s8_revised
+  callbacks:
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+      # Secondary criterion tracks noise-free latent-mean UA gain alongside total loss.
+      secondary_monitor: "val/pred_gap_mean"
+      secondary_mode: "max"

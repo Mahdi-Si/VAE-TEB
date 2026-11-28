@@ -84,7 +84,9 @@ def read_arm(run_dir: str) -> Dict[str, Any]:
             ``eval_results`` folder.
 
     Returns:
-        ``{'table': DataFrame, 'switches': {name: value}}``.
+        ``{'table': DataFrame, 'switches': {name: value}, 'event_lag_window_s': float | None}``;
+        the window is the evaluation's own resolved ``eval_config.event_lag_window_s``, ``None``
+        when the run dumped no config or no window.
 
     Raises:
         FileNotFoundError: If the per-anchor table is absent.
@@ -96,13 +98,44 @@ def read_arm(run_dir: str) -> Dict[str, Any]:
     if missing:
         raise ValueError(f"{results / PER_ANCHOR_FILENAME} lacks the columns {missing}")
     switches: Dict[str, Any] = {}
+    window: Optional[float] = None
     config_path = results / RESOLVED_CONFIG_FILENAME
     if config_path.is_file():
         with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         vae = (config.get("model_config") or {}).get("VAE_model") or {}
         switches = {name: vae.get(name, "(absent)") for name in SWITCHES}
-    return {"table": table, "switches": switches}
+        value = (config.get("eval_config") or {}).get("event_lag_window_s")
+        window = None if value is None else float(value)
+    return {"table": table, "switches": switches, "event_lag_window_s": window}
+
+
+def resolve_event_window_s(
+    event_window_s: Optional[float], masked: Mapping[str, Any], control: Mapping[str, Any]
+) -> float:
+    """The ``event`` window: the caller's, else the one both evaluations resolved.
+
+    Args:
+        event_window_s: An explicit window in seconds, or ``None``.
+        masked: The masked arm, from :func:`read_arm`.
+        control: The control arm, from :func:`read_arm`.
+
+    Returns:
+        The window in seconds.
+
+    Raises:
+        ValueError: If no window is given and the arms recorded none, or two different ones; a
+            silent default would split the anchors at a reach neither evaluation used.
+    """
+    if event_window_s is not None:
+        return float(event_window_s)
+    recorded = {arm["event_lag_window_s"] for arm in (masked, control)} - {None}
+    if len(recorded) != 1:
+        raise ValueError(
+            f"cannot derive event_window_s: the arms' resolved eval_config.event_lag_window_s "
+            f"are {sorted(recorded) or 'absent'}. Pass --event-window-s explicitly."
+        )
+    return recorded.pop()
 
 
 def join_arms(masked: pd.DataFrame, control: pd.DataFrame, event_window_s: float) -> pd.DataFrame:
@@ -255,18 +288,19 @@ def main(masked_dir: Optional[str] = None, control_dir: Optional[str] = None,
         masked_dir: The masked arm's evaluation output directory.
         control_dir: The control's evaluation output directory.
         output_dir: Where the two reports go; created if absent.
-        event_window_s: Seconds after an onset that count as ``event``. Default: 220, the
-            training contraction weight's reach (55 steps of 4 s).
+        event_window_s: Seconds after an onset that count as ``event``. Default: the
+            ``eval_config.event_lag_window_s`` both evaluations resolved
+            (:func:`resolve_event_window_s`).
         resamples: Bootstrap resamples over recordings. Default: 2000.
         seed: Bootstrap seed. Default: 42.
 
     Returns:
         The process exit code.
     """
-    window = 220.0 if event_window_s is None else float(event_window_s)
     resamples = 2000 if resamples is None else int(resamples)
     seed = 42 if seed is None else int(seed)
     masked, control = read_arm(masked_dir), read_arm(control_dir)
+    window = resolve_event_window_s(event_window_s, masked, control)
     joined = join_arms(masked["table"], control["table"], window)
     report = {
         "event_window_s": window, "bootstrap_resamples": resamples, "seed": seed,
@@ -321,7 +355,8 @@ RUN_ARGS: Dict[str, Any] = {
     # str -- where quality_arms_comparison.json and .md go. Aggregates only: safe to send.
     "output_dir": r"/data/deid/isilon/MS_model/q3_2026/lag_attn_transformer_cfs_new/comparison",
     # ========================= Everything below has a default =========================
-    # float | None -- seconds after a contraction onset that count as `event`.  (None -> 220)
+    # float | None -- seconds after a contraction onset that count as `event`.
+    #   (None -> the eval_config.event_lag_window_s both evaluations resolved)
     "event_window_s": None,
     # int | None -- bootstrap resamples over recordings.  (None -> 2000)
     "resamples": None,

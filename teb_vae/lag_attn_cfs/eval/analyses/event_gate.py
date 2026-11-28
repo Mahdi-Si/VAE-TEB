@@ -2,7 +2,8 @@ r"""How the posterior event gate behaves: when it is shut, who shut it, and what
 
 The posterior applies the effective gate $g^{\mathrm{eff}}_t = g_t\,o_t$ to both of its residuals,
 where $g_t$ is the learned gate and $o_t$ says whether at least one UA lag key survived the
-signal-quality mask. The objective charges $\lambda\,\mathbb E_t[g^{\mathrm{eff}}_t]$, so a gate
+signal-quality mask (the hard mode) or the running-gap removal (the soft and input modes under
+``source_running_gap_keys='remove'``, which keep the invalid keys). The objective charges $\lambda\,\mathbb E_t[g^{\mathrm{eff}}_t]$, so a gate
 that stays open is a gate the model is paying for. The mean of $g^{\mathrm{eff}}_t$ alone cannot
 say whether that payment is used well, because $g^{\mathrm{eff}}_t = 0$ for two different reasons:
 

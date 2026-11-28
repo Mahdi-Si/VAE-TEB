@@ -623,17 +623,34 @@ def test_a_step_mask_epsilon_equal_to_the_statistics_pairs(
 
 
 @pytest.mark.parametrize(
-    "spec, epsilon", [({"bits": ["invalid"]}, 0.05), ({"rho_epsilon": 0.2}, None)],
-    ids=["bits_only", "statistics_without_epsilon"],
+    "spec, epsilon", [({"bits": ["invalid"]}, 0.05), ({"bits": ["invalid"]}, None)],
+    ids=["bits_only", "bits_only_statistics_without_epsilon"],
 )
 def test_a_step_mask_without_an_epsilon_pair_is_not_refused(
     quality_shard: Path, tmp_path: Path, spec: Dict[str, Any], epsilon: Optional[float]
 ) -> None:
-    r"""A bits-only mask has no $\varepsilon$ to compare, and old statistics record none."""
+    r"""A bits-only mask has no $\varepsilon$ to compare, whatever the statistics record."""
     stats = _write_stats(tmp_path / "stats.hdf5", quality_version=QUALITY_VERSION,
                          rho_epsilon=epsilon)
     dataset = _dataset(quality_shard, stats_path=str(stats), ua_step_mask=spec, fhr_step_mask=spec)
     assert dataset.stats_quality_rho_epsilon == epsilon
+
+
+@pytest.mark.parametrize("key", ["ua_step_mask", "fhr_step_mask"])
+def test_a_step_mask_epsilon_against_quality_statistics_that_record_none_is_refused(
+    quality_shard: Path, tmp_path: Path, key: str
+) -> None:
+    r"""Constants computed with no $\rho$ rule used every value an $\varepsilon = 0.2$ mask removes."""
+    stats = _write_stats(tmp_path / "stats.hdf5", quality_version=QUALITY_VERSION, rho_epsilon=None)
+    with pytest.raises(ValueError, match=rf"{key}\.rho_epsilon is 0\.2 .*no quality_rho_epsilon"):
+        _dataset(quality_shard, stats_path=str(stats), **{key: {"rho_epsilon": 0.2}})
+
+
+def test_a_trim_other_than_the_statistics_is_refused(quality_shard: Path, tmp_path: Path) -> None:
+    """The constants describe another window of every recording, so the loader stops."""
+    stats = _write_stats(tmp_path / "stats.hdf5", quality_version=QUALITY_VERSION, rho_epsilon=0.05)
+    with pytest.raises(ValueError, match=r"trim_minutes=2\.0 .*trim_minutes=1"):
+        _dataset(quality_shard, stats_path=str(stats), trim_minutes=2.0)
 
 
 # =================================================================================================

@@ -487,7 +487,10 @@ def test_a_rendered_page_has_fifteen_rows_and_logs_no_warning(tmp_path, caplog) 
     assert failures == [], failures
     assert n_input_rows == 2
     assert 2 + 6 + 2 + n_input_rows + 5 == samples_analysis.EXPECTED_PAGE_ROWS
-    assert "warning" not in caplog.text.lower(), caplog.text
+    # fontTools logs a font-timestamp notice while the PDF backend subsets a font that an earlier
+    # test loaded; that is the font file's metadata, not the page builder's handler.
+    own = [r for r in caplog.records if not r.name.startswith("fontTools")]
+    assert not any(r.levelno >= logging.WARNING for r in own), caplog.text
 
     # One segment, both variants, and the reduced one named by the tail rather than by position:
     # the pair is what a reader looks for in the directory.

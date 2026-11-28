@@ -403,6 +403,25 @@ def pytest_configure(config: pytest.Config) -> None:
 # difference as an encoder finding.
 # =================================================================================================
 @pytest.fixture(scope="session")
+def cohort_shards(tmp_path_factory):
+    """Generate the eight causal subgroup shards under ``integer_harmonic_v1`` to match ``tiny.yaml``."""
+    from scripts.make_tiny_shard import COHORT_SUBGROUPS, _cli as make_tiny_shard_cli
+    from teb_vae.lag_attn_cfs.tests.conftest import COHORT_SEQ_LEN
+
+    directory = tmp_path_factory.mktemp("causal_cohort_int")
+    exit_code = make_tiny_shard_cli(
+        [
+            "--variants", "causal_cohort",
+            "--out-dir", str(directory),
+            "--seq-len", str(COHORT_SEQ_LEN),
+            "--phase-operator", "integer_harmonic_v1",
+        ]
+    )
+    assert exit_code == 0
+    return [str(Path(directory) / f"{subgroup}.hdf5") for subgroup in COHORT_SUBGROUPS]
+
+
+@pytest.fixture(scope="session")
 def trf_cohort_run(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
     r"""One real fit of this cell against the generated cohort shards; returns the run directory.
 

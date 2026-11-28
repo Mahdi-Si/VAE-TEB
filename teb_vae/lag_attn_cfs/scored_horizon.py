@@ -43,7 +43,7 @@ the rule removed three quarters of the phase cells.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -94,16 +94,12 @@ def resolve_target_scored_horizon(config: Mapping[str, Any]) -> Optional[Tuple[i
             f"{CUTOFF_KEY} is set but dataset_config names no shard to read the phase-leg "
             f"frequencies from"
         )
-    with h5py.File(paths[0], "r") as handle:
-        width_st = int(handle[TARGET_BLOCKS[0]].shape[1])
-        attrs = handle[TARGET_BLOCKS[1]].attrs
-        if "sel_xi_i_hz" not in attrs:
-            raise ValueError(
-                f"{paths[0]}: the {TARGET_BLOCKS[1]} block carries no sel_xi_i_hz, so the phase "
-                f"channels' slow-leg frequencies are unknown; rebuild the shard with the current "
-                f"writer or unset {CUTOFF_KEY}"
-            )
-        xi_slow = np.asarray(attrs["sel_xi_i_hz"], dtype=float)
+    width_st = _agreed_width(paths, TARGET_BLOCKS[0])
+    xi_slow = _agreed_attr(
+        paths, TARGET_BLOCKS[1], "sel_xi_i_hz",
+        "so the phase channels' slow-leg frequencies are unknown; rebuild the shard with the "
+        f"current writer or unset {CUTOFF_KEY}",
+    )
 
     c_y = int(vae["c_y"])
     if width_st + xi_slow.size != c_y:
@@ -155,37 +151,90 @@ def resolve_target_scored_start(config: Mapping[str, Any]) -> Optional[Tuple[int
             f"curve from"
         )
     starts = []
-    with h5py.File(paths[0], "r") as handle:
-        for block in TARGET_BLOCKS:
-            width = int(handle[block].shape[1])
-            threshold = thresholds.get(block)
-            if threshold is None:
-                starts.extend([0] * width)
-                continue
-            attrs = handle[block].attrs
-            if "causal_novelty_curve" not in attrs:
-                raise ValueError(
-                    f"{paths[0]}: the {block} block carries no causal_novelty_curve; rebuild the "
-                    f"shard with the current writer or unset {MIN_NOVELTY_KEY}"
-                )
-            curve = np.asarray(attrs["causal_novelty_curve"], dtype=float)
-            if curve.shape[0] != width:
-                raise ValueError(
-                    f"{paths[0]}: the {block} novelty curve has {curve.shape[0]} rows for "
-                    f"{width} channels"
-                )
-            if curve.shape[1] < horizon + 1:
-                raise ValueError(
-                    f"the {block} novelty curve is tabulated to {curve.shape[1] - 1} steps, "
-                    f"fewer than H={horizon}"
-                )
-            # Column tau + 1 is the scored element at horizon step tau on the stored clock.
-            novel = curve[:, 1 : horizon + 1] >= threshold
-            starts.extend(int(np.argmax(row)) if row.any() else horizon for row in novel)
+    for block in TARGET_BLOCKS:
+        width = _agreed_width(paths, block)
+        threshold = thresholds.get(block)
+        if threshold is None:
+            starts.extend([0] * width)
+            continue
+        curve = _agreed_attr(
+            paths, block, "causal_novelty_curve",
+            f"rebuild the shard with the current writer or unset {MIN_NOVELTY_KEY}",
+        )
+        if curve.shape[0] != width:
+            raise ValueError(
+                f"{paths[0]}: the {block} novelty curve has {curve.shape[0]} rows for "
+                f"{width} channels"
+            )
+        if curve.shape[1] < horizon + 1:
+            raise ValueError(
+                f"the {block} novelty curve is tabulated to {curve.shape[1] - 1} steps, "
+                f"fewer than H={horizon}"
+            )
+        # Column tau + 1 is the scored element at horizon step tau on the stored clock.
+        novel = curve[:, 1 : horizon + 1] >= threshold
+        starts.extend(int(np.argmax(row)) if row.any() else horizon for row in novel)
     c_y = int(vae["c_y"])
     if len(starts) != c_y:
         raise ValueError(f"the shard's target blocks hold {len(starts)} channels but c_y={c_y}")
     return tuple(starts)
+
+
+def _agreed_width(paths: Sequence[str], block: str) -> int:
+    """Return a stored block's channel width, refusing shards that disagree on it.
+
+    Args:
+        paths: The configured shards, every one of which is read.
+        block: The stored block name.
+
+    Returns:
+        The width every shard gives.
+
+    Raises:
+        ValueError: If two shards give different widths.
+    """
+    widths = {}
+    for path in paths:
+        with h5py.File(path, "r") as handle:
+            widths[path] = int(handle[block].shape[1])
+    if len(set(widths.values())) > 1:
+        raise ValueError(f"the configured shards disagree on the {block} width: {widths}")
+    return widths[paths[0]]
+
+
+def _agreed_attr(paths: Sequence[str], block: str, name: str, remedy: str) -> np.ndarray:
+    """Read one per-channel attribute of a stored block, refusing shards that disagree on it.
+
+    One shard alone cannot speak for the rest: a pool that mixed two builds would otherwise score
+    every shard by the first one's rule.
+
+    Args:
+        paths: The configured shards, every one of which is read.
+        block: The stored block name.
+        name: The attribute name.
+        remedy: What the operator should do when the attribute is missing.
+
+    Returns:
+        The attribute of the first shard, as a float array.
+
+    Raises:
+        ValueError: If a shard lacks the attribute, or if two shards hold different values.
+    """
+    first = None
+    for path in paths:
+        with h5py.File(path, "r") as handle:
+            attrs = handle[block].attrs
+            if name not in attrs:
+                raise ValueError(f"{path}: the {block} block carries no {name}; {remedy}")
+            value = np.asarray(attrs[name], dtype=float)
+        if first is None:
+            first = value
+        elif value.shape != first.shape or not np.array_equal(value, first, equal_nan=True):
+            raise ValueError(
+                f"{path}: its {block} {name} differs from {paths[0]}'s; the configured shards come "
+                f"from different builds, so no single rule fits them"
+            )
+    return first
 
 
 def _block_thresholds(value: Any) -> Optional[Dict[str, Optional[float]]]:

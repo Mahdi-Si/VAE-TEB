@@ -64,6 +64,7 @@ class IrfSourceHead(nn.Module):
     HIGHPASS_WINDOW = 75  # steps of the trailing mean removed from the target and from Z
     PREQ_GAP = 15         # the IRF that predicts step s was fitted on steps <= s - PREQ_GAP
     MIN_UA_COVER = 0.8    # valid share of the last 120 s of UA for Z to count
+    MIN_PREQ_ROWS = 10    # prequential rows in the window before the gate can open
 
     def __init__(self, horizon: int, channels: int, gate_k: float = 4.4, context_steps: int = 0, knots=KNOTS):
         super().__init__()
@@ -79,9 +80,18 @@ class IrfSourceHead(nn.Module):
         self.eta_logit = nn.Parameter(torch.full((self.H, channels), 2.0))
 
     def context_irf(self, Z, z_ok, y, y_ok, step_ok) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """At every step: the ridge IRF of each channel ``h`` (B, T, J, C), its gate ``a`` (B, T, C)
-        and the gate's statistic ``z`` = slope / standard error (B, T, C); the gate is open where z > k."""
+        r"""At every step: the ridge IRF of each channel ``h`` (B, T, J, C), its gate ``a`` (B, T, C)
+        and the gate's statistic ``z`` = slope / standard error (B, T, C); the gate is open where z > k.
+
+        The normal equations and the prequential sums run in float64, as in
+        ``teb_vae.coupling_irf.model``, and the three outputs are cast back to the input dtype. A
+        prequential row $s$ counts only when the IRF fitted at $s - g$ had rows of its own
+        ($g$ = ``PREQ_GAP``), so the startup steps with no prediction yet add neither residual nor
+        support. The gate stays shut ($a = z = 0$) until ``MIN_PREQ_ROWS`` such rows are in the window.
+        """
         W, g, hp = self.context_steps, self.PREQ_GAP, self.HIGHPASS_WINDOW
+        dtype = Z.dtype
+        Z, y = Z.double(), y.double()
         # ponytail: one normal matrix for all channels, with rows w = UA covered and FHR step valid.
         # A channel's own invalid rows (its warm-up) only zero its residual, so its IRF is shrunk a
         # little and its two trailing means cover different rows. Use per-channel matrices if slow
@@ -98,17 +108,22 @@ class IrfSourceHead(nn.Module):
         Zc, r = (Z - mZ) * w[..., None], (y - my) * v
         Szz = trailing_sum(Zc[..., :, None] * Zc[..., None, :], W)           # (B, T, J, J)
         Szr = trailing_sum(Zc[..., :, None] * r[..., None, :], W)            # (B, T, J, C)
-        lam = torch.exp(self.log_lambda)
-        pen = lam[0] * torch.eye(self.J, dtype=Z.dtype, device=Z.device) + lam[1] * self.pen_smooth
+        lam = torch.exp(self.log_lambda).double()
+        pen = lam[0] * torch.eye(self.J, dtype=Z.dtype, device=Z.device) + lam[1] * self.pen_smooth.double()
         h = batched_solve(Szz + trailing_sum(w, W).clamp_min(1)[..., None, None] * pen, Szr)
         # prequential check: predict step s with the IRF fitted on steps <= s - gap, then calibrate
         h_past = torch.cat([torch.zeros_like(h[:, :g]), h[:, :-g]], 1)
-        pred = torch.einsum("btjc,btj->btc", h_past, Zc) * v
-        Spp, Spr = trailing_sum(pred * pred, W), trailing_sum(pred * r, W)
+        fitted = trailing_sum(v, W)                                          # (B, T, C) rows each IRF saw
+        vp = v * (torch.cat([torch.zeros_like(fitted[:, :g]), fitted[:, :-g]], 1) > 0)
+        pred, rp = torch.einsum("btjc,btj->btc", h_past, Zc) * vp, r * vp
+        Spp, Spr, n = trailing_sum(pred * pred, W), trailing_sum(pred * rp, W), trailing_sum(vp, W)
         slope = Spr / (Spp + 1e-9)
-        resid = (trailing_sum(r * r, W) - 2 * slope * Spr + slope * slope * Spp).clamp_min(0) / trailing_sum(v, W).clamp_min(1)
+        resid = (trailing_sum(rp * rp, W) - 2 * slope * Spr + slope * slope * Spp).clamp_min(0) / n.clamp_min(1)
         se = torch.sqrt((resid + 1e-12) / (Spp + 1e-9))
-        return h, (slope - self.gate_k * se).clamp(0, 1), slope / se
+        enough = n >= self.MIN_PREQ_ROWS
+        a = torch.where(enough, (slope - self.gate_k * se).clamp(0, 1), torch.zeros_like(slope))
+        z = torch.where(enough, slope / se, torch.zeros_like(slope))
+        return h.to(dtype), a.to(dtype), z.to(dtype)
 
     def forward(self, y, y_ok, step_ok, ua, ua_ok, anchors) -> Dict[str, torch.Tensor]:
         """The mean shifts at the anchors.

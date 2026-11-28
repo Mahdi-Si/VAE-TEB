@@ -383,6 +383,34 @@ def test_the_history_before_an_anchor_is_an_earlier_anchors_future() -> None:
     assert np.isnan(series[: first + 1]).all()
 
 
+def test_the_band_is_the_predictive_sd_under_a_student_t_density() -> None:
+    r"""Under ``student_nu`` $= \nu$ the head's $\sigma^2$ is a squared scale, and the predictive
+    variance is $\sigma^2 \nu / (\nu - 2)$, so the $\pm 1\sigma$ band is $\sqrt{\nu/(\nu-2)}$ times
+    the Gaussian one (here $\sqrt{2}$ at $\nu = 4$)."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    channels = forecast_analysis.overlay_channels(_CHANNELS, 1)
+    retained = _retained_blocks()
+    retained["logvar_full"] = np.zeros_like(retained["mu_full"])  # sigma = 1
+    geometry = {"horizon": _HORIZON, "anchor_first": _ANCHOR_FLOOR, "anchor_stride": 1}
+    samples = forecast_analysis.overlay_samples(
+        retained, pd.DataFrame({"guid": ["g0", "g1"]}), None, geometry=geometry, count=1
+    )
+
+    def _half_width(student_nu: Optional[float]) -> float:
+        figure = forecast_analysis.build_overlay_figure(
+            retained, samples, channels, geometry=geometry, student_nu=student_nu
+        )
+        try:
+            band = figure.axes[2 * len(samples)].collections[-1].get_paths()[0].vertices[:, 1]
+        finally:
+            shared_figures.plt.close(figure)
+        return float(band.max() - band.min()) / 2.0
+
+    assert _half_width(None) == pytest.approx(1.0)
+    assert _half_width(4.0) == pytest.approx(np.sqrt(2.0))
+
+
 def test_the_band_widens_to_the_marginal_variance_under_the_ar_residual() -> None:
     r"""$v_\tau = \sigma^2_\tau + \phi^2 v_{\tau-1}$: the density scores the innovation, so the
     residual accumulates earlier innovations and the band drawn around the mean must too."""

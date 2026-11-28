@@ -348,11 +348,12 @@ model_config:
     source_mask_mode: hard
     # RUNNING-GAP KEYS. The bridge across an invalid UA run [a, b] reads `ua_bridge_guard_s` of
     # samples after b, so a key whose step starts at or after a can rest on UA after the anchor
-    # while the run is still running. `remove` takes those keys out of the attention per anchor
-    # (both mask modes) and closes the gate where none is left; the forward then takes a seventh
-    # input built from `up_valid`. Needs `source_quality_mask` and `emit_quality_mask`. No
-    # parameter. keep = the model without the rule, bitwise.
-    source_running_gap_keys: keep
+    # while the run is still running. `remove` (SHIPPED) takes those keys out of the attention per
+    # anchor (both mask modes) and closes the gate where none is left; the forward then takes a
+    # seventh input built from `up_valid`. Needs `source_quality_mask` and `emit_quality_mask`. No
+    # parameter. `keep` = the model without the rule, bitwise (required when `source_quality_mask`
+    # or `emit_quality_mask` is false).
+    source_running_gap_keys: remove
     # The bridge's end-slope window in seconds (the builder's 4 s), the guard of the rule above.
     ua_bridge_guard_s: 4.0
     # TOLERANT FLAGS (seconds). An invalid UA run of at most this length is short; a channel's
@@ -397,9 +398,10 @@ model_config:
     # `source_path: irf` only (task-level). Multiplier on the learning rate of the head's three
     # parameter tensors, which form their own optimizer group. 1.0 = one group, as before the key.
     irf_lr_scale: 1.0
-    # Task-level. Train the UA path only (source adapter, lag attention, posterior head, gates);
-    # the target encoder, prior, decoder and AR(1) coefficient keep their loaded weights. For
-    # continuing a converged warm start. false = every parameter trains, as before the key.
+    # Task-level. Train the UA path only (lag attention, query projection, posterior head, gates);
+    # the source adapter, target encoder, prior, decoder and AR(1) coefficient keep their loaded
+    # weights and stay in eval mode (no dropout). For continuing a converged warm start.
+    # false = every parameter trains, as before the key.
     freeze_target_path: false
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
@@ -1210,7 +1212,7 @@ dataset_config:
       label: null
       # 0: the FIFO cache stores fully processed samples, and under the DistributedSampler's
       # per-epoch reshuffle a worker almost never re-sees a cached index.
-      cache_size: 10000
+      cache_size: 0
       # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only warns.
       #
       # It does one MORE thing here than in the two-sided cells: the stored warm-up vectors are

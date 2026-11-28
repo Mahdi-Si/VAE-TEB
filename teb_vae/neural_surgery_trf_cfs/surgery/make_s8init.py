@@ -34,7 +34,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs  # noqa: E402
-from train.graph_models_utils import check_model_class, load_checkpoint_strict  # noqa: E402
+from train.graph_models_utils import check_model_class, load_checkpoint_strict, network_state_dict  # noqa: E402
 
 KEY = "decoder.persistence_lag_weight"
 #: The IDE entry: set ``source`` and press Run. ``output`` None writes ``<source stem>-s8init.ckpt``.
@@ -49,11 +49,13 @@ def build(source: Path, output: Path, lags: int) -> Path:
     """Zero-pad the AR skip to ``lags`` lags, write the warm start, and check it is exact."""
     blob = torch.load(str(source), map_location="cpu", weights_only=False)
     check_model_class(blob, SeqVaeLagAttnTrfCfs.__name__)
+    if "persistence_lags" not in (blob.get("model_kwargs") or {}):
+        raise ValueError(f"{source} records no model_kwargs['persistence_lags']; give a rung-7 checkpoint")
     old_lags = int(blob["model_kwargs"]["persistence_lags"])
     if lags <= old_lags:
         raise ValueError(f"lags={lags} must exceed the checkpoint's persistence_lags={old_lags}")
-    # Lightning's checkpoint holds the network twice (model. and the compiled _orig_model.); keep one.
-    state = {k: v for k, v in blob["state_dict"].items() if k.startswith("model.")}
+    # One copy of the network, whatever the wrapper (model., model._orig_mod., _orig_model.).
+    state = {f"model.{k}": v for k, v in network_state_dict(blob).items()}
     w = state[f"model.{KEY}"]
     state[f"model.{KEY}"] = torch.cat([w, w.new_zeros(w.shape[0], lags - old_lags, w.shape[2])], 1)
     kwargs = dict(blob["model_kwargs"], persistence_lags=lags)

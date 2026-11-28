@@ -500,26 +500,93 @@ def _run_job(job: Job) -> Dict[str, Any]:
             "seconds": round(time.time() - start, 1)}
 
 
-def is_complete(path: str, digest: str, source_pickle_path: str,
-                quality_version: Optional[int] = None) -> bool:
-    """Return whether *path* is a finished file of this GUID set, this pickle and these rules.
+def _attr_str(value: Any) -> Optional[str]:
+    """Decode an HDF5 string attribute to ``str``, preserving ``None``."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def is_complete(
+    path: str,
+    digest: str,
+    source_pickle_path: str,
+    quality_version: Optional[int] = None,
+    transform: Optional[str] = None,
+    leg_alignment: Optional[str] = None,
+    phase_operator: Optional[str] = None,
+    quality_valid_boxes: Optional[bool] = None,
+) -> bool:
+    """Return whether *path* is a finished file of this GUID set, pickle, transform and quality rules.
+
+    A rerun into an existing output directory skips a file only when every requested build axis
+    matches the root attributes written into *path*. Any optional argument left as ``None`` is not
+    checked, preserving compatibility with callers that validate only a subset of attributes.
 
     Args:
-        path: The final path of the file.
+        path: The final path of the HDF5 file.
         digest: ``guid_set_digest`` of the file's records.
-        source_pickle_path: The pickle every file of the build records.
-        quality_version: ``signal_quality.QUALITY_VERSION`` for a build with the quality step,
+        source_pickle_path: The pickle path every file of the build records.
+        quality_version: ``signal_quality.QUALITY_VERSION`` for a build with the quality step, or
             ``None`` for one without it. A file of other rules, or of the other kind, is rebuilt.
+        transform: Expected root ``transform`` attribute (``'two_sided'`` or ``'causal'``), or
+            ``None`` to skip checking it.
+        leg_alignment: Expected root ``causal_leg_alignment`` attribute for causal builds, or
+            ``None`` to skip. Ignored when ``transform == 'two_sided'``.
+        phase_operator: Expected root ``causal_phase_operator`` attribute for causal builds, or
+            ``None`` to skip. Ignored when ``transform == 'two_sided'``.
+        quality_valid_boxes: Expected root ``quality_box_valid`` boolean flag when
+            ``quality_version`` is not ``None``, or ``None`` to skip.
+
+    Returns:
+        ``True`` if *path* exists and every checked root attribute matches; ``False`` otherwise.
     """
     if not os.path.exists(path):
         return False
     import h5py
 
     with h5py.File(path, "r") as f:
-        stored = f.attrs.get("quality_version")
-        return (f.attrs.get("source_guid_digest") == digest
-                and f.attrs.get("source_pickle_path") == str(source_pickle_path)
-                and (None if stored is None else int(stored)) == quality_version)
+        if (_attr_str(f.attrs.get("source_guid_digest")) != digest
+                or _attr_str(f.attrs.get("source_pickle_path")) != str(source_pickle_path)):
+            return False
+        stored_q = f.attrs.get("quality_version")
+        if (None if stored_q is None else int(stored_q)) != quality_version:
+            return False
+        if transform is not None and _attr_str(f.attrs.get("transform")) != str(transform):
+            return False
+        if transform != "two_sided":
+            if (leg_alignment is not None
+                    and _attr_str(f.attrs.get("causal_leg_alignment")) != str(leg_alignment)):
+                return False
+            if (phase_operator is not None
+                    and _attr_str(f.attrs.get("causal_phase_operator")) != str(phase_operator)):
+                return False
+        if quality_version is not None and quality_valid_boxes is not None:
+            stored_box = f.attrs.get("quality_box_valid")
+            if stored_box is None or bool(float(stored_box)) != bool(quality_valid_boxes):
+                return False
+        return True
+
+
+def _completion_kwargs(settings: Mapping[str, Any]) -> Dict[str, Any]:
+    """Extract the :func:`is_complete` build-rule keyword arguments from *settings*.
+
+    Args:
+        settings: Build settings mapping containing transform and signal-quality options.
+
+    Returns:
+        Keyword arguments forwarded to :func:`is_complete`, :func:`assemble_file`, and
+        :func:`assemble_kfold`.
+    """
+    return {
+        "quality_version": settings.get("quality_version"),
+        "transform": settings.get("transform"),
+        "leg_alignment": settings.get("leg_alignment"),
+        "phase_operator": settings.get("phase_operator"),
+        "quality_valid_boxes": settings.get("quality_valid_boxes"),
+    }
 
 
 def run_jobs(jobs: Sequence[Job], settings: Mapping[str, Any],
@@ -544,9 +611,10 @@ def run_jobs(jobs: Sequence[Job], settings: Mapping[str, Any],
             only the failed ones.
     """
     digest = _pipeline().guid_set_digest
+    check_kw = _completion_kwargs(settings)
     todo = [j for j in jobs if not is_complete(j.path, digest(list(j.records)),
                                                settings["source_pickle_path"],
-                                               settings.get("quality_version"))]
+                                               **check_kw)]
     logger.info(f"{len(jobs) - len(todo)} of {len(jobs)} files are complete; "
                 f"{len(todo)} to build")
     todo.sort(key=lambda j: -len(j.records))
@@ -705,9 +773,16 @@ class AssemblyTask:
     guids: frozenset
 
 
-def assemble_file(task: AssemblyTask, source_pickle_path: str,
-                  batch_rows: int = COPY_BATCH_ROWS,
-                  quality_version: Optional[int] = None) -> Dict[str, Any]:
+def assemble_file(
+    task: AssemblyTask,
+    source_pickle_path: str,
+    batch_rows: int = COPY_BATCH_ROWS,
+    quality_version: Optional[int] = None,
+    transform: Optional[str] = None,
+    leg_alignment: Optional[str] = None,
+    phase_operator: Optional[str] = None,
+    quality_valid_boxes: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Write one partition file as the concatenation of its unit files.
 
     The empty file copies the first unit's datasets and attributes, which
@@ -719,6 +794,10 @@ def assemble_file(task: AssemblyTask, source_pickle_path: str,
         source_pickle_path: The pickle every file of the build records.
         batch_rows: Rows per read.
         quality_version: As in :func:`is_complete`.
+        transform: As in :func:`is_complete`.
+        leg_alignment: As in :func:`is_complete`.
+        phase_operator: As in :func:`is_complete`.
+        quality_valid_boxes: As in :func:`is_complete`.
 
     Returns:
         A summary of the file.
@@ -730,7 +809,11 @@ def assemble_file(task: AssemblyTask, source_pickle_path: str,
     import h5py
 
     dst, sources, digest = task.path, task.sources, task.digest
-    if is_complete(dst, digest, source_pickle_path, quality_version):
+    if is_complete(
+        dst, digest, source_pickle_path, quality_version,
+        transform=transform, leg_alignment=leg_alignment,
+        phase_operator=phase_operator, quality_valid_boxes=quality_valid_boxes,
+    ):
         return {"path": dst, "skipped": True}
     partial = dst + PARTIAL_SUFFIX
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
@@ -787,22 +870,52 @@ def plan_assembly(output_base_path: str, partitions: pd.DataFrame, members: pd.D
             for path, sources, recs in targets]
 
 
-def assemble_kfold(tasks: Sequence[AssemblyTask], source_pickle_path: str,
-                   workers: int, quality_version: Optional[int] = None) -> List[Dict[str, Any]]:
+def assemble_kfold(
+    tasks: Sequence[AssemblyTask],
+    source_pickle_path: str,
+    workers: int,
+    quality_version: Optional[int] = None,
+    transform: Optional[str] = None,
+    leg_alignment: Optional[str] = None,
+    phase_operator: Optional[str] = None,
+    quality_valid_boxes: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
     """Write every partition file, in *workers* processes (CPU work: LZF and disk).
+
+    Args:
+        tasks: Partition assembly tasks to materialize.
+        source_pickle_path: The pickle every file of the build records.
+        workers: Number of worker processes ($\\le 1$ runs in-process).
+        quality_version: As in :func:`is_complete`.
+        transform: As in :func:`is_complete`.
+        leg_alignment: As in :func:`is_complete`.
+        phase_operator: As in :func:`is_complete`.
+        quality_valid_boxes: As in :func:`is_complete`.
 
     Returns:
         One summary per partition file.
     """
     if workers <= 1:
-        return [assemble_file(t, source_pickle_path, quality_version=quality_version)
-                for t in tasks]
+        return [
+            assemble_file(
+                t, source_pickle_path, quality_version=quality_version,
+                transform=transform, leg_alignment=leg_alignment,
+                phase_operator=phase_operator, quality_valid_boxes=quality_valid_boxes,
+            )
+            for t in tasks
+        ]
     import multiprocessing as mp
 
     results = []
     with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
-        futures = [pool.submit(assemble_file, t, source_pickle_path, COPY_BATCH_ROWS,
-                               quality_version) for t in tasks]
+        futures = [
+            pool.submit(
+                assemble_file, t, source_pickle_path, COPY_BATCH_ROWS,
+                quality_version, transform, leg_alignment, phase_operator,
+                quality_valid_boxes,
+            )
+            for t in tasks
+        ]
         for i, future in enumerate(as_completed(futures), 1):
             results.append(future.result())
             if i % 20 == 0 or i == len(futures):
@@ -985,8 +1098,9 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
 
     # A unit is needed only while a partition file it feeds is incomplete: a rerun after a
     # finished build, whose units are deleted, must not transform them again.
+    check_kw = _completion_kwargs(settings)
     pending = [t for t in tasks
-               if not is_complete(t.path, t.digest, str(pickle_path), quality_version)]
+               if not is_complete(t.path, t.digest, str(pickle_path), **check_kw)]
     needed = {source for t in pending for source in t.sources}
     jobs = [j for j in jobs if j.kind != "unit" or j.path in needed]
     results = run_jobs(jobs, settings, devices)
@@ -994,7 +1108,7 @@ def main(fold_dir: Optional[str] = None, screening_csv_path: Optional[str] = Non
     assembled: List[Dict[str, Any]] = []
     if "kfold" in steps:
         assembled = assemble_kfold(pending, str(pickle_path), int(assembly_workers or 4),
-                                   quality_version)
+                                   **check_kw)
         if not keep_units and (out / KFOLD_DIR / UNITS_DIR).exists():
             shutil.rmtree(out / KFOLD_DIR / UNITS_DIR)
         if pending:

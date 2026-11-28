@@ -150,6 +150,27 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     "target_attention_blocks",
     "source_attention_blocks",
     "source_attention_window",
+    # Change what the posterior reads: how a bad UA key is masked out of the lag attention, and
+    # whether a running gap's bridged keys are removed. Neither adds a parameter, so a checkpoint
+    # loads under any value and a disagreeing config would mislabel the masked coupling.
+    "source_mask_mode",
+    "source_running_gap_keys",
+    # Part of the density: the decoder log-variance bounds, the base branch's decode (a posterior
+    # sample or the prior mean), and the coverage floor below which a block is not scored.
+    "decoder_logvar_clamp",
+    "base_decode",
+    "coverage_floor",
+    # Change what the source path is: the lag attention or the impulse-response head, its readout
+    # and gate evidence, and the gate's slope, context and channels.
+    "source_path",
+    "irf_readout",
+    "irf_gate_evidence",
+    "irf_gate_k",
+    "irf_context_steps",
+    "irf_channels",
+    # ``target_min_novelty`` is absent on purpose: it is no constructor keyword, so it never reaches
+    # ``model_kwargs``. The ``target_scored_start`` vector it resolves to is re-resolved and
+    # compared in the reconciliation instead, as ``target_scored_horizon`` is.
 )
 
 

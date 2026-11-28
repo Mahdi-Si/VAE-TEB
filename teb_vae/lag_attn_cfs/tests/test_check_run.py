@@ -683,3 +683,75 @@ def test_an_absent_tier_two_column_is_reported_as_absent(tmp_path, capsys):
 
     assert code == 0
     assert "val/kld_source_null: absent" in capsys.readouterr().out
+
+
+# =================================================================================================
+# The S6-S8 arm keys, the validation loss, the absolute floor and the configured criteria
+# =================================================================================================
+#: The revision's arm keys, written out for the same reason :data:`STATED_ARM` is.
+_REVISED_ARM: Dict[str, Any] = {
+    "source_mask_mode": "soft",
+    "source_running_gap_keys": "remove",
+    "source_valid_tolerance_s": 4.0,
+    "event_weight_ua_tolerance_s": None,
+    "ua_bridge_guard_s": 4.0,
+    "decoder_logvar_clamp": [-9.0, 3.0],
+    "forecast_student_nu": 8.0,
+    "forecast_ar_max": 0.95,
+    "freeze_target_path": True,
+}
+
+
+def test_a_revised_run_must_state_every_revised_arm_key(tmp_path, capsys):
+    """A conv-LSTM run never had these keys and passes without them; a run stating one of them
+    came from the revised configuration and fails when another one is silent."""
+    write_run(tmp_path / "all", arm={**STATED_ARM, **_REVISED_ARM})
+    assert check_run.main(run_dir=str(tmp_path / "all")) == 0
+    assert statuses(capsys)[6] == PASS
+
+    partial = {key: value for key, value in _REVISED_ARM.items() if key != "freeze_target_path"}
+    write_run(tmp_path / "partial", arm={**STATED_ARM, **partial})
+    assert check_run.main(run_dir=str(tmp_path / "partial")) == 1
+    printed = capsys.readouterr().out
+    assert "freeze_target_path" in printed and "[FAIL] 6." in printed
+
+
+def test_a_non_finite_validation_loss_fails_the_loss_criterion(tmp_path, capsys):
+    """A NaN validation loss selects no checkpoint while the training loss stays finite."""
+    rows = [dict(_row(epoch), **{"val/total_loss": 1400.0 - epoch}) for epoch in range(ROWS)]
+    rows[4]["val/total_loss"] = float("nan")
+    write_run(tmp_path, rows=rows)
+
+    assert check_run.main(run_dir=str(tmp_path)) == 1
+    assert statuses(capsys)[3] == FAIL
+
+
+def test_the_recomposition_admits_noise_on_a_near_zero_gap(tmp_path, capsys):
+    """Both splits near zero: a $10^{-7}$ disagreement is most of the sum, and the absolute floor
+    is what keeps it a pass."""
+    rows = [_row(epoch) for epoch in range(ROWS)]
+    for row in rows:
+        for stage in ("train", "val"):
+            row.update({f"{stage}/pred_gap_warm_lo": 1e-7, f"{stage}/pred_gap_warm_mid": 0.0,
+                        f"{stage}/pred_gap_warm_hi": 0.0, f"{stage}/pred_gap_st": 0.0,
+                        f"{stage}/pred_gap_ph": 0.0})
+    write_run(tmp_path, rows=rows)
+
+    assert check_run.main(run_dir=str(tmp_path)) == 0
+    assert statuses(capsys)[4] == PASS
+
+
+def test_the_checkpoint_criteria_are_the_runs_own():
+    """Read from the run's configuration, with their direction: a gain is maximised."""
+    config = {"advanced_config": {"callbacks": {"model_checkpoint": {
+        "monitor": "val/total_loss", "mode": "min",
+        "secondary_monitor": "val/pred_gap_mean", "secondary_mode": "max",
+    }}}}
+    assert check_run.checkpoint_criteria(config) == (
+        ("val/total_loss", "min"), ("val/pred_gap_mean", "max"),
+    )
+    rows = [{"val/total_loss": str(value), "val/pred_gap_mean": str(gain)}
+            for value, gain in ((3.0, 0.1), (1.0, 0.5), (2.0, 0.9))]
+    readings = dict(check_run.tier_two_readings(rows, config))
+    assert readings["val/total_loss best epoch"].startswith("row 1 ")
+    assert readings["val/pred_gap_mean best epoch"].startswith("row 2 ")

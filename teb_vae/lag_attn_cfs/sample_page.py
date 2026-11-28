@@ -1042,6 +1042,9 @@ def _window_block_scores(
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
     student_nu: Optional[float] = None,
+    channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
+    target_quality_mask: bool = False,
 ) -> Optional[Dict[str, np.ndarray]]:
     r"""Each drawn window's own block score, under the objective's likelihood and its mask.
 
@@ -1063,6 +1066,11 @@ def _window_block_scores(
         ar_coef: The model's AR(1) coefficient $\phi_c$, or ``None``, for the same reason.
         student_nu: The model's Student-$t$ $\nu$, or ``None`` for the Gaussian density, for
             the same reason.
+        channel_weight: The objective's per-channel weight $(C_{\mathrm{keep}},)$, or ``None``.
+            The logged block scores are sums of the weighted term, so a window's score is too.
+        horizon_weight: The objective's per-step weight $(H,)$, or ``None``, for the same reason.
+        target_quality_mask: Whether the objective zeroes the steps where a kept target channel
+            is flagged; the window then drops them as the objective's mask does.
 
     Returns:
         ``{'base': (W,), 'full': (W,)}`` over the drawn windows, ``NaN`` for a window whose
@@ -1076,6 +1084,14 @@ def _window_block_scores(
 
     index, geometry = rows.sample_index, rows.geometry
     horizon = int(geometry.horizon)
+    if target_quality_mask:
+        # The objective's own order: the target-quality mask first, the clock pooling after.
+        _, target_valid = _kept_block_shares(rows.batch, index, TARGET_BLOCKS, stitched.keep)
+        if target_valid is not None:
+            weight = weight.clone()
+            weight[index] = weight[index] * torch.as_tensor(
+                target_valid, dtype=weight.dtype, device=weight.device
+            )
     with torch.no_grad():
         # The objective's own pooled validity: under a forecast clock a shifted element inside a
         # signal gap is dropped there, so it must be dropped from this curve too.
@@ -1119,6 +1135,10 @@ def _window_block_scores(
                     cell_mask=cell_mask, ar_coef=ar_coef, step_mask=step_mask,
                     student_nu=student_nu,
                 )
+                if channel_weight is not None:
+                    per_element = per_element * channel_weight.to(per_element)
+                if horizon_weight is not None:
+                    per_element = per_element * horizon_weight.to(per_element)[:, None]
                 window_scores.append(float((per_element * step_mask[:, None]).sum()))
             scores[branch] = np.asarray(window_scores, dtype=float)
     return scores
@@ -1236,6 +1256,9 @@ def _draw_gap_row(
     cell_mask: Optional[torch.Tensor] = None,
     ar_coef: Optional[torch.Tensor] = None,
     student_nu: Optional[float] = None,
+    channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
+    target_quality_mask: bool = False,
 ) -> None:
     r"""Draw ``pred_gap``: each drawn window's block score, base against full, plus the profiles.
 
@@ -1255,6 +1278,10 @@ def _draw_gap_row(
         ar_coef: The model's AR(1) coefficient, for the window scorer.
         student_nu: The model's Student-$t$ $\nu$, for the window scorer. The $\pm 2\sigma$
             inset stays a scale band; it is a figure, not a score.
+        channel_weight: The objective's per-channel weight, for the window scorer.
+        horizon_weight: The objective's per-step weight, for the window scorer.
+        target_quality_mask: Whether the objective removes flagged target steps, for the window
+            scorer.
     """
     ax, cax = rows.row_axes("pred_gap")
     cax.set_visible(False)
@@ -1273,6 +1300,9 @@ def _draw_gap_row(
         cell_mask=cell_mask,
         ar_coef=ar_coef,
         student_nu=student_nu,
+        channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
+        target_quality_mask=target_quality_mask,
     )
     if scores is None:
         # The row keeps its title, its axis and its place, so the rows below stay column-aligned
@@ -1870,6 +1900,8 @@ def causal_forecast_rows(
     source_keep_index: Optional[Sequence[int]] = None,
     source_blocks: Sequence[str] = SOURCE_BLOCKS,
     target_quality_mask: bool = False,
+    channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
 
@@ -1924,7 +1956,10 @@ def causal_forecast_rows(
         source_blocks: The source stream's blocks in concatenation order -- both UA blocks, or
             ``up_ph`` alone when the model does not read ``up_st``.
         target_quality_mask: Whether the objective removes flagged target steps, so the mask row
-            draws the steps it removed.
+            draws the steps it removed and the per-window score drops them.
+        channel_weight: The objective's per-channel weight (``target_channel_weight``), so a
+            window's score is the weighted term the logged block scores sum.
+        horizon_weight: The objective's per-step horizon weight, for the same reason.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -1943,24 +1978,30 @@ def causal_forecast_rows(
         ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
     )
 
-    # The two monitor rows read the batch and the forward dict only, so they are drawn before the
-    # forecast is stitched and on any page that reserved them.
-    if rows.wants(QUALITY_MASK_ROW):
-        _draw_quality_mask_row(
-            rows,
-            keep_index=keep_index,
-            source_keep_index=source_keep_index,
-            source_blocks=tuple(source_blocks),
-            target_quality_mask=bool(target_quality_mask),
-        )
-    if rows.wants(EVENT_GATE_ROW):
-        _draw_event_gate_row(rows)
+    def draw_monitor_rows() -> None:
+        """Draw the two monitor rows, which read the batch and the forward dict only.
+
+        Called after the forecast rows, and on the early return, because ``row_axes`` creates a
+        row's axes when it is first drawn: drawing them first would put them ahead of the forecast
+        row in ``figure.axes`` although the layout places them below it.
+        """
+        if rows.wants(QUALITY_MASK_ROW):
+            _draw_quality_mask_row(
+                rows,
+                keep_index=keep_index,
+                source_keep_index=source_keep_index,
+                source_blocks=tuple(source_blocks),
+                target_quality_mask=bool(target_quality_mask),
+            )
+        if rows.wants(EVENT_GATE_ROW):
+            _draw_event_gate_row(rows)
 
     # Everything below belongs to the forecast row and the six rows reserved under it. A page
     # built without any of them has no axes for it, and ``row_axes`` raises rather than inventing
     # one -- inside a callback that swallows exceptions, which would cost the page. Each row is
     # checked on its own below, so a page keeping the lane row alone scores no window.
     if not any(rows.wants(name) for name in (FORECAST_ROW, *dict(CAUSAL_EXTRA_ROWS))):
+        draw_monitor_rows()
         return
 
     anchors = to_numpy(rows.outs["anchor_index"][index]).astype(int).ravel()
@@ -2031,4 +2072,8 @@ def causal_forecast_rows(
             cell_mask=cell_mask,
             ar_coef=ar_coef,
             student_nu=student_nu,
+            channel_weight=channel_weight,
+            horizon_weight=horizon_weight,
+            target_quality_mask=bool(target_quality_mask),
         )
+    draw_monitor_rows()

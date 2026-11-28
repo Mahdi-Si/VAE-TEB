@@ -261,7 +261,6 @@ Q4_DATASET_PATHS: Dict[str, str] = {
 PRODUCTION_RUNTIME_PATHS: Dict[str, str] = {
     "general_config.cuda_devices": "this cell's production GPU allocation",
     "general_config.accumulate_grad_batches": "this cell's production effective batch size",
-    "dataset_config.dataloader_config.dataset_kwargs.cache_size": "this cell's production loader cache",
 }
 
 #: The ENCODER edge: what may differ from the conv-LSTM causal cell, and why. Anything not here must

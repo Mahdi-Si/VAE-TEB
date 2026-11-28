@@ -89,7 +89,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -212,7 +212,7 @@ RETAINED_QUANTITIES: Dict[str, Tuple[str, ...]] = {
 }
 
 #: Retained names a batch carries only when ``load_fields`` asked for the raw trace behind them,
-#: or, for ``up_valid``, only when the run trained with ``event_weight_ua_valid``.
+#: or, for ``up_valid``, only when the loader emits the quality mask (``emit_quality_mask``).
 OPTIONAL_RETAINED: Tuple[str, ...] = ("up_raw", "fhr_raw", "up_valid")
 
 #: How the retained forecast pair was decoded, written into the retention record so the arrays are
@@ -540,11 +540,15 @@ class Collector:
         num_mc_samples: Latent draws per anchor, for the cost record.
         device: The device the pass runs on, for the cost record.
         ua_valid_events: Detect contractions under the batch's ``up_valid`` as well as its
-            ``weight``, as a run trained with ``event_weight_ua_valid`` did.
-        ua_valid_tolerance_s: The run's ``event_weight_ua_tolerance_s``: with
-            ``ua_valid_events``, the samples of invalid UA runs of at most this many seconds
-            count as valid, as the training detector counted them. ``None`` -- the default --
-            reads ``up_valid`` unchanged.
+            ``weight``. ``None`` -- the default, and what :func:`collect_tables` passes -- reads
+            ``up_valid`` whenever the batch carries it and the weight alone otherwise, so two
+            checkpoints evaluated on the same shards are stratified on one contraction
+            population whatever their training ``event_weight_ua_valid``. ``True`` requires the
+            mask (NaN ages without it); ``False`` never reads it. The same policy decides
+            whether a retained ``up_valid`` is kept.
+        ua_valid_tolerance_s: Where ``up_valid`` is read, the samples of invalid UA runs of at
+            most this many seconds count as valid. ``None`` -- the default -- reads
+            ``up_valid`` unchanged.
     """
 
     def __init__(
@@ -554,11 +558,11 @@ class Collector:
         model: Any = None,
         num_mc_samples: Optional[int] = None,
         device: Any = None,
-        ua_valid_events: bool = False,
+        ua_valid_events: Optional[bool] = None,
         ua_valid_tolerance_s: Optional[float] = None,
     ) -> None:
         self._plan = plan
-        self._ua_valid_events = bool(ua_valid_events)
+        self._ua_valid_events = None if ua_valid_events is None else bool(ua_valid_events)
         self._ua_valid_tolerance_s = ua_valid_tolerance_s
         self._model = model
         self._num_mc_samples = num_mc_samples
@@ -765,9 +769,11 @@ class Collector:
 
         The onset is taken on the stored timeline, the one every other number in the run is on.
 
-        When the run trained with ``event_weight_ua_valid``, the detector also reads the batch's
-        ``up_valid``: an invalid UA sample is a gap, as it was for the training weight. A batch
-        without ``up_valid`` then gives NaN throughout, so a missing mask reads as "not measured".
+        Wherever the batch carries ``up_valid`` (under the default policy of ``ua_valid_events``),
+        the detector also reads it: an invalid UA sample is a gap. The policy does not depend on
+        the run's training ``event_weight_ua_valid``, so two checkpoints on the same shards are
+        binned on the same contractions. Under ``ua_valid_events=True`` a batch without
+        ``up_valid`` gives NaN throughout, so a missing mask reads as "not measured".
 
         Args:
             batch: The batch, for its raw ``up``, its ``weight`` and, under the UA switch, its
@@ -793,22 +799,22 @@ class Collector:
             else weight.detach().cpu().to(torch.float64).numpy().reshape(batch_size, -1)
         )
         ua_valid = None
-        if self._ua_valid_events:
-            mask = batch_field(batch, "up_valid")
-            if not isinstance(mask, torch.Tensor):
-                return ages
+        mask = None if self._ua_valid_events is False else batch_field(batch, "up_valid")
+        if self._ua_valid_events and not isinstance(mask, torch.Tensor):
+            return ages
+        if isinstance(mask, torch.Tensor):
             given_t = mask.detach().cpu().to(torch.bool).reshape(batch_size, -1)
-            # The training detector's tolerance, so a table bin and a training weight name one
-            # event; a no-op when the run set none.
+            # The evaluation's tolerance, the same for every checkpoint; a no-op when unset.
             given_t = tolerant_reward_validity(given_t, self._ua_valid_tolerance_s)
             given = given_t.numpy()[:, :raw_len]
             # A short mask leaves its tail invalid, as traces.up_event_validity does for the
             # retained traces, so the two readers of one batch find the same contractions.
             ua_valid = np.zeros((batch_size, raw_len), dtype=bool)
             ua_valid[:, : given.shape[1]] = given
-        # Each anchor's causal endpoint on the raw grid; a contraction at or before it is one the
-        # anchor could have read.
-        endpoints = decimation * (anchor_index.astype(np.float64) + 1.0) - 1.0
+        # Each anchor's causal sample on the trimmed raw grid ($D \cdot t$): stored step $t$ is
+        # decimated at sample $D \cdot t$ and reads only samples $\le D \cdot t$, so a contraction
+        # at or before $D \cdot t$ is one the anchor could have read.
+        endpoints = decimation * anchor_index.astype(np.float64)
         for index in range(batch_size):
             valid = (
                 None if weights is None
@@ -850,7 +856,15 @@ class Collector:
             for name in tensors:
                 if name not in readout.retained:
                     continue
-                rows = readout.retained[name].detach().cpu().numpy()
+                tensor = readout.retained[name].detach().cpu()
+                if name == "up_valid":
+                    if self._ua_valid_events is False:
+                        continue
+                    # The detector's own mask, so the traces and the table find one population.
+                    tensor = tolerant_reward_validity(
+                        tensor.to(torch.bool), self._ua_valid_tolerance_s
+                    )
+                rows = tensor.numpy()
                 self._retained.setdefault(name, []).append(rows[keep])
 
     # -- accumulators --------------------------------------------------------------
@@ -1275,10 +1289,11 @@ def collect_tables(
         # From the model rather than from a caller's argument, so the cost record names the device
         # the pass actually ran on rather than the one it was asked for.
         device=next(model.parameters()).device,
-        # The training detector's own validity, read off the run's hparams, so a table bin and a
-        # training weight name one event.
-        ua_valid_events=bool(getattr(task, "hparams", {}).get("event_weight_ua_valid", False)),
-        ua_valid_tolerance_s=getattr(task, "hparams", {}).get("event_weight_ua_tolerance_s"),
+        # Not read off the run's training ``event_weight_ua_valid`` / tolerance: the contraction
+        # population must be one per set of shards, so two checkpoints are compared on the same
+        # contractions. ``up_valid`` is read wherever the loader emits it, strictly.
+        ua_valid_events=None,
+        ua_valid_tolerance_s=None,
     )
     results = evaluate(
         task,
@@ -1389,12 +1404,44 @@ def config_digest(eval_config: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+#: The ``dataset_config`` leaves that decide which segments and which values the pass scores: the
+#: shards, the statistics, the quality masks and the epoch bounds; the second tuple names leaves of
+#: ``dataloader_config.dataset_kwargs``. ``max_hours_before_delivery`` is an ``eval_config`` key and
+#: is already in that block's digest.
+DATASET_PROVENANCE_KEYS: Tuple[str, ...] = ("vae_test_datasets", "stat_path")
+DATASET_KWARGS_PROVENANCE_KEYS: Tuple[str, ...] = (
+    "ua_step_mask", "fhr_step_mask", "emit_quality_mask", "trim_minutes", "epoch_min",
+    "epoch_max",
+)
+
+
+def dataset_digest(dataset_config: Mapping[str, Any]) -> str:
+    """Return a digest of the ``dataset_config`` leaves the collected tables depend on.
+
+    Only :data:`DATASET_PROVENANCE_KEYS` and :data:`DATASET_KWARGS_PROVENANCE_KEYS` enter it, so a
+    worker count or a pin-memory switch does not refuse a reuse, while a different shard list,
+    statistics file, quality mask or epoch bound does.
+
+    Args:
+        dataset_config: The merged run's ``dataset_config`` block.
+
+    Returns:
+        The hex digest.
+    """
+    kwargs = ((dataset_config.get("dataloader_config") or {}).get("dataset_kwargs")) or {}
+    picked = {name: dataset_config.get(name) for name in DATASET_PROVENANCE_KEYS}
+    picked.update({name: kwargs.get(name) for name in DATASET_KWARGS_PROVENANCE_KEYS})
+    canonical = json.dumps(picked, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def provenance(
     *,
     checkpoint_path: Optional[Any],
     eval_config: Dict[str, Any],
     num_samples: int,
     max_batches: Optional[int] = None,
+    dataset_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return the identity of the run whose tables these are.
 
@@ -1406,6 +1453,9 @@ def provenance(
         max_batches: The smoke-run batch cap, or ``None`` for the whole loader. It decides the
             population as surely as ``max_samples`` does, and it lives outside ``eval_config``, so
             without it here a smoke run's tables would be reused as a full run's.
+        dataset_config: The merged run's ``dataset_config`` block, or ``None`` for a caller that
+            has none. Given, its :func:`dataset_digest` joins the record, so tables collected
+            over other shards, statistics or quality masks are refused rather than reused.
 
     Returns:
         The provenance record.
@@ -1422,6 +1472,10 @@ def provenance(
         "num_mc_samples": int(num_samples),
         "max_batches": None if max_batches is None else int(max_batches),
         "eval_config_digest": config_digest(eval_config),
+        **(
+            {} if dataset_config is None
+            else {"dataset_config_digest": dataset_digest(dataset_config)}
+        ),
     }
 
 
@@ -1647,6 +1701,7 @@ def check_provenance(record: Dict[str, Any], expected: Dict[str, Any]) -> None:
         ("num_mc_samples", "the Monte Carlo draw count"),
         ("max_batches", "the --max-batches smoke cap"),
         ("eval_config_digest", "the eval_config block"),
+        ("dataset_config_digest", "the dataset_config shards, statistics and quality masks"),
     ):
         if key in found and key in expected and found[key] != expected[key]:
             raise TablesProvenanceMismatch(
@@ -1664,6 +1719,7 @@ def load_or_collect(
     eval_config: Dict[str, Any],
     num_samples: int,
     max_batches: Optional[int] = None,
+    dataset_config: Optional[Mapping[str, Any]] = None,
 ) -> Collection:
     """Reuse a finished run's tables when they describe this run, otherwise collect them.
 
@@ -1678,6 +1734,8 @@ def load_or_collect(
         eval_config: The validated ``eval_config`` block.
         num_samples: The Monte Carlo draw count in force.
         max_batches: The smoke-run batch cap in force, or ``None``.
+        dataset_config: The merged run's ``dataset_config`` block, or ``None``; see
+            :func:`provenance`.
 
     Returns:
         The collection, either read back or freshly collected and written.
@@ -1689,7 +1747,7 @@ def load_or_collect(
     results_dir = Path(results_dir)
     expected = provenance(
         checkpoint_path=checkpoint_path, eval_config=eval_config, num_samples=num_samples,
-        max_batches=max_batches,
+        max_batches=max_batches, dataset_config=dataset_config,
     )
     if (results_dir / COLLECTION_FILENAME).is_file():
         collection = load_collection(results_dir)

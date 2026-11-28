@@ -64,6 +64,8 @@ model_config:
     # validity switch goes off too. `event_weight_reach_steps` is then not read. [0.0, true]
     event_weight_floor: null
     event_weight_ua_valid: false
+    # The tolerance widens the detector's UA validity, which is off; stated so no rung's value leaks in.
+    event_weight_ua_tolerance_s: null
 
 advanced_config:
   tracking:

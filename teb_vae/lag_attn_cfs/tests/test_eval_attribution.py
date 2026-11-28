@@ -626,8 +626,9 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
     for stem in (class_contrast.CLASS_FIGURE, class_contrast.CLASS_MAP_FIGURE, class_contrast.GRADCAM_FIGURE):
         assert (directory / f"{stem}.pdf").is_file()
     stats = pd.read_csv(directory / class_contrast.STATS_FILENAME)
+    # Plus the classes' coupling level $K_t$ in its own Holm family (``level:kld``).
     assert set(stats["family"]) == {*(f"ig:{r}" for r in class_contrast.COHORT_READOUTS),
-                                    *(f"gradcam:{r}" for r in class_contrast.GRADCAM_READOUTS)}
+                                    *(f"gradcam:{r}" for r in class_contrast.GRADCAM_READOUTS), "level:kld"}
     cams = pd.read_csv(directory / class_contrast.GRADCAM_ROWS_FILENAME)
     assert set(cams["readout"]) == set(class_contrast.GRADCAM_READOUTS) and cams["guid"].nunique() == 7
     assert plt.get_fignums() == []

@@ -18,7 +18,6 @@ def _extract_state_dict(obj):
             "state_dict",
             "model_state_dict",
             "pytorch_model_state_dict",
-            "model_state_dict",
             "model",
             "module",
             "network",
@@ -97,7 +96,8 @@ def _normalize_checkpoint_state_dict(state_dict):
 
 
 def load_checkpoint_torch(model, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # A Lightning checkpoint pickles hparams and callback state; PyTorch >= 2.6 refuses those by default.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = _extract_state_dict(checkpoint)
     state_dict = OrderedDict(state_dict)
     normalized_state_dict, renamed = _normalize_checkpoint_state_dict(state_dict)
@@ -231,6 +231,29 @@ def _prepare_checkpoint_state_dict(
     if renamed:
         logger.info("Checkpoint keys were normalized prior to loading")
     return cleaned_state_dict
+
+
+def network_state_dict(checkpoint: Any, map_location: str = "cpu") -> OrderedDict:
+    """Return a checkpoint's network weights with every wrapper prefix removed.
+
+    A Lightning checkpoint holds the network under ``model.`` (``model._orig_mod.`` when it
+    was compiled) and again under ``_orig_model.``; both reduce to the same bare keys, which
+    are the keys of the bare network's own ``state_dict()``.
+
+    Args:
+        checkpoint: Path to a checkpoint, an object containing a state_dict, or a raw state_dict.
+        map_location: torch.load map_location argument for file-based checkpoints.
+
+    Returns:
+        The bare network state dict.
+
+    Raises:
+        ValueError: If no state dict can be extracted from ``checkpoint``.
+    """
+    state = _prepare_checkpoint_state_dict(checkpoint, map_location=map_location)
+    if state is None:
+        raise ValueError(f"no network state dict could be extracted from {checkpoint!r:.200}")
+    return state
 
 
 def load_checkpoint_strict(

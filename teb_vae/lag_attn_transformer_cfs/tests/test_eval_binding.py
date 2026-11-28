@@ -102,6 +102,18 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
         "persistence_lags",
         # The 2026-11-10 Student-t innovation density.
         "forecast_student_nu",
+        # The S6-S8 source masking, density bounds and impulse-response source path.
+        "source_mask_mode",
+        "source_running_gap_keys",
+        "decoder_logvar_clamp",
+        "base_decode",
+        "coverage_floor",
+        "source_path",
+        "irf_readout",
+        "irf_gate_evidence",
+        "irf_gate_k",
+        "irf_context_steps",
+        "irf_channels",
     }
 
     assert set(GEOMETRY_KEYS) == (

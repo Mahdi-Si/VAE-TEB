@@ -40,7 +40,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs  # noqa: E402
-from train.graph_models_utils import check_model_class, load_checkpoint_strict  # noqa: E402
+from train.graph_models_utils import check_model_class, load_checkpoint_strict, network_state_dict  # noqa: E402
 
 #: The head's keywords, as in the three configs: the calibrated gate, the FHR level and the fast
 #: scattering channels.
@@ -62,7 +62,8 @@ MODES: Dict[str, Dict[str, Any]] = {
         dropped=(),
         model_kwargs=dict(_HEAD, irf_readout=True, irf_gate_evidence=True),
         task_hparams=dict(_HEAD_TASK, lambda_source_irf=1.0, lambda_full_wrong=1.0,
-                          event_weight_floor=None, event_weight_ua_valid=False),
+                          event_weight_floor=None, event_weight_ua_valid=False,
+                          event_weight_ua_tolerance_s=None),
         unchanged=("mu_base", "logvar_base", "mu_full", "logvar_full"),
     ),
     "source": dict(
@@ -74,7 +75,7 @@ MODES: Dict[str, Dict[str, Any]] = {
                           source_running_gap_keys="keep"),
         task_hparams=dict(_HEAD_TASK, lambda_event_gate=0.0, lambda_source_null=0.0,
                           event_weight_floor=None, event_weight_ua_valid=False,
-                          source_valid_tolerance_s=None),
+                          event_weight_ua_tolerance_s=None, source_valid_tolerance_s=None),
         unchanged=("mu_base", "logvar_base"),
     ),
 }
@@ -120,8 +121,8 @@ def build(source: Path, output: Path, mode: str) -> Path:
     stored = blob["model_kwargs"]
     if stored.get("source_path", "lag_attn") != "lag_attn" or stored.get("irf_readout", False):
         raise ValueError(f"{source} already holds an IRF head; give the rung-8 checkpoint")
-    # Lightning's checkpoint holds the network twice (model. and the compiled _orig_model.); keep one.
-    old_state = {k[len("model."):]: v for k, v in blob["state_dict"].items() if k.startswith("model.")}
+    # One copy of the network, whatever the wrapper (model., model._orig_mod., _orig_model.).
+    old_state = dict(network_state_dict(blob))
     old = load_checkpoint_strict(model=SeqVaeLagAttnTrfCfs(**stored), checkpoint=old_state)
     if old is None:
         raise RuntimeError(f"{source} does not load strictly into the network of its own model_kwargs")

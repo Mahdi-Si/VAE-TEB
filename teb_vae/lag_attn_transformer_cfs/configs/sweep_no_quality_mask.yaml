@@ -29,6 +29,7 @@ base: default.yaml
 model_config:
   VAE_model:
     source_quality_mask: false
+    source_running_gap_keys: keep
     event_weight_ua_valid: false
     target_quality_mask: false
 

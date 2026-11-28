@@ -5,25 +5,35 @@ validity mask ``up_valid`` $(B, L)$, $L = D\,T$ raw samples on the trimmed grid,
 per feature step. Three rules read that mask, and this module holds the pure functions behind
 all three.
 
+**The step grid.** The causal decimation keeps every $D$-th filter output, so trimmed step $s$
+is the filter output at raw sample $Ds$ (``hdf5_dataset._step_masks``). Its value reads raw
+samples $\le Ds$ only. Step $0$ reads one sample of the trimmed grid and the rest from the
+trimmed-off lead-in. A channel with a causal window of $W_c$ steps reads at most the samples
+$[D(s - W_c),\, Ds]$.
+
 **Key removal** (model keyword ``source_running_gap_keys: remove``). The bridge across an invalid
 run $[a, b]$ is drawn toward the samples after $b$, and its end slope reads $g$ further samples
-(the builder's bridge slope window, ``ua_bridge_guard_s``). A coefficient at step $s$ with
-$a < D(s+1)$ can therefore rest on UA after step $s$ while the run is still running. For an
-anchor $t$ and the key at lag $\ell$, $s = t - \ell$,
+(the builder's bridge slope window, ``ua_bridge_guard_s``), so it reads up to sample $b + 1 + g$.
+A coefficient at step $s$ reads the bridge when $a \le Ds$, and the bridge reads past anchor $t$
+when $b + 1 + g > Dt$. For an anchor $t$ and the key at lag $\ell$, $s = t - \ell$,
 
-$$R_{t\ell} = \exists\,[a, b]:\; a < D(t - \ell + 1) \;\land\; b + g + 1 \ge D(t + 1),$$
+$$R_{t\ell} = \exists\,[a, b]:\; a \le D(t - \ell) \;\land\; b + g + 1 > Dt,$$
 
 for runs of every length. A removed key leaves that anchor's attention; once the run has stopped
 running, its keys return.
 
 **Tolerant flags** (task key ``source_valid_tolerance_s``). An invalid run of
-$n \le T_{\mathrm{tol}} f_s$ samples is *short*; every other run is *long*. With $W_c$ the causal
-window of channel $c$ in feature steps on the untrimmed grid,
+$n \le T_{\mathrm{tol}} f_s$ samples is *short*; every other run is *long*. A run that touches
+sample $0$ or sample $L - 1$ of the trimmed grid may continue outside it, so it counts as long.
+With $W_c$ the causal window of channel $c$ in feature steps on the untrimmed grid,
 
-$$v'_{s,c} = v_{s,c} \;\lor\; \bigl(\text{no long-run sample in } [D(s+1-W_c),\, D(s+1))\bigr).$$
+$$v'_{s,c} = v_{s,c} \;\lor\; \bigl(D(s - W_c) \ge 0 \;\land\;
+\text{no long-run sample in } [D(s - W_c),\, Ds]\bigr).$$
 
-There is no exception for the steps inside a short run, because key removal already takes every
-key whose value can read past its anchor out of the attention. The rule only turns a flag valid.
+A window that starts before sample $0$ reads the trimmed-off lead-in, which ``up_valid`` does not
+cover, so that flag is never turned valid. There is no exception for the steps inside a short
+run, because key removal already takes every key whose value can read past its anchor out of
+the attention. The rule only turns a flag valid.
 
 **Tolerant reward** (task key ``event_weight_ua_tolerance_s``). The contraction detector reads a
 raw validity in which the samples of short runs count as valid, so a contraction is dropped only
@@ -87,7 +97,10 @@ def run_table(invalid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def split_runs(
-    up_valid: torch.Tensor, tolerance_s: float, fs: float = RAW_FS_HZ
+    up_valid: torch.Tensor,
+    tolerance_s: float,
+    fs: float = RAW_FS_HZ,
+    edge_runs_long: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Split the invalid samples of a batch into long-run and short-run samples.
 
@@ -97,6 +110,9 @@ def split_runs(
         up_valid: Raw UA validity $(B, L)$, ``True`` = valid.
         tolerance_s: $T_{\mathrm{tol}}$ in seconds.
         fs: The raw sampling rate in Hz.
+        edge_runs_long: Count a run that touches sample $0$ or sample $L - 1$ as long, whatever
+            its visible length. On a trimmed grid such a run may continue outside the grid, so
+            its true length is unknown.
 
     Returns:
         ``(long_bad, short_bad)``: boolean $(B, L)$ on the device of ``up_valid``.
@@ -105,6 +121,8 @@ def split_runs(
     batch, length = invalid.shape
     rows, starts, ends = run_table(invalid)
     is_long = (ends - starts + 1) > seconds_to_samples(tolerance_s, fs)
+    if edge_runs_long:
+        is_long |= (starts == 0) | (ends == length - 1)
     long_bad = np.zeros((batch, length), dtype=bool)
     short_bad = np.zeros((batch, length), dtype=bool)
     # A +1 at each run start and a -1 one past its end; the running sum is 1 exactly inside.
@@ -127,8 +145,11 @@ def tolerant_flags(
 ) -> torch.Tensor:
     r"""Apply the tolerance rule to the per-channel validity flags.
 
-    $v'_{s,c} = v_{s,c} \lor (\text{no long-run sample in } [D(s+1-W_c), D(s+1)))$. A window that
-    starts before the trimmed grid is cut at sample $0$.
+    $v'_{s,c} = v_{s,c} \lor (D(s - W_c) \ge 0 \land \text{no long-run sample in }
+    [D(s - W_c), Ds])$. Step $s$ ends at raw sample $Ds$, so the window reads no sample after it.
+    A window that starts before sample $0$ reaches into the trimmed-off lead-in, which
+    ``up_valid`` does not cover, so its flag keeps the dataset's value. A run that touches either
+    end of the grid counts as long (``edge_runs_long`` of :func:`split_runs`).
 
     Args:
         flags: The dataset's flags $(B, T, C)$, boolean, ``True`` = usable, at the declared
@@ -157,15 +178,16 @@ def tolerant_flags(
             f"window_steps has {int(window.numel())} entries against {width} flag channels; the "
             f"windows are positional against the declared source channels."
         )
-    long_bad, _ = split_runs(up_valid, tolerance_s, fs)
+    long_bad, _ = split_runs(up_valid, tolerance_s, fs, edge_runs_long=True)
     long_bad = long_bad.to(flags.device)
     cumulative = torch.cat(
         [long_bad.new_zeros((batch, 1), dtype=torch.long), long_bad.long().cumsum(dim=1)], dim=1
     )                                                                          # (B, L + 1)
-    end = (torch.arange(steps, device=flags.device) + 1) * int(decimation)     # (T,)
-    start = (end[:, None] - window.clamp_min(1)[None, :] * int(decimation)).clamp_min(0)
-    count = cumulative[:, end][:, :, None] - cumulative[:, start]              # (B, T, C)
-    return flags.to(torch.bool) | (count == 0)
+    # Exclusive end Ds + 1: the window's last sample is the step's own endpoint Ds.
+    end = torch.arange(steps, device=flags.device) * int(decimation) + 1       # (T,)
+    raw_start = end[:, None] - 1 - window.clamp_min(1)[None, :] * int(decimation)   # (T, C)
+    count = cumulative[:, end][:, :, None] - cumulative[:, raw_start.clamp_min(0)]  # (B, T, C)
+    return flags.to(torch.bool) | ((raw_start >= 0)[None] & (count == 0))
 
 
 def tolerant_reward_validity(
@@ -197,11 +219,13 @@ def removed_keys(
 ) -> torch.Tensor:
     r"""Keys that an anchor must not read, because their value rests on UA after the anchor.
 
-    $$R_{t\ell} = \exists\,[a, b]:\; a < D(t - \ell + 1) \;\land\; b + g + 1 \ge D(t + 1).$$
+    $$R_{t\ell} = \exists\,[a, b]:\; a \le D(t - \ell) \;\land\; b + g + 1 > Dt.$$
 
-    Each run $[a, b]$ covers the anchors $t \in [\lfloor a/D \rfloor,\,
-    \lfloor (b + g + 1)/D \rfloor - 1]$, and at a covered anchor it removes the lags
-    $0 \le \ell \le t - \lfloor a/D \rfloor$. With $m_t$ the smallest $\lfloor a/D \rfloor$ over
+    Step $s$ ends at raw sample $Ds$, so it reads a run that starts at $a$ from step
+    $\lceil a/D \rceil$ on. The bridge reads up to sample $b + 1 + g$, so it reads past anchor $t$
+    while $Dt \le b + g$. Each run therefore covers the anchors
+    $t \in [\lceil a/D \rceil,\, \lfloor (b + g)/D \rfloor]$, and at a covered anchor it removes the
+    lags $0 \le \ell \le t - \lceil a/D \rceil$. With $m_t$ the smallest $\lceil a/D \rceil$ over
     the runs covering $t$, $R_{t\ell} = [\ell \le t - m_t]$. Within a row both interval ends are
     non-decreasing in the run index, so $m_t$ is the start of the first run whose end reaches $t$.
 
@@ -226,8 +250,8 @@ def removed_keys(
     batch = int(invalid.shape[0])
     guard = seconds_to_samples(guard_s, fs)
     rows, starts, ends = run_table(invalid)
-    first = starts // int(decimation)
-    last = np.minimum(steps - 1, (ends + guard + 1) // int(decimation) - 1)
+    first = (starts + int(decimation) - 1) // int(decimation)
+    last = np.minimum(steps - 1, (ends + guard) // int(decimation))
     covers = last >= first
     anchor = np.arange(steps)
     # The default m_t = t + 1 makes t - m_t = -1, which removes no lag.
@@ -245,7 +269,7 @@ def removed_keys(
 
 
 def _check_raw_grid(up_valid: torch.Tensor, steps: int, decimation: int) -> None:
-    """Refuse a raw mask that is not the trimmed grid of the feature steps.
+    r"""Refuse a raw mask that is not the trimmed grid of the feature steps.
 
     Args:
         up_valid: Raw UA validity $(B, L)$.

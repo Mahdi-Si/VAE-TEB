@@ -36,11 +36,19 @@ def test_truncation_crossings_interpolate_on_the_grid():
 
 def test_contraction_body_maps_to_lags_behind_the_anchor():
     decimation = 16
-    onset, end = np.array([160]), np.array([400])  # steps 10 .. 25 on the raw grid
+    onset, end = np.array([160]), np.array([400])  # exact grid steps 10 .. 25
     anchors = np.array([5, 10, 20, 40])
     geo = contraction_lags(onset, end, anchors, decimation)
     assert geo["index"][0] == -1 and np.isnan(geo["age_s"][0])  # before the onset: none behind it
     assert (geo["lo"][1], geo["hi"][1]) == (0, 0)  # the onset step itself, at lag 0
     assert (geo["lo"][2], geo["hi"][2]) == (0, 10)  # still running: lags 0 .. anchor - onset
     assert (geo["lo"][3], geo["hi"][3]) == (15, 30)  # finished: 40 - 25 .. 40 - 10
-    assert np.isclose(geo["age_s"][3], (decimation * 41 - 1 - 160) / 4.0)
+    assert np.isclose(geo["age_s"][3], (decimation * 40 - 160) / 4.0)
+
+    # Interior raw onset (161 is strictly after step 10's causal sample 160): first visible at
+    # step 11 (causal sample 176), never prematurely at step 10.
+    interior = contraction_lags(np.array([161]), np.array([400]), np.array([10, 11, 40]), decimation)
+    assert interior["index"][0] == -1 and np.isnan(interior["age_s"][0])
+    assert interior["index"][1] == 0 and (interior["lo"][1], interior["hi"][1]) == (0, 0)
+    assert np.isclose(interior["age_s"][1], (decimation * 11 - 161) / 4.0)
+    assert (interior["lo"][2], interior["hi"][2]) == (15, 29)

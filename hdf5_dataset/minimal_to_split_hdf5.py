@@ -302,7 +302,10 @@ def main(minimal_paths: Sequence[str], output_dir: str, last_hours: Optional[flo
         final = os.path.join(output_dir, split, f"{sg}.hdf5")
         files[split].append(os.path.abspath(final))
         records = grp["record_path"].tolist()
-        if bfd.is_complete(final, cnp.guid_set_digest(records), source, quality_version):
+        if bfd.is_complete(
+            final, cnp.guid_set_digest(records), source, quality_version,
+            transform=cnp.CAUSAL, leg_alignment=leg_alignment, phase_operator=phase_operator,
+        ):
             with h5py.File(final, "r") as f:
                 other = {k: f.attrs.get(f"quality_{k}") for k in rules}
             if any(other[k] != v for k, v in rules.items()):

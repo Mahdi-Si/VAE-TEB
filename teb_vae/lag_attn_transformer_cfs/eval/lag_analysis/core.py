@@ -105,6 +105,12 @@ def build_index(ds) -> dict:
             if "up_valid_frac" in h:
                 frac[m] = h["up_valid_frac"][:][rows[m]]
     sub = np.array([subgroup_of(p) for p in ds.paths], object)[files]
+    # A recording in two subgroups would get one subgroup silently and stall `select_rows`.
+    pairs = sorted(set(zip(guid, sub)))
+    clash = sorted({g for (g, _), (h, _) in zip(pairs, pairs[1:]) if g == h})
+    if clash:
+        raise ValueError(f"{len(clash)} GUID(s) appear in more than one subgroup (shard), e.g. {clash[:3]}; "
+                         "each recording must belong to one subgroup.")
     return {"guid": guid, "epoch": epoch, "up_valid_frac": frac, "subgroup": sub, "file": files}
 
 
@@ -245,8 +251,9 @@ def eps_for(guid, epoch, K, anchors, d_z, seed=0):
     With seed 0 this is the study's rule (`capture/replay.py: EPS_SEED_RULE`)."""
     key = f"{guid}|{math.floor(float(epoch))}|eps369" + (f"|{seed}" if seed else "")
     s = int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big") % (2 ** 63)
-    e = torch.randn(max(K // 2, 1), anchors, d_z, generator=torch.Generator("cpu").manual_seed(s))
-    return torch.cat([e, -e])[:K] if K > 1 else e
+    # ceil(K / 2) draws, so an odd K >= 3 still gets K rows; even K and K = 1 are unchanged.
+    e = torch.randn((K + 1) // 2, anchors, d_z, generator=torch.Generator("cpu").manual_seed(s))
+    return torch.cat([e, -e])[:K]
 
 
 def kappa_terms(alpha, alpha_s, delta):
@@ -309,16 +316,9 @@ def detect(task, batch):
         ev = EW._detect_events(up[i], w[i], decimation=dec, detector=task._event_detector(),
                                raw_valid=None if uv is None else uv[i])
         events.append(ev)
-        for o in np.asarray(ev["onset_raw"], np.int64) // dec:
+        for o in (np.asarray(ev["onset_raw"], np.int64) + dec - 1) // dec:
             reward[i, o:o + REWARD_STEPS + 1] = True
     return torch.from_numpy(reward), events
-
-
-def run_starts(r):
-    """Anchor indices where a reward run starts: the contraction onsets seen from the anchors. A run
-    that starts at the first anchor is left out (its onset is unknown)."""
-    s = np.flatnonzero(r & ~np.r_[False, r[:-1]])
-    return s[s > 0]
 
 
 # ----------------------------------------------------------------------------- one batch
@@ -361,6 +361,8 @@ class Ctx:
         sl = slice(a0, a0 + A)
         feats = torch.cat([inputs[0], inputs[1]], -1)
         weight = task._target_quality_weight(b, b.weight)
+        if hasattr(model, "scored_weight"):        # the forecast clock's pooled validity, as the objective scores
+            weight = model.scored_weight(weight)
         valid = (weight >= VALID_THRESHOLD).to(feats.dtype)
         future = valid[:, 1:].unfold(1, model.horizon, 1)[:, sl]                      # steps t + 1 + tau
         step_valid = valid[:, sl, None] * future                                      # (B, A, H)
@@ -463,10 +465,14 @@ class Ctx:
         return kept.any(-1)[:, self.E["sl"]].expand(self.B, -1)
 
     def clean(self, km, rm, delta=0):
-        """(B, A) clean anchors: all L keys valid, none removed, all warm in UA time."""
+        r"""(B, A) clean anchors: all L keys valid, none removed, all warm in UA time, and the UA anchor
+        $t - \delta$ of a shift $\delta$ inside the segment."""
         E, model = self.E, self.run["model"]
-        warm = max(getattr(model, "source_warmup_steps", None) or (0,)) + model.lag_attn.L - 1
-        ok = (torch.arange(E["a0"], E["a0"] + E["A"], device=self.run["device"]) - delta >= warm)[None]
+        combined = getattr(model, "_combined_source_steps", None)
+        waits = combined() if callable(combined) else getattr(model, "source_warmup_steps", None)
+        warm = max(waits or (0,)) + model.lag_attn.L - 1
+        src = torch.arange(E["a0"], E["a0"] + E["A"], device=self.run["device"]) - delta
+        ok = ((src >= warm) & (src < E["feats"].shape[1]))[None]
         if km is not None:
             ok = ok & km[:, E["sl"]].all(-1)
         if rm is not None:
@@ -632,11 +638,26 @@ class Ctx:
         return self.memo(("donor", which, reward_only), build)
 
     def onsets(self, which="own"):
-        """Contraction onsets per row as anchor indices, from the reward runs ('own' or donor 'A')."""
+        """Contraction onsets per row as anchor indices ('own' or donor 'A'), from the detector's
+        `onset_raw` on the step grid of the reward mask. Every onset is kept: also one before the first
+        anchor (its later anchors still have an age) and one less than 64 s after the previous one."""
         def build():
-            if which == "own":
-                r = self.E["reward"].cpu().numpy()
-            else:
-                r = detect(self.run["task"], self.ab)[0][:, self.E["sl"]].numpy()
-            return [run_starts(x).astype(float) for x in r]
+            events = self.detected[1] if which == "own" else detect(self.run["task"], self.ab)[1]
+            dec = int(self.run["model"].geometry.decimation)
+            return [
+                ((np.asarray(e["onset_raw"], np.int64) + dec - 1) // dec - self.E["a0"]).astype(float)
+                for e in events
+            ]
         return self.memo(("onsets", which), build)
+
+    def since_onset(self):
+        """(B, A) steps from the latest own onset at or before each anchor; infinity without one."""
+        def build():
+            out = np.full((self.B, self.E["A"]), np.inf)
+            a = np.arange(self.E["A"])
+            for i, ons in enumerate(self.onsets("own")):
+                ons = np.sort(ons)
+                k = np.searchsorted(ons, a, "right") - 1
+                out[i] = np.where(k >= 0, a - ons[np.maximum(k, 0)], np.inf) if len(ons) else np.inf
+            return torch.as_tensor(out, device=self.run["device"])
+        return self.memo("since_onset", build)

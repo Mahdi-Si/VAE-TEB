@@ -36,8 +36,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
-import pandas as pd
+#: Repository root: ``teb_vae/lag_attn_cfs/eval/coupling_sparsity.py`` -> up four.
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+
+# Launched as a script (an IDE's Run button) this file's own directory goes on sys.path instead
+# of the repository root, and the absolute import below fails before __main__ is reached.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from teb_vae.lag_attn_cfs.eval.launch import resolve_launch_args  # noqa: E402
 
 #: Upper edges of the event-age bins in seconds; the last open bin and the "no contraction behind
 #: this anchor" bin are added by :func:`event_age_bins`. $30$ s is the shortest published
@@ -323,6 +333,27 @@ def run(
     return {"event_age": event_age, "onset_hours": onset_hours}
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser.
+
+    Every argument defaults to ``None``, so a value absent from the command line falls back to
+    :data:`RUN_ARGS` per key rather than to an argparse default that would shadow it.
+
+    Returns:
+        The parser. Every ``dest`` is also a :data:`RUN_ARGS` key.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--eval-dir", dest="eval_dir", default=None)
+    parser.add_argument("--output-dir", dest="output_dir", default=None)
+    parser.add_argument("--bootstrap", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--trim-minutes", dest="trim_minutes", type=float, default=None,
+        help="loader trim in minutes; omitted, it is read from the run's resolved_config.yaml",
+    )
+    return parser
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Command-line entry; with no arguments, :data:`RUN_ARGS` is the configuration.
 
@@ -332,26 +363,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     Raises:
         SystemExit: If the evaluation directory does not exist.
     """
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--eval-dir", default=RUN_ARGS["eval_dir"])
-    parser.add_argument("--output-dir", default=RUN_ARGS["output_dir"])
-    parser.add_argument("--bootstrap", type=int, default=RUN_ARGS["bootstrap"])
-    parser.add_argument("--seed", type=int, default=RUN_ARGS["seed"])
-    parser.add_argument(
-        "--trim-minutes", type=float, default=RUN_ARGS["trim_minutes"],
-        help="loader trim in minutes; omitted, it is read from the run's resolved_config.yaml",
-    )
-    args = parser.parse_args(argv)
-    if not os.path.isdir(args.eval_dir):
-        raise SystemExit(f"eval dir not found: {args.eval_dir} (edit RUN_ARGS or pass --eval-dir)")
+    args, _sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    if args["eval_dir"] is None or not os.path.isdir(args["eval_dir"]):
+        raise SystemExit(f"eval dir not found: {args['eval_dir']} (edit RUN_ARGS or pass --eval-dir)")
     run(
-        args.eval_dir,
-        output_dir=args.output_dir,
-        bootstrap=args.bootstrap,
-        seed=args.seed,
-        trim_minutes=args.trim_minutes,
+        args["eval_dir"],
+        output_dir=args["output_dir"],
+        bootstrap=200 if args["bootstrap"] is None else args["bootstrap"],
+        seed=0 if args["seed"] is None else args["seed"],
+        trim_minutes=args["trim_minutes"],
     )
-
 
 if __name__ == "__main__":
     main(sys.argv[1:])

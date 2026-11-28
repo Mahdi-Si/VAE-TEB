@@ -2880,7 +2880,7 @@ def _calibration_verdict(
             values,
         )
 
-    worst_level, worst_error = None, 0.0
+    worst_level, worst_error, scored = None, 0.0, 0
     for record in levels:
         level = int(record.get("level_sigma", 0))
         observed = float(record.get("observed", float("nan")))
@@ -2891,11 +2891,20 @@ def _calibration_verdict(
         if not (math.isfinite(observed) and nominal_tail > 0.0):
             continue
         error = abs((1.0 - observed) - nominal_tail) / nominal_tail
-        if error > worst_error:
+        scored += 1
+        if worst_level is None or error > worst_error:
             worst_level, worst_error = level, error
+    if not scored:
+        # Every observed coverage is NaN (no scored coefficient): no evidence either way, so the
+        # verdict must not read the empty maximum 0 as a perfect match.
+        values["worst_relative_tail_error"] = float("nan")
+        return Verdict(
+            "calibration_near_nominal", INCONCLUSIVE, criterion,
+            "no coverage level had a finite observed rate, so the calibration was not measured.",
+            values,
+        )
     values["worst_relative_tail_error"] = float(worst_error)
-    if worst_level is not None:
-        values["worst_level_sigma"] = float(worst_level)
+    values["worst_level_sigma"] = float(worst_level)
 
     within = worst_error <= float(tail_tolerance)
     return Verdict(

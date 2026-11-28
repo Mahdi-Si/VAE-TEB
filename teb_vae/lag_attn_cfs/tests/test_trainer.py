@@ -436,3 +436,52 @@ def test_a_config_naming_no_second_monitor_builds_no_second_callback(driver) -> 
     checkpoints = [cb for cb in captured["callbacks"] if isinstance(cb, ModelCheckpoint)]
     assert len(checkpoints) == 1
     assert driver.secondary_checkpoint_callback is None
+
+
+def test_a_missing_warm_start_and_a_freeze_without_one_are_refused_before_the_run(tmp_path):
+    """Both launch, and both fail late or not at all: a missing checkpoint only at
+    ``create_model``, after every rank built its run directory; a freeze with no checkpoint never,
+    training a source path against a randomly initialised base."""
+    present = tmp_path / "core.ckpt"
+    present.touch()
+
+    def config(checkpoint, freeze):
+        return {
+            "model_config": {
+                "core_model_checkpoint": checkpoint,
+                "VAE_model": {"freeze_target_path": freeze},
+            }
+        }
+
+    shared_trainer._check_core_model_checkpoint(config(None, False))
+    shared_trainer._check_core_model_checkpoint(config(str(present), True))
+    with pytest.raises(ValueError, match="does not exist"):
+        shared_trainer._check_core_model_checkpoint(config(str(tmp_path / "absent.ckpt"), False))
+    with pytest.raises(ValueError, match="freeze_target_path"):
+        shared_trainer._check_core_model_checkpoint(config(None, True))
+
+
+def test_a_warm_start_trained_under_other_semantic_kwargs_is_named_in_the_log():
+    """``load_checkpoint_strict`` matches shapes only, so a checkpoint fitted under another
+    clamp or Student-$t$ $\nu$ loads silently; the comparison is at the constructor default when
+    the config leaves the key unset."""
+    from loguru import logger
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        assert shared_trainer._warn_checkpoint_kwargs_disagree(
+            {"forecast_student_nu": 8.0, "decoder_logvar_clamp": [-9.0, 3.0]},
+            {"forecast_student_nu": 8, "decoder_logvar_clamp": (-9, 3)},
+            SeqVaeLagAttnCfs,
+            "core.ckpt",
+            keys=("forecast_student_nu", "decoder_logvar_clamp"),
+        ) == []
+        assert not messages, messages
+        assert shared_trainer._warn_checkpoint_kwargs_disagree(
+            {"forecast_student_nu": 8.0}, {"forecast_student_nu": 4.0}, SeqVaeLagAttnCfs,
+            "core.ckpt", keys=("forecast_student_nu",),
+        ) == ["forecast_student_nu"]
+        assert any("forecast_student_nu" in message for message in messages), messages
+    finally:
+        logger.remove(sink)

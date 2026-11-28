@@ -238,6 +238,28 @@ def test_a_run_with_no_predictive_distribution_is_inconclusive() -> None:
     assert "mse" in verdict.detail
 
 
+@pytest.mark.parametrize("package", ["lag_attn_cfs", "lag_attn_rws"])
+def test_a_census_with_no_finite_coverage_is_inconclusive_rather_than_a_pass(package) -> None:
+    """All-``NaN`` observed rates are no evidence; the empty maximum ``0`` is not a perfect match.
+    A census whose every level is exactly nominal still passes."""
+    import importlib
+
+    verdict_of = importlib.import_module(f"teb_vae.{package}.eval.metrics")._calibration_verdict
+    nan_levels = [
+        {"level_sigma": level, "observed": float("nan"), "nominal": nominal}
+        for level, nominal in zip(COVERAGE_LEVELS, COVERAGE_NOMINALS)
+    ]
+    exact_levels = [{**record, "observed": record["nominal"]} for record in nan_levels]
+
+    empty = verdict_of({"coverage": nan_levels}, tail_tolerance=0.1)
+    exact = verdict_of({"coverage": exact_levels}, tail_tolerance=0.1)
+
+    assert empty.status == INCONCLUSIVE
+    assert math.isnan(empty.values["worst_relative_tail_error"])
+    assert exact.status == PASS
+    assert exact.values["worst_relative_tail_error"] == 0.0
+
+
 # =================================================================================================
 # The analysis, its skip, and its recommendation
 # =================================================================================================

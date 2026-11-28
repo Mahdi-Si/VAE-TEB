@@ -234,7 +234,7 @@ def _u_stream(batch):
 
 
 def test_the_null_arm_replaces_exactly_the_three_keys_it_names(perturb_posterior):
-    """Three, not the permutation arm's seven. The absences are the design: this is a KL readout,
+    """Four, not the permutation arm's eight. The absences are the design: this is a KL readout,
     so it draws no latent sample and runs no decoder -- and the three keys it therefore leaves
     behind still hold the *matched* forward's values, which is what the named constant warns about
     and what a reader must not take for the null's."""

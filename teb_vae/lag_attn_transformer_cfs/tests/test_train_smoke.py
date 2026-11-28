@@ -32,6 +32,7 @@ import torch
 import yaml
 
 from teb_vae.lag_attn.config import load_config
+from teb_vae.lag_attn_cfs.trainer import OPTIONAL_CAUSAL_SUFFIXES
 from teb_vae.lag_attn_transformer_cfs import trainer as trainer_module
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
 from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
@@ -60,7 +61,7 @@ SMOKE_EPOCHS = 2
 #: which it was while nothing gated that stream -- nor the target's survivor count: it is what the
 #: shipped source clock, a hundred-odd seconds faster than the target's, leaves standing.
 GUARDED_TARGET_CHANNELS = 76
-GUARDED_SOURCE_CHANNELS = 46
+GUARDED_SOURCE_CHANNELS = 42
 
 #: The tiny variant's resolved model block: the geometry the fit actually trains at, read off the
 #: config rather than restated, so a geometry change re-derives every count below instead of
@@ -288,10 +289,13 @@ def test_every_declared_metric_reaches_the_logger_and_none_is_all_nan(fit):
 
     missing = [name for name in LagAttnTrfCfsTrainer.TRACKED_METRICS if name not in frame.columns]
     assert missing == [], missing
+    optional = {
+        f"{stage}/{name}" for stage in ("train", "val") for name in OPTIONAL_CAUSAL_SUFFIXES
+    }
     empty = [
         name
         for name in LagAttnTrfCfsTrainer.TRACKED_METRICS
-        if name in frame.columns and frame[name].isna().all()
+        if name not in optional and name in frame.columns and frame[name].isna().all()
     ]
     assert empty == [], empty
 

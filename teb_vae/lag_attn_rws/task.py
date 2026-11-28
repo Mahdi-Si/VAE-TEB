@@ -217,10 +217,13 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                 forecast-mode shift, which trains the head beside the lag attention. ``0.0`` --
                 the default -- adds nothing.
             lambda_full_wrong: Weight of the full branch's block likelihood with another row's
-                UA (the batch rolled by one), a training term that charges the lag-attention path
-                for a gain it also takes from a UA that is not its own. Logged as
-                ``pred_gap_full_wrong``. Refused on a net built with ``source_path='irf'``.
-                ``0.0`` -- the default -- adds nothing and computes nothing.
+                UA, $\lambda_{\mathrm{wrong}}\,\beta\,(D_1(\pi U) - \operatorname{stopgrad}(D_0))$,
+                a training term that charges the lag-attention path for a gain it also takes from a
+                UA that is not its own. Logged as ``pred_gap_full_wrong``. Rides the $\beta$
+                schedule so a from-scratch run can discover own-UA coupling before specificity
+                ramps in (and stays equal to ``lambda_full_wrong`` whenever $\beta = 1$). Refused
+                on a net built with ``source_path='irf'``. ``0.0`` -- the default -- adds nothing
+                and computes nothing.
             lambda_source_expl: Under a net built with the IRF head only (``source_path='irf'``
                 or ``irf_readout``), and refused otherwise. Weight of the full-branch likelihood scored at the detached base
                 forecast plus the IRF head's explain-mode shift, which reads UA up to the target
@@ -862,6 +865,19 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         return rws_events.detect_contractions
 
+    def _event_step_align(self) -> str:
+        r"""Raw-to-step rounding convention for contraction events: ``'floor'`` on raw-signal cells.
+
+        On raw-signal cells step $t$ spans forward raw block $[Dt, D(t+1) - 1]$, so flooring maps a
+        raw onset onto the step whose block contains it. Causal-feature cells override this to
+        ``'ceil'``, because stored causal step $t$ sits at trimmed raw sample $Dt$ and reads only
+        samples $\le Dt$.
+
+        Returns:
+            ``'floor'`` for raw-signal cells.
+        """
+        return "floor"
+
     def _event_anchor_weight(
         self, batch: Any, weight: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -908,6 +924,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             cache=self._event_onset_cache,
             detector=self._event_detector(),
             raw_valid=self._event_ua_valid(batch),
+            step_align=self._event_step_align(),
         )
 
     def _segment_keys(self, batch: Any) -> Optional[list]:
@@ -972,6 +989,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             keys=self._segment_keys(batch),
             cache=self._event_span_cache,
             detector=self._event_detector(),
+            step_align=self._event_step_align(),
         )
 
     def _target_step_valid(self, batch: Any) -> torch.Tensor:
@@ -1126,13 +1144,15 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             main_loss = main_loss + irf_loss
             metrics["total_loss"] = main_loss
             metrics.update(irf_metrics)
-        # The full branch under another row's UA, as a loss term on every stage.
+        # The full branch under another row's UA, as a loss term on every stage. Rides the beta
+        # schedule (like lambda_event_gate and lambda_source_null) so from-scratch runs warm up
+        # specificity alongside KL, while staying identical whenever beta = 1.
         lambda_full_wrong = float(self.hparams.get("lambda_full_wrong", 0.0))
         if lambda_full_wrong > 0.0:
             nll_full_wrong, wrong_metrics = self._full_wrong_term(
                 batch, forward_outputs, fhr_raw, weight, likelihood, stage
             )
-            main_loss = main_loss + lambda_full_wrong * nll_full_wrong
+            main_loss = main_loss + lambda_full_wrong * beta * nll_full_wrong
             metrics["total_loss"] = main_loss
             metrics.update(wrong_metrics)
         # Unprefixed and detached: the breaker watches metrics['main_loss'] by exact name and

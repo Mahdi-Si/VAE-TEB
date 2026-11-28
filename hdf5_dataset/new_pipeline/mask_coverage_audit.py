@@ -855,7 +855,7 @@ def measure_group(segments: Sequence[SegmentData], geometry: AuditGeometry,
                 try:
                     onsets = contraction_onset_steps(seg.up, seg.weight, decimation=d,
                                                      detector=detect_contractions,
-                                                     raw_valid=valid)
+                                                     raw_valid=valid, step_align="ceil")
                 except ValueError:
                     failures += 1
                     onsets = np.zeros(0, dtype=np.int16)
@@ -863,7 +863,8 @@ def measure_group(segments: Sequence[SegmentData], geometry: AuditGeometry,
                     torch.from_numpy(seg.up[None]), torch.from_numpy(seg.weight[None]),
                     decimation=d, reach_steps=g.event_reach_steps, floor=0.0,
                     keys=[index], cache={index: onsets}, detector=detect_contractions,
-                    raw_valid=None if valid is None else torch.from_numpy(valid[None]))
+                    raw_valid=None if valid is None else torch.from_numpy(valid[None]),
+                    step_align="ceil")
                 active[mode].append(w_event[0].numpy() >= 1.0)
                 counts[mode].append(len(onsets))
         on = torch.from_numpy(np.stack(active["on"]))[:, anchors]

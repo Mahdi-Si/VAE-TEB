@@ -348,6 +348,16 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         # are already in the checkpoint's ``model_kwargs``, and a second copy of them under another
         # name would be a second thing to keep true across a resume.
         self.pl_model.warmup_budget = self.resolved_warmup
+        # A warm start from a checkpoint whose channels were built by another phase operator,
+        # leg alignment or forecast clock loads whenever the widths coincide; say so in the log.
+        trained = self.core_checkpoint_representation
+        representation = getattr(self.resolved_warmup, "representation", None)
+        if trained is not None and callable(representation) and trained != representation():
+            logger.warning(
+                f"core_model_checkpoint {self.checkpoint!r} was trained under "
+                f"causal_representation={trained!r}, but this run resolves "
+                f"{representation()!r}: the weights load, but they read other channels."
+            )
 
     # ------------------------------------------------------------------
     # Pre-flight

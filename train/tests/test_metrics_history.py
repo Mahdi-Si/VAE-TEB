@@ -141,24 +141,24 @@ def test_the_epoch_column_is_the_real_epoch_not_the_row_index(tmp_path, history,
     source.history["train/total_loss"] = list(history)
     callback = MetricsHistoryCsvCallback(source=source, output_dir=str(tmp_path))
 
-    callback.on_validation_epoch_end(FakeTrainer(current_epoch=1), None)
+    callback.on_train_epoch_end(FakeTrainer(current_epoch=1), None)
 
     frame = pd.read_csv(tmp_path / "metrics_history.csv")
     assert list(frame["epoch"]) == expected
 
 
-def test_the_csv_is_rewritten_each_validation_epoch(tmp_path):
+def test_the_csv_is_rewritten_each_epoch(tmp_path):
     """So a killed run leaves the history it reached rather than nothing."""
     source = MetricsLoggingCallback(tracked_metrics=("train/total_loss",))
     callback = MetricsHistoryCsvCallback(source=source, output_dir=str(tmp_path))
     trainer = FakeTrainer()
 
     source.history["train/total_loss"].append(3.0)
-    callback.on_validation_epoch_end(trainer, None)
+    callback.on_train_epoch_end(trainer, None)
     assert len(pd.read_csv(tmp_path / "metrics_history.csv")) == 1
 
     source.history["train/total_loss"].append(2.0)
-    callback.on_validation_epoch_end(trainer, None)
+    callback.on_train_epoch_end(trainer, None)
     assert len(pd.read_csv(tmp_path / "metrics_history.csv")) == 2
 
 
@@ -226,8 +226,61 @@ def test_a_tracked_metric_absent_from_callback_metrics_records_nan(tmp_path):
         }
     )
 
-    source.on_validation_epoch_end(trainer, None)
+    source.on_train_epoch_end(trainer, None)
 
     assert source.history["train/total_loss"] == [2.0]
     assert len(source.history["kld_beta"]) == 1
     assert source.history["kld_beta"][0] != source.history["kld_beta"][0]  # NaN
+
+
+# --------------------------------------------------------------------------------------
+# Epoch alignment under a real Trainer
+# --------------------------------------------------------------------------------------
+class _StepLossModel(TinyLightningModel):
+    """Records every training step's loss, so the epoch mean can be checked exactly."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.step_losses = {}
+
+    def compute_loss_and_metrics(self, batch, batch_idx, stage):
+        loss, metrics = super().compute_loss_and_metrics(batch, batch_idx, stage)
+        if stage == "train":
+            self.step_losses.setdefault(self.current_epoch, []).append(float(loss.detach()))
+        return loss, metrics
+
+
+def test_row_e_holds_epoch_e_lr_and_epoch_mean_train_metrics(tmp_path):
+    """Row $e$ is epoch $e$: its own LR (none NaN, the decay on the milestone row) and the
+    epoch-mean ``train/*`` value rather than the last micro-batch's."""
+    import lightning as L
+    from torch.utils.data import DataLoader, TensorDataset
+
+    torch.manual_seed(0)
+    data = TensorDataset(torch.randn(16, 4), torch.randn(16, 4))
+    model = _StepLossModel(lr=1e-2, lr_milestones=[1], lr_gamma=0.1)
+    source = MetricsLoggingCallback(tracked_metrics=("train/total_loss", "val/total_loss", "lr"))
+    writer = MetricsHistoryCsvCallback(source=source, output_dir=str(tmp_path))
+    trainer = L.Trainer(
+        max_epochs=3,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=1,
+        callbacks=[source, writer],
+        default_root_dir=str(tmp_path),
+    )
+    trainer.fit(model, DataLoader(data, batch_size=4), DataLoader(data, batch_size=8))
+
+    frame = pd.read_csv(tmp_path / "metrics_history.csv")
+    assert list(frame["epoch"]) == [0, 1, 2]
+    assert frame["lr"].tolist() == pytest.approx([1e-2, 1e-3, 1e-3])
+    expected = [sum(v) / len(v) for _, v in sorted(model.step_losses.items())]
+    assert frame["train/total_loss"].tolist() == pytest.approx(expected, rel=1e-5)
+    assert frame["train/total_loss"].tolist() != pytest.approx(
+        [v[-1] for _, v in sorted(model.step_losses.items())], rel=1e-5
+    )
+    assert frame["val/total_loss"].notna().all()

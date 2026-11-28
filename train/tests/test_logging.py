@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
+import train.graph_model_base as gmb
 from train.graph_model_base import _RUN_STAMP_ENV, _resolve_run_stamp
 from train.test_utils import FakeMLflowLogger, make_graph_model
 from utils.custom_logger import (
@@ -277,9 +278,31 @@ def test_ddp_child_inherits_the_parent_stamp(monkeypatch):
 def test_parent_after_fit_does_not_reuse_a_stale_stamp(monkeypatch):
     """Lightning sets LOCAL_RANK=0 in the parent once fit starts; a second run in
     that process must still get its own directory."""
+    monkeypatch.setattr(gmb, "_USED_RUN_STAMPS", {"FIRST-RUN-STAMP"})
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setenv(_RUN_STAMP_ENV, "FIRST-RUN-STAMP")
     assert _resolve_run_stamp() != "FIRST-RUN-STAMP"
+
+
+def test_torchrun_rank_zero_honours_the_exported_stamp(monkeypatch):
+    """Under torchrun rank 0 is launched like every other rank, with the job script's
+    ``TEB_RUN_STAMP``; it must land in the same directory as ranks $1..N-1$."""
+    monkeypatch.setattr(gmb, "_USED_RUN_STAMPS", set())
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv(_RUN_STAMP_ENV, "JOB-STAMP")
+    assert _resolve_run_stamp() == "JOB-STAMP"
+
+
+def test_sequential_runs_in_one_process_never_share_a_stamp(monkeypatch):
+    """The exported stamp names the first run only; the next run in the same
+    rank-0 process mints its own."""
+    monkeypatch.setattr(gmb, "_USED_RUN_STAMPS", set())
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv(_RUN_STAMP_ENV, "JOB-STAMP")
+    assert _resolve_run_stamp() == "JOB-STAMP"
+    second = _resolve_run_stamp()
+    assert second != "JOB-STAMP"
+    assert os.environ[_RUN_STAMP_ENV] == second
 
 
 def test_ranks_agree_on_the_run_directory(config_path, tmp_path, monkeypatch):

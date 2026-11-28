@@ -450,11 +450,11 @@ def test_the_source_event_mask_ands_the_contraction_spans_into_the_source_mask(m
     module._stage = "val"
     batch = _masked_batch()
 
-    # The wiring: the task's spans are the shared helper's, with the task's own detector.
+    # The wiring: the task's spans are the shared helper's, with the task's own detector and grid.
     spans = module._source_event_steps(batch, batch.weight)
     reference = contraction_source_mask(
         batch.up, batch.weight, decimation=int(module.orig_model.geometry.decimation),
-        detector=module._event_detector(),
+        detector=module._event_detector(), step_align=module._event_step_align(),
     )
     assert torch.equal(spans, reference)
 
@@ -559,6 +559,38 @@ def test_the_quality_labels_are_read_from_the_batch_whatever_the_model_applies(p
     assert bool((gapped["target_bad_steps"][0] == 0.0).all())
     supported = gapped["contributing"][1] > 0
     assert bool((gapped["target_bad_steps"][1][supported] > 0.0).all())
+
+
+def test_the_key_open_label_applies_the_runs_tolerance_and_running_gap_removal(perturb_posterior):
+    r"""Under ``source_valid_tolerance_s`` and ``source_running_gap_keys='remove'`` the label is
+    still the forward's ``source_open``: relaxed by the tolerant flags and less the removed keys.
+    A label read off the dataset's raw step flags alone would disagree on both counts."""
+    batch = make_stub_batch()
+    windows = [3] * (batch.up_st.shape[-1] + batch.up_ph.shape[-1])
+    model_kwargs = dict(
+        tiny_warmup_kwargs(source_quality_mask=True, posterior_event_gate=True),
+        source_running_gap_keys="remove",
+    )
+    module = make_task(
+        model_kwargs,
+        hparams={"source_valid_tolerance_s": 16.0, "source_valid_windows": windows},
+    )
+    perturb_posterior(module.orig_model)
+    module.eval()
+    batch.up_st_step_valid = torch.ones(batch.up_st.shape, dtype=torch.bool)
+    batch.up_ph_step_valid = torch.ones(batch.up_ph.shape, dtype=torch.bool)
+    batch.up_st_step_valid[0] = False                     # relaxed back to valid by a 1 s run
+    batch.up_valid = torch.ones(batch.up.shape, dtype=torch.bool)
+    batch.up_valid[0, 100:104] = False                    # 1 s: short at 16 s
+    batch.up_valid[1, :] = False                          # one run over the whole segment
+
+    torch.manual_seed(0)
+    per_anchor = evaluate_batch(module, batch, num_samples=1).per_anchor
+
+    assert torch.equal(per_anchor["ua_key_open"], per_anchor["source_open"])
+    # Non-vacuity: both corrections changed the label somewhere.
+    assert bool((per_anchor["ua_key_open"][0] == 1.0).any())
+    assert bool((per_anchor["ua_key_open"][1] == 0.0).all())
 
 
 # ---------------------------------------------------------------------------------------

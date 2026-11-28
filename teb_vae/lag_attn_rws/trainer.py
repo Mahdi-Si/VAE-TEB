@@ -209,6 +209,12 @@ class LagAttnRwsTrainer(GraphModelBase):
     #: ``AttributeError`` on every run that kept one.
     secondary_checkpoint_callback: Optional[ModelCheckpoint] = None
 
+    #: The ``core_model_checkpoint`` blob's own ``causal_representation`` stamp, kept by
+    #: :meth:`create_model` so a sibling that resolves its representation afterwards can compare
+    #: the two without loading the blob a second time. ``None`` when no checkpoint was loaded or
+    #: the blob carries no stamp.
+    core_checkpoint_representation: Optional[Dict[str, Any]] = None
+
     @classmethod
     def plot_callback_cls(cls) -> type[Callback]:
         """Return the diagnostic-plot callback class, importing it on the way.
@@ -355,6 +361,10 @@ class LagAttnRwsTrainer(GraphModelBase):
             blob = torch.load(str(self.checkpoint), map_location="cpu", weights_only=False)
             # Before the load, not after: a blob from another model may align by accident.
             check_model_class(blob, self.MODEL_CLS.__name__)
+            _warn_checkpoint_kwargs_disagree(
+                blob.get("model_kwargs"), model_kwargs, self.MODEL_CLS, str(self.checkpoint)
+            )
+            self.core_checkpoint_representation = blob.get("causal_representation")
             if load_checkpoint_strict(model=self.pytorch_model, checkpoint=blob) is None:
                 raise RuntimeError(
                     f"could not align core_model_checkpoint {self.checkpoint!r} into "
@@ -548,7 +558,13 @@ class LagAttnRwsTrainer(GraphModelBase):
             filename=f"{self.CHECKPOINT_STEM}-{{epoch:02d}}",
             save_top_k=checkpoint_config.get("save_top_k", 3),
             mode=checkpoint_config.get("mode", "min"),
+            # The final epoch's weights are kept whatever the monitor ranked them: a run whose
+            # monitor is noisy (a sampled base branch) otherwise loses its last state for good.
+            save_last=bool(checkpoint_config.get("save_last", True)),
         )
+        # Under the primary stem, so a reader globbing `<stem>-epoch=*` finds it among the
+        # primary criterion's files rather than as an unattributed `last.ckpt`.
+        self.checkpoint_callback.CHECKPOINT_NAME_LAST = f"{self.CHECKPOINT_STEM}-{{epoch:02d}}-last"
         callback_list: List[Callback] = [
             self.metrics_callback,
             self.metrics_csv_callback,
@@ -684,6 +700,7 @@ def main(
             graph_model.config, fields=trainer_cls.TARGET_FIELDS
         )
         _check_causal_budget_resolves(graph_model.config)
+        _check_core_model_checkpoint(graph_model.config)
         # After the four, before setup_config: the four are this architecture's and stay called
         # by name here (three other places import them individually and assert on this order),
         # while a sibling architecture's own guards go behind the hook. Handed the already-loaded
@@ -741,6 +758,104 @@ def _persist_resolved_config(resolved_path: str, checkpoint_dir: str) -> None:
         # Not fatal: this file serves the *later* evaluation run, and refusing to train because a
         # write failed would cost the multi-day run it exists to describe.
         logger.warning(f"could not write {destination}: {exc}")
+
+
+#: Constructor kwargs that change what a warm-started checkpoint's weights MEAN without changing
+#: any tensor shape, so ``load_checkpoint_strict`` accepts the blob whatever their values are.
+CHECKPOINT_SEMANTIC_KWARGS: Tuple[str, ...] = (
+    "decoder_logvar_clamp",
+    "forecast_student_nu",
+    "forecast_ar_max",
+    "source_mask_mode",
+    "source_running_gap_keys",
+)
+
+
+def _comparable(value: Any) -> Any:
+    """Return ``value`` with sequences as lists of floats where possible, for a YAML/blob compare.
+
+    Args:
+        value: A constructor kwarg as the config or the checkpoint holds it.
+
+    Returns:
+        A value that compares equal across ``tuple``/``list`` and ``int``/``float`` spellings.
+    """
+    if isinstance(value, (list, tuple)):
+        return [_comparable(item) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+def _warn_checkpoint_kwargs_disagree(
+    checkpoint_kwargs: Optional[Dict[str, Any]],
+    model_kwargs: Dict[str, Any],
+    model_cls: type,
+    checkpoint: str,
+    keys: Sequence[str] = CHECKPOINT_SEMANTIC_KWARGS,
+) -> List[str]:
+    """Warn for every semantic kwarg the checkpoint was trained under that this config changes.
+
+    A key the config leaves unset is compared at the constructor's own default, because that is
+    the value the built net runs with.
+
+    Args:
+        checkpoint_kwargs: The blob's ``model_kwargs``, or ``None`` for a blob without them.
+        model_kwargs: The kwargs this run builds the net with.
+        model_cls: The net class, whose signature supplies the defaults.
+        checkpoint: The checkpoint path, for the message.
+        keys: The kwargs to compare.
+
+    Returns:
+        The names of the disagreeing keys, in ``keys`` order.
+    """
+    if not checkpoint_kwargs:
+        return []
+    parameters = inspect.signature(model_cls.__init__).parameters
+    disagree = []
+    for key in keys:
+        if key not in parameters:
+            continue
+        default = parameters[key].default
+        configured = model_kwargs.get(key, None if default is inspect.Parameter.empty else default)
+        trained = checkpoint_kwargs.get(key, default)
+        if _comparable(configured) != _comparable(trained):
+            disagree.append(key)
+            logger.warning(
+                f"core_model_checkpoint {checkpoint!r} was trained with {key}={trained!r}, "
+                f"but this run builds {key}={configured!r}: the weights load, but they were "
+                f"fitted under another value."
+            )
+    return disagree
+
+
+def _check_core_model_checkpoint(config: Dict[str, Any]) -> None:
+    """Refuse a warm start from a checkpoint that is not there, and a freeze with nothing to keep.
+
+    ``create_model`` would only fail on the missing file after every rank had built its run
+    directory; and ``freeze_target_path`` with no checkpoint freezes a randomly initialised
+    target path, which trains to completion and reports a source gain over a base that never
+    learned anything.
+
+    Args:
+        config: The resolved run config.
+
+    Raises:
+        ValueError: If ``core_model_checkpoint`` names a file that does not exist, or if
+            ``freeze_target_path`` is set while ``core_model_checkpoint`` is null.
+    """
+    model_config = config.get("model_config", {}) or {}
+    checkpoint = model_config.get("core_model_checkpoint")
+    if checkpoint is not None and not os.path.isfile(str(checkpoint)):
+        raise ValueError(
+            f"model_config.core_model_checkpoint does not exist: {checkpoint!r}."
+        )
+    if checkpoint is None and (model_config.get("VAE_model", {}) or {}).get("freeze_target_path"):
+        raise ValueError(
+            "model_config.VAE_model.freeze_target_path is true but "
+            "model_config.core_model_checkpoint is null: the frozen target path would keep its "
+            "random initial weights. Set core_model_checkpoint, or set freeze_target_path: false."
+        )
 
 
 def _check_stat_path(config: Dict[str, Any]) -> None:

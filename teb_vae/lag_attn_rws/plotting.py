@@ -28,7 +28,9 @@ made the timing of any other figure's appearance decide how it looked.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union, cast
 
 import torch
@@ -70,6 +72,43 @@ def _first_validation_batch(trainer: Any) -> Optional[Any]:
         return next(iter(loader))
     except StopIteration:
         return None
+
+
+def _leading_samples(batch: Any, count: int) -> Any:
+    """Return ``batch`` cut to its first ``count`` samples, every other field unchanged.
+
+    The page draws ``num_examples`` samples, and a dense forward over a full production batch
+    (hundreds of samples) only to draw two of them stalls rank 0 while every other rank waits.
+
+    Args:
+        batch: A mapping (the loader's ``AttributeDict``) or an object with the fields as
+            attributes.
+        count: How many leading samples to keep.
+
+    Returns:
+        A batch of the same kind. A tensor or list whose leading length is the batch size is cut;
+        anything else is passed through.
+    """
+    fields = dict(batch) if isinstance(batch, Mapping) else dict(vars(batch))
+    guid = fields.get("guid")
+    size = len(guid) if isinstance(guid, (list, tuple)) else None
+    for value in fields.values():
+        if size is None and isinstance(value, torch.Tensor) and value.dim() > 0:
+            size = int(value.shape[0])
+    if size is None or size <= count:
+        return batch
+
+    def cut(value: Any) -> Any:
+        if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == size:
+            return value[:count]
+        if isinstance(value, (list, tuple)) and len(value) == size:
+            return type(value)(value[:count])
+        return value
+
+    sliced = {name: cut(value) for name, value in fields.items()}
+    if isinstance(batch, Mapping):
+        return type(batch)(sliced)
+    return SimpleNamespace(**sliced)
 
 
 def _first_validation_dataset(trainer: Any) -> Optional[Any]:
@@ -385,17 +424,25 @@ class LagAttnRwsPlotCallback(Callback):
             pl_module: The task.
             epoch: The current epoch.
         """
+        # Cut before the transfer: only the drawn samples reach the device or the forward.
+        batch = _leading_samples(batch, self.num_examples)
         batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
         # orig_model, not model: the latter may be a compiled wrapper without the net's methods.
         model = pl_module.orig_model
 
         inputs = pl_module._build_forward_inputs(batch)
         fhr_raw, weight = pl_module._build_raw_target(batch)
+        # The training step's own order: the contraction detector reads the unmasked weight, the
+        # objective the target-quality-masked one, and the contraction weight is closed where
+        # the forward closed the source.
+        full_anchor_weight = pl_module._event_anchor_weight(batch, weight)
+        weight = pl_module._target_quality_weight(batch, weight)
 
         was_training = pl_module.training
         pl_module.eval()
         try:
             outs = model(*inputs)
+            full_anchor_weight = pl_module._close_event_weight(full_anchor_weight, outs)
             # The schedule's value for this epoch, not hparams['kld_beta']: under any warm-up the
             # raw hyperparameter is the endpoint and the figure would report a constant.
             beta = float(pl_module._resolve_beta(pl_module.current_epoch))
@@ -420,8 +467,16 @@ class LagAttnRwsPlotCallback(Callback):
                 # from the hparams and the contraction weight from this batch's raw UP, so the
                 # figure's total is the step's total.
                 lambda_event_gate=float(pl_module.hparams.get("lambda_event_gate", 0.0)),
-                full_anchor_weight=pl_module._event_anchor_weight(batch, weight),
+                full_anchor_weight=full_anchor_weight,
             )["metrics"]
+            # The source-null penalty the step adds to ``total_loss``, so the page's total is
+            # the training curve's.
+            lambda_source_null = float(pl_module.hparams.get("lambda_source_null", 0.0))
+            if lambda_source_null > 0.0:
+                kl_null = pl_module._source_null_penalty(inputs, outs, weight)
+                scalars = dict(scalars)
+                scalars["total_loss"] = scalars["total_loss"] + lambda_source_null * beta * kl_null
+                scalars["source_null_kl_penalty"] = kl_null.detach()
             kld_per_dim = model.kld_tensor(
                 mu_prior=outs["mu_prior"],
                 logvar_prior=outs["logvar_prior"],

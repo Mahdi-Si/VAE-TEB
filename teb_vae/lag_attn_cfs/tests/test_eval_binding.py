@@ -235,6 +235,26 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
                 "high_gain_overlap_share": 0.61,
             }
         },
+        # The event-gate analysis's block, shaped as ``event_gate.run_event_gate_analysis`` returns it.
+        "event_gate": {
+            "headline": {
+                "learned_gate_mean_open_keys": 0.7,
+                "applied_gate_mean": 0.6,
+                "forced_shut_frac": 0.1,
+                "model_shut_frac": 0.2,
+                "open_frac": 0.5,
+                "gate_kl_spearman": 0.3,
+            }
+        },
+        # The gate-regime analysis's block, shaped as ``gate_open.run_gate_open_analysis`` returns it.
+        "gate_open": {
+            "headline": {
+                "gate_on_frac": 0.55,
+                "gate_on_kl_contribution_nats": 0.9,
+                "gate_on_gain_mc_contribution_nats": 0.12,
+                "gate_off_gain_mc_contribution_nats": 0.01,
+            }
+        },
         "verdicts": [],
     }
 

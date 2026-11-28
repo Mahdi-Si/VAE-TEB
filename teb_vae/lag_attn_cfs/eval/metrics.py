@@ -107,7 +107,7 @@ import torch
 from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
 )
-from teb_vae.lag_attn_cfs.ua_tolerance import tolerant_reward_validity
+from teb_vae.lag_attn_cfs.ua_tolerance import tolerant_flags
 from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_CAVEAT
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.losses import (
@@ -306,16 +306,25 @@ def forward_kwargs(task: Any, batch: Any, u_stream: torch.Tensor) -> Dict[str, A
     mask ``source_key_removed`` the task builds from the batch's ``up_valid``. It too is the
     batch's own and survives an intervention on the values, for the same reason.
 
+    A model with an IRF head (``source_path='irf'`` or ``irf_readout``) also gets the head's
+    three inputs ``ua_level``, ``ua_valid`` and ``target_step_valid`` from the task's
+    ``_build_irf_inputs``; its forward refuses to run without them.
+
     Returns:
         ``{'source_valid': (B, T, c_u) bool}`` under ``source_quality_mask``, plus
-        ``{'source_key_removed': (B, T, L) bool}`` under running-gap removal, ``{}`` otherwise.
+        ``{'source_key_removed': (B, T, L) bool}`` under running-gap removal, plus the three IRF
+        inputs (each $(B, T)$) under an IRF head, ``{}`` otherwise.
     """
     model = task.orig_model
-    if not bool(getattr(model, "source_quality_mask", False)):
-        return {}
-    kwargs = {"source_valid": task._build_source_valid(batch, u_stream)}
-    if getattr(model, "source_running_gap_keys", "keep") == "remove":
-        kwargs["source_key_removed"] = task._build_source_key_removed(batch, u_stream)
+    kwargs: Dict[str, Any] = {}
+    if bool(getattr(model, "source_quality_mask", False)):
+        kwargs["source_valid"] = task._build_source_valid(batch, u_stream)
+        if getattr(model, "source_running_gap_keys", "keep") == "remove":
+            kwargs["source_key_removed"] = task._build_source_key_removed(batch, u_stream)
+    if getattr(model, "irf_head", None) is not None:
+        # Last, so a positional reader of the two masks keeps its order.
+        ua_level, ua_valid, step_valid = task._build_irf_inputs(batch)
+        kwargs.update(ua_level=ua_level, ua_valid=ua_valid, target_step_valid=step_valid)
     return kwargs
 
 
@@ -631,6 +640,7 @@ def forecast_innovation(
     target: torch.Tensor,
     ar_coef: Optional[torch.Tensor] = None,
     step_mask: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""The residual each cell's predictive density is actually about.
 
@@ -646,11 +656,13 @@ def forecast_innovation(
         ar_coef: $\phi_c$, $(C_{\mathrm{keep}},)$, or ``None``.
         step_mask: The forecast mask $(B, A_{\max}, H)$, or ``None``. A masked step's residual is
             not lagged, so the recursion restarts after a gap exactly as ``raw_sample_score`` does.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``. Each
+            channel's chain restarts at its first scored step, as ``raw_sample_score`` does.
 
     Returns:
         The innovation, the broadcast shape of ``target - mu``.
     """
-    return forecast_innovation_and_logvar(mu, target, None, ar_coef, step_mask)[0]
+    return forecast_innovation_and_logvar(mu, target, None, ar_coef, step_mask, cell_mask)[0]
 
 
 def forecast_innovation_and_logvar(
@@ -659,6 +671,7 @@ def forecast_innovation_and_logvar(
     logvar: Optional[torch.Tensor],
     ar_coef: Optional[torch.Tensor] = None,
     step_mask: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""The innovation of :func:`forecast_innovation` and the log-variance it is scored under.
 
@@ -673,6 +686,7 @@ def forecast_innovation_and_logvar(
         logvar: The forecast log-variance, or ``None``.
         ar_coef: $\phi_c$, $(C_{\mathrm{keep}},)$, or ``None``.
         step_mask: The forecast mask $(B, A_{\max}, H)$, or ``None``.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``.
 
     Returns:
         ``(innovation, logvar_eff)``; ``logvar_eff`` is ``logvar`` without ``ar_coef``.
@@ -680,7 +694,7 @@ def forecast_innovation_and_logvar(
     residual = target - mu
     if ar_coef is None:
         return residual, logvar
-    return ar_innovation(residual, ar_coef, step_mask, logvar)
+    return ar_innovation(residual, ar_coef, step_mask, logvar, cell_mask)
 
 
 def _scored_cells(mask: torch.Tensor, cell_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1484,7 +1498,9 @@ def horizon_residual_sums(
         The four sums, each $(H,)$ in float64.
     """
     residual_sq = (target - mu) ** 2
-    innovation, logvar_eff = forecast_innovation_and_logvar(mu, target, logvar, ar_coef, mask)
+    innovation, logvar_eff = forecast_innovation_and_logvar(
+        mu, target, logvar, ar_coef, mask, cell_mask
+    )
     innovation_sq = residual_sq if ar_coef is None else innovation**2
     if student_nu is not None:
         # Applied only under the Student-t density, so the Gaussian sums keep their bits.
@@ -1500,7 +1516,8 @@ def horizon_residual_sums(
         "sum_standardised_sq": (innovation_sq * torch.exp(-logvar_eff) * masked).sum(
             dim=(0, 1, 3), dtype=torch.float64
         ),
-        "sum_logvar": (logvar * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
+        # The log-variance the standardised sum divides by, so the two describe one density.
+        "sum_logvar": (logvar_eff * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
         "count": count,
     }
 
@@ -1609,7 +1626,8 @@ class BatchReadout:
             band-resolved skill analysis is computed from, and it is per sample because every
             statistic in this pipeline reduces per recording before it reduces anything else.
         sq_error_per_channel_base: Per-channel masked mean squared error of the target-only
-            branch, $(B, C_{\mathrm{keep}})$; its mean over channels is ``sq_error_base``. A skill
+            branch's mean-decoded forecast, $(B, C_{\mathrm{keep}})$; its mean over channels is
+            ``sq_error_base``. A skill
             score resolved by frequency band needs a natural zero, and a pooled squared error has
             none.
         sq_error_per_channel_full: The same for the source-conditioned branch.
@@ -2007,7 +2025,9 @@ def calibration_sums(
         the reduction does not already give.
     """
     weights = _scored_cells(mask, cell_mask).expand_as(target).reshape(-1)
-    innovation, logvar_eff = forecast_innovation_and_logvar(mu, target, logvar, ar_coef, mask)
+    innovation, logvar_eff = forecast_innovation_and_logvar(
+        mu, target, logvar, ar_coef, mask, cell_mask
+    )
     residual = innovation.expand_as(target).reshape(-1)
     flat_logvar = logvar_eff.expand_as(target).reshape(-1)
     sigma = torch.exp(0.5 * flat_logvar)
@@ -2490,8 +2510,12 @@ def anchor_quality_labels(
 
     * ``ua_key_open`` -- $1$ where at least one lag key of the anchor survives the UA step mask,
       $o_t = \exists \ell: K_{t\ell}$, built by the net's own :meth:`source_key_mask` from the
-      batch's ``up_*_step_valid``. Under ``source_quality_mask`` it equals the forward's
-      ``source_open``; on a control it says which anchors that mask would have closed.
+      batch's ``up_*_step_valid``, relaxed by the run's ``source_valid_tolerance_s`` and, under
+      ``source_running_gap_keys='remove'``, less the running-gap keys the forward removes. Under
+      ``source_quality_mask`` with ``source_mask_mode='hard'`` it equals the forward's
+      ``source_open`` (under ``'soft'`` or ``'input'``, ``source_open`` stays $1$ whenever any
+      unremoved lag key exists, whereas ``ua_key_open`` records whether any *valid* unremoved lag
+      key survives); on a control it says which anchors that mask would have closed.
     * ``target_bad_steps`` -- the forecast steps of the anchor that the FHR step mask removes,
       $\sum_\tau (m^{\mathrm{plain}}_{\tau} - m^{\mathrm{clean}}_{\tau})$, both masks without the
       coverage floor. $0$ means the anchor's forecast window holds no bridged FHR, so the two arms
@@ -2528,8 +2552,26 @@ def anchor_quality_labels(
                 f"the UA step mask has shape {tuple(valid.shape)} but the source stream has "
                 f"{tuple(u_stream.shape)}"
             )
+        valid = valid.to(u_stream.device)
+        tolerance = task.hparams.get("source_valid_tolerance_s")
+        up_valid = batch_field(batch, "up_valid")
+        if tolerance is not None and isinstance(up_valid, torch.Tensor):
+            # The run's own tolerant flags, as ``_build_source_valid`` relaxes them for the forward.
+            valid = tolerant_flags(
+                valid,
+                up_valid.to(device=u_stream.device, dtype=torch.bool),
+                task._source_valid_windows().to(u_stream.device),
+                float(tolerance),
+                decimation=int(model.geometry.decimation),
+            )
         lag_mask = model.build_lag_mask(int(u_stream.shape[1]), u_stream.device)
         key_mask = model.source_key_mask(valid, lag_mask, u_stream.dtype)
+        if (
+            getattr(model, "source_running_gap_keys", "keep") == "remove"
+            and isinstance(up_valid, torch.Tensor)
+        ):
+            # The running-gap keys the forward removes, so the label is the forward's source_open.
+            key_mask = key_mask & ~task._build_source_key_removed(batch, u_stream)
         labels["ua_key_open"] = key_mask.any(dim=-1).gather(1, anchors).to(u_stream.dtype)
     target_blocks = [batch_field(batch, f"{name}_step_valid") for name in ("fhr_st", "fhr_ph")]
     if all(block is not None for block in target_blocks):
@@ -2596,6 +2638,16 @@ def evaluate_batch(
     $(\mu^q - \mu^p)^2 / \sigma_p^2$, so a prior variance pinned on its lower clamp inflates the
     coupling readout by orders of magnitude while ``mean_logvar_full`` and ``mean_logvar_base``
     -- which are *decoder* variances -- look perfectly healthy.
+
+    **Which forecast each readout reads.** ``nll_base_block`` / ``nll_full_block`` (and so
+    ``pred_gap``) score the forward's own decoded latents, for parity with the objective. Every
+    other forecast readout reads the mean-decoded pair $\mu_y(\mathbb E[z])$, the forecasts
+    ``mean_pred_gap`` scores: the point errors ``sq_error_*`` / ``abs_error_*`` /
+    ``signed_error_*`` and their per-channel vectors, ``forecast_difference_sq``, the calibration
+    census and the horizon sums; a single latent draw would otherwise add Monte Carlo noise to
+    each of them. The channel decompositions (``gap_per_channel``, ``pred_gap_st`` / ``_ph`` /
+    ``_warm_*``) stay on the training path, because they are partial sums of ``pred_gap`` and
+    recombine into the objective's own logged reductions.
 
     Args:
         task: The Lightning task wrapping the loaded net.
@@ -2736,9 +2788,9 @@ def evaluate_batch(
         model,
         {name: value for name, value in branches.items() if not (base_is_mean and name == "base")},
         target, mask, anchors=anchors, likelihood=likelihood,
-        # Kept only when a caller retains forecasts: four branches' decoded blocks held to the end
-        # of the batch are the largest transient here, and nothing else reads them.
-        persistence=outputs.get("persistence"), forecasts=mean_forecasts if retain else None,
+        # Always kept: the point errors, the channel decompositions, the calibration census and
+        # the horizon sums below all read this deterministic pair rather than one latent draw.
+        persistence=outputs.get("persistence"), forecasts=mean_forecasts,
     )
     if base_is_mean:
         mean_scores["base"] = training_base_block
@@ -2746,6 +2798,12 @@ def evaluate_batch(
     mean_forecasts = {
         name: mean_forecasts[name] for name in ("base", "full") if name in mean_forecasts
     }
+    # The deterministic forecast of each branch, decoded at its latent mean. Every readout below
+    # that is not the training-path block itself reads these, so a single posterior draw (and,
+    # under ``base_decode: sample``, a single prior draw) adds no Monte Carlo noise to a point
+    # error, a channel decomposition, a calibration statistic or a horizon curve.
+    (mean_mu_base, mean_logvar_base) = mean_forecasts["base"]
+    (mean_mu_full, mean_logvar_full) = mean_forecasts["full"]
 
     kld_btd = model.kld_tensor(
         mu_prior=outputs["mu_prior"],
@@ -2853,8 +2911,9 @@ def evaluate_batch(
     # Point-forecast error, in the loader's z units and per *scored coefficient* rather than per
     # anchor. The squares stay unrooted here -- see :func:`masked_raw_error_sums`. The cell mask
     # decides which coefficients count; the AR(1) term does not apply to an error of the mean.
+    # The two model branches are their mean-decoded forecasts, so the error has no draw noise.
     point_forecasts: Dict[str, torch.Tensor] = {
-        "base": outputs["mu_base"], "full": outputs["mu_full"], **baselines
+        "base": mean_mu_base, "full": mean_mu_full, **baselines
     }
     for name, point_mu in point_forecasts.items():
         sums = masked_raw_error_sums(point_mu, target, mask, cell_mask=cell_mask)
@@ -2870,7 +2929,7 @@ def evaluate_batch(
     # reason as the latent quantities above. Distinct from ``pred_gap``, which is a difference of
     # *scores*: two forecasts can differ everywhere and score identically.
     columns["forecast_difference_sq"] = _per_sample_element_mean(
-        (outputs["mu_full"] - outputs["mu_base"]) ** 2, mask, cell_mask
+        (mean_mu_full - mean_mu_base) ** 2, mask, cell_mask
     )
 
     # ---------------------------------------------------------------------
@@ -2880,6 +2939,8 @@ def evaluate_batch(
     # is a different reduction of this one pair -- the per-channel gap vector, the two stored-block
     # gaps, the three warm-up tertile gaps and their per-anchor rows -- which is what makes all six
     # partial sums of the ``pred_gap`` they are read beside rather than six unrelated numbers.
+    # Deliberately the training path, not the mean-decoded pair: each is the model's own
+    # ``_resolved_forecast_gaps`` reduction, so it recombines into the logged ``pred_gap_*``.
     base_by_channel = branch_channel_scores(
         outputs["mu_base"], outputs["logvar_base"], target, mask, likelihood=likelihood,
         **density,
@@ -3126,12 +3187,13 @@ def evaluate_batch(
         per_anchor[f"mean_nll_{name}_block"] = mean_scores[name]
     per_anchor["mean_pred_gap"] = mean_scores["base"] - mean_scores["full"]
 
-    # The observation model's calibration census, over the full branch's scored coefficients.
+    # The observation model's calibration census, over the full branch's scored coefficients, at
+    # its mean-decoded forecast (no draw noise in the PIT or the coverage).
     # Empty under ``'mse'``: the decoder's log-variance head is never fitted there, so a
     # probability integral transform of its output would be arithmetic over an untrained tensor.
     calibration = (
         calibration_sums(
-            outputs["mu_full"], outputs["logvar_full"], target, mask,
+            mean_mu_full, mean_logvar_full, target, mask,
             logvar_clamp=decoder_logvar_bound(model), **density,
         )
         if likelihood == "gaussian_nll"
@@ -3161,15 +3223,12 @@ def evaluate_batch(
         # detected under the coverage the per-anchor table's detector read.
         batch_weight = batch_field(batch, "weight")
         available["weight"] = batch_weight if isinstance(batch_weight, torch.Tensor) else weight
-        # The UA mask the training detector read, under ``event_weight_ua_valid`` only, so the
-        # event analyses find the contractions the contraction column was measured from.
-        if bool(task.hparams.get("event_weight_ua_valid", False)):
-            up_valid = batch_field(batch, "up_valid")
-            if isinstance(up_valid, torch.Tensor):
-                # With the training detector's tolerance, when the run set one.
-                available["up_valid"] = tolerant_reward_validity(
-                    up_valid.to(torch.bool), task.hparams.get("event_weight_ua_tolerance_s")
-                )
+        # The batch's raw UA mask whenever it carries one, whatever the run's training
+        # ``event_weight_ua_valid``: the collector applies the evaluation's own contraction policy
+        # to it, so every checkpoint on these shards is stratified on one contraction population.
+        up_valid = batch_field(batch, "up_valid")
+        if isinstance(up_valid, torch.Tensor):
+            available["up_valid"] = up_valid.to(torch.bool)
         up_raw = batch_field(batch, "up")
         if isinstance(up_raw, torch.Tensor):
             available["up_raw"] = up_raw
@@ -3201,12 +3260,8 @@ def evaluate_batch(
         # exactly the pooled ``sq_error_*`` column beside it and a band-level skill has a zero.
         # Under a scored-cell mask each channel divides by its OWN scored pairs; the pooled column
         # is then the count-weighted mean of these rather than their plain mean.
-        sq_error_per_channel_base=_per_channel_sq_error(
-            outputs["mu_base"], target, mask, cell_mask
-        ),
-        sq_error_per_channel_full=_per_channel_sq_error(
-            outputs["mu_full"], target, mask, cell_mask
-        ),
+        sq_error_per_channel_base=_per_channel_sq_error(mean_mu_base, target, mask, cell_mask),
+        sq_error_per_channel_full=_per_channel_sq_error(mean_mu_full, target, mask, cell_mask),
         calibration_sums=calibration,
         n_control_pairs=n_control_pairs,
         n_same_recording_pairs=n_same_recording_pairs,
@@ -3216,8 +3271,8 @@ def evaluate_batch(
         horizon_sums={
             f"{branch}_{statistic}": value
             for branch, (branch_mu, branch_logvar) in (
-                ("base", (outputs["mu_base"], outputs["logvar_base"])),
-                ("full", (outputs["mu_full"], outputs["logvar_full"])),
+                ("base", (mean_mu_base, mean_logvar_base)),
+                ("full", (mean_mu_full, mean_logvar_full)),
             )
             for statistic, value in {
                 **horizon_residual_sums(branch_mu, branch_logvar, target, mask, **density),
@@ -4484,7 +4539,7 @@ def _calibration_verdict(
             values,
         )
 
-    worst_level, worst_error = None, 0.0
+    worst_level, worst_error, scored = None, 0.0, 0
     for record in levels:
         level = int(record.get("level_sigma", 0))
         observed = float(record.get("observed", float("nan")))
@@ -4495,11 +4550,20 @@ def _calibration_verdict(
         if not (math.isfinite(observed) and nominal_tail > 0.0):
             continue
         error = abs((1.0 - observed) - nominal_tail) / nominal_tail
-        if error > worst_error:
+        scored += 1
+        if worst_level is None or error > worst_error:
             worst_level, worst_error = level, error
+    if not scored:
+        # Every observed coverage is NaN (no scored coefficient): no evidence either way, so the
+        # verdict must not read the empty maximum 0 as a perfect match.
+        values["worst_relative_tail_error"] = float("nan")
+        return Verdict(
+            "calibration_near_nominal", INCONCLUSIVE, criterion,
+            "no coverage level had a finite observed rate, so the calibration was not measured.",
+            values,
+        )
     values["worst_relative_tail_error"] = float(worst_error)
-    if worst_level is not None:
-        values["worst_level_sigma"] = float(worst_level)
+    values["worst_level_sigma"] = float(worst_level)
 
     within = worst_error <= float(tail_tolerance)
     return Verdict(

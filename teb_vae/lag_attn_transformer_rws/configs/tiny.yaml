@@ -36,6 +36,9 @@ general_config:
   folders_config: {out_dir_base: output/teb_vae_trf_rws_tiny}
 
 model_config:
+  # Cold start: the base file's warm-start checkpoint is a production-width server path, which the
+  # launch pre-flight refuses wherever it is absent and which these widths could not load anyway.
+  core_model_checkpoint: null
   VAE_model:
     d_model: 32          # = num_heads * d_head, and = encoder_num_heads * 8 (even head width)
     d_z: 8               # divisible by num_heads, required by the head-structured posterior

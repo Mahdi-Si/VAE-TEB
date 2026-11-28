@@ -852,6 +852,42 @@ def test_the_per_window_score_is_the_objectives_own_number(task, stub_batch):
         plt.close(figure)
 
 
+def test_the_per_window_score_carries_the_objectives_channel_and_horizon_weights(
+    task, stub_batch
+):
+    r"""The logged block scores sum the term times ``target_channel_weight`` and
+    ``horizon_weight``, so a window's score must too: doubling both weights quadruples every
+    finite window, and a page drawn without them reads the unweighted term."""
+    module = task()
+    pieces = _forward(module, stub_batch)
+
+    def drawn(model_weights):
+        model = module.orig_model
+        keep = len(model.target_gate.keep_index)
+        horizon = int(model.geometry.horizon)
+        weights = {
+            "target_channel_weight": torch.full((keep,), model_weights),
+            "horizon_weight": torch.full((horizon,), model_weights),
+        }
+        for name, value in weights.items():
+            setattr(model, name, value)
+        try:
+            figure = _render(module, stub_batch, pieces=pieces)
+        finally:
+            for name in weights:
+                setattr(model, name, None)
+        try:
+            ax = _axes_titled(figure, "Per-window forecast score")
+            return np.asarray(_labelled(ax, "$D_1$ full")[0].get_ydata(), dtype=float)
+        finally:
+            plt.close(figure)
+
+    unit, doubled = drawn(1.0), drawn(2.0)
+    finite = np.isfinite(unit)
+    assert finite.any()
+    np.testing.assert_allclose(doubled[finite], 4.0 * unit[finite], rtol=1e-5)
+
+
 def test_the_score_row_survives_a_batch_with_no_validity_signal(task, stub_batch):
     """The mask is a function of ``weight``, and scoring an invalid span would put a spike on the
     row the objective never saw. So the row is annotated rather than raised over: it keeps its

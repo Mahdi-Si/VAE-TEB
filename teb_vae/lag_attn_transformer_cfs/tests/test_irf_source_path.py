@@ -116,6 +116,27 @@ def test_nothing_at_an_anchor_depends_on_the_future():
     assert torch.allclose(own["delta_expl"][:, past], _head(y_later, ua, ok)["delta_expl"][:, past], atol=1e-5)
 
 
+def test_the_gate_stays_shut_until_the_prequential_window_has_rows():
+    """No prequential prediction exists before ``PREQ_GAP`` steps of fitted rows, so those startup
+    steps can neither open the gate nor count as support; the outputs keep the input dtype."""
+    y, ua, ok = _coupled(9.0)
+    head = IrfSourceHead(30, y.shape[-1]).eval()
+    with torch.no_grad():
+        tone = torch.zeros_like(ua)
+        Z = torch.nn.functional.conv1d(
+            torch.nn.functional.pad((ua - tone).clamp_min(0)[:, None], (head.D, 0)), head.w_full
+        ).transpose(1, 2)
+        z_ok = ok & (torch.arange(ua.shape[1])[None] >= head.D)
+        h, a, z = head.context_irf(Z, z_ok, y, ok[..., None].expand_as(y), ok)
+
+    assert h.dtype == a.dtype == z.dtype == y.dtype
+    # Rows start at step D + 9 (ten rows in the trailing mean); predictions PREQ_GAP later; the gate
+    # after MIN_PREQ_ROWS of those.
+    first_open = head.D + 9 + head.PREQ_GAP + head.MIN_PREQ_ROWS - 1
+    assert not a[:, :first_open].any() and not z[:, :first_open].any()
+    assert a[:, first_open:, 0].any()
+
+
 @pytest.mark.parametrize("true_delay", [5.0, 9.0, 15.0])    # 20, 36 and 60 s
 def test_a_planted_delay_is_read_and_another_rows_ua_opens_the_gate_much_less(true_delay):
     y, ua, ok = _coupled(true_delay)
@@ -237,6 +258,34 @@ def test_the_wrong_ua_full_term_sends_its_gradient_where_the_full_term_does(pert
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.target_encoder.parameters())
 
 
+def test_lambda_full_wrong_rides_the_beta_schedule(perturb_posterior):
+    r"""``lambda_full_wrong`` scales with $\beta(e)$ so a from-scratch run warms up specificity
+    alongside KL (zero weight at $\beta=0$, full weight at $\beta=1$) while still logging
+    ``pred_gap_full_wrong`` at every epoch."""
+    schedule = {"kind": "linear_warmup", "start": 0.0, "end": 1.0, "warmup_epochs": 10}
+    module_zero = make_task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE),
+        hparams=dict(lambda_full_wrong=0.25, beta_schedule=schedule),
+    )
+    perturb_posterior(module_zero.orig_model)
+    batch = _batch()
+    torch.manual_seed(7)
+    loss_beta0, metrics_beta0 = module_zero.compute_loss_and_metrics(batch, 0, "train")
+    assert "pred_gap_full_wrong" in metrics_beta0
+    # At epoch 0, beta = 0 so total_loss equals the unweighted full+base+prior objective without harm.
+    assert torch.isfinite(loss_beta0)
+    # With constant beta = 1, the harm term contributes with weight lambda_full_wrong.
+    module_one = make_task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE),
+        hparams=dict(lambda_full_wrong=0.25, kld_beta=1.0),
+    )
+    module_one.orig_model.load_state_dict(module_zero.orig_model.state_dict())
+    torch.manual_seed(7)
+    loss_beta1, metrics_beta1 = module_one.compute_loss_and_metrics(batch, 0, "train")
+    assert "pred_gap_full_wrong" in metrics_beta1
+    assert not torch.allclose(loss_beta0, loss_beta1)
+
+
 def test_freeze_target_path_keeps_the_base_forecast_and_trains_the_ua_path(perturb_posterior):
     """``freeze_target_path``: a large step on the objective with the wrong-UA term moves the full
     forecast and leaves the base forecast bit-identical, prior clock included."""
@@ -267,6 +316,56 @@ def test_freeze_target_path_keeps_the_base_forecast_and_trains_the_ua_path(pertu
     assert model.get_parameter("lag_attn.W_k.weight").grad.abs().sum() > 0
     assert torch.equal(base_before, base_after)
     assert not torch.equal(full_before, full_after)
+
+
+def test_the_wrong_ua_terms_draw_every_donor_from_another_recording(monkeypatch):
+    """Rows of one recording side by side, as on an unshuffled loader: a roll by one would hand
+    half of them their own recording's UA. The derangement gives every row another GUID's UA."""
+    module = make_task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, source_path="irf"),
+        hparams=dict(lambda_source_wrong=1.0),
+    )
+    batch = _batch()
+    batch.guid = ["A", "A", "B", "B"]
+    batch.up = torch.arange(4, dtype=batch.up.dtype)[:, None].expand_as(batch.up).clone()
+    model, calls = module.orig_model, []
+    original = model.irf_source
+
+    def spy(target_features, ua_level, *args):
+        calls.append(ua_level)
+        return original(target_features, ua_level, *args)
+
+    monkeypatch.setattr(model, "irf_source", spy)
+    _loss, metrics = module.compute_loss_and_metrics(batch, 0, "train")
+
+    assert "pred_gap_wrong" in metrics and len(calls) == 2
+    own, wrong = calls[0][:, -1], calls[1][:, -1]
+    donor = [int((own == value).nonzero()[0]) for value in wrong]
+    assert all(batch.guid[row] != batch.guid[donor[row]] for row in range(4)), donor
+
+
+@pytest.mark.parametrize("freeze", [False, True])
+def test_freeze_target_path_keeps_the_frozen_modules_in_eval_mode_through_train(freeze):
+    """``task.train(True)`` -- what Lightning calls every epoch -- leaves the frozen modules' dropout
+    off: two forwards under different seeds give bit-identical prior and source state, while the
+    posterior head trains. Without the freeze the same two forwards differ, so the dropout is live."""
+    module = make_task(
+        model_kwargs=tiny_warmup_kwargs(
+            anchor_stride=TINY_STRIDE, prior_availability_input=True, dropout=0.3
+        ),
+        freeze_target_path=freeze,
+    )
+    module.train(True)
+    batch = _batch()
+    outs = []
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            outs.append(module.orig_model(*module._build_forward_inputs(batch)))
+
+    assert module.orig_model.posterior_head.training
+    for key in ("mu_prior", "logvar_prior", "source_state"):
+        assert torch.equal(outs[0][key], outs[1][key]) is freeze, key
 
 
 def test_with_the_option_off_the_model_is_the_one_before_the_option_existed():

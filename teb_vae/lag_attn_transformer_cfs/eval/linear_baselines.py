@@ -110,8 +110,19 @@ def is_fit_recording(guid: Any) -> bool:
     Returns:
         ``True`` when the MD5 hash of the identifier is even.
     """
-    text = guid if isinstance(guid, str) else bytes(guid).decode(errors="ignore")
-    return int(hashlib.md5(text.encode()).hexdigest(), 16) % 2 == 0
+    return int(hashlib.md5(_guid_text(guid).encode()).hexdigest(), 16) % 2 == 0
+
+
+def _guid_text(guid: Any) -> str:
+    """Return a recording identifier as ``str``, decoding bytes.
+
+    Args:
+        guid: The recording identifier, as ``str`` or as bytes.
+
+    Returns:
+        The identifier as text.
+    """
+    return guid if isinstance(guid, str) else bytes(guid).decode(errors="ignore")
 
 
 def _lagged(stream: torch.Tensor, anchors: torch.Tensor, lags: int) -> torch.Tensor:
@@ -153,18 +164,21 @@ def collect(
     Returns:
         ``{"fit": {...}, "eval": {...}, "width_st": int}``. Each half holds ``y_lags``
         ``(N, P, C)``, ``u_lags`` ``(N, P, C_u)`` and ``target`` ``(N, H, C)``; ``eval`` also holds
-        ``model_full`` and ``model_base`` ``(N, H, C)``. All in float64 on the CPU. ``width_st``
-        is the declared width of the ``fhr_st`` block, the forward's first input, so a kept
-        channel whose declared index is below it is a scattering channel.
+        ``model_full`` and ``model_base`` ``(N, H, C)``, and ``guid``, the recording of each row.
+        All tensors in float64 on the CPU. ``width_st`` is the declared width of the ``fhr_st``
+        block, the forward's first input, so a kept channel whose declared index is below it is a
+        scattering channel.
     """
     model = task.orig_model
-    target_keep = model.target_gate.keep_index
+    target_gate = getattr(model, "target_gate", None)
+    target_keep = None if target_gate is None else target_gate.keep_index
     source_gate = getattr(model, "source_gate", None)
     source_keep = None if source_gate is None else source_gate.keep_index
     store: Dict[str, Dict[str, List[torch.Tensor]]] = {
         _FIT: {"y_lags": [], "u_lags": [], "target": []},
         _EVAL: {"y_lags": [], "u_lags": [], "target": [], "model_full": [], "model_base": []},
     }
+    eval_guids: List[str] = []
     width_st = None
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -194,7 +208,7 @@ def collect(
 
         model_full, model_base = _decode(out["mu_post"]), _decode(out["mu_prior"])
 
-        y = torch.index_select(raw_target, -1, target_keep)
+        y = raw_target if target_keep is None else torch.index_select(raw_target, -1, target_keep)
         source = inputs[2]
         # The slot is None on a model with the IRF head and no source-quality mask.
         masked = len(inputs) > 5 and inputs[5] is not None
@@ -204,6 +218,14 @@ def collect(
             source_valid = torch.index_select(source_valid, -1, source_keep)
         source = source * source_valid.to(source.dtype)
         y_lags, u_lags = _lagged(y, anchors, lags), _lagged(source, anchors, lags)
+        # Under running-gap removal the model never reads a key whose bridge looks past the
+        # anchor; ``ridge_yu`` must not read it either. $R_{t\ell}$ is $(B, T, L)$ in lag order.
+        removed = inputs[6] if len(inputs) > 6 else None
+        if removed is not None:
+            if removed.shape[-1] < lags:
+                raise ValueError(f"lags={lags} exceeds the model's {removed.shape[-1]} lag keys")
+            at_anchor = removed.gather(1, anchors[:, :, None].expand(-1, -1, removed.shape[-1]))
+            u_lags = u_lags * (~at_anchor[..., :lags, None]).to(u_lags.dtype)
 
         for row, guid in enumerate(batch.guid):
             mask = keep[row]
@@ -216,6 +238,7 @@ def collect(
             if "model_full" in part:
                 part["model_full"].append(model_full[row][mask].double().cpu())
                 part["model_base"].append(model_base[row][mask].double().cpu())
+                eval_guids.extend([_guid_text(guid)] * int(mask.sum()))
         if batch_index % 20 == 0:
             logger.info(f"batch {batch_index}")
     collected: Dict[str, Any] = {"width_st": width_st}
@@ -223,12 +246,16 @@ def collect(
         if not part["target"]:
             raise ValueError(f"no anchor fell in the {name!r} half: read more batches")
         collected[name] = {key: torch.cat(values) for key, values in part.items()}
+    collected[_EVAL]["guid"] = eval_guids
     return collected
 
 
 def _ridge(features_fit: torch.Tensor, targets_fit: torch.Tensor, features_eval: torch.Tensor,
            ridge: float) -> torch.Tensor:
-    r"""Fit $W = (X^\top X + \lambda N I)^{-1} X^\top Y$ with an intercept and predict.
+    r"""Fit $W = (X^\top X + \lambda N I_0)^{-1} X^\top Y$ with an intercept and predict.
+
+    $I_0$ is the identity with a zero in the intercept's diagonal entry, so the ridge shrinks the
+    weights but never pulls the intercept towards zero.
 
     Args:
         features_fit: ``(N, F)``.
@@ -244,7 +271,9 @@ def _ridge(features_fit: torch.Tensor, targets_fit: torch.Tensor, features_eval:
     x_fit = torch.cat([features_fit, ones_fit], 1)
     x_eval = torch.cat([features_eval, ones_eval], 1)
     gram = x_fit.T @ x_fit
-    gram = gram + ridge * x_fit.shape[0] * torch.eye(gram.shape[0], dtype=gram.dtype)
+    penalty = torch.eye(gram.shape[0], dtype=gram.dtype)
+    penalty[-1, -1] = 0.0  # the intercept column
+    gram = gram + ridge * x_fit.shape[0] * penalty
     return x_eval @ torch.linalg.solve(gram, x_fit.T @ targets_fit)
 
 
@@ -288,7 +317,7 @@ def forecasts(data: Dict[str, Any], ridge: float) -> Dict[str, torch.Tensor]:
 
 
 def score(predictions: Dict[str, torch.Tensor], target: torch.Tensor, cell_mask: np.ndarray,
-          is_scattering: np.ndarray) -> Dict[str, Dict[str, Any]]:
+          is_scattering: np.ndarray, guids: Optional[Sequence[str]] = None) -> Dict[str, Dict[str, Any]]:
     r"""Mean squared error over the scored cells, per block and per horizon step.
 
     Args:
@@ -296,11 +325,14 @@ def score(predictions: Dict[str, torch.Tensor], target: torch.Tensor, cell_mask:
         target: ``(N, H, C)``.
         cell_mask: ``(H, C)`` boolean, the model's scored cells.
         is_scattering: ``(C,)`` boolean, ``True`` for a kept ``fhr_st`` channel.
+        guids: The recording of each of the $N$ rows, or ``None`` to skip the per-recording mean.
 
     Returns:
         Per forecaster: ``mse_all``, ``mse_st``, ``mse_ph`` over the scored cells; ``mse_tau0_st``
         and ``mse_tau0_ph`` at the first step; and ``mse_by_tau_st`` and ``mse_by_tau_ph``, the
-        per-step means over scored cells (``None`` at a step with none).
+        per-step means over scored cells (``None`` at a step with none). With ``guids`` also
+        ``mse_all_per_recording``, $\frac{1}{G}\sum_g \mathrm{MSE}_g$, so a recording with many
+        anchors does not outweigh the others as it does in the flat anchor mean ``mse_all``.
     """
     def _mean(cells: np.ndarray, mask: np.ndarray) -> Optional[float]:
         return float(cells[mask].mean()) if mask.any() else None
@@ -319,6 +351,12 @@ def score(predictions: Dict[str, torch.Tensor], target: torch.Tensor, cell_mask:
             "mse_by_tau_st": [_mean(cells[tau], st_mask[tau]) for tau in range(cells.shape[0])],
             "mse_by_tau_ph": [_mean(cells[tau], ph_mask[tau]) for tau in range(cells.shape[0])],
         }
+        if guids is not None and cell_mask.any():
+            per_row = ((prediction - target) ** 2).numpy()[:, cell_mask].mean(-1)  # (N,)
+            groups = np.asarray(guids)
+            table[name]["mse_all_per_recording"] = float(
+                np.mean([per_row[groups == guid].mean() for guid in np.unique(groups)])
+            )
     return table
 
 
@@ -332,7 +370,7 @@ def write_markdown(path: Path, report: Dict[str, Any]) -> None:
     def _cell(value: Optional[float]) -> str:
         return "--" if value is None else f"{value:.4f}"
 
-    columns = ("mse_all", "mse_st", "mse_ph", "mse_tau0_st", "mse_tau0_ph")
+    columns = ("mse_all", "mse_all_per_recording", "mse_st", "mse_ph", "mse_tau0_st", "mse_tau0_ph")
     lines = [
         "# Linear baselines",
         "",
@@ -346,12 +384,14 @@ def write_markdown(path: Path, report: Dict[str, Any]) -> None:
     ]
     for name in FORECASTERS:
         row = report["table"][name]
-        lines.append(f"| `{name}` | " + " | ".join(_cell(row[c]) for c in columns) + " |")
+        lines.append(f"| `{name}` | " + " | ".join(_cell(row.get(c)) for c in columns) + " |")
     gain = report["source_gain"]
     lines += [
         "",
         f"Linear source gain (`ridge_y` - `ridge_yu`, MSE): {_cell(gain['linear'])}. "
-        f"Model source gain (`model_base` - `model_full`, MSE): {_cell(gain['model'])}.",
+        f"Model source gain (`model_base` - `model_full`, MSE): {_cell(gain['model'])}. "
+        f"Per-recording means: linear {_cell(gain.get('linear_per_recording'))}, "
+        f"model {_cell(gain.get('model_per_recording'))}.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -405,18 +445,30 @@ def main(checkpoint: str, output_dir: str, config: Optional[str] = None,
         task, GraphDataModule(run_config).test_dataloader(), torch_device,
         lags=lags, anchor_subsample=anchor_subsample, max_batches=max_batches,
     )
-    cell_mask = model.forecast_likelihood_kwargs()["cell_mask"].bool().cpu().numpy()
-    is_scattering = model.target_gate.keep_index.cpu().numpy() < data["width_st"]
+    horizon, width = data[_EVAL]["target"].shape[1:]
+    cell_mask = model.forecast_likelihood_kwargs()["cell_mask"]
+    # No scored-cell mask means every cell of the block is scored.
+    cell_mask = (
+        np.ones((horizon, width), dtype=bool) if cell_mask is None else cell_mask.bool().cpu().numpy()
+    )
+    target_gate = getattr(model, "target_gate", None)
+    keep = np.arange(width) if target_gate is None else target_gate.keep_index.cpu().numpy()
+    is_scattering = keep < data["width_st"]
 
-    table = score(forecasts(data, ridge), data[_EVAL]["target"], cell_mask, is_scattering)
-    linear_gain = (
-        None if table["ridge_y"]["mse_all"] is None
-        else table["ridge_y"]["mse_all"] - table["ridge_yu"]["mse_all"]
+    table = score(
+        forecasts(data, ridge), data[_EVAL]["target"], cell_mask, is_scattering, data[_EVAL]["guid"]
     )
-    model_gain = (
-        None if table["model_base"]["mse_all"] is None
-        else table["model_base"]["mse_all"] - table["model_full"]["mse_all"]
-    )
+
+    def _gain(worse: str, better: str, key: str) -> Optional[float]:
+        a, b = table[worse].get(key), table[better].get(key)
+        return None if a is None or b is None else a - b
+
+    gains = {
+        "linear": _gain("ridge_y", "ridge_yu", "mse_all"),
+        "model": _gain("model_base", "model_full", "mse_all"),
+        "linear_per_recording": _gain("ridge_y", "ridge_yu", "mse_all_per_recording"),
+        "model_per_recording": _gain("model_base", "model_full", "mse_all_per_recording"),
+    }
     report = {
         "checkpoint_name": checkpoint_path.name,
         "lags": lags,
@@ -425,7 +477,8 @@ def main(checkpoint: str, output_dir: str, config: Optional[str] = None,
         "n_fit": int(data[_FIT]["target"].shape[0]),
         "n_eval": int(data[_EVAL]["target"].shape[0]),
         "n_scored_cells": int(cell_mask.sum()),
-        "source_gain": {"linear": linear_gain, "model": model_gain},
+        "n_eval_recordings": len(set(data[_EVAL]["guid"])),
+        "source_gain": gains,
         "table": table,
     }
     out = Path(output_dir)

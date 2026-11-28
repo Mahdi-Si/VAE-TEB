@@ -156,12 +156,17 @@ class LaggedSourceAttention(NamedTuple):
         gate: The gate the posterior head applies ``(B, T, 1)``, or ``None`` when the model has
             neither an event gate nor a hard mask.
         event_gate: The gate returned and charged as ``event_gate``: the effective gate
-            $g_t\,o_t$ in the hard mode, the learned gate in the soft mode, ``None`` without a
-            gate.
-        event_gate_learned: The learned gate before the hard mask closes it. ``None`` in the soft
-            mode and without a hard mask, where it equals ``event_gate``.
-        source_open: $o_t = \exists \ell: K_{t\ell}$ ``(B, T)`` in the hard mode, else ``None``.
-            Under running-gap removal $K$ is first reduced to $K \wedge \lnot R$.
+            $g_t\,o_t$ in the hard mode and under running-gap removal, the learned gate in the
+            soft mode without removal, ``None`` without a gate.
+        event_gate_learned: The learned gate before the mask closes it: in the hard mode, and in
+            the soft and input modes under running-gap removal. ``None`` otherwise, where nothing
+            closes the gate and it equals ``event_gate``. In the input mode without a learned
+            gate it is ``None`` too.
+        source_open: $o_t$ ``(B, T)``: $\exists \ell: K_{t\ell} \wedge \lnot R_{t\ell}$ in the hard
+            mode ($R \equiv 0$ without removal), and
+            $\exists \ell: \mathrm{lag\_mask}_{t\ell} \wedge \lnot R_{t\ell}$ in the soft and
+            input modes under running-gap removal. ``None`` in the soft and input modes without
+            removal, and without a quality mask.
         invalid_mass: The soft or input mode's attention mass on invalid keys per head
             ``(B, T, M)``, else ``None``.
     """
@@ -1315,8 +1320,10 @@ class CausalWarmupInputs:
               It is the one way to tell an anchor the model shut ($o_t = 1$, small $g_t$) from an
               anchor the data shut ($o_t = 0$), because ``event_gate`` is $0$ in both.
             * Under ``source_mask_mode='soft'`` or ``'input'`` the three mask keys above change:
-              ``source_open`` and ``event_gate_learned`` are absent, because nothing is closed and
-              ``event_gate`` is the learned gate itself; ``source_key_mask`` is still returned;
+              without running-gap removal, ``source_open`` and ``event_gate_learned`` are absent,
+              because nothing is closed and ``event_gate`` is the learned gate itself (with
+              removal both are returned, ``source_open`` computed from
+              $\mathrm{lag\_mask} \wedge \lnot R$); ``source_key_mask`` is still returned;
               and two keys are added: ``source_invalid_mass``, the attention mass each head put
               on invalid keys, $(B, T, M)$, and ``source_quality``, the adapter's per-channel
               flags, $(B, T, C_u)$. In the ``'input'`` mode ``source_invalid_mass`` is a readout
@@ -1503,9 +1510,9 @@ class CausalWarmupInputs:
             # Present only under ``posterior_event_gate``, for the reason ``persistence`` is.
             outputs["event_gate"] = event_gate
         if attended.invalid_mass is not None:
-            # The soft mode closes nothing, so it returns no ``source_open``: the objective and
-            # the task then treat every anchor as open, which is the soft mode's meaning. The key
-            # mask is still returned, because every control must hand the attention the same
+            # The soft mode closes nothing on its own, so without running-gap removal it returns
+            # no ``source_open``: the objective and the task then treat every anchor as open. The
+            # key mask is still returned, because every control must hand the attention the same
             # validity input the forward used.
             outputs["source_key_mask"] = key_mask
             outputs["source_invalid_mass"] = attended.invalid_mass
@@ -1513,7 +1520,7 @@ class CausalWarmupInputs:
             # and the occlusion arms) encode it with this recording's flags.
             outputs["source_quality"] = quality
         if source_open is not None:
-            # Present only under ``source_quality_mask``, for the reason ``persistence`` is.
+            # Present only where an anchor can be closed: the hard mode, or running-gap removal.
             outputs["source_key_mask"] = key_mask
             outputs["source_open"] = source_open
             if event_gate_learned is not None:
@@ -1855,11 +1862,16 @@ class CausalWarmupInputs:
             if evidence is not None:
                 logits = logits + self.irf_evidence_gate(evidence)
             gate = torch.sigmoid(logits)
-            if removed is not None:
-                # An anchor with no key left attends to nothing, but the gate reads a LayerNorm of
-                # a zero summary and stays open; closing it keeps q = p there.
-                gate = gate * kept.any(dim=-1, keepdim=True).to(gate.dtype)
-            return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+            if removed is None:
+                return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+            # An anchor with no key left attends to nothing, but the gate reads a LayerNorm of a
+            # zero summary and stays open; closing it keeps q = p there. The learned gate and
+            # $o_t$ are returned, so a reader can tell a removal-shut anchor from a model-shut one.
+            source_open = kept.any(dim=-1)
+            applied = gate * source_open[..., None].to(gate.dtype)
+            return LaggedSourceAttention(
+                alpha, heads, applied, applied, gate, source_open, invalid_mass
+            )
 
         if key_mask is not None and getattr(self, "source_mask_mode", "hard") == "input":
             lag_mask = lag_mask.to(torch.bool)
@@ -1869,11 +1881,15 @@ class CausalWarmupInputs:
             # A readout only: nothing in the model reads it.
             invalid_mass = (alpha * invalid[:, :, None, :]).sum(dim=-1)  # (B, T, M)
             gate = self.posterior_head.event_gate_values(heads)
-            if removed is not None:
-                # As in the soft mode: an anchor with no key left keeps q = p. Without a learned
-                # gate, the open indicator itself is the gate.
-                gate, _ = self._close_gate(gate, kept.any(dim=-1), heads.dtype)
-            return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+            if removed is None:
+                return LaggedSourceAttention(alpha, heads, gate, gate, None, None, invalid_mass)
+            # As in the soft mode: an anchor with no key left keeps q = p. Without a learned gate,
+            # the open indicator itself is the gate.
+            source_open = kept.any(dim=-1)
+            applied, _ = self._close_gate(gate, source_open, heads.dtype)
+            return LaggedSourceAttention(
+                alpha, heads, applied, applied, gate, source_open, invalid_mass
+            )
 
         if removed is not None:
             key_mask = key_mask.to(torch.bool) & ~removed.to(torch.bool)

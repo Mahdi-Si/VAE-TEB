@@ -123,13 +123,15 @@ def test_the_forward_takes_no_target() -> None:
 
     The reconstruction target is now the same *kind* of tensor the model is shown, so the two could
     be confused in a way the raw sibling's cannot -- and a forward that had been handed the future
-    would still return every contract shape. The forward takes three streams, two integers and the
-    optional source-quality mask, which describes the source alone; it is ``compute_loss`` that
-    gathers a target afterwards, from a stream the caller passes separately.
+    would still return every contract shape. The forward takes three streams, two integers, the
+    optional source-quality and running-gap masks, which describe the source alone, and the IRF
+    head's UA level, UA validity and FHR step validity -- a mask, never a target value. It is
+    ``compute_loss`` that gathers a target afterwards, from a stream the caller passes separately.
     """
     parameters = list(inspect.signature(SeqVaeLagAttnCfs.forward).parameters)
     assert parameters == [
-        "self", "y_st", "y_ph", "u_stream", "anchor_phase", "anchor_stride", "source_valid"
+        "self", "y_st", "y_ph", "u_stream", "anchor_phase", "anchor_stride", "source_valid",
+        "source_key_removed", "ua_level", "ua_valid", "target_step_valid",
     ]
 
     model = _model().eval()

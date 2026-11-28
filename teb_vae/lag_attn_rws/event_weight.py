@@ -92,6 +92,37 @@ def _detect_events(
     return detector(trace, fs=FS_RAW, valid=valid)
 
 
+_STEP_ALIGN_MODES = ("floor", "ceil")
+
+
+def _raw_to_step(raw_indices: np.ndarray, decimation: int, step_align: str) -> np.ndarray:
+    r"""Map raw sample indices onto the decimated step grid.
+
+    Args:
+        raw_indices: Integer raw-sample indices.
+        decimation: Raw samples per decimated step $D$.
+        step_align: Grid convention:
+            * ``'floor'`` ($\lfloor i / D \rfloor$): forward-block convention used by raw-signal
+              cells, where step $k$ covers raw block $[Dk, D(k+1) - 1]$.
+            * ``'ceil'`` ($\lceil i / D \rceil$): causal-feature convention, where stored step $k$
+              sits at trimmed raw sample $Dk$ and reads only samples $\le Dk$, so an event at raw
+              index $i$ first becomes visible at the smallest step $k$ with $Dk \ge i$.
+
+    Returns:
+        Integer ``int64`` step indices.
+
+    Raises:
+        ValueError: If ``step_align`` is not ``'floor'`` or ``'ceil'``.
+    """
+    dec = int(decimation)
+    arr = np.asarray(raw_indices, dtype=np.int64)
+    if step_align == "floor":
+        return arr // dec
+    if step_align == "ceil":
+        return (arr + dec - 1) // dec
+    raise ValueError(f"step_align must be one of {_STEP_ALIGN_MODES}, got {step_align!r}")
+
+
 def contraction_span_steps(
     up_raw: np.ndarray,
     weight: np.ndarray,
@@ -99,11 +130,13 @@ def contraction_span_steps(
     decimation: int,
     detector: Callable[..., Dict[str, Any]] = detect_contractions,
     raw_valid: Optional[np.ndarray] = None,
+    step_align: str = "floor",
 ) -> np.ndarray:
     r"""Contraction spans of one segment on the decimated grid: ``(n, 2)`` onset and end steps.
 
-    The same detection as :func:`contraction_onset_steps`; each raw index is floored onto the
-    decimated grid, so step $k$ is in a span when $o \le k \le e$.
+    The same detection as :func:`contraction_onset_steps`; each raw index is mapped onto the
+    decimated grid according to ``step_align`` (floored for raw-signal blocks, ceiled for causal
+    point-sampled steps), so step $k$ is in a span when $o \le k \le e$.
 
     Args:
         up_raw: The raw UP trace; see :func:`contraction_onset_steps`.
@@ -111,6 +144,8 @@ def contraction_span_steps(
         decimation: Raw samples per decimated step $D$.
         detector: The ``detect_contractions`` to run.
         raw_valid: Optional per-raw-sample UA validity, ANDed into the detector's validity.
+        step_align: Raw-to-step rounding rule, ``'floor'`` (default, raw-signal cells) or
+            ``'ceil'`` (causal-feature cells, where step $k$ sits at raw sample $Dk$).
 
     Returns:
         ``int16`` ``(n, 2)`` array of ``(onset, end)`` steps, ascending by onset.
@@ -118,8 +153,8 @@ def contraction_span_steps(
     found = _detect_events(
         up_raw, weight, decimation=decimation, detector=detector, raw_valid=raw_valid
     )
-    onsets = np.asarray(found["onset_raw"], dtype=np.int64) // int(decimation)
-    ends = np.asarray(found["end_raw"], dtype=np.int64) // int(decimation)
+    onsets = _raw_to_step(found["onset_raw"], decimation, step_align)
+    ends = _raw_to_step(found["end_raw"], decimation, step_align)
     order = np.argsort(onsets, kind="stable")
     return np.stack([onsets[order], ends[order]], axis=1).astype(np.int16).reshape(-1, 2)
 
@@ -131,6 +166,7 @@ def contraction_onset_steps(
     decimation: int,
     detector: Callable[..., Dict[str, Any]] = detect_contractions,
     raw_valid: Optional[np.ndarray] = None,
+    step_align: str = "floor",
 ) -> np.ndarray:
     r"""Contraction onsets of one segment on the decimated grid, from its raw UP trace.
 
@@ -146,6 +182,8 @@ def contraction_onset_steps(
             cells' detector.
         raw_valid: Optional per-raw-sample UA validity (the loader's ``up_valid``), ANDed into
             the validity the detector reads. ``None`` -- the default -- is the weight alone.
+        step_align: Raw-to-step rounding rule, ``'floor'`` (default, raw-signal cells) or
+            ``'ceil'`` (causal-feature cells, where step $k$ sits at raw sample $Dk$).
 
     Returns:
         The onsets as ``int16`` decimated-step indices, ascending, possibly empty.
@@ -154,12 +192,12 @@ def contraction_onset_steps(
         ValueError: If the trace holds a non-finite sample. The shards are finite by construction
             and the loader adds nothing, so a NaN here is an upstream change worth failing on
             rather than a row silently scored at the floor. Also if ``raw_valid`` is shorter than
-            the grid.
+            the grid, or ``step_align`` is invalid.
     """
     onsets = _detect_events(
         up_raw, weight, decimation=decimation, detector=detector, raw_valid=raw_valid
     )["onset_raw"]
-    return np.sort(np.asarray(onsets, dtype=np.int64) // int(decimation)).astype(np.int16)
+    return np.sort(_raw_to_step(onsets, decimation, step_align)).astype(np.int16)
 
 
 def contraction_source_mask(
@@ -171,6 +209,7 @@ def contraction_source_mask(
     keys: Optional[Sequence[Hashable]] = None,
     cache: Optional[MutableMapping[Hashable, np.ndarray]] = None,
     detector: Callable[..., Dict[str, Any]] = detect_contractions,
+    step_align: str = "floor",
 ) -> torch.Tensor:
     r"""The $(B, T)$ steps that lie inside a detected contraction, $o \le k \le e$.
 
@@ -187,6 +226,7 @@ def contraction_source_mask(
         keys: One hashable key per row, or ``None``.
         cache: A span cache keyed by ``keys``, or ``None``.
         detector: The ``detect_contractions`` to run.
+        step_align: Raw-to-step rounding rule, ``'floor'`` or ``'ceil'``.
 
     Returns:
         Boolean $(B, T)$ on ``weight``'s device, ``True`` inside a contraction.
@@ -195,7 +235,8 @@ def contraction_source_mask(
     spans = _cached_rows(
         up_raw, weight, raw_valid, keys, cache,
         lambda trace, row_weight, row_valid: contraction_span_steps(
-            trace, row_weight, decimation=decimation, detector=detector, raw_valid=row_valid
+            trace, row_weight, decimation=decimation, detector=detector, raw_valid=row_valid,
+            step_align=step_align,
         ),
     )
     out = np.zeros((batch, steps), dtype=bool)
@@ -272,6 +313,7 @@ def contraction_anchor_weight(
     cache: Optional[MutableMapping[Hashable, np.ndarray]] = None,
     detector: Callable[..., Dict[str, Any]] = detect_contractions,
     raw_valid: Optional[torch.Tensor] = None,
+    step_align: str = "floor",
 ) -> torch.Tensor:
     r"""Build the $(B, T)$ full-branch anchor weight from the raw UP trace.
 
@@ -293,6 +335,8 @@ def contraction_anchor_weight(
             ``up_valid``. An event that touches an invalid UA sample is dropped. ``None`` -- the
             default -- is the weight alone, bitwise the earlier behaviour. A cache must be fed one
             choice only.
+        step_align: Raw-to-step rounding rule, ``'floor'`` (default, raw-signal cells) or
+            ``'ceil'`` (causal-feature cells, where step $k$ sits at raw sample $Dk$).
 
     Returns:
         The weight $(B, T)$ on ``weight``'s device and dtype, every entry $w_{\min}$ or $1$.
@@ -312,7 +356,8 @@ def contraction_anchor_weight(
     onsets_per_row = _cached_rows(
         up_raw, weight, raw_valid, keys, cache,
         lambda trace, row_weight, row_valid: contraction_onset_steps(
-            trace, row_weight, decimation=decimation, detector=detector, raw_valid=row_valid
+            trace, row_weight, decimation=decimation, detector=detector, raw_valid=row_valid,
+            step_align=step_align,
         ),
     )
     out = np.full((batch, steps), floor, dtype=np.float32)

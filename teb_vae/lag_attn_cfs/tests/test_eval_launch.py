@@ -43,7 +43,7 @@ from teb_vae.lag_attn_cfs.eval import launch
 #: discovered, and cross-checked against the directories by
 #: :func:`test_the_tuple_names_every_module_with_a_main_block`.
 #:
-#: The first three are the evaluation's. The rest are the package's own runners and the fixture
+#: The first five are the evaluation's. The rest are the package's own runners and the fixture
 #: builder that feeds them -- an operator launches all of them the same way and each is a place the
 #: Run button can break silently, so they are held to one convention rather than to the one the
 #: directory they happen to sit in would suggest.
@@ -55,6 +55,8 @@ ENTRY_POINTS: Tuple[str, ...] = (
     "teb_vae.lag_attn_cfs.eval.probe",
     "teb_vae.lag_attn_cfs.eval.run",
     "teb_vae.lag_attn_cfs.eval.verify",
+    "teb_vae.lag_attn_cfs.eval.coupling_sparsity",
+    "teb_vae.lag_attn_cfs.eval.run_dashboard",
     "teb_vae.lag_attn_cfs.check_run",
     "teb_vae.lag_attn_cfs.lag_recovery_check",
     "teb_vae.lag_attn_cfs.warmup_budget",

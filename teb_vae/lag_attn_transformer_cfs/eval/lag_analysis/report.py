@@ -22,7 +22,7 @@ from .steps import AGES, GATE_OPEN, KAPPA_SHIFTS, L0, PLANT_STEPS, SHIFTS
 N_BOOT = 2000
 MIN_EVENTS = 5
 BIN_NAMES = [f"{int(a)}-{int(b)} min" for a, b in zip(TIME_BINS[:-1], TIME_BINS[1:])]
-CLOCK = "Seconds are on the stored clock. UA is stored 20 s earlier than recorded: recorded = stored - 20 s."
+CLOCK = "Seconds are on the stored clock of the shards."
 
 # Reference: checkpoint 369, lag study. Value, 95 % interval, n GUIDs, row of REF_SOURCE. The study's block
 # was the classes acidosis + HIE (here `adverse`) unless the row says otherwise. Provenance only.
@@ -79,10 +79,10 @@ ARMS = (  # first matching prefix names the arm(s) a statistic is computed from
     ("irf.plant", "IRF head, response planted after surA's UA"), ("irf.r_", "IRF head and lag attention, own UA"),
     ("irf.", "IRF head, own UA"), ("raw.", "raw signals, no model"),
 )
-HEADLINE = ["gain.sg_rw", "gain.sg_surB_rw", "shift.F8", "shift.F32", "shift.W50", "shift.kappa_h0", "shift.kappa_h1",
+HEADLINE = ["gain.sg_rw", "gain.sg_all", "gain.sg_outside_rw", "gain.sg_surB_rw", "shift.F8", "shift.F32", "shift.W50", "shift.kappa_h0", "shift.kappa_h1",
             "shift.kappa_h2", "shift.kappa_h3", "heads.kl_share_main", "heads.shapley_main", "heads.short_loss_share",
             "clamp.pos", "clamp.static", "clamp.rev", "clock.omega_gate", "clock.omega_kl", "clock.omega_lag",
-            "clock.dip", "events.peak", "groups.slow", "raw.nadir", "raw.depth"]
+            "clock.dip", "events.peak", "events.peak_0_180", "groups.slow", "raw.nadir", "raw.depth"]
 READ = {
     "gain": "The specific gain is what the right UA adds over a wrong one. A value near zero with an interval "
             "that covers zero means the model does not use the recording's own UA for its forecast.",
@@ -128,7 +128,7 @@ def pooled(v, W, H):
     """Equal-weight mean over subgroups of the W-weighted mean of GUID values v (n,) or (n, P); NaN left out."""
     v = np.asarray(v, float)
     one = v.ndim == 1
-    v = v.reshape(len(v), -1)
+    v = v.reshape(len(v), int(np.prod(v.shape[1:])))          # not -1: an empty class has no recording
     ok = np.isfinite(v)
     v0 = np.where(ok, v, 0.0)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -138,28 +138,50 @@ def pooled(v, W, H):
 
 
 def wmedian(v, W):
+    r"""Weighted median of the finite values v (n,) under each row of weights W (draws, n).
+
+    With cumulative weights $c_j$ of the sorted values and total $c_n$, the median is the midpoint
+    $\frac{1}{2}(v_{(j_-)} + v_{(j_+)})$ of the first order statistic with $c_j \ge c_n / 2$ and the first
+    with $c_j > c_n / 2$, so equal weights on an even count give $\frac{1}{2}(v_{(n/2)} + v_{(n/2+1)})$.
+
+    Returns:
+        (draws,) medians; NaN for a row without positive weight, or everywhere when no value is finite.
+    """
     ok = np.isfinite(v)
     v, W = v[ok], W[:, ok]
     if not v.size:
         return np.full(len(W), np.nan)
     o = np.argsort(v)
-    c = np.cumsum(W[:, o], 1)
-    return v[o][(c >= c[:, -1:] / 2).argmax(1)]
+    vs, c = v[o], np.cumsum(W[:, o], 1)
+    half = c[:, -1:] / 2
+    mid = 0.5 * (vs[(c >= half).argmax(1)] + vs[(c > half).argmax(1)])
+    return np.where(c[:, -1] > 0, mid, np.nan)
 
 
 def parabolic_peak(Y, x):
-    """Y (draws, bins) -> location and height of the 3-point parabolic peak around the maximum."""
-    Y = np.atleast_2d(Y)
-    i = np.clip(np.nanargmax(np.where(np.isfinite(Y), Y, -np.inf), 1), 1, Y.shape[1] - 2)
+    """Y (draws, bins) -> location and height of the 3-point parabolic peak around the maximum.
+
+    The vertex offset is applied only where the parabola opens downwards and both neighbours are
+    finite; otherwise the maximum bin itself is returned. A row whose maximum bin is not finite (for
+    example a row without a finite entry) gives (NaN, NaN).
+    """
+    Y = np.atleast_2d(np.asarray(Y, float))
+    i = np.clip(np.argmax(np.where(np.isfinite(Y), Y, -np.inf), 1), 1, Y.shape[1] - 2)
     r = np.arange(len(Y))
     y0, y1, y2 = Y[r, i - 1], Y[r, i], Y[r, i + 1]
     den = y0 - 2 * y1 + y2
-    d = np.clip(np.where(den < 0, 0.5 * (y0 - y2) / np.where(den < 0, den, -1), 0.0), -1, 1)
-    return x[i] + d * (x[1] - x[0]), y1 - 0.25 * (y0 - y2) * d
+    fit = (den < 0) & np.isfinite(y0) & np.isfinite(y2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d = np.where(fit, np.clip(0.5 * (y0 - y2) / np.where(fit, den, -1.0), -1, 1), 0.0)
+        height = np.where(fit, y1 - 0.25 * (y0 - y2) * d, y1)
+    found = np.isfinite(y1)
+    return np.where(found, x[i] + d * (x[1] - x[0]), np.nan), np.where(found, height, np.nan)
 
 
 def w50(Y, xs):
-    """First crossing of 0.5 by the line through (0, 1) and (xs, Y) per draw; the last x if never crossed."""
+    """First crossing of 0.5 by the line through (0, 1) and (xs, Y) per draw; the last x if never
+    crossed; NaN for a draw without a finite share."""
+    empty = ~np.isfinite(np.asarray(Y, float)).any(1)
     Y = np.column_stack([np.ones(len(Y)), Y])
     xs = np.r_[0.0, xs]
     out, done = np.full(len(Y), xs[-1]), np.zeros(len(Y), bool)
@@ -168,6 +190,7 @@ def w50(Y, xs):
             t = xs[k - 1] + (Y[:, k - 1] - 0.5) / (Y[:, k - 1] - Y[:, k]) * (xs[k] - xs[k - 1])
         hit = ~done & (Y[:, k] < 0.5)
         out[hit], done = t[hit], done | hit
+    out[empty] = np.nan
     return out
 
 
@@ -222,7 +245,8 @@ class View:
 def nfin(*vs):
     ok = np.ones(len(vs[0]), bool)
     for v in vs:
-        ok &= np.isfinite(np.asarray(v, float).reshape(len(v), -1)).all(1)
+        v = np.asarray(v, float)
+        ok &= np.isfinite(v.reshape(len(v), int(np.prod(v.shape[1:])))).all(1)
     return int(ok.sum())
 
 
@@ -246,13 +270,14 @@ class Rows(list):
 
 
 def blocks_of(d):
-    """Block name -> GUID mask: `adverse` = classes acidosis + HIE, `healthy` = the two healthy classes, `all`."""
+    """Block name -> GUID mask: `adverse` = classes acidosis + HIE, `healthy` = the two healthy classes, `all`.
+    `adverse` and `healthy` are left out when they hold no recording; `all` is always there."""
     cls = np.array([class_of(s)[0] for s in d["subgroup"]], object)
     if any(c is None for c in cls):
         return {"all": np.ones(len(cls), bool)}, None, None
     cs = np.array([class_of(s)[1] for s in d["subgroup"]], bool)
-    return {"adverse": np.isin(cls, ("acidosis", "hie")), "healthy": np.isin(cls, ("healthy_bg", "healthy_no_bg")),
-            "all": np.ones(len(cls), bool)}, cls, cs
+    bl = {"adverse": np.isin(cls, ("acidosis", "hie")), "healthy": np.isin(cls, ("healthy_bg", "healthy_no_bg"))}
+    return {**{b: m for b, m in bl.items() if m.any()}, "all": np.ones(len(cls), bool)}, cls, cs
 
 
 def main_head(steps):
@@ -274,6 +299,15 @@ def stats_gain(d, R, C):
               "key mask, on reward-window anchors (0-60 s after a contraction onset) with at least one key and at "
               "least half of the scored cells valid; K shared latent samples.")
         R.put("gain.sg_all", b, v.pool(sga), nfin(sga), "nats per cell", "The same on all anchors with at least one key.")
+        if "am_out" in d:
+            for w, k, txt in (("outside_rw", "out", "anchors outside the reward window (more than 60 s after the latest "
+                                                    "contraction onset, or with no onset before)"),
+                              ("post_60_180", "post", "anchors 60-180 s after the latest contraction onset"),
+                              ("quiet", "quiet", "anchors more than 180 s after the latest contraction onset, or with no onset before")):
+                x = v[f"am_{k}"] - v[f"as_{k}"]
+                R.put(f"gain.sg_{w}", b, v.pool(x), nfin(x), "nats per cell", f"The same specific gain (surA) on {txt}.")
+            sgb_all = v["bm_all"] - v["bs_all"]
+            R.put("gain.sg_surB_all", b, v.pool(sgb_all), nfin(sgb_all), "nats per cell", "Specific gain against surB on all anchors with at least one key.")
         R.put("gain.sg_surB_rw", b, v.pool(sgb), nfin(sgb), "nats per cell",
               "Specific gain against the same recording's UA at least 40 min away (surB), reward-window anchors; "
               "recordings with such a segment only.")
@@ -281,6 +315,10 @@ def stats_gain(d, R, C):
                              ("bs_rw", "surB", "the same recording's UA at least 40 min away"), ("g0_rw", "null", "zeroed UA")):
             R.put(f"gain.gain_{name}_rw", b, v.pool(v[k]), nfin(v[k]), "nats per cell",
                   f"Forecast gain (base NLL minus full NLL per valid scored cell) with {txt}, reward-window anchors.")
+            ka = k.replace("_rw", "_all")
+            if ka in d:
+                R.put(f"gain.gain_{name}_all", b, v.pool(v[ka]), nfin(v[ka]), "nats per cell",
+                      f"The same forecast gain with {txt}, all anchors with at least one key.")
         for j, name in enumerate(("scattering", "phase")):
             x = v["am_blk"][:, j] - v["as_blk"][:, j]
             R.put(f"gain.sg_rw_{name}", b, v.pool(x), nfin(x), "nats per cell", f"Specific gain on the {name} target channels only.")
@@ -301,8 +339,8 @@ def stats_shift(d, R, C):
     pos, neg = [SHIFTS.index(s) for s in sorted(x for x in SHIFTS if x > 0)], [SHIFTS.index(-s) for s in sorted(x for x in SHIFTS if x > 0)]
     xs = sec[pos]
 
-    def tuning(v):
-        F = v.pool(v["f_num"]) / v.pool(v["f_den"])[:, None]
+    def tuning(v, tag=""):
+        F = v.pool(v["f_num" + tag]) / v.pool(v["f_den" + tag])[:, None]
         pair = 0.5 * (F[:, pos] + F[:, neg])
         return F, pair, w50(pair, xs), 0.5 * (w50(F[:, pos], xs) - w50(F[:, neg], xs))
 
@@ -316,6 +354,14 @@ def stats_shift(d, R, C):
                   "clean (all keys valid and warm) in every shifted window.")
         R.put("shift.W50", b, W, v.n, "s", "Shift at which half of the gain is lost: first crossing of 0.5 by the line through the measured shares.")
         R.put("shift.delta0", b, d0, v.n, "s", "Centre of the tuning curve: (W50 of delays - W50 of advances) / 2. Positive: the gain tolerates a delayed UA better.")
+        if "f_den_all" in d:
+            va = View(d, m).keep(np.isfinite(d["f_den_all"][m]) & np.isfinite(d["f_num_all"][m]).all(1))
+            _, pair_a, W_a, d0_a = tuning(va, "_all")
+            for j, x in enumerate(xs):
+                R.put(f"shift.F{int(x)}_all", b, pair_a[:, j], va.n, "share",
+                      f"The share of the gain kept under a shift of {int(x)} s on every clean anchor, not only the reward window.")
+            R.put("shift.W50_all", b, W_a, va.n, "s", "W50 on every clean anchor.")
+            R.put("shift.delta0_all", b, d0_a, va.n, "s", "Tuning centre on every clean anchor.")
         C[f"shift.tuning.{b}"] = curve(np.r_[sec[:len(sec) // 2], 0.0, sec[len(sec) // 2:]], np.column_stack([F[:, :len(sec) // 2], np.ones(len(F)), F[:, len(sec) // 2:]]),
                                        "shift of the own UA, s (positive = UA delayed)", "share of the gain kept")
         if "k_num" in d:
@@ -360,7 +406,7 @@ def stats_heads(d, R, C):
         R.put("heads.short_mass_main", b, v.pool(v["m_short"][:, hs]), nfin(v["m_short"][:, hs]), "share", f"Attention mass of the main head on lags 0-{L0}.")
         R.put("heads.loo_main", b, 1 - v.ratio(sg[:, 1 << hs], full), nfin(full), "share", "Share of the specific gain lost when only the main head is switched off.")
         R.put("heads.only_main", b, v.ratio(sg[:, (2 ** M - 1) ^ (1 << hs)], full), nfin(full), "share", "Share of the specific gain kept when only the main head is left on.")
-        R.put("heads.kl_null_ratio_main", b, v.ratio(v["kl0"][:, hs], v["kl"][:, hs]), v.n, "share", "KL of the main head with zeroed UA / with own UA.")
+        R.put("heads.kl_null_ratio_main", b, v.ratio(v["kl0"][:, hs], v["kl"][:, hs]), nfin(v["kl0"][:, hs], v["kl"][:, hs]), "share", "KL of the main head with zeroed UA / with own UA.")
         R.put("heads.drift_main", b, v.pool(v["drift"][:, hs]), nfin(v["drift"][:, hs]), "steps over the span",
               "R07: within-segment slope of the main head's expected lag on the anchor index times the clean span.")
         if "short_loss" in d:
@@ -375,12 +421,15 @@ def stats_heads(d, R, C):
 def stats_clamp(d, R, C):
     for b, m in blocks_of(d)[0].items():
         v = View(d, m)
-        for mode, txt in (("pos", "its position-only profile (keys zeroed: query x lag embedding + lag bias)"),
-                          ("static", "its static profile (position term at the mean query)"),
-                          ("rev", "the static profile with lags 0-14 in reversed order (control)")):
-            R.put(f"clamp.{mode}", b, v.ratio(v[f"c_{mode}"], v["c_m"]), nfin(v[f"c_{mode}"]), "share",
-                  f"Share of the matched gain kept when every head's attention is replaced by {txt}; gate recomputed; "
-                  "reward-window anchors, K samples.")
+        for tag, where in (("", "reward-window anchors"), ("_all", "all anchors with at least one key")):
+            if "c_m" + tag not in d:
+                continue
+            for mode, txt in (("pos", "its position-only profile (keys zeroed: query x lag embedding + lag bias)"),
+                              ("static", "its static profile (position term at the mean query)"),
+                              ("rev", "the static profile with lags 0-14 in reversed order (control)")):
+                R.put(f"clamp.{mode}{tag}", b, v.ratio(v[f"c_{mode}{tag}"], v["c_m" + tag]), nfin(v[f"c_{mode}{tag}"]), "share",
+                      f"Share of the matched gain kept when every head's attention is replaced by {txt}; gate recomputed; "
+                      f"{where}, K samples.")
 
 
 def _window(s, n, lo, hi):
@@ -423,15 +472,18 @@ def stats_events(d, R, C):
             own, null, sur = cur(0, 0), cur(1, 0), cur(0, 1)
             gate = [cur(0, 2), cur(1, 2)]
             kl = [cur(0, 4), cur(1, 4)]
-        win = (AGES >= 0) & (AGES <= 60)
-        loc, height = parabolic_peak(own[:, win], AGES[win])
-        R.put("events.peak", b, loc, v.n, "s after onset",
-              "R37: location of the parabolic peak over 0-60 s of the pooled onset-locked matched gain (joint mask, 4-s age "
-              f"bins); onsets = starts of the reward window; recordings with at least {MIN_EVENTS} events on the own and on the donor's clock.")
-        R.put("events.peak_height_over_null", b, height - np.nanmax(null, 1), v.n, "nats per cell",
-              "Peak height minus the maximum of the null curve (the same anchors locked on the donor's onsets).")
-        loc_s, _ = parabolic_peak((own - sur)[:, win], AGES[win])
-        R.put("events.peak_specific", b, loc_s, v.n, "s after onset", "The same location for the specific gain (matched minus surA).")
+        for hi, tag in ((60, ""), (180, "_0_180")):   # 0-60 s as in the lag study; 0-180 s so a later peak is not cut at 60 s
+            win = (AGES >= 0) & (AGES <= hi)
+            loc, height = parabolic_peak(own[:, win], AGES[win])
+            R.put("events.peak" + tag, b, loc, v.n, "s after onset",
+                  f"R37: location of the parabolic peak over 0-{hi} s of the pooled onset-locked matched gain (joint mask, 4-s age "
+                  f"bins); onsets = the contraction detector's onsets; recordings with at least {MIN_EVENTS} events on the own and "
+                  "on the donor's clock.")
+            R.put("events.peak_height_over_null" + tag, b, height - np.nanmax(null, 1), v.n, "nats per cell",
+                  f"Peak height (0-{hi} s) minus the maximum of the null curve (the same anchors locked on the donor's onsets).")
+            loc_s, _ = parabolic_peak((own - sur)[:, win], AGES[win])
+            R.put("events.peak_specific" + tag, b, loc_s, v.n, "s after onset",
+                  f"The same location over 0-{hi} s for the specific gain (matched minus surA).")
         C[f"events.gain.{b}"] = curve(AGES, np.stack([own, sur, null], -1), "s after contraction onset", "gain, nats per cell",
                                       ["own UA", "donor UA", "own UA on the donor's clock (null)"])
         C[f"events.gate.{b}"] = curve(AGES, np.stack(gate, -1), "s after contraction onset", "gate", ["own clock", "donor's clock (null)"])
@@ -446,22 +498,25 @@ def stats_events(d, R, C):
             med = STEP_S * (k + (0.5 - prev) / np.maximum(cum[np.arange(len(cum)), k] - prev, 1e-12))
             R.put(f"events.first_open{tag}", b, med, int((cnt[:, 1] > 0).sum()), "s after onset",
                   f"Median time from {txt} to the first anchor with gate >= {GATE_OPEN} (own UA), among onsets before which "
-                  "the gate was shut for 20 s and after which it opens within 180 s; interpolated inside the 4-s bin.")
+                  "the gate was shut for 20 s, with a follow-up of at least 60 s, and after which it opens within 180 s; "
+                  "interpolated inside the 4-s bin.")
             R.put(f"events.never_open{tag}", b, v.pool(cnt[:, 2]) / v.pool(cnt[:, 0]), int((cnt[:, 0] > 0).sum()), "share",
                   f"Share of such onsets ({txt}) after which the gate does not open (follow-up of at least 60 s).")
 
 
 def _contrast(v, x, cls, cs, a, b):
-    """Mean over the delivery modes of (mean of class a - mean of class b), per bootstrap draw."""
-    parts = []
+    """Mean over the delivery modes of (mean of class a - mean of class b), per bootstrap draw, and the
+    number of recordings with a finite value in the modes where both classes have one (0 if none)."""
+    parts, n = [], 0
     for mode in (True, False):
         ma, mb = (cls == a) & (cs == mode), (cls == b) & (cs == mode)
-        if ma.any() and mb.any():
+        if nfin(x[ma]) and nfin(x[mb]):
+            n += nfin(x[ma | mb])
             with np.errstate(invalid="ignore", divide="ignore"):
                 fa = (v.W[:, ma] @ np.nan_to_num(x[ma])) / (v.W[:, ma] @ np.isfinite(x[ma]))
                 fb = (v.W[:, mb] @ np.nan_to_num(x[mb])) / (v.W[:, mb] @ np.isfinite(x[mb]))
             parts.append(fa - fb)
-    return np.nanmean(np.stack(parts), 0) if parts else np.full(len(v.W), np.nan)
+    return (np.nanmean(np.stack(parts), 0) if parts else np.full(len(v.W), np.nan)), n
 
 
 def stats_groups(d, R, C, hs):
@@ -471,10 +526,11 @@ def stats_groups(d, R, C, hs):
           "gate_open": (v["open"], "share", f"share of anchors with gate >= {GATE_OPEN}")}
     binq = {"sg": d["gm@bin"] - d["gs@bin"], "gate_open": d["open@bin"]}
     if "kl" in d:
-        hs = 0 if hs is None else hs
         qs["kl"] = (v["kl"], "nats per anchor", "KL per anchor")
-        qs["elag"] = (v["elag"][:, hs], "steps of 4 s", "expected lag of the main head on clean anchors")
-        binq.update(kl=d["kl@bin"], elag=d["elag@bin"][:, :, hs])
+        binq["kl"] = d["kl@bin"]
+        if hs is not None:     # no heads or clock step: the main head is unknown, so its lag rows are left out
+            qs["elag"] = (v["elag"][:, hs], "steps of 4 s", "expected lag of the main head on clean anchors")
+            binq["elag"] = d["elag@bin"][:, :, hs]
     for q, (x, unit, txt) in qs.items():
         for j, name in enumerate(BIN_NAMES):
             xb = binq[q][:, j].astype(float)
@@ -488,7 +544,7 @@ def stats_groups(d, R, C, hs):
             w = View(d, cs == mode)
             R.put(f"groups.{q}.{name}", name, w.pool(x[cs == mode]), nfin(x[cs == mode]), unit, f"{txt}, delivery mode {name} (equal weight of the classes).")
         for a, b in (("hie", "healthy_bg"), ("acidosis", "healthy_bg"), ("hie", "acidosis"), ("healthy_bg", "healthy_no_bg")):
-            R.put(f"groups.{q}.{a}-{b}", "contrast", _contrast(v, x, cls, cs, a, b), nfin(x[np.isin(cls, (a, b))]), unit,
+            R.put(f"groups.{q}.{a}-{b}", "contrast", *_contrast(v, x, cls, cs, a, b), unit,
                   f"Difference of {txt}: {a} minus {b}, mean of the differences inside each delivery mode. "
                   + ("Placebo for how recordings were selected. " if b == "healthy_no_bg" else "") + "Differs from the study: no covariate adjustment.")
     if "g_slow" in d:
@@ -503,7 +559,8 @@ def stats_irf(d, R, C):
     for b, m in blocks_of(d)[0].items():
         v = View(d, m)
         for tag, txt in (("", "own UA"), ("_w", "another recording's UA")):
-            R.put(f"irf.gate_open{tag}", b, v.pool(np.nanmean(v["open" + tag], 1)), v.n, "share",
+            go = np.nanmean(v["open" + tag], 1)
+            R.put(f"irf.gate_open{tag}", b, v.pool(go), nfin(go), "share",
                   f"Share of (anchor, head channel) cells with an open IRF gate, {txt}; anchors with UA cover and enough valid cells.")
             for nm, name in (("delta", "pred_gap_irf"), ("delta_expl", "pred_gap_expl")):
                 R.put(f"irf.{name}{tag}", b, v.pool(v[f"gap_{nm}{tag}"]), nfin(v[f"gap_{nm}{tag}"]), "nats per cell",
@@ -519,7 +576,8 @@ def stats_irf(d, R, C):
                                                         for w in v.W[1:201]]) if np.isfinite(dl).any() else np.full(2, np.nan)
             R.put(f"irf.delay_{qn}", b, vals, nfin(dl), "s",
                   f"{qn} over recordings of the level-channel IRF delay (most negative point of the IRF, anchors with an open gate; "
-                  "segment median, then mean over the recording's segments). Includes the channel's filter latency. Interval from 200 draws.")
+                  "segment median, then mean over the recording's segments). Includes the channel's filter latency. Interval from 200 draws. "
+                  "Recordings weighted equally: a quantile over recordings, not the subgroup-equal mean.")
         a, c = d["delay@half"][m][:, 0].astype(float), d["delay@half"][m][:, 1].astype(float)
         ok = np.isfinite(a) & np.isfinite(c)
 
@@ -530,7 +588,8 @@ def stats_irf(d, R, C):
             return 2 * r / (1 + r)
         if ok.sum() > 10:
             R.put("irf.delay_reliability", b, np.array([rel(w) for w in v.W]), int(ok.sum()), "reliability",
-                  "Split-half reliability of the per-recording delay: correlation between odd and even segments, Spearman-Brown corrected.")
+                  "Split-half reliability of the per-recording delay: correlation between odd and even segments, Spearman-Brown corrected. "
+                  "Recordings weighted equally, not subgroup-equal.")
         for j, st in enumerate(PLANT_STEPS):
             R.put(f"irf.plant_err_{int(STEP_S * st)}s", b, v.median(v["plant_err"][:, j]), nfin(v["plant_err"][:, j]), "s",
                   f"Planted response {int(STEP_S * st)} s after the donor's UA on the level channel (one normalised unit deep): "
@@ -547,7 +606,8 @@ def stats_irf(d, R, C):
                         mx, my = (w * x[okk]).sum() / w.sum(), (w * y[okk]).sum() / w.sum()
                         return (w * (x[okk] - mx) * (y[okk] - my)).sum() / np.sqrt((w * (x[okk] - mx) ** 2).sum() * (w * (y[okk] - my) ** 2).sum())
                     R.put(f"irf.r_{e}_{q}_recordings", b, np.array([corr(w) for w in v.W]), int(okk.sum()), "correlation",
-                          f"Across recordings: Pearson correlation of the GUID means of the head's evidence ({etxt}) and {qtxt}.")
+                          f"Across recordings: Pearson correlation of the GUID means of the head's evidence ({etxt}) and {qtxt}. "
+                          "Recordings weighted equally, not subgroup-equal.")
                     R.put(f"irf.r_{e}_{q}_anchors", b, v.pool(v[f"r_{e}_{q}"]), nfin(v[f"r_{e}_{q}"]), "correlation",
                           f"Across anchors: the same correlation over the anchors of a segment (at least 40), mean over segments and recordings.")
 
@@ -599,7 +659,7 @@ def curve(x, Y, xlabel, ylabel, names=None):
     Y = np.asarray(Y, float)
     Y = Y[..., None] if Y.ndim == 2 else Y
     lo, hi = np.nanpercentile(Y[1:], [2.5, 97.5], 0)
-    r = lambda a: np.round(np.where(np.isfinite(a), a, 0.0).T, 6).tolist()        # noqa: E731
+    r = lambda a: np.round(a.T, 6).tolist()        # noqa: E731  NaN stays a gap; `_clean` writes it as null
     return {"x": np.asarray(x, float).tolist(), "y": r(Y[0]), "lo": r(lo), "hi": r(hi), "xlabel": xlabel, "ylabel": ylabel,
             "series": names or [""]}
 
@@ -646,6 +706,13 @@ def verdict(row):
     return "differs"
 
 
+def _yerr(row):
+    """Error-bar deltas of a row with a finite estimate, never negative (a percentile interval need not
+    contain the sample estimate); zero without an interval."""
+    est, ci = row["estimate"], row["ci95"] or [row["estimate"]] * 2
+    return [[max(0.0, est - ci[0])], [max(0.0, ci[1] - est)]]
+
+
 def figures(curves, rows, out, hb):
     import matplotlib
     matplotlib.use("Agg")
@@ -678,10 +745,9 @@ def figures(curves, rows, out, hb):
 
     def bars(ax, ids, labels, ylabel, ref=True):
         rs = [by.get((i, hb)) for i in ids]
-        keep = [(r, l) for r, l in zip(rs, labels) if r is not None]
+        keep = [(r, l) for r, l in zip(rs, labels) if r is not None and np.isfinite(r["estimate"])]
         for k, (r, l) in enumerate(keep):
-            ci = r["ci95"] or [r["estimate"]] * 2
-            ax.errorbar(k, r["estimate"], yerr=[[r["estimate"] - ci[0]], [ci[1] - r["estimate"]]], fmt="o", color="C0", capsize=3)
+            ax.errorbar(k, r["estimate"], yerr=_yerr(r), fmt="o", color="C0", capsize=3)
             if ref and r["reference"]:
                 ax.plot(k + 0.2, r["reference"]["value"], "s", color="C1", ms=4)
         ax.set_xticks(range(len(keep)), [l for _, l in keep], fontsize=7, rotation=20)
@@ -710,8 +776,10 @@ def figures(curves, rows, out, hb):
         axs[0].set_title("Raw signals around the UA peak of a contraction (all recordings)", fontsize=9)
         save(fig, "raw_peak_locked.png")
     for name, ids, labels, ylabel in (
-            ("gain_arms.png", ["gain.gain_matched_rw", "gain.gain_surA_rw", "gain.gain_surB_rw", "gain.gain_null_rw", "gain.sg_rw", "gain.sg_surB_rw"],
-             ["own UA", "surA", "surB", "zeroed UA", "specific (surA)", "specific (surB)"], "gain, nats per cell"),
+            ("gain_arms.png", ["gain.gain_matched_rw", "gain.gain_surA_rw", "gain.gain_surB_rw", "gain.gain_null_rw", "gain.sg_rw",
+                               "gain.sg_surB_rw", "gain.sg_all", "gain.sg_outside_rw"],
+             ["own UA", "surA", "surB", "zeroed UA", "specific (surA)", "specific (surB)", "specific, all anchors",
+              "specific, outside reward window"], "gain, nats per cell"),
             ("heads.png", [f"heads.{k}_h{h}" for k in ("kl_share", "shapley") for h in range(8)],
              [f"{k} h{h}" for k in ("KL share", "gain share") for h in range(8)], "share"),
             ("clamp.png", ["clamp.pos", "clamp.static", "clamp.rev"], ["position only", "static", "reversed (control)"], "share of the gain kept"),
@@ -727,10 +795,9 @@ def figures(curves, rows, out, hb):
     if cl:
         fig, axs = plt.subplots(1, 2, figsize=(8, 3.4))
         for ax, q, yl in zip(axs, ("sg", "gate_open"), ("specific gain, nats per cell", "gate open share")):
-            rs = [r for r in cl if r["id"].split(".")[1] == q]
+            rs = [r for r in cl if r["id"].split(".")[1] == q and np.isfinite(r["estimate"])]
             for k, r in enumerate(rs):
-                ci = r["ci95"] or [r["estimate"]] * 2
-                ax.errorbar(k, r["estimate"], yerr=[[r["estimate"] - ci[0]], [ci[1] - r["estimate"]]], fmt="o", capsize=3, color="C0")
+                ax.errorbar(k, r["estimate"], yerr=_yerr(r), fmt="o", capsize=3, color="C0")
             ax.set_xticks(range(len(rs)), [r["block"] for r in rs], fontsize=7, rotation=20)
             ax.set_ylabel(yl)
         axs[0].set_title("By class (GUID means, 95 % bootstrap interval)", fontsize=9)
@@ -756,8 +823,10 @@ def _build(out, info):
                      ("groups", lambda d, R, C: stats_groups(d, R, C, hs)), ("irf", stats_irf), ("raw", stats_raw)):
         if name in steps:
             fn(steps[name], R, C)
-    blocks = {r["block"] for r in R}
-    hb = "adverse" if "adverse" in blocks else "all"
+    hb = "adverse" if any(r["block"] == "adverse" and r["n_guids"] > 0 for r in R) else "all"
+    info = dict(info, notes=list(info.get("notes", [])))
+    if hs is None and "kl" in steps.get("groups", {}):
+        info["notes"].append("groups: the main head's expected-lag rows are left out: no heads or clock step names the main head.")
     (out / "lag_analysis.json").write_text(json.dumps(_clean({
         "about": "Key = '<statistic id>@<block>'. Blocks: adverse = classes acidosis + HIE, healthy = healthy_bg + healthy_no_bg, "
                  "all = every recording, a class or delivery-mode name, or contrast. Each entry: estimate, ci95 (percentile GUID-cluster "

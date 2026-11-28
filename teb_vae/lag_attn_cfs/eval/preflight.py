@@ -93,7 +93,11 @@ from teb_vae.lag_attn_cfs.model_kwargs import (
 )
 from teb_vae.lag_attn_cfs.scored_horizon import CUTOFF_KEY as SCORED_HORIZON_CUTOFF_KEY
 from teb_vae.lag_attn_cfs.scored_horizon import FAST_HORIZON_KEY as SCORED_HORIZON_FAST_KEY
-from teb_vae.lag_attn_cfs.scored_horizon import resolve_target_scored_horizon
+from teb_vae.lag_attn_cfs.scored_horizon import MIN_NOVELTY_KEY as SCORED_START_KEY
+from teb_vae.lag_attn_cfs.scored_horizon import (
+    resolve_target_scored_horizon,
+    resolve_target_scored_start,
+)
 
 # The training entry point's own guards, imported rather than copied. Their messages name the exact
 # command that regenerates a stats file and the exact reason a width mismatch must not be "fixed" by
@@ -186,13 +190,17 @@ SCHEDULE_KEYS: Tuple[str, ...] = ("kld_beta", "beta_schedule")
 #: beside this sentence in :func:`group_delay_summary`.
 CAUSALITY_STATEMENT = (
     "The stored coefficients are produced by a strictly one-sided filter bank, so a coefficient at "
-    "step t is a function of {x(s) : s <= t} alone and a forecast of step t + 1 + tau is a genuine "
-    "forecast: this run's inputs do not contain their own future. The coupling readout is still "
-    "named source_conditioned_kl_raw and no number in this run may be labelled a transfer entropy: "
-    f"the lag map is an attribution over stored-coefficient time, uncorrected for a composed "
-    f"one-sided group delay reaching {MAX_MEASURED_GROUP_DELAY_SECONDS:g} s on the committed causal "
-    "fixture -- as long as a lag search window or longer (this run's window is lag.n_lags in its "
-    "collection record). causal_delay_s records this run's own per-block delays."
+    "step t is a function of {x(s) : s <= t} alone (on the preprocessed segment) and a forecast of "
+    "step t + 1 + tau is a genuine forecast: the filter bank and model do not read future samples. "
+    "On signal-quality builds (root attribute quality_version), per-segment artifact detection "
+    "(ua_quality / fhr_quality) and gap bridging are offline preprocessing steps applied to each "
+    "segment before the strictly causal filter bank runs; source_running_gap_keys='remove' "
+    "excludes lag keys inside any UA gap still bridged past the anchor. The coupling readout is "
+    "still named source_conditioned_kl_raw and no number in this run may be labelled a transfer "
+    "entropy: the lag map is an attribution over stored-coefficient time, uncorrected for a "
+    f"composed one-sided group delay reaching {MAX_MEASURED_GROUP_DELAY_SECONDS:g} s on the "
+    "committed causal fixture -- as long as a lag search window or longer (this run's window is "
+    "lag.n_lags in its collection record). causal_delay_s records this run's own per-block delays."
 )
 
 #: The causality-record keys the *shared* half owns, which no encoder disclosure may return.
@@ -979,17 +987,20 @@ def check_warmup_budget_matches_checkpoint(
 # =================================================================================================
 # Checkpoint reconciliation
 # =================================================================================================
-def _scored_horizon_digest(steps: Optional[Tuple[int, ...]]) -> str:
-    """Name a scored-horizon vector in a refusal without printing one integer per channel.
+def _scored_horizon_digest(
+    steps: Optional[Tuple[int, ...]], none_text: str = "none (every cell scored)"
+) -> str:
+    r"""Name a per-channel step vector in a refusal without printing one integer per channel.
 
     Args:
-        steps: $H_c$ per declared channel, or ``None``.
+        steps: $H_c$ (or $\tau^{0}_c$) per declared channel, or ``None``.
+        none_text: What ``None`` means for this vector.
 
     Returns:
-        ``'none (every cell scored)'``, or the vector's length and its distinct values with counts.
+        *none_text*, or the vector's length and its distinct values with counts.
     """
     if steps is None:
-        return "none (every cell scored)"
+        return none_text
     values, counts = np.unique(np.asarray(steps, dtype=int), return_counts=True)
     spread = ", ".join(f"{int(count)} x {int(value)}" for value, count in zip(values, counts))
     return f"{len(steps)} channels ({spread})"
@@ -1091,6 +1102,30 @@ def reconcile_with_checkpoint(
                 f"target_scored_horizon: the config's rule resolves to "
                 f"{_scored_horizon_digest(expected_scored)}, the checkpoint was built with "
                 f"{_scored_horizon_digest(stamped_scored)}"
+            )
+
+    # The per-channel scored start $\tau^{0}_c$, the other half of the scored mask, compared the
+    # same way: it is resolved from ``target_min_novelty`` and the shards' novelty curves, so a
+    # config whose rule resolves elsewhere would score cells the checkpoint never trained on.
+    try:
+        expected_start = _as_int_tuple(resolve_target_scored_start(config_view_for_budget(config)))
+    except (ValueError, OSError, KeyError) as exc:
+        raise EvalPreconditionUnmet(
+            f"the per-channel scored start ({SCORED_START_KEY}) could not be resolved against "
+            f"dataset_config.vae_test_datasets: {exc}"
+        ) from exc
+    stamped_start = _as_int_tuple(model_kwargs.get("target_scored_start"))
+    if expected_start is not None or stamped_start is not None:
+        compared["target_scored_start"] = {
+            "config": None if expected_start is None else list(expected_start),
+            "checkpoint": None if stamped_start is None else list(stamped_start),
+        }
+        if expected_start != stamped_start:
+            unset = "none (every channel starts at step 0)"
+            disagreements.append(
+                f"target_scored_start: the config's rule resolves to "
+                f"{_scored_horizon_digest(expected_start, unset)}, the checkpoint was built with "
+                f"{_scored_horizon_digest(stamped_start, unset)}"
             )
 
     if disagreements:

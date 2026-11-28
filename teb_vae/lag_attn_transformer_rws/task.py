@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Optional, Union
 
+from loguru import logger
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
@@ -108,6 +109,18 @@ class SeqVaeLagAttnTrfRwsTask(SeqVaeLagAttnRwsTask):
         bounded_run = max_epochs > 0 and math.isfinite(total_steps)
         steps_per_epoch = max(1, round(total_steps / max_epochs)) if bounded_run else 1
         step_milestones = [milestone * steps_per_epoch for milestone in milestones]
+        # A ramp that outlasts the run, or the first decay, is a schedule that never reaches its
+        # base rate (the decay multiplies a still-rising ramp); legal, but almost never intended.
+        if bounded_run and warmup_steps >= total_steps:
+            logger.warning(
+                f"lr_warmup_steps={warmup_steps} >= the run's {int(total_steps)} optimizer "
+                f"steps: the learning rate never reaches its base value."
+            )
+        if step_milestones and warmup_steps >= min(step_milestones):
+            logger.warning(
+                f"lr_warmup_steps={warmup_steps} >= the first milestone at step "
+                f"{min(step_milestones)}: the decay starts before the ramp has finished."
+            )
 
         def lr_factor(step: int) -> float:
             """Multiplier on the base learning rate at optimizer step ``step`` (zero-based)."""

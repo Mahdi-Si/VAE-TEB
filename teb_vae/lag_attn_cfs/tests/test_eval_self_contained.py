@@ -124,6 +124,10 @@ NO_TORCH_FORBIDDEN: Tuple[str, ...] = ("torch", f"{PACKAGE}.binding")
 #: that outlived its use, and the next reach for that name would go unreported.
 EXEMPTIONS: Dict[str, Set[str]] = {
     "binding": {"teb_vae.lag_attn_cfs.task"},
+    # The forked-from package's one stdlib-only file utility (copy the tables without figures).
+    # It reads no table and runs no analysis, so it cannot become a half-fork, and both runners
+    # must write the same ``_send`` folder.
+    "run": {"teb_vae.lag_attn_rws.eval.send_pack"},
 }
 
 

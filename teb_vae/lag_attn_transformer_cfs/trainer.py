@@ -14,14 +14,14 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
     # the stamp so ranks 1..N-1 share rank 0's run directory.
     TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
         -m teb_vae.lag_attn_transformer_cfs.trainer \
-        --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_source_only.yaml
+        --config teb_vae/lag_attn_transformer_cfs/configs/run_s8_revised.yaml
 
 From an IDE's Run button, with no command line: ``RUN_CONFIG`` at the bottom of this file names the
-config to use -- ``configs/run_s8_source_only.yaml``, the continuation from the trained epoch-369
-S8 weights on the original production shards that trains the UA path only. Note a
-Run-button launch of a production config is a *single* process whose seven ``cuda_devices`` make
-Lightning spawn DDP workers underneath it; for a single-device smoke run point ``RUN_CONFIG`` at
-``configs/tiny.yaml``.
+config to use -- ``configs/run_s8_revised.yaml``, the fresh from-scratch revised S8 run on the
+2026-11-18 production shards (wider 8.13 M FHR trunk, no contraction-onset weighting, calibrated
+wrong-UA specificity penalty). Note a Run-button launch of a production config is a *single* process
+whose seven ``cuda_devices`` make Lightning spawn DDP workers underneath it; for a single-device
+smoke run point ``RUN_CONFIG`` at ``configs/tiny.yaml``.
 
 **Everything here is inherited, from two parents at once, and the three class attributes are the
 entire difference between building this architecture and building either model it is compared
@@ -144,7 +144,7 @@ def _resolve_cli_config_path(config_path: str) -> str:
 #: ``--config`` on the command line always wins over this value. A relative path is resolved against
 #: the repository root, not the working directory.
 #:
-RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/run_s8_source_only.yaml"
+RUN_CONFIG: str | None = "teb_vae/lag_attn_transformer_cfs/configs/run_s8_revised.yaml"
 
 
 if __name__ == "__main__":

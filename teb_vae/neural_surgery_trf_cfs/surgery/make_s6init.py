@@ -45,7 +45,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs  # noqa: E402
-from train.graph_models_utils import check_model_class, load_checkpoint_strict  # noqa: E402
+from train.graph_models_utils import check_model_class, load_checkpoint_strict, network_state_dict  # noqa: E402
 
 #: The committed fit: the six non-epoch-524 tensors, the two digests and the fit's report.
 ASSET = _REPO / "teb_vae" / "neural_surgery_trf_cfs" / "assets" / "s6init_fitted.npz"
@@ -98,19 +98,16 @@ def network_state(blob: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
     """Return a checkpoint's network state without the ``model.`` prefix.
 
     Args:
-        blob: A loaded checkpoint holding ``state_dict``.
+        blob: A loaded checkpoint holding ``state_dict``. A compiled run's
+            ``model._orig_mod.`` keys reduce to the same bare keys.
 
     Returns:
         The state dict of the network.
 
     Raises:
-        RuntimeError: If no key carries the prefix.
+        ValueError: If no network state dict can be extracted.
     """
-    state = {key[len(PREFIX):]: value for key, value in blob["state_dict"].items()
-             if key.startswith(PREFIX)}
-    if not state:
-        raise RuntimeError(f"no state-dict key starts with {PREFIX!r}")
-    return state
+    return dict(network_state_dict(blob))
 
 
 def export(source: Path, fitted: Path, asset: Path = ASSET) -> Path:

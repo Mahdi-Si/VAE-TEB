@@ -17,15 +17,17 @@ has a channel axis whose members become honest at different times:
   the emitted record says so: the source blocks' warm-ups are long against the lag window, so most
   of the searched lag range reads source steps that are still settling. The number exists to be *measured* across arms, not to be passed.
 
-* **The two geometry guards.** ``anchors_per_sample`` must be $T_{\mathrm{valid}} - F$ and
+* **The two geometry guards.** ``anchors_per_sample`` must be $T_{\mathrm{ceil}} - F$ and
   ``target_warm_frac`` exactly $1.0$. Both are exact structural numbers rather than statistics, and
   both decide what population every other number in the run was computed over: a decoded anchor
   count off by one means the forward ran at the training tiling, and a warm fraction below one
   means some scored coefficient lay inside its channel's warm-up and was scored as signal.
 
 **The guards' expectations are computed from the run's own geometry, never from a literal.** The
-collection record carries $T$, $T_{\mathrm{valid}}$ and the anchor floor the pass decoded at, so
-$A_{\max} = T_{\mathrm{valid}} - F$ is arithmetic on numbers the checkpoint itself produced -- and
+collection record carries $T$, $T_{\mathrm{valid}}$, the effective ceiling
+$T_{\mathrm{ceil}} = \texttt{anchor\_last} + 1 \le T_{\mathrm{valid}}$ (an advancing forecast
+clock never decodes its trailing anchors) and the anchor floor the pass decoded at, so
+$A_{\max} = T_{\mathrm{ceil}} - F$ is arithmetic on numbers the checkpoint itself produced -- and
 an arm that legitimately moves the horizon or the floor moves the expectation with it instead of
 failing a guard written against the shipped geometry.
 
@@ -169,7 +171,7 @@ GEOMETRY_TOLERANCE = 1e-6
 def expected_geometry(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     r"""What the run's own geometry says the two guards must read.
 
-    $A_{\max} = T_{\mathrm{valid}} - F$ is recomputed here from the two numbers it is made of
+    $A_{\max} = T_{\mathrm{ceil}} - F$ is recomputed here from the two numbers it is made of
     rather than read straight out of ``anchors_per_sample``, so the expectation and the collection
     pass's own record of it are two derivations that can disagree -- and a disagreement between
     them is reported instead of one number checking itself.
@@ -186,8 +188,12 @@ def expected_geometry(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     geometry = dict((record or {}).get("geometry") or {})
     t_valid = geometry.get("t_valid")
     floor = geometry.get("anchor_floor")
+    # The effective ceiling $T_{\mathrm{ceil}}$ = ``anchor_last + 1``: an advancing forecast clock
+    # never decodes its trailing anchors, so $T_{\mathrm{valid}}$ is only the stored-clock fallback.
+    last = geometry.get("anchor_last")
+    ceiling = t_valid if last is None else int(last) + 1
     derived = (
-        None if t_valid is None or floor is None else int(t_valid) - int(floor)
+        None if ceiling is None or floor is None else int(ceiling) - int(floor)
     )
     recorded = geometry.get("anchors_per_sample")
     return {

@@ -24,7 +24,7 @@ import pytest
 import yaml
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer
+from teb_vae.lag_attn_cfs.trainer import OPTIONAL_CAUSAL_SUFFIXES, LagAttnCfsTrainer
 from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS
 from train.callbacks import MetricsLoggingCallback, _unreachable_metric_names
 
@@ -110,8 +110,14 @@ def test_the_tracked_list_and_the_emitted_metrics_agree_in_both_directions(
     emitted |= {f"val/{name}" for name in val_metrics}
     tracked = set(LagAttnCfsTrainer.TRACKED_METRICS)
 
+    # The optional columns belong to switches the tiny config leaves off (``lambda_source_null``,
+    # the IRF source path, ``lambda_full_wrong``): tracked, and emitted by none of its stages.
+    optional = {f"{stage}/{name}" for stage in ("train", "val") for name in OPTIONAL_CAUSAL_SUFFIXES}
+
     assert emitted - tracked == set(), f"the task emits {emitted - tracked}, which nothing collects"
-    assert tracked - emitted - LOGGED_THROUGH_A_HOOK == set()
+    assert optional <= tracked
+    assert emitted.isdisjoint(optional), sorted(emitted & optional)
+    assert tracked - emitted - LOGGED_THROUGH_A_HOOK - optional == set()
     assert len(tracked) == len(LagAttnCfsTrainer.TRACKED_METRICS)
     # The negative control on the seam: the inherited module-global list alone would lose columns
     # this model emits, so the first assertion above can fail.

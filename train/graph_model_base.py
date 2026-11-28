@@ -111,6 +111,8 @@ _DEAD_CONFIG_KEYS = {
 
 # Carries the run's timestamp from the launching process to its DDP children.
 _RUN_STAMP_ENV = "TEB_RUN_STAMP"
+# Stamps this process has already given to a rank-0 run, minted or inherited.
+_USED_RUN_STAMPS: set = set()
 
 
 def _resolve_run_stamp() -> str:
@@ -127,23 +129,30 @@ def _resolve_run_stamp() -> str:
     subprocess launcher does ``os.environ.copy()`` into each child — so the parent
     stamps the environment once and children inherit the exact string.
 
-    The inherit branch is keyed on a **non-zero** ``LOCAL_RANK`` deliberately.
-    Lightning's launcher keeps rank $0$ for the parent and spawns children for
-    $1..N-1$ only, and it sets ``LOCAL_RANK=0`` in the parent's own environment once
-    ``fit`` starts. Inheriting on any set ``LOCAL_RANK`` would therefore make a
-    *second* run in the same process reuse the first run's directory.
+    A rank with a **non-zero** ``LOCAL_RANK`` always inherits. Rank $0$ (``LOCAL_RANK``
+    equal to ``"0"``) inherits only a stamp this process has not used yet: under
+    ``torchrun`` every rank is launched independently, so the job script exports
+    ``TEB_RUN_STAMP`` and rank $0$ must read it like the others. Lightning's launcher
+    also sets ``LOCAL_RANK=0`` in the parent's own environment once ``fit`` starts, and
+    the stamp it then finds is the one this process already used for its first run;
+    a *second* run in the same process therefore mints a fresh stamp rather than reuse
+    the first run's directory. With ``LOCAL_RANK`` unset (a plain single-process
+    launch) the stamp is always fresh, so a stale shell export never joins two runs.
 
-    lean-limit: covers Lightning's ``ddp``/``ddp_spawn`` launchers; under
-    ``torchrun`` every rank is launched independently and inherits nothing, so the
-    job script must export ``TEB_RUN_STAMP`` itself.
+    Returns:
+        The run's timestamp string, also exported to ``TEB_RUN_STAMP`` for children.
     """
     local_rank = os.environ.get("LOCAL_RANK")
     inherited = os.environ.get(_RUN_STAMP_ENV)
     if inherited and local_rank not in (None, "0"):
         return inherited
+    if inherited and local_rank == "0" and inherited not in _USED_RUN_STAMPS:
+        _USED_RUN_STAMPS.add(inherited)
+        return inherited
 
     stamp = datetime.now().strftime("%Y-%m-%d--[%H-%M]")
     os.environ[_RUN_STAMP_ENV] = stamp
+    _USED_RUN_STAMPS.add(stamp)
     return stamp
 
 

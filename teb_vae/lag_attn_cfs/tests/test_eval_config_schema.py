@@ -226,13 +226,15 @@ def test_a_set_event_window_is_kept_and_warned_about_when_it_disagrees() -> None
 
 
 def test_the_derived_window_selects_exactly_the_anchors_training_weighted() -> None:
-    """The identity the derivation rests on, checked on the two grids the code actually uses.
+    r"""The identity the derivation rests on, checked on the two causal grids the code actually uses.
 
-    Training floors each raw onset onto the decimated grid and weights anchors $[o, o + R]$
-    (``contraction_anchor_weight``); the collection pass measures the age from the raw onset to the
-    anchor's last raw sample (``Collector._contraction_ages``). The derived window must split the
+    Causal-feature training ceils each raw onset onto the decimated grid ($o = \lceil i_{\mathrm{on}}
+    / D \rceil$) and weights anchors $[o, o + R]$ (``contraction_anchor_weight(...,
+    step_align='ceil')``); the collection pass measures the age from the raw onset to the anchor's
+    causal raw sample $Dt$ (``Collector._contraction_ages``). The derived window must split the
     second exactly where the first ends, under both the inclusive and the strict comparison the
-    analyses use, for every onset phase inside a step.
+    analyses use, for every onset phase inside a step -- and step $o - 1$ must lie strictly before
+    the raw onset ($D(o - 1) < i_{\mathrm{on}}$).
     """
     from teb_vae.lag_attn_cfs.eval.events import FS_RAW
 
@@ -242,10 +244,12 @@ def test_the_derived_window_selects_exactly_the_anchors_training_weighted() -> N
         _with_reach(None, event_weight_floor=0.0, event_weight_reach_steps=reach,
                     raw_per_step=raw_per_step)
     )["event_lag_window_s"]
-    for onset_raw in range(10 * raw_per_step, 11 * raw_per_step):
-        onset_step = onset_raw // raw_per_step
+    for onset_raw in range(10 * raw_per_step - (raw_per_step - 1), 10 * raw_per_step + 1):
+        onset_step = (onset_raw + raw_per_step - 1) // raw_per_step
+        assert onset_step == 10
+        assert raw_per_step * (onset_step - 1) < onset_raw <= raw_per_step * onset_step
         for anchor in range(onset_step, onset_step + reach + 10):
-            age = (raw_per_step * (anchor + 1) - 1 - onset_raw) / FS_RAW
+            age = (raw_per_step * anchor - onset_raw) / FS_RAW
             trained = anchor - onset_step <= reach
             assert (age <= window) == trained, (onset_raw, anchor, age)
             assert (age < window) == trained, (onset_raw, anchor, age)

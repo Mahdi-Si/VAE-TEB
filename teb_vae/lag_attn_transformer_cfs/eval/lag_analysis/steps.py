@@ -132,23 +132,29 @@ def step_gain(ctx, acc):
     acc.mean("g_rw", p, g, rw & ak & okc)                        # matched gain, own mask
     acc.mean("g_all", p, g, ak & okc)
     P0 = ctx.arm(ctx.ua("null"))
-    acc.mean("g0_rw", p, ctx.gain(P0, rw & ak & okc)[0], rw & ak & okc)
+    g0 = ctx.gain(P0, ak & okc)[0]
+    acc.mean("g0_rw", p, g0, rw & ak & okc)
+    acc.mean("g0_all", p, g0, ak & okc)
     acc.mean("gate", p, ctx.matched["gate"], ak)
     if ctx.run["lag"]:
         acc.mean("kl", p, ctx.matched["kl"].sum(-1), ak)        # KL per anchor, nats
         acc.mean("kl0", p, P0["kl"].sum(-1), ak)
+    # Anchor windows by the age since the latest own onset: the reward window (0-60 s), its complement,
+    # and the complement split into 60-180 s after an onset and quiet (later, or no onset before).
+    age = ctx.since_onset()
+    windows = {"rw": rw, "all": torch.ones_like(rw), "out": ~rw,
+               "post": (age > core.REWARD_STEPS) & (age <= 3 * core.REWARD_STEPS), "quiet": age > 3 * core.REWARD_STEPS}
     for which, m, tag in (("A", ctx.mA, "a"), ("B", ctx.mB, "b")):
-        D = ctx.donor(which, reward_only=which == "B")
+        D = ctx.donor(which)
         mj = D["ak"] & m[:, None]
         (gJ, cJ), (gX, cX) = D["gJ"], D["gX"]
-        acc.mean(f"{tag}m_rw", p, gJ, mj & rw & okc)             # matched and surrogate under the joint mask
-        acc.mean(f"{tag}s_rw", p, gX, mj & rw & okc)
+        for w in (windows if which == "A" else ("rw", "all")):  # matched and surrogate under the joint mask
+            acc.mean(f"{tag}m_{w}", p, gJ, mj & windows[w] & okc)
+            acc.mean(f"{tag}s_{w}", p, gX, mj & windows[w] & okc)
         if ctx.run["lag"]:
             acc.mean(f"{tag}_klm", p, D["PJ"]["kl"].sum(-1), mj)
             acc.mean(f"{tag}_kls", p, D["PX"]["kl"].sum(-1), mj)
         if which == "A":
-            acc.mean("am_all", p, gJ, mj & okc)
-            acc.mean("as_all", p, gX, mj & okc)
             for nm, cell in (("m", cJ), ("s", cX)):
                 tau, blk = ctx.gain_tau(cell)
                 acc.mean(f"a{nm}_tau", p, tau, mj & rw & okc)   # by horizon step
@@ -166,9 +172,13 @@ def step_shift(ctx, acc):
         P[d] = ctx.arm(ua)
         if d in KAPPA_SHIFTS:                                    # eligible: clean in every shifted window
             call = call & (ctx.clean(ua["km"], ua["rm"], d) if lag else ua["inside"])
-    sel = rw & okc & ak & call
-    acc.mean("f_num", p, torch.stack([ctx.gain(P[d], sel, mean=True)[0] for d in SHIFTS], -1), sel)   # gain at latent means
-    acc.mean("f_den", p, ctx.gain(ctx.matched, sel, mean=True)[0], sel)
+    sel_all = okc & ak & call
+    sel = rw & sel_all
+    num = torch.stack([ctx.gain(P[d], sel_all, mean=True)[0] for d in SHIFTS], -1)   # gain at latent means
+    den = ctx.gain(ctx.matched, sel_all, mean=True)[0]
+    for tag, m in (("", sel), ("_all", sel_all)):               # reward-window anchors; every clean anchor
+        acc.mean("f_num" + tag, p, num, m)
+        acc.mean("f_den" + tag, p, den, m)
     if lag:                                                      # tracking index: every clean anchor
         kn = [core.kappa_terms(ctx.matched["alpha"], P[d]["alpha"], d) for d in KAPPA_SHIFTS]
         w = call[..., None]
@@ -224,14 +234,18 @@ def step_heads(ctx, acc):
 def step_clamp(ctx, acc):
     p, own = ctx.pos, ctx.ua("own")
     ak, okc, rw = _own(ctx)
-    sel = rw & ak & okc
+    sel_all = ak & okc
+    sel = rw & sel_all
     acc.mean("c_m", p, ctx.gm[0], sel)
+    acc.mean("c_m_all", p, ctx.gm[0], sel_all)
     # mean query of the other half of the recordings (cross-fit, so a row never shapes its own profile)
     qbar = ctx.run["qbar"][1 - ctx.run["ghalf"][p]][:, None]
     for mode in ("pos", "static", "rev"):
         with core.clamp(ctx.run["model"], mode, qbar):
             P = ctx.arm(own)
-        acc.mean(f"c_{mode}", p, ctx.gain(P, sel)[0], sel)
+        g = ctx.gain(P, sel_all)[0]
+        acc.mean(f"c_{mode}", p, g, sel)
+        acc.mean(f"c_{mode}_all", p, g, sel_all)
 
 
 # ----------------------------------------------------------------------------- 5. clock (R34, R38)
@@ -285,8 +299,10 @@ def step_clock(ctx, acc):
 def first_opening(onsets, gate, ak, next_cap=45):
     """Per segment: histogram of the gate's first-opening latency after each incident onset (bins of 4 s,
     4 .. 180 s) and counts (incident, opened, never). Incident: the anchors 20 s before the onset up to
-    the onset exist, have a key and a shut gate. Follow-up: the anchors after the onset up to 180 s, the
-    next onset or the segment end. Never: no open anchor in a follow-up of at least 60 s."""
+    the onset exist, have a key and a shut gate, and the follow-up is at least 60 s (15 anchors).
+    Follow-up: the anchors after the onset up to 180 s, the next onset or the segment end. An onset with
+    a shorter follow-up is right-censored and counts nowhere, opened or not. Never: no open anchor in
+    the follow-up."""
     hist, cnt = np.zeros(next_cap), np.zeros(3)
     op, A = (gate >= GATE_OPEN) & ak, len(gate)
     ons = np.sort(np.asarray(onsets, int))
@@ -295,10 +311,12 @@ def first_opening(onsets, gate, ak, next_cap=45):
             continue
         end = min(A, o + next_cap + 1, ons[j + 1] if j + 1 < len(ons) else A)
         fol = op[o + 1:end]
+        if len(fol) < 15:
+            continue
         if fol.any():
             cnt[:2] += 1
             hist[int(fol.argmax())] += 1
-        elif len(fol) >= 15:
+        else:
             cnt[[0, 2]] += 1
     return hist, cnt
 
@@ -409,6 +427,8 @@ def step_raw(ctx, acc):
     T = b.weight.shape[1]
     lvl, ok = ua_step_level(b.fhr, b.fhr_valid if hasattr(b, "fhr_valid") else torch.ones_like(b.fhr, dtype=torch.bool), dec, T)
     ua, uok = ua_step_level(b.up, b.up_valid if hasattr(b, "up_valid") else torch.ones_like(b.up, dtype=torch.bool), dec, T)
+    if not hasattr(b, "fhr_valid"):                                               # zero-padded gaps carry weight 0
+        ok = ok & (b.weight > 0)
     (fm, fs), (um, us) = run["scale"]["fhr"], run["scale"]["up"]
     lvl, ua = _np(lvl) * fs + fm, _np(ua) * us + um                              # bpm and toco units
     ok, uok = _np(ok) > 0, _np(uok) > 0

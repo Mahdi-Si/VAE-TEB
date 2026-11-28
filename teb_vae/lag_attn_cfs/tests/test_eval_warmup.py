@@ -196,6 +196,19 @@ def test_the_expected_anchor_count_is_derived_from_the_runs_own_geometry() -> No
     assert expected["expected_target_warm_frac"] == 1.0
 
 
+def test_the_expected_anchor_count_reads_the_effective_ceiling_not_t_valid() -> None:
+    r"""An advancing forecast clock never decodes its trailing anchors, so the collection pass
+    records ``anchor_last`` $= T_{\mathrm{ceil}} - 1 < T_{\mathrm{valid}} - 1$ and
+    $A_{\max} = T_{\mathrm{ceil}} - F$; reading $T_{\mathrm{valid}}$ would fail every such run."""
+    record = _record()
+    ceiling = SHIPPED_T_VALID - 15
+    record["geometry"].update(anchor_last=ceiling - 1, anchors_per_sample=ceiling - SHIPPED_FLOOR)
+    expected = warmup_analysis.expected_geometry(record)
+
+    assert expected["expected_anchors_per_sample"] == ceiling - SHIPPED_FLOOR
+    assert expected["geometry_self_consistent"] is True
+
+
 @pytest.mark.parametrize(
     "t_valid, floor, anchors",
     [

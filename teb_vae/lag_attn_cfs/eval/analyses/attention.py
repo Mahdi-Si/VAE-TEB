@@ -123,7 +123,8 @@ def truncated_anchor_accounting(geometry: Dict[str, Any], n_lags: int) -> Dict[s
 
     Lag $\ell$ at anchor $t$ refers to source step $t - \ell$, which does not exist for
     $\ell > t$, so the anchor's lag support is $\min(t + 1, L)$ and is complete only from
-    $t = L - 1$ on. The decoded range is $[F, T_{\mathrm{valid}})$: nothing below the anchor floor
+    $t = L - 1$ on. The decoded range is $[F, T_{\mathrm{ceil}})$, where the effective ceiling
+    $T_{\mathrm{ceil}} = \texttt{anchor\_last} + 1 \le T_{\mathrm{valid}}$: nothing below the anchor floor
     is decoded at all, and the tail $H$ anchors have no fully observed future to score against.
 
     Wherever the anchor floor clears the furthest lag, $F \ge L - 1$, the count
@@ -140,12 +141,15 @@ def truncated_anchor_accounting(geometry: Dict[str, Any], n_lags: int) -> Dict[s
         support, and the fraction. Zero counts on a geometry the record did not carry.
     """
     floor = int(geometry.get("anchor_floor", 0))
-    t_valid = int(geometry.get("t_valid", 0))
+    # The effective ceiling ``anchor_last + 1``; ``t_valid`` only when the record predates it,
+    # since an advancing forecast clock never decodes its trailing anchors.
+    last = geometry.get("anchor_last")
+    ceiling = int(geometry.get("t_valid", 0)) if last is None else int(last) + 1
     first_complete = max(int(n_lags) - 1, 0)
-    n_decoded = max(t_valid - floor, 0)
-    n_truncated = max(min(first_complete, t_valid) - floor, 0)
+    n_decoded = max(ceiling - floor, 0)
+    n_truncated = max(min(first_complete, ceiling) - floor, 0)
     return {
-        "decoded_anchor_range": [floor, t_valid],
+        "decoded_anchor_range": [floor, ceiling],
         "n_decoded_anchors": n_decoded,
         "first_untruncated_anchor": first_complete,
         "n_truncated_anchors": n_truncated,

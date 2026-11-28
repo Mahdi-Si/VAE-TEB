@@ -71,6 +71,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     BASELINE_NAMES,
     FORECAST_BRANCHES,
     NORMALISED_UNIT,
+    predictive_variance_factor,
 )
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
@@ -802,6 +803,7 @@ def build_overlay_figure(
     ar_coef: Optional[np.ndarray] = None,
     raw_scales: Optional[Dict[str, Tuple[float, float]]] = None,
     predictive_band: bool = True,
+    student_nu: Optional[float] = None,
 ) -> Any:
     r"""Draw retained samples side by side: the raw signals, then each chosen channel's forecast.
 
@@ -826,11 +828,15 @@ def build_overlay_figure(
         ar_coef: $\phi_c$ per kept channel, or ``None``; widens the band to the marginal variance.
         raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`.
         predictive_band: Whether the log-variance head was trained, so a band means anything.
+        student_nu: $\nu$ of the Student-$t$ innovation density, or ``None`` for the Gaussian.
+            The head's $\sigma^2$ is then a squared scale, so the band is widened by
+            $\sqrt{\nu / (\nu - 2)}$ to the predictive standard deviation.
 
     Returns:
         The figure, already laid out; the caller renders and closes it.
     """
     target = np.asarray(retained["target"])
+    band_scale = 1.0 if student_nu is None else float(np.sqrt(1.0 / predictive_variance_factor(student_nu)))
     horizon = int(geometry.get("horizon") or target.shape[2])
     first = int(geometry.get("anchor_first", geometry.get("anchor_floor", 0)) or 0)
     stride = int(geometry.get("anchor_stride") or 1)
@@ -895,7 +901,7 @@ def build_overlay_figure(
                           linestyle=figures.SERIES_STYLES[branch]["linestyle"])
                 logvar = retained.get(f"logvar_{branch}")
                 if predictive_band and logvar is not None:
-                    spread = np.sqrt(marginal_variance(
+                    spread = band_scale * np.sqrt(marginal_variance(
                         np.exp(np.asarray(logvar[row, position, :, channel], dtype=np.float64)),
                         None if ar_coef is None else float(ar_coef[channel]),
                     ))
@@ -1091,6 +1097,7 @@ def _emit_overlay(context: Any, directory: Path, *, output_dir: Any, seed: int) 
         ar_coef=ar_coef,
         raw_scales=traces.raw_signal_scales(getattr(context, "config", None)),
         predictive_band=str(record.get("likelihood") or "") == "gaussian_nll",
+        student_nu=(record.get("likelihood_structure") or {}).get("student_nu"),
     )
     written = figures.render_figure(figure, directory / OVERLAY_FIGURE)
     table = pd.DataFrame(samples)

@@ -106,6 +106,11 @@ STAGES: Tuple[str, ...] = ("train", "val")
 #: **other** rather than against the number they both decompose.
 RECOMPOSITION_TOLERANCE = 1e-6
 
+#: Absolute floor under the relative tolerance above. Where both splits sum to almost nothing (a gap
+#: of a few $10^{-6}$ nats, which an early or source-blind epoch produces), float32 noise is a large
+#: *fraction* of the sum and the relative test alone fails rows that agree to the last digit kept.
+RECOMPOSITION_ABS_FLOOR = 1e-5
+
 #: How many trailing rows the coupling readout's tail is read over. Not a criterion -- criterion 6
 #: carries no threshold and no epoch -- but "still rising at the end" needs a window to be a
 #: statement at all, and one stated here is one a reader can check.
@@ -188,6 +193,22 @@ ARM_KEYS: Tuple[str, ...] = (
     "alibi_slope_scale",
     "causal_align_reference",
     "causal_align_reference_source",
+)
+
+#: The arm keys the S6-S8 revisions and the source-only continuation added. A conv-LSTM causal run
+#: never had them, so they are required only of a run whose resolved configuration states at least
+#: one: such a run was launched from the revised configuration, and one silent key there is a key
+#: that predates the run's own base file.
+REVISED_ARM_KEYS: Tuple[str, ...] = (
+    "source_mask_mode",
+    "source_running_gap_keys",
+    "source_valid_tolerance_s",
+    "event_weight_ua_tolerance_s",
+    "ua_bridge_guard_s",
+    "decoder_logvar_clamp",
+    "forecast_student_nu",
+    "forecast_ar_max",
+    "freeze_target_path",
 )
 
 #: Where the run's own identity is looked for, in order. One of these must be present and non-empty,
@@ -440,7 +461,10 @@ def check_loss_and_breaker(rows: Sequence[Dict[str, str]]) -> Verdict:
     if not losses:
         return Verdict(3, title, FAIL, "train/total_loss is absent")
 
-    non_finite = [value for value in losses if not math.isfinite(value)]
+    # The validation loss too: a NaN there selects no checkpoint and leaves the training loss finite.
+    non_finite = [
+        value for value in losses + _floats(rows, "val/total_loss") if not math.isfinite(value)
+    ]
     latched = [value for value in skipped if value != 0.0]
     if non_finite or latched:
         return Verdict(3, title, FAIL,
@@ -484,7 +508,11 @@ def check_gap_recomposition(rows: Sequence[Dict[str, str]]) -> Verdict:
             warm = sum(series[index] for series in tertiles)
             block = sum(series[index] for series in blocks)
             scale = max(abs(warm), abs(block))
-            relative = abs(warm - block) if scale == 0.0 else abs(warm - block) / scale
+            difference = abs(warm - block)
+            relative = (
+                0.0 if difference <= RECOMPOSITION_ABS_FLOOR
+                else difference if scale == 0.0 else difference / scale
+            )
             worst = max(worst, relative)
             compared += 1
     if not compared:
@@ -556,7 +584,8 @@ def _lookup(config: Dict[str, Any], dotted: str) -> Tuple[bool, Any]:
 def check_arm_is_stated(config: Optional[Dict[str, Any]]) -> Verdict:
     """Criterion 6: the run's own artifacts state which arm it trained.
 
-    Every key in :data:`ARM_KEYS` must be **present** in the resolved configuration, and at least
+    Every key in :data:`ARM_KEYS` must be **present** in the resolved configuration -- and every key
+    of :data:`REVISED_ARM_KEYS` too, once the configuration states any one of them -- and at least
     one of :data:`IDENTITY_PATHS` must carry a non-empty name. Presence rather than value: each of
     these keys has a comparison arm on the other side of it, so no single value is the right one --
     what is not acceptable is a run whose artifacts cannot say which side it was on.
@@ -581,7 +610,10 @@ def check_arm_is_stated(config: Optional[Dict[str, Any]]) -> Verdict:
 
     stated: List[str] = []
     missing: List[str] = []
-    for key in ARM_KEYS:
+    revised = any(
+        _lookup(config, f"model_config.VAE_model.{key}")[0] for key in REVISED_ARM_KEYS
+    )
+    for key in ARM_KEYS + (REVISED_ARM_KEYS if revised else ()):
         found, value = _lookup(config, f"model_config.VAE_model.{key}")
         (stated if found else missing).append(f"{key}={value!r}" if found else key)
 
@@ -703,7 +735,37 @@ def _tail_direction(values: Sequence[float]) -> str:
     return f"{direction} by {change:+.4g} over the last {len(tail)} rows"
 
 
-def tier_two_readings(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
+def checkpoint_criteria(config: Optional[Dict[str, Any]]) -> Tuple[Tuple[str, str], ...]:
+    """The run's own checkpoint criteria, as ``(monitor, mode)``, read from its configuration.
+
+    The trainer builds its two ``ModelCheckpoint`` callbacks from
+    ``advanced_config.callbacks.model_checkpoint``, so that block says which metric each kept file
+    was selected on and in which direction. A hard-coded pair reports the wrong epoch for a run that
+    selects on, say, ``val/pred_gap_mean`` (max).
+
+    Args:
+        config: The resolved run configuration, or ``None`` when none was found.
+
+    Returns:
+        The primary criterion, then the secondary one when the configuration names it. Without a
+        configuration, :data:`CHECKPOINT_MONITORS`, both minimised.
+    """
+    if config is None:
+        return tuple((monitor, "min") for monitor in CHECKPOINT_MONITORS)
+    _found, block = _lookup(config, "advanced_config.callbacks.model_checkpoint")
+    block = block if isinstance(block, dict) else {}
+    mode = str(block.get("mode", "min"))
+    criteria = [(str(block.get("monitor", "val/total_loss")), mode)]
+    if block.get("secondary_monitor"):
+        criteria.append(
+            (str(block["secondary_monitor"]), str(block.get("secondary_mode", mode)))
+        )
+    return tuple(criteria)
+
+
+def tier_two_readings(
+    rows: Sequence[Dict[str, str]], config: Optional[Dict[str, Any]] = None
+) -> List[Tuple[str, str]]:
     """Every tier-2 number, beside its name.
 
     Reported and never gated. This is the first causal-feature model in the tree: there is no prior
@@ -713,6 +775,8 @@ def tier_two_readings(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
 
     Args:
         rows: The parsed rows.
+        config: The resolved run configuration, for the checkpoint criteria; ``None`` reads the
+            default pair.
 
     Returns:
         ``(name, reading)`` pairs, in report order.
@@ -760,20 +824,25 @@ def tier_two_readings(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
     # The two checkpoint criteria, as the epoch each is minimised at. A run keeps two sets of
     # weights because the composite optimum and the best conditioned forecast are different epochs;
     # how far apart they sit is what says whether keeping both was worth the disk.
-    argmins: Dict[str, int] = {}
-    for monitor in CHECKPOINT_MONITORS:
+    criteria = checkpoint_criteria(config)
+    best: Dict[str, int] = {}
+    for monitor, mode in criteria:
+        # A non-finite row is never a checkpoint's best, whatever the direction.
         values = _floats(rows, monitor)
-        if not values:
+        finite = [index for index, value in enumerate(values) if math.isfinite(value)]
+        if not finite:
             readings.append((f"{monitor} best epoch", "absent"))
             continue
-        index = min(range(len(values)), key=values.__getitem__)
-        argmins[monitor] = index
+        pick = max if mode == "max" else min
+        index = pick(finite, key=values.__getitem__)
+        best[monitor] = index
         readings.append(
             (f"{monitor} best epoch",
-             f"row {index} of {len(values)} at {values[index]:.6g}; final {values[-1]:.6g}")
+             f"row {index} of {len(values)} at {values[index]:.6g} ({mode}); "
+             f"final {values[-1]:.6g}")
         )
-    if len(argmins) == len(CHECKPOINT_MONITORS):
-        first, second = (argmins[monitor] for monitor in CHECKPOINT_MONITORS)
+    if len(criteria) == 2 and len(best) == 2:
+        first, second = (best[monitor] for monitor, _mode in criteria)
         readings.append(
             ("the two checkpoint criteria",
              f"{second - first:+d} rows apart"
@@ -884,7 +953,7 @@ def main(
         print(f"         {verdict.detail}")
     print()
     print("Tier 2 -- reported and interpreted, not passed or failed")
-    for name, reading in tier_two_readings(rows):
+    for name, reading in tier_two_readings(rows, resolved):
         print(f"  {name}: {reading}")
 
     tally = {status: sum(1 for verdict in verdicts if verdict.status == status)

@@ -82,6 +82,7 @@ model_config:
       warmup_epochs: 20
     # This shard predates the signal-quality step, so it carries nothing to mask with.
     source_quality_mask: false
+    source_running_gap_keys: keep
     event_weight_ua_valid: false
     target_quality_mask: false
 

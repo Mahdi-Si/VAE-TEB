@@ -107,6 +107,18 @@ def test_a_floor_below_the_lag_window_truncates_anchors_again() -> None:
     assert accounting["truncated_fraction"] == pytest.approx(0.25)
 
 
+def test_the_decoded_range_ends_at_the_effective_ceiling() -> None:
+    r"""The record's ``anchor_last`` $= T_{\mathrm{ceil}} - 1$ bounds the decoded range, not
+    $T_{\mathrm{valid}}$: an advancing forecast clock never decodes its trailing anchors."""
+    accounting = attention.truncated_anchor_accounting(
+        {"anchor_floor": 30, "t_valid": 270, "anchor_last": 249}, _SHIPPED_N_LAGS
+    )
+
+    assert accounting["decoded_anchor_range"] == [30, 250]
+    assert accounting["n_decoded_anchors"] == 220
+    assert accounting["n_truncated_anchors"] == 60
+
+
 def test_the_untruncated_mask_is_the_anchors_that_see_every_lag() -> None:
     """$t \\ge L - 1$, and nothing else: the mask the restricted profile is averaged over."""
     mask = untruncated_anchor_mask(seq_len=8, n_lags=4)

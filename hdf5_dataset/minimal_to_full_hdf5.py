@@ -248,8 +248,9 @@ def run_jobs(jobs: Sequence[Any], settings: Dict[str, Any], devices: Optional[Se
     install_adaptor(paths)
     if not devices or len(devices) < 2:
         return bfd.run_jobs(jobs, settings, devices)
+    check_kw = bfd._completion_kwargs(settings)
     todo = [j for j in jobs if not bfd.is_complete(
-        j.path, cnp.guid_set_digest(list(j.records)), settings["source_pickle_path"], None)]
+        j.path, cnp.guid_set_digest(list(j.records)), settings["source_pickle_path"], **check_kw)]
     logger.info(f"{len(jobs) - len(todo)} of {len(jobs)} files are complete; {len(todo)} to build")
     results, failed = [], []
     ctx = mp.get_context("spawn")
@@ -333,12 +334,15 @@ def main(minimal_paths: Sequence[str], output_base_path: str, n_folds: Optional[
     with open(out / bfd.MANIFEST_NAME, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    pending = [t for t in tasks if not bfd.is_complete(t.path, t.digest, str(pickle_path))]
+    check_kw = bfd._completion_kwargs(settings)
+    pending = [t for t in tasks
+               if not bfd.is_complete(t.path, t.digest, str(pickle_path), **check_kw)]
     needed = {source for t in pending for source in t.sources}
     jobs = [j for j in bfd.plan_jobs(str(out), members, None, ["kfold"]) if j.path in needed]
     results = run_jobs(jobs, settings, devices, paths)
     bfd.check_files_agree(sorted(j.path for j in jobs))
-    assembled = bfd.assemble_kfold(pending, str(pickle_path), int(assembly_workers or 4))
+    assembled = bfd.assemble_kfold(pending, str(pickle_path), int(assembly_workers or 4),
+                                   **check_kw)
     if not keep_units and (out / bfd.KFOLD_DIR / bfd.UNITS_DIR).exists():
         shutil.rmtree(out / bfd.KFOLD_DIR / bfd.UNITS_DIR)
     if pending:

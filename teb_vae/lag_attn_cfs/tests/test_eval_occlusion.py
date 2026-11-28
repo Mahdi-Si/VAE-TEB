@@ -275,22 +275,30 @@ def test_an_empty_occlusion_is_exactly_the_reference_arm(task) -> None:
 
 
 def test_the_live_fraction_reports_how_much_of_a_band_held_a_value(task) -> None:
-    """The column that separates "the source did not matter at those lags" from "there was less
+    r"""The column that separates "the source did not matter at those lags" from "there was less
     source there to remove".
 
-    A band reaching into the warm-up region finds a stream the availability mechanism has already
-    zeroed, so its delta is near zero for a reason that says nothing about the model. Measured on
-    the *gated* stream the intervention actually edits, and bounded to $[0, 1]$ because it is a
-    fraction of positions rather than a magnitude.
+    A band reaching into the warm-up region finds a stream the adapter's availability
+    $m_{t,c} = \mathbb 1[t \ge \delta_c]$ zeroes, so its delta is near zero for a reason that says
+    nothing about the model. Measured on the gated stream *times* $m$ -- ``source_gate`` does not
+    zero cold steps, the adapter does -- so it never exceeds the band's available share, and
+    bounded to $[0, 1]$ because it is a fraction of positions rather than a magnitude.
     """
     module = _running_task(task)
     record = occlusion_analysis.collect_batch(
         module, make_stub_batch(seed=1), bands=TINY_BANDS, seed=0
     )
 
+    availability = module.orig_model.source_adapter.availability.to(torch.float64)
+    assert float(availability.min()) == 0.0  # the warm-up is non-empty, so the bound below bites
+    anchors = torch.as_tensor(record["anchors"])
     assert set(record["live_fraction"]) == set(TINY_BANDS)
     for name, fraction in record["live_fraction"].items():
         assert 0.0 <= float(fraction) <= 1.0, (name, fraction)
+        mask = occlusion_analysis.band_mask(anchors, TINY_BANDS[name], availability.shape[0])
+        available = float((mask[:, :, None].to(torch.float64) * availability).sum())
+        bound = available / (float(mask.sum()) * availability.shape[1])
+        assert float(fraction) <= bound + 1e-12, (name, fraction, bound)
 
 
 # =================================================================================================

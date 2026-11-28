@@ -287,20 +287,65 @@ class HyperparameterLoggingCallback(Callback):
         log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
 
 
+def _is_fitting(trainer) -> bool:
+    """Return whether ``trainer`` runs ``fit`` (``True`` when the trainer has no state)."""
+    fn = getattr(getattr(trainer, "state", None), "fn", None)
+    return fn is None or fn == "fit"
+
+
 class MetricsLoggingCallback(Callback):
-    """Collect arbitrary metrics each validation epoch for post-analysis."""
+    r"""Collect the tracked metrics once per epoch, one row per epoch $e$.
+
+    Lightning runs the epoch-end validation loop *inside* training epoch $e$, before the
+    training epoch's metrics are reduced. At ``on_validation_epoch_end`` the ``train/*`` keys
+    of ``trainer.callback_metrics`` therefore hold the last micro-batch's value, and ``lr``
+    (logged with ``on_epoch=True`` at epoch start) still holds epoch $e-1$'s reduced value.
+    So this callback captures the ``val/*`` names at validation end and writes the row at
+    ``on_train_epoch_end``, where every other name holds epoch $e$'s reduced value. An epoch
+    with no validation gets $\mathrm{NaN}$ in its ``val/*`` columns; a ``validate``-only run
+    (no training epoch) writes its row at validation end. The sanity-check pass writes nothing.
+    """
 
     def __init__(self, tracked_metrics: Optional[Iterable[str]] = None) -> None:
+        """Initialize.
+
+        Args:
+            tracked_metrics: Exact ``trainer.callback_metrics`` names to collect.
+        """
         super().__init__()
         self.tracked_metrics: Tuple[str, ...] = tuple(
             tracked_metrics or ("train/total_loss", "val/total_loss", "kld_beta", "learning_rate")
         )
         self.history: Dict[str, List[float]] = {name: [] for name in self.tracked_metrics}
+        # The val/* values of the current epoch's validation pass, until the row is written.
+        self._pending_val: Dict[str, float] = {}
+
+    def _append_row(self, metrics) -> None:
+        """Append one row: pending ``val/*`` values, ``metrics`` for every other name."""
+        for name in self.tracked_metrics:
+            if name.startswith("val/"):
+                value = self._pending_val.get(name, float("nan"))
+            else:
+                value = _metric_to_float(metrics.get(name))
+            self.history[name].append(value)
+        self._pending_val = {}
 
     def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+        """Capture this epoch's ``val/*`` values; write the row when not fitting."""
+        if getattr(trainer, "sanity_checking", False):
+            return
         metrics = trainer.callback_metrics
-        for name in self.tracked_metrics:
-            self.history[name].append(_metric_to_float(metrics.get(name)))
+        self._pending_val = {
+            name: _metric_to_float(metrics.get(name))
+            for name in self.tracked_metrics
+            if name.startswith("val/")
+        }
+        if not _is_fitting(trainer):
+            self._append_row(metrics)
+
+    def on_train_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+        """Write epoch $e$'s row from its reduced metrics and its captured ``val/*`` values."""
+        self._append_row(trainer.callback_metrics)
 
     def as_dict(self) -> Dict[str, List[float]]:
         return self.history
@@ -331,8 +376,8 @@ class MetricsHistoryCsvCallback(Callback):
 
     ``MetricsLoggingCallback`` accumulates ``self.history`` and never writes it anywhere, so a
     run's metric history dies with the process unless something serialises it. This is that
-    something. It rewrites the file every validation epoch, so a killed run still leaves the
-    history it had reached rather than nothing at all.
+    something. It rewrites the file at the end of every training epoch, so a killed run still
+    leaves the history it had reached rather than nothing at all.
 
     On construction it warns about tracked names the framework can never emit. Those are not an
     error -- the CSV is still written -- but they are silent otherwise: the column appears, and
@@ -395,11 +440,24 @@ class MetricsHistoryCsvCallback(Callback):
         frame.to_csv(path, index=False)
         return path
 
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
-        """Rewrite the CSV so a killed run still leaves the history it had."""
+    def _rewrite(self, trainer) -> None:
+        """Rewrite the CSV on rank zero, anchored to the current epoch."""
         if trainer.is_global_zero and not trainer.sanity_checking:
             self._last_epoch = trainer.current_epoch
             self._write(last_epoch=self._last_epoch)
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
+        """Rewrite the CSV so a killed run still leaves the history it had.
+
+        The source writes its row in the same hook, so it must precede this callback in the
+        trainer's callback list; otherwise the file lags one epoch until ``on_fit_end``.
+        """
+        self._rewrite(trainer)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
+        """Rewrite the CSV after a ``validate``-only pass, which has no training epoch."""
+        if not _is_fitting(trainer):
+            self._rewrite(trainer)
 
     def on_fit_end(self, trainer, pl_module) -> None:  # type: ignore[override]
         """Write the final history CSV on rank zero."""

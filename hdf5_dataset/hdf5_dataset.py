@@ -11,7 +11,6 @@ import atexit
 import threading
 import warnings
 from dataclasses import dataclass, field
-from functools import lru_cache
 import gc
 from torch.utils.data.dataloader import default_collate
 import yaml
@@ -2104,12 +2103,16 @@ class CombinedHDF5Dataset(Dataset):
         attribute read as ``None`` on both sides. Old statistics beside old data
         is ``None == None`` and passes. The stats file's ``quality_rho_epsilon``
         (``None`` when absent) is kept as ``stats_quality_rho_epsilon``, and a
-        step mask whose ``rho_epsilon`` differs from it is refused.
+        step mask whose ``rho_epsilon`` differs from it is refused. A step mask
+        with a ``rho_epsilon`` is refused as well against a signal-quality stats
+        file that records none, because those constants excluded nothing by
+        $\rho$. A recorded ``trim_minutes`` must equal the dataset's.
 
         Raises:
             ValueError: On a quality, variant or leg-alignment mismatch, on a
-                step-mask $\varepsilon$ that differs from the statistics', or on
-                a block whose channel count disagrees with the stats file's.
+                step-mask $\varepsilon$ that differs from the statistics' or that
+                they do not record, on a ``trim_minutes`` mismatch, or on a block
+                whose channel count disagrees with the stats file's.
         """
         try:
             with h5py.File(self.stats_path, 'r') as f:
@@ -2118,6 +2121,7 @@ class CombinedHDF5Dataset(Dataset):
                 stats_operator = resolve_phase_operator(f.attrs)
                 stats_quality = f.attrs.get('quality_version')
                 stats_rho_epsilon = f.attrs.get('quality_rho_epsilon')
+                stats_trim_minutes = f.attrs.get('trim_minutes')
                 stats_widths = {
                     field: int(f[field].attrs['n_channels'])
                     for field in f.keys()
@@ -2133,9 +2137,26 @@ class CombinedHDF5Dataset(Dataset):
         self.stats_quality_rho_epsilon = (
             None if stats_rho_epsilon is None else float(stats_rho_epsilon)
         )
+        if (self.trim_minutes is not None and stats_trim_minutes is not None
+                and not np.isclose(float(stats_trim_minutes), float(self.trim_minutes))):
+            raise ValueError(
+                f"Dataset trim_minutes={self.trim_minutes} but {self.stats_path} was computed "
+                f"with trim_minutes={float(stats_trim_minutes):g}. The constants then describe "
+                f"another window of every recording. Set trim_minutes to "
+                f"{float(stats_trim_minutes):g}, or recompute the statistics at this trim."
+            )
         for key, rule in (('ua_step_mask', self._ua_step_rule),
                           ('fhr_step_mask', self._fhr_step_rule)):
             epsilon = None if rule is None else rule[-2]
+            if (epsilon is not None and stats_quality is not None
+                    and self.stats_quality_rho_epsilon is None):
+                raise ValueError(
+                    f"{key}.rho_epsilon is {epsilon:g} but {self.stats_path} is a signal-quality "
+                    f"statistics file with no quality_rho_epsilon: it was computed with no "
+                    f"contamination rule, so the mask would remove values the normalisation "
+                    f"used. Set {key}.rho_epsilon to null, or recompute the statistics with "
+                    f"quality_rho_epsilon={epsilon:g}."
+                )
             if (epsilon is not None and self.stats_quality_rho_epsilon is not None
                     and not np.isclose(epsilon, self.stats_quality_rho_epsilon)):
                 raise ValueError(
@@ -2217,8 +2238,9 @@ class CombinedHDF5Dataset(Dataset):
                 # Load global metadata
                 self.log_epsilon = f.attrs.get('log_epsilon', 1e-6)
                 stats_trim_minutes = f.attrs.get('trim_minutes', -1.0)
-                if self.trim_minutes is not None and stats_trim_minutes != self.trim_minutes:
-                    warnings.warn(f"Dataset trim_minutes ({self.trim_minutes}) does not match stats file trim_minutes ({stats_trim_minutes}). This may lead to incorrect normalization.")
+                # A recorded trim that differs was refused by _check_stats_pairing; only an absent one is left.
+                if self.trim_minutes is not None and stats_trim_minutes < 0:
+                    warnings.warn(f"Stats file {self.stats_path} records no trim_minutes; the dataset uses trim_minutes={self.trim_minutes}. This may lead to incorrect normalization.")
                 elif self.trim_minutes is None and stats_trim_minutes > 0:
                      warnings.warn(f"Stats file was created with trim_minutes={stats_trim_minutes}, but dataset is not using trimming. Normalization might be incorrect.")
 
@@ -2444,7 +2466,8 @@ class CombinedHDF5Dataset(Dataset):
                         self.paths[file_idx], 'r',
                         libver='latest',
                         swmr=True,
-                        rdcc_nbytes=1024**2 * 128,    # 128MB cache per file
+                        # 8 MB per file: every persistent worker opens every shard, so 128 MB grew past 150 GB.
+                        rdcc_nbytes=1024**2 * 8,
                         rdcc_nslots=10007,            # Prime number for hash table
                         rdcc_w0=0.75,                 # Cache write policy
                         driver='sec2'                 # System call driver for better performance
@@ -2468,11 +2491,22 @@ class CombinedHDF5Dataset(Dataset):
                     except:
                         pass
 
-    @lru_cache(maxsize=128)
     def _get_sample_fields(self, file_idx: int) -> Tuple[str, ...]:
-        """Cache available fields for each file."""
-        f = self._open_handle(file_idx)
-        return tuple(f.keys())
+        """The field names one file stores, cached on the instance.
+
+        An instance dict rather than ``functools.lru_cache``: a method cache keeps a strong
+        reference to every ``self`` it has seen, so datasets were never freed.
+
+        Args:
+            file_idx: Index of the file in ``self.paths``.
+
+        Returns:
+            The file's top-level keys.
+        """
+        cache = self.__dict__.setdefault('_sample_fields_cache', {})
+        if file_idx not in cache:
+            cache[file_idx] = tuple(self._open_handle(file_idx).keys())
+        return cache[file_idx]
 
     def _create_tensor(self, data: np.ndarray, pin_memory: bool = None) -> torch.Tensor:
         """Optimized tensor creation with optional memory pinning."""

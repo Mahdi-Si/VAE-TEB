@@ -193,20 +193,39 @@ def effect_lags(gain_none: Any, gain_near: np.ndarray, gain_far: np.ndarray, gri
 
 
 def contraction_lags(onset_raw: np.ndarray, end_raw: np.ndarray, anchors: np.ndarray, decimation: int) -> Dict[str, np.ndarray]:
-    """For each anchor, the most recent contraction at or before it and the lags covering its body.
+    r"""For each anchor, the most recent contraction at or before it and the lags covering its body.
 
-    Returns ``age_s`` (anchor endpoint minus onset), ``lo``/``hi`` (inclusive lags of the body, ``lo``
-    is 0 while the contraction is still running) and ``index`` (-1 where no contraction is behind).
+    On the causal-feature step grid, stored step $t$ sits at trimmed raw sample $Dt$ and reads only
+    samples $\le Dt$. A contraction spanning raw indices $[i_{\mathrm{on}}, i_{\mathrm{end}}]$ is
+    therefore visible at anchor $t$ once $Dt \ge i_{\mathrm{on}}$, and its body spans decimated
+    steps $[\lceil i_{\mathrm{on}} / D \rceil, \lceil i_{\mathrm{end}} / D \rceil]$.
+
+    Args:
+        onset_raw: Contraction onset indices in raw samples.
+        end_raw: Contraction end indices in raw samples.
+        anchors: Anchor indices on the decimated step grid.
+        decimation: Raw samples per decimated step $D$.
+
+    Returns:
+        Mapping with ``age_s`` (anchor causal sample $Dt$ minus onset in seconds), ``lo``/``hi``
+        (inclusive lags of the body, ``lo`` is $0$ while the contraction is still running) and
+        ``index`` ($-1$ where no contraction is behind).
     """
     anchors = np.asarray(anchors, dtype=np.int64)
-    endpoint = decimation * (anchors + 1) - 1
+    endpoint = decimation * anchors
     order = np.argsort(onset_raw)
     onset_raw, end_raw = np.asarray(onset_raw)[order], np.asarray(end_raw)[order]
     k = np.searchsorted(onset_raw, endpoint, side="right") - 1
     has = k >= 0
     kk = np.clip(k, 0, None)
-    on_step = (onset_raw[kk] // decimation) if onset_raw.size else np.zeros_like(anchors)
-    end_step = (end_raw[kk] // decimation) if end_raw.size else np.zeros_like(anchors)
+    on_step = (
+        ((onset_raw[kk] + decimation - 1) // decimation)
+        if onset_raw.size else np.zeros_like(anchors)
+    )
+    end_step = (
+        ((end_raw[kk] + decimation - 1) // decimation)
+        if end_raw.size else np.zeros_like(anchors)
+    )
     lo = anchors - np.minimum(end_step, anchors)
     hi = anchors - on_step
     age = (endpoint - (onset_raw[kk] if onset_raw.size else 0)) / events.FS_RAW
