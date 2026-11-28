@@ -17,14 +17,15 @@ general_config:
   seed: 42
   cuda_devices: [1, 2, 3, 4, 5, 6, 7]
   # Stable from-scratch Transformer peak LR (avoiding S8's 3e-3 gradient spikes), with 2000-step
-  # warmup, 150 epochs at peak after the 50-epoch beta ramp, then x0.1 drops at epochs 200 & 320.
-  lr: 5.0e-04
-  lr_milestone: [200, 320]
+  # warmup (~4.8 epochs at ~420 steps/epoch), 230 full epochs at peak after the 50-epoch beta ramp,
+  # then x0.1 drops at epochs 280 (80-epoch polish) and 360 (40-epoch fine-settling).
+  lr: 4.0e-04
+  lr_milestone: [280, 360]
   lr_warmup_steps: 2000
   epochs: 400
-  # 128 x 7 GPUs x 8 grad-accum = 7,168 segments/update (~21.5 GB/GPU peak fp32, safer than S8's
-  # ~24.0 GB/GPU at batch 228 while closely matching its 7,980 effective batch size).
-  accumulate_grad_batches: 8
+  # 128 x 7 GPUs x 5 grad-accum = 4,480 segments/update (matches default.yaml's effective batch
+  # size for ~420 updates/epoch = ~168k total updates in 400 epochs, at ~21.5 GB/GPU peak fp32).
+  accumulate_grad_batches: 5
   batch_size:
     train: 128
     test: 128
